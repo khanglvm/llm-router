@@ -1,0 +1,26 @@
+{
+  "name": "@khanglvm/llm-router",
+  "version": "1.0.0",
+  "description": "LLM Router route (local + Cloudflare Worker)",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "llm-router": "./src/cli-entry.js",
+    "llm-router-route": "./src/cli-entry.js"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "start": "node ./src/cli-entry.js start",
+    "config": "node ./src/cli-entry.js config",
+    "deploy:worker": "node ./src/cli-entry.js deploy",
+    "test:provider-smoke": "node ./scripts/provider-smoke-suite.mjs"
+  },
+  "dependencies": {
+    "@levu/snap": "^0.3.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+.DS_Store
+.npm-cache/
+*.tgz
+.llm-router.worker.json
+.llm-router.runtime.json
+
+# Local secrets / test inputs
+.env
+.env.*
+!.env.example
+!.env.test-suite.example

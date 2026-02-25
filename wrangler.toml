@@ -1,0 +1,18 @@
+name = "llm-router-route"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# No custom routes are defined by default.
+# Configure routes/domains per environment in your own deployment setup.
+
+# Optional non-secret vars
+[vars]
+ENVIRONMENT = "production"
+
+# Required secret(s):
+# LLM_ROUTER_CONFIG_JSON  - All-in-one JSON config exported by:
+#                          llm-router deploy --export-only=true --out=.llm-router.worker.json
+#                          wrangler secret put LLM_ROUTER_CONFIG_JSON < .llm-router.worker.json
+#
+# Optional override:
+# LLM_ROUTER_MASTER_KEY   - Overrides config.masterKey at runtime
