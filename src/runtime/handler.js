@@ -37,6 +37,43 @@ const HOP_BY_HOP_HEADERS = [
 
 const DEFAULT_FALLBACK_CIRCUIT_FAILURES = 2;
 const DEFAULT_FALLBACK_CIRCUIT_COOLDOWN_MS = 30_000;
+const DEFAULT_ORIGIN_RETRY_ATTEMPTS = 3;
+const DEFAULT_ORIGIN_RETRY_BASE_DELAY_MS = 250;
+const DEFAULT_ORIGIN_RETRY_MAX_DELAY_MS = 3_000;
+const DEFAULT_ORIGIN_FALLBACK_COOLDOWN_MS = 45_000;
+const DEFAULT_ORIGIN_RATE_LIMIT_COOLDOWN_MS = 30_000;
+const DEFAULT_ORIGIN_BILLING_COOLDOWN_MS = 15 * 60_000;
+const DEFAULT_ORIGIN_AUTH_COOLDOWN_MS = 10 * 60_000;
+const DEFAULT_ORIGIN_POLICY_COOLDOWN_MS = 2 * 60_000;
+const ERROR_TEXT_SCAN_LIMIT = 4_096;
+const BILLING_HINTS = [
+  "insufficient_quota",
+  "insufficient quota",
+  "insufficient balance",
+  "insufficient credits",
+  "not enough credits",
+  "out of credits",
+  "payment required",
+  "billing hard limit",
+  "quota exceeded"
+];
+const AUTH_HINTS = [
+  "invalid api key",
+  "incorrect api key",
+  "api key not valid",
+  "authentication",
+  "unauthorized",
+  "permission denied",
+  "forbidden"
+];
+const POLICY_HINTS = [
+  "moderation",
+  "policy_violation",
+  "content policy",
+  "safety",
+  "unsafe",
+  "flagged"
+];
 const fallbackCircuitState = new Map();
 
 function sanitizePassthroughHeaders(headers) {
@@ -121,7 +158,7 @@ async function loadRuntimeConfig(getConfig, env) {
 }
 
 function shouldRetryStatus(status) {
-  return status === 429 || status === 408 || status >= 500;
+  return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
 function toNonNegativeInteger(value, fallback) {
@@ -129,6 +166,98 @@ function toNonNegativeInteger(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed < 0) return fallback;
   return parsed;
+}
+
+function toBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function sleep(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(rawValue, now = Date.now()) {
+  if (!rawValue) return 0;
+
+  const seconds = Number.parseInt(String(rawValue).trim(), 10);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, 24 * 60 * 60 * 1000);
+  }
+
+  const parsedAt = Date.parse(String(rawValue).trim());
+  if (!Number.isFinite(parsedAt)) return 0;
+  return Math.min(Math.max(0, parsedAt - now), 24 * 60 * 60 * 1000);
+}
+
+function resolveRetryPolicy(env = {}) {
+  const originRetryAttemptsRaw = toNonNegativeInteger(
+    env?.LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS,
+    DEFAULT_ORIGIN_RETRY_ATTEMPTS
+  );
+  const originRetryAttempts = Math.min(Math.max(originRetryAttemptsRaw, 1), 10);
+
+  const originRetryBaseDelayMs = Math.max(
+    0,
+    toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_RETRY_BASE_DELAY_MS,
+      DEFAULT_ORIGIN_RETRY_BASE_DELAY_MS
+    )
+  );
+  const originRetryMaxDelayMs = Math.max(
+    originRetryBaseDelayMs,
+    toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_RETRY_MAX_DELAY_MS,
+      DEFAULT_ORIGIN_RETRY_MAX_DELAY_MS
+    )
+  );
+
+  return {
+    originRetryAttempts,
+    originRetryBaseDelayMs,
+    originRetryMaxDelayMs,
+    originFallbackCooldownMs: toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_FALLBACK_COOLDOWN_MS,
+      DEFAULT_ORIGIN_FALLBACK_COOLDOWN_MS
+    ),
+    originRateLimitCooldownMs: toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_RATE_LIMIT_COOLDOWN_MS,
+      DEFAULT_ORIGIN_RATE_LIMIT_COOLDOWN_MS
+    ),
+    originBillingCooldownMs: toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_BILLING_COOLDOWN_MS,
+      DEFAULT_ORIGIN_BILLING_COOLDOWN_MS
+    ),
+    originAuthCooldownMs: toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_AUTH_COOLDOWN_MS,
+      DEFAULT_ORIGIN_AUTH_COOLDOWN_MS
+    ),
+    originPolicyCooldownMs: toNonNegativeInteger(
+      env?.LLM_ROUTER_ORIGIN_POLICY_COOLDOWN_MS,
+      DEFAULT_ORIGIN_POLICY_COOLDOWN_MS
+    ),
+    allowPolicyFallback: toBoolean(env?.LLM_ROUTER_ALLOW_POLICY_FALLBACK, false)
+  };
+}
+
+function computeRetryDelayMs(attemptNumber, policy) {
+  const exponent = Math.max(0, attemptNumber - 1);
+  const exponential = policy.originRetryBaseDelayMs * (2 ** exponent);
+  const capped = Math.min(exponential, policy.originRetryMaxDelayMs);
+  const jitterMultiplier = 0.5 + (Math.random() * 0.5);
+  return Math.max(0, Math.round(capped * jitterMultiplier));
+}
+
+function hasAnyHint(text, hints) {
+  if (!text) return false;
+  for (const hint of hints) {
+    if (text.includes(hint)) return true;
+  }
+  return false;
 }
 
 function resolveFallbackCircuitPolicy(env = {}) {
@@ -198,8 +327,15 @@ function markCandidateSuccess(candidate) {
   fallbackCircuitState.delete(candidateCircuitKey(candidate));
 }
 
-function markCandidateFailure(candidate, result, policy, now = Date.now()) {
+function markCandidateFailure(candidate, result, policy, options = {}) {
+  const now = options?.now ?? Date.now();
+  const trackFailure = options?.trackFailure !== false;
   const key = candidateCircuitKey(candidate);
+  if (!trackFailure) {
+    fallbackCircuitState.delete(key);
+    return;
+  }
+
   if (!isFallbackCircuitEnabled(policy)) {
     fallbackCircuitState.delete(key);
     return;
@@ -222,6 +358,23 @@ function markCandidateFailure(candidate, result, policy, now = Date.now()) {
       : 0,
     lastFailureAt: now,
     lastFailureStatus: result.status
+  });
+}
+
+function setCandidateCooldown(candidate, cooldownMs, policy, status, now = Date.now()) {
+  if (!isFallbackCircuitEnabled(policy)) return;
+  if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return;
+
+  const key = candidateCircuitKey(candidate);
+  const prior = fallbackCircuitState.get(key) || {};
+  const priorOpenUntil = Number.isFinite(prior.openUntil) ? Number(prior.openUntil) : 0;
+  const openUntil = Math.max(priorOpenUntil, now + cooldownMs);
+
+  fallbackCircuitState.set(key, {
+    consecutiveRetryableFailures: prior?.consecutiveRetryableFailures || 0,
+    openUntil,
+    lastFailureAt: now,
+    lastFailureStatus: status
   });
 }
 
@@ -465,7 +618,11 @@ async function toProviderError(response) {
   const parsed = parseJsonSafely(raw);
   const message =
     parsed?.error?.message ||
+    parsed?.error?.code ||
+    parsed?.error?.type ||
     parsed?.error ||
+    parsed?.code ||
+    parsed?.type ||
     parsed?.message ||
     raw ||
     `Provider request failed with status ${response.status}`;
@@ -480,6 +637,208 @@ async function toProviderError(response) {
       }
     }
   };
+}
+
+async function readProviderErrorHint(result) {
+  if (!(result?.upstreamResponse instanceof Response)) return "";
+  try {
+    const raw = await result.upstreamResponse.clone().text();
+    if (!raw) return "";
+    const limitedRaw = raw.slice(0, ERROR_TEXT_SCAN_LIMIT);
+    const parsed = parseJsonSafely(limitedRaw);
+    const fragments = [
+      parsed?.error?.code,
+      parsed?.error?.type,
+      parsed?.error?.message,
+      parsed?.error,
+      parsed?.code,
+      parsed?.type,
+      parsed?.message,
+      limitedRaw
+    ];
+    return fragments
+      .filter((entry) => entry !== undefined && entry !== null)
+      .map((entry) => String(entry).toLowerCase())
+      .join(" ");
+  } catch {
+    return "";
+  }
+}
+
+async function classifyFailureResult(result, retryPolicy) {
+  const status = Number.isFinite(result?.status) ? Number(result.status) : 0;
+  const retryAfterMs = parseRetryAfterMs(result?.upstreamResponse?.headers?.get("retry-after"));
+
+  if (result?.errorKind === "configuration_error") {
+    return {
+      category: "configuration_error",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: retryPolicy.originFallbackCooldownMs
+    };
+  }
+
+  if (result?.errorKind === "not_supported_error") {
+    return {
+      category: "not_supported_error",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: 0
+    };
+  }
+
+  if (result?.errorKind === "network_error") {
+    return {
+      category: "network_error",
+      retryable: true,
+      retryOrigin: true,
+      allowFallback: true,
+      originCooldownMs: 0
+    };
+  }
+
+  if (status === 429) {
+    const rateLimitCooldown = retryAfterMs > 0 ? retryAfterMs : retryPolicy.originRateLimitCooldownMs;
+    return {
+      category: "rate_limited",
+      retryable: true,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: rateLimitCooldown
+    };
+  }
+
+  if (status === 402) {
+    return {
+      category: "billing_exhausted",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: retryPolicy.originBillingCooldownMs
+    };
+  }
+
+  if (status === 401) {
+    return {
+      category: "auth_failed",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: retryPolicy.originAuthCooldownMs
+    };
+  }
+
+  if (status === 403) {
+    const hintText = await readProviderErrorHint(result);
+    if (hasAnyHint(hintText, BILLING_HINTS)) {
+      return {
+        category: "billing_exhausted",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: retryPolicy.originBillingCooldownMs
+      };
+    }
+
+    if (hasAnyHint(hintText, POLICY_HINTS)) {
+      return {
+        category: "policy_blocked",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: retryPolicy.allowPolicyFallback,
+        originCooldownMs: retryPolicy.originPolicyCooldownMs
+      };
+    }
+
+    if (hasAnyHint(hintText, AUTH_HINTS)) {
+      return {
+        category: "auth_failed",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: retryPolicy.originAuthCooldownMs
+      };
+    }
+
+    return {
+      category: "forbidden",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: retryPolicy.originAuthCooldownMs
+    };
+  }
+
+  if (status === 404 || status === 410) {
+    return {
+      category: "not_found",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: true,
+      originCooldownMs: retryPolicy.originFallbackCooldownMs
+    };
+  }
+
+  if (status === 408 || status === 409 || status >= 500) {
+    return {
+      category: "temporary_error",
+      retryable: true,
+      retryOrigin: true,
+      allowFallback: true,
+      originCooldownMs: retryAfterMs
+    };
+  }
+
+  if ([400, 413, 422].includes(status)) {
+    return {
+      category: "invalid_request",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: false,
+      originCooldownMs: 0
+    };
+  }
+
+  if (status >= 400 && status < 500) {
+    return {
+      category: "client_error",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: false,
+      originCooldownMs: 0
+    };
+  }
+
+  return {
+    category: "unknown_error",
+    retryable: false,
+    retryOrigin: false,
+    allowFallback: true,
+    originCooldownMs: 0
+  };
+}
+
+async function buildFailureResponse(result) {
+  if (result?.response instanceof Response) return result.response;
+
+  if (result?.upstreamResponse instanceof Response) {
+    if (!result.translateError) {
+      return passthroughResponseWithCors(result.upstreamResponse);
+    }
+    const providerError = await toProviderError(result.upstreamResponse);
+    return jsonResponse(providerError.payload, result.upstreamResponse.status);
+  }
+
+  const fallbackStatus = Number.isFinite(result?.status) ? Number(result.status) : 503;
+  return jsonResponse({
+    type: "error",
+    error: {
+      type: "api_error",
+      message: `Provider request failed with status ${fallbackStatus}.`
+    }
+  }, fallbackStatus);
 }
 
 function normalizePath(pathname) {
@@ -618,6 +977,7 @@ async function makeProviderCall({
       ok: false,
       status: 500,
       retryable: false,
+      errorKind: "configuration_error",
       response: jsonResponse({
         type: "error",
         error: {
@@ -640,6 +1000,7 @@ async function makeProviderCall({
       ok: false,
       status: 503,
       retryable: true,
+      errorKind: "network_error",
       response: jsonResponse({
         type: "error",
         error: {
@@ -651,21 +1012,12 @@ async function makeProviderCall({
   }
 
   if (!response.ok) {
-    if (!translate) {
-      return {
-        ok: false,
-        status: response.status,
-        retryable: shouldRetryStatus(response.status),
-        response: passthroughResponseWithCors(response)
-      };
-    }
-
-    const providerError = await toProviderError(response);
     return {
       ok: false,
       status: response.status,
       retryable: shouldRetryStatus(response.status),
-      response: jsonResponse(providerError.payload, response.status)
+      upstreamResponse: response,
+      translateError: translate
     };
   }
 
@@ -705,6 +1057,7 @@ async function makeProviderCall({
       ok: false,
       status: 501,
       retryable: false,
+      errorKind: "not_supported_error",
       response: jsonResponse({
         type: "error",
         error: {
@@ -730,7 +1083,7 @@ async function makeProviderCall({
     return {
       ok: false,
       status: 502,
-      retryable: false,
+      retryable: true,
       response: jsonResponse({
         type: "error",
         error: {
@@ -763,6 +1116,7 @@ async function makeProviderCall({
     ok: false,
     status: 501,
     retryable: false,
+    errorKind: "not_supported_error",
     response: jsonResponse({
       type: "error",
       error: {
@@ -828,41 +1182,86 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
 
   const candidates = [resolved.primary, ...resolved.fallbacks];
   const fallbackCircuitPolicy = resolveFallbackCircuitPolicy(env);
+  const retryPolicy = resolveRetryPolicy(env);
   const orderedCandidates = orderCandidatesByCircuit(candidates, fallbackCircuitPolicy);
-  let lastErrorResponse = null;
+  let lastErrorResult = null;
   let lastErrorMessage = "Unknown error";
 
   for (let index = 0; index < orderedCandidates.length; index += 1) {
     const { candidate } = orderedCandidates[index];
-    const result = await makeProviderCall({
-      body,
-      sourceFormat,
-      stream,
-      candidate,
-      env
-    });
+    const isOriginCandidate = candidate.requestModelId === resolved.primary.requestModelId;
+    const maxAttempts = isOriginCandidate ? retryPolicy.originRetryAttempts : 1;
 
-    if (result.ok) {
-      markCandidateSuccess(candidate);
-      return result.response;
+    let result = null;
+    let classification = null;
+    let attempt = 0;
+
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      result = await makeProviderCall({
+        body,
+        sourceFormat,
+        stream,
+        candidate,
+        env
+      });
+
+      if (result.ok) {
+        markCandidateSuccess(candidate);
+        return result.response;
+      }
+
+      classification = await classifyFailureResult(result, retryPolicy);
+      const canRetryOrigin = isOriginCandidate &&
+        classification.retryOrigin &&
+        attempt < maxAttempts;
+      if (!canRetryOrigin) break;
+
+      const delayMs = computeRetryDelayMs(attempt, retryPolicy);
+      await sleep(delayMs);
     }
 
-    markCandidateFailure(candidate, result, fallbackCircuitPolicy);
-    lastErrorResponse = result.response;
+    markCandidateFailure(
+      candidate,
+      { status: result?.status, retryable: classification?.retryable },
+      fallbackCircuitPolicy,
+      { trackFailure: isOriginCandidate }
+    );
+
+    if (isOriginCandidate) {
+      const hasNextCandidate = index < orderedCandidates.length - 1;
+      const fallbackPenaltyMs = hasNextCandidate && classification?.allowFallback
+        ? retryPolicy.originFallbackCooldownMs
+        : 0;
+      const originCooldownMs = Math.max(
+        classification?.originCooldownMs || 0,
+        fallbackPenaltyMs
+      );
+      if (originCooldownMs > 0) {
+        setCandidateCooldown(
+          candidate,
+          originCooldownMs,
+          fallbackCircuitPolicy,
+          result?.status
+        );
+      }
+    }
+
+    lastErrorResult = result;
     const isFallbackAttempt = candidate.requestModelId !== resolved.primary.requestModelId;
     lastErrorMessage = enrichErrorMessage(
-      `status=${result.status}`,
+      `status=${result?.status} category=${classification?.category || "unknown"}`,
       candidate,
       isFallbackAttempt
     );
 
     const hasNextCandidate = index < orderedCandidates.length - 1;
-    if (!result.retryable && !hasNextCandidate) {
-      return result.response;
+    if (!hasNextCandidate || classification?.allowFallback === false) {
+      return buildFailureResponse(result);
     }
   }
 
-  if (lastErrorResponse) return lastErrorResponse;
+  if (lastErrorResult) return buildFailureResponse(lastErrorResult);
 
   return jsonResponse({
     type: "error",
