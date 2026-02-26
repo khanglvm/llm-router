@@ -1,6 +1,6 @@
 # llm-router
 
-`llm-router` is an API proxy for AI providers, with OpenAI-format and Anthropic-format compatibility.
+`llm-router` is an API proxy for apps and consumers (especially CLI coding tools), giving one centralized endpoint to access LLMs from multiple providers with OpenAI-format and Anthropic-format compatibility.
 
 It supports:
 - local route server (`~/.llm-router.json`)

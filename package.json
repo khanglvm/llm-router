@@ -1,7 +1,7 @@
 {
   "name": "@khanglvm/llm-router",
-  "version": "1.0.2",
-  "description": "LLM Router route (local + Cloudflare Worker)",
+  "version": "1.0.3",
+  "description": "Centralized LLM API proxy for apps/CLI tools across providers (OpenAI + Anthropic compatible)",
   "type": "module",
   "main": "src/index.js",
   "bin": {
