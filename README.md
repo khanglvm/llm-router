@@ -1,6 +1,6 @@
 # llm-router
 
-`llm-router` routes OpenAI-format and Anthropic-format requests across your configured providers.
+`llm-router` is an API proxy for AI providers, with OpenAI-format and Anthropic-format compatibility.
 
 It supports:
 - local route server (`~/.llm-router.json`)
@@ -27,6 +27,16 @@ Local endpoints:
 - Anthropic: `http://127.0.0.1:8787/anthropic`
 - OpenAI: `http://127.0.0.1:8787/openai`
 - Unified: `http://127.0.0.1:8787/route` (or `/` and `/v1`)
+
+## Smart Fallback Behavior
+
+`llm-router` can fail over from a primary model to configured fallback models with status-aware logic:
+- `429` (rate-limited): immediate fallback (no origin retry), with `Retry-After` respected when present.
+- Temporary failures (`408`, `409`, `5xx`, network errors): origin-only bounded retries with jittered backoff, then fallback.
+- Billing/quota exhaustion (`402`, or provider-specific billing signals): immediate fallback with longer origin cooldown memory.
+- Auth and permission failures (`401` and relevant `403` cases): no retry; fallback to other providers/models when possible.
+- Policy/moderation blocks: no retry; cross-provider fallback is disabled by default (`LLM_ROUTER_ALLOW_POLICY_FALLBACK=false`).
+- Invalid client requests (`400`, `413`, `422`): no retry and no fallback short-circuit.
 
 ## Main Commands
 
