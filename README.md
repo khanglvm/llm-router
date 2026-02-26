@@ -1,9 +1,9 @@
 # llm-router
 
-`llm-router` is a gateway to access multiple models across multiple providers, with a unified format (OpenAI + Anthropic) and seamless model fallback.
+`llm-router` is a gateway for accessing multiple models across any provider that supports OpenAI or Anthropic formats, featuring a unified format and seamless model fallback.
 
 It supports:
-- local route server (`~/.llm-router.json`)
+- local route server (config file location: `~/.llm-router.json`)
 - Cloudflare Worker route runtime (`LLM_ROUTER_CONFIG_JSON` secret)
 - CLI + TUI management (`config`, `start`, `deploy`, `worker-key`)
 
@@ -16,7 +16,7 @@ npm i -g @khanglvm/llm-router
 ## Quick Start
 
 ```bash
-# 1) Open config TUI (default behavior)
+# 1) Open config TUI (default behavior) to manage providers, models, fallbacks, and auth
 llm-router
 
 # 2) Start local route server
@@ -24,9 +24,9 @@ llm-router start
 ```
 
 Local endpoints:
+- Unified (Auto transform): `http://127.0.0.1:8787/route` (or `/` and `/v1`)
 - Anthropic: `http://127.0.0.1:8787/anthropic`
 - OpenAI: `http://127.0.0.1:8787/openai`
-- Unified: `http://127.0.0.1:8787/route` (or `/` and `/v1`)
 
 ## Smart Fallback Behavior
 
