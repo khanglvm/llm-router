@@ -1,7 +1,7 @@
 {
   "name": "@khanglvm/llm-router",
   "version": "1.0.3",
-  "description": "Centralized LLM API proxy for apps/CLI tools across providers (OpenAI + Anthropic compatible)",
+  "description": "Single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
   "type": "module",
   "main": "src/index.js",
   "bin": {
