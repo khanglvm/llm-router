@@ -1,7 +1,8 @@
 import { promises as fsPromises } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { SnapTui } from "@levu/snap/dist/index.js";
+import { SnapTui, runPasswordPrompt } from "@levu/snap/dist/index.js";
 import {
   applyConfigChanges,
   buildProviderFromConfigInput,
@@ -37,6 +38,23 @@ const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 1;
 const EXIT_VALIDATION = 2;
 const NPM_PACKAGE_NAME = "@khanglvm/llm-router";
+const STRONG_MASTER_KEY_MIN_LENGTH = 24;
+const DEFAULT_GENERATED_MASTER_KEY_LENGTH = 48;
+const MAX_GENERATED_MASTER_KEY_LENGTH = 256;
+const WEAK_MASTER_KEY_PATTERN = /(password|changeme|default|secret|token|admin|qwerty|letmein|123456)/i;
+export const CLOUDFLARE_FREE_SECRET_SIZE_LIMIT_BYTES = 5 * 1024;
+const CLOUDFLARE_FREE_TIER_PATTERN = /\bfree\b/i;
+const CLOUDFLARE_PAID_TIER_PATTERN = /\b(pro|business|enterprise|paid|unbound)\b/i;
+const CLOUDFLARE_API_TOKEN_ENV_NAME = "CLOUDFLARE_API_TOKEN";
+const CLOUDFLARE_API_TOKEN_ALT_ENV_NAME = "CF_API_TOKEN";
+const CLOUDFLARE_ACCOUNT_ID_ENV_NAME = "CLOUDFLARE_ACCOUNT_ID";
+const CLOUDFLARE_API_TOKEN_PRESET_NAME = "Edit Cloudflare Workers";
+const CLOUDFLARE_API_TOKEN_DASHBOARD_URL = "https://dash.cloudflare.com/profile/api-tokens";
+const CLOUDFLARE_API_TOKEN_GUIDE_URL = "https://developers.cloudflare.com/fundamentals/api/get-started/create-token/";
+const CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4";
+const CLOUDFLARE_VERIFY_TOKEN_URL = `${CLOUDFLARE_API_BASE_URL}/user/tokens/verify`;
+const CLOUDFLARE_MEMBERSHIPS_URL = `${CLOUDFLARE_API_BASE_URL}/memberships`;
+const CLOUDFLARE_API_PREFLIGHT_TIMEOUT_MS = 10_000;
 
 function canPrompt() {
   return Boolean(process.stdout.isTTY && process.stdin.isTTY);
@@ -62,6 +80,95 @@ function toNumber(value, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function clampMasterKeyLength(value) {
+  const parsed = Math.floor(toNumber(value, DEFAULT_GENERATED_MASTER_KEY_LENGTH));
+  if (!Number.isFinite(parsed)) return DEFAULT_GENERATED_MASTER_KEY_LENGTH;
+  return Math.min(MAX_GENERATED_MASTER_KEY_LENGTH, Math.max(parsed, STRONG_MASTER_KEY_MIN_LENGTH));
+}
+
+function normalizeMasterKeyPrefix(value) {
+  const normalized = String(value ?? "gw_")
+    .replace(/[\r\n\t]/g, "")
+    .trim();
+  if (!normalized) return "gw_";
+  return normalized.slice(0, 32);
+}
+
+function analyzeMasterKeyStrength(rawKey) {
+  const key = String(rawKey || "");
+  const reasons = [];
+  if (key.length < STRONG_MASTER_KEY_MIN_LENGTH) {
+    reasons.push(`length must be >= ${STRONG_MASTER_KEY_MIN_LENGTH}`);
+  }
+
+  const hasLower = /[a-z]/.test(key);
+  const hasUpper = /[A-Z]/.test(key);
+  const hasDigit = /[0-9]/.test(key);
+  const hasSymbol = /[^A-Za-z0-9]/.test(key);
+  const classes = [hasLower, hasUpper, hasDigit, hasSymbol].filter(Boolean).length;
+  if (classes < 3) {
+    reasons.push("use at least 3 character classes (lower/upper/digits/symbols)");
+  }
+
+  if (WEAK_MASTER_KEY_PATTERN.test(key)) {
+    reasons.push("contains common weak pattern");
+  }
+  if (/(.)\1{5,}/.test(key)) {
+    reasons.push("contains long repeated characters");
+  }
+
+  return {
+    strong: reasons.length === 0,
+    reasons
+  };
+}
+
+function generateStrongMasterKey({ length, prefix } = {}) {
+  const targetLength = clampMasterKeyLength(length);
+  const safePrefix = normalizeMasterKeyPrefix(prefix);
+  const randomLength = Math.max(
+    STRONG_MASTER_KEY_MIN_LENGTH,
+    targetLength - safePrefix.length
+  );
+
+  let fallbackKey = "";
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const token = randomBytes(Math.ceil(randomLength * 0.8) + 16)
+      .toString("base64url")
+      .slice(0, randomLength);
+    const key = `${safePrefix}${token}`;
+    fallbackKey = key;
+    if (analyzeMasterKeyStrength(key).strong) {
+      return key;
+    }
+  }
+
+  return fallbackKey;
+}
+
+async function ensureStrongWorkerMasterKey(context, masterKey, { allowWeakMasterKey = false } = {}) {
+  const report = analyzeMasterKeyStrength(masterKey);
+  if (report.strong || allowWeakMasterKey) {
+    return { ok: true, allowWeakMasterKey };
+  }
+
+  const reasons = report.reasons.join("; ");
+  if (canPrompt()) {
+    const proceed = await context.prompts.confirm({
+      message: `Worker master key looks weak (${reasons}). Continue anyway?`,
+      initialValue: false
+    });
+    if (proceed) {
+      return { ok: true, allowWeakMasterKey: true };
+    }
+  }
+
+  return {
+    ok: false,
+    errorMessage: `Weak worker master key rejected (${reasons}). Use a stronger random key or pass --allow-weak-master-key=true to override.`
+  };
 }
 
 function parseJsonObjectArg(value, fieldName) {
@@ -90,6 +197,36 @@ function applyDefaultHeaders(headers, { force = true } = {}) {
     next["User-Agent"] = DEFAULT_PROVIDER_USER_AGENT;
   }
   return next;
+}
+
+async function promptSecretInput(context, {
+  message,
+  required = true,
+  validate
+} = {}) {
+  if (context?.prompts && typeof context.prompts.password === "function") {
+    return context.prompts.password({
+      message,
+      required,
+      validate,
+      mask: "*"
+    });
+  }
+
+  if (canPrompt()) {
+    return runPasswordPrompt({
+      message,
+      required,
+      validate,
+      mask: "*"
+    });
+  }
+
+  return context.prompts.text({
+    message,
+    required,
+    validate
+  });
 }
 
 function providerEndpointsFromConfig(provider) {
@@ -148,10 +285,11 @@ function dedupeList(values) {
 
 function tokenizeLooseListInput(raw) {
   if (Array.isArray(raw)) return dedupeList(raw.flatMap((item) => tokenizeLooseListInput(item)));
-  const text = String(raw || "")
-    .replace(/[\n\r\t]+/g, " ")
-    .replace(/[;,]+/g, " ");
-  return dedupeList(text.split(/\s+/g));
+  const text = String(raw || "").replace(/[;,]+/g, "\n");
+  const tokens = text
+    .split(/\r?\n/g)
+    .flatMap((line) => String(line || "").trim().split(/\s+/g));
+  return dedupeList(tokens);
 }
 
 function normalizeEndpointToken(token) {
@@ -341,7 +479,7 @@ function maybeReportInputCleanup(context, label, rawValue, cleanedValues) {
   if ((cleanedValues || []).length > 0) {
     info?.(`Cleaned ${label} input: parsed ${(cleanedValues || []).length} item(s) from free-form text.`);
   } else {
-    warn?.(`Could not parse any ${label} from the provided text. Use comma/semicolon/space-separated values.`);
+    warn?.(`Could not parse any ${label} from the provided text. Use comma/semicolon/space/newline-separated values.`);
   }
 }
 
@@ -659,13 +797,17 @@ function summarizeConfig(config, configPath, { includeSecrets = false } = {}) {
   return lines.join("\n");
 }
 
-function runCommand(command, args, { cwd, input } = {}) {
+function runCommand(command, args, { cwd, input, envOverrides } = {}) {
+  const safeEnvOverrides = envOverrides && typeof envOverrides === "object"
+    ? envOverrides
+    : {};
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
     input,
     env: {
       ...process.env,
+      ...safeEnvOverrides,
       FORCE_COLOR: "0"
     }
   });
@@ -679,12 +821,816 @@ function runCommand(command, args, { cwd, input } = {}) {
   };
 }
 
-function runWrangler(args, { cwd, input } = {}) {
-  const direct = runCommand("wrangler", args, { cwd, input });
+function runWrangler(args, { cwd, input, envOverrides } = {}) {
+  const direct = runCommand("wrangler", args, { cwd, input, envOverrides });
   if (!direct.error) return direct;
 
   const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
-  return runCommand(npxCmd, ["wrangler", ...args], { cwd, input });
+  return runCommand(npxCmd, ["wrangler", ...args], { cwd, input, envOverrides });
+}
+
+function runWranglerWithNpx(args, { cwd, input, envOverrides } = {}) {
+  const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
+  return runCommand(npxCmd, ["wrangler", ...args], { cwd, input, envOverrides });
+}
+
+export function resolveCloudflareApiTokenFromEnv(env = process.env) {
+  const primary = String(env?.[CLOUDFLARE_API_TOKEN_ENV_NAME] || "").trim();
+  if (primary) {
+    return {
+      token: primary,
+      source: CLOUDFLARE_API_TOKEN_ENV_NAME
+    };
+  }
+
+  const fallback = String(env?.[CLOUDFLARE_API_TOKEN_ALT_ENV_NAME] || "").trim();
+  if (fallback) {
+    return {
+      token: fallback,
+      source: CLOUDFLARE_API_TOKEN_ALT_ENV_NAME
+    };
+  }
+
+  return {
+    token: "",
+    source: "none"
+  };
+}
+
+export function buildCloudflareApiTokenSetupGuide() {
+  return [
+    `Cloudflare deploy requires ${CLOUDFLARE_API_TOKEN_ENV_NAME}.`,
+    `Create a User Profile API token in dashboard: ${CLOUDFLARE_API_TOKEN_DASHBOARD_URL}`,
+    "Do not use Account API Tokens for this deploy flow.",
+    `Token docs: ${CLOUDFLARE_API_TOKEN_GUIDE_URL}`,
+    `Recommended preset: ${CLOUDFLARE_API_TOKEN_PRESET_NAME}.`,
+    `Then set ${CLOUDFLARE_API_TOKEN_ENV_NAME} in your shell/CI environment.`
+  ].join("\n");
+}
+
+export function validateCloudflareApiTokenInput(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return `${CLOUDFLARE_API_TOKEN_ENV_NAME} is required for deploy.`;
+  return undefined;
+}
+
+function buildCloudflareApiTokenTroubleshooting(preflightMessage = "") {
+  return [
+    preflightMessage,
+    "Required token capabilities for wrangler deploy:",
+    "- User details: Read",
+    "- User memberships: Read",
+    `- Account preset/template: ${CLOUDFLARE_API_TOKEN_PRESET_NAME}`,
+    `Verify token manually: curl \"${CLOUDFLARE_VERIFY_TOKEN_URL}\" -H \"Authorization: Bearer $${CLOUDFLARE_API_TOKEN_ENV_NAME}\"`,
+    buildCloudflareApiTokenSetupGuide()
+  ].filter(Boolean).join("\n");
+}
+
+function normalizeCloudflareMembershipAccount(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const accountObj = entry.account && typeof entry.account === "object" ? entry.account : {};
+  const accountId = String(
+    accountObj.id
+    || entry.account_id
+    || entry.accountId
+    || entry.id
+    || ""
+  ).trim();
+  if (!accountId) return null;
+
+  const accountName = String(
+    accountObj.name
+    || entry.account_name
+    || entry.accountName
+    || entry.name
+    || `Account ${accountId.slice(0, 8)}`
+  ).trim();
+
+  return {
+    accountId,
+    accountName: accountName || `Account ${accountId.slice(0, 8)}`
+  };
+}
+
+export function extractCloudflareMembershipAccounts(payload) {
+  const list = Array.isArray(payload?.result) ? payload.result : [];
+  const map = new Map();
+  for (const entry of list) {
+    const normalized = normalizeCloudflareMembershipAccount(entry);
+    if (!normalized) continue;
+    if (!map.has(normalized.accountId)) {
+      map.set(normalized.accountId, normalized);
+    }
+  }
+  return Array.from(map.values());
+}
+
+function cloudflareErrorFromPayload(payload, fallback) {
+  const base = String(fallback || "Unknown Cloudflare API error");
+  if (!payload || typeof payload !== "object") return base;
+
+  const errors = Array.isArray(payload.errors) ? payload.errors : [];
+  const first = errors.find((entry) => entry && typeof entry === "object");
+  if (!first) return base;
+
+  const code = Number.isFinite(first.code) ? `code ${first.code}` : "";
+  const message = String(first.message || first.error || "").trim();
+  if (code && message) return `${message} (${code})`;
+  if (message) return message;
+  if (code) return code;
+  return base;
+}
+
+export function evaluateCloudflareTokenVerifyResult(payload) {
+  const status = String(payload?.result?.status || "").toLowerCase();
+  const active = payload?.success === true && status === "active";
+  if (active) {
+    return { ok: true, message: "Token is active." };
+  }
+  return {
+    ok: false,
+    message: cloudflareErrorFromPayload(
+      payload,
+      "Token verification failed. Ensure token is valid and active."
+    )
+  };
+}
+
+export function evaluateCloudflareMembershipsResult(payload) {
+  if (payload?.success !== true || !Array.isArray(payload?.result)) {
+    return {
+      ok: false,
+      message: cloudflareErrorFromPayload(
+        payload,
+        "Could not list Cloudflare memberships for this token."
+      )
+    };
+  }
+
+  if (payload.result.length === 0) {
+    return {
+      ok: false,
+      message: "Token can authenticate but has no accessible memberships."
+    };
+  }
+
+  const accounts = extractCloudflareMembershipAccounts(payload);
+  return {
+    ok: true,
+    message: `Token has access to ${payload.result.length} membership(s).`,
+    count: payload.result.length,
+    accounts
+  };
+}
+
+async function cloudflareApiGetJson(url, token) {
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`
+      },
+      signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(CLOUDFLARE_API_PREFLIGHT_TIMEOUT_MS)
+        : undefined
+    });
+    const rawText = await response.text();
+    const payload = parseJsonSafely(rawText) || {};
+    return {
+      ok: response.ok,
+      status: response.status,
+      payload
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      payload: null,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function preflightCloudflareApiToken(token) {
+  const verified = await cloudflareApiGetJson(CLOUDFLARE_VERIFY_TOKEN_URL, token);
+  if (verified.status === 0) {
+    return {
+      ok: false,
+      stage: "verify",
+      message: `Cloudflare token preflight failed while verifying token: ${verified.error || "network error"}`
+    };
+  }
+
+  const verifyEval = evaluateCloudflareTokenVerifyResult(verified.payload);
+  if (!verified.ok || !verifyEval.ok) {
+    return {
+      ok: false,
+      stage: "verify",
+      message: `Cloudflare token verification failed: ${verifyEval.message}`
+    };
+  }
+
+  const memberships = await cloudflareApiGetJson(CLOUDFLARE_MEMBERSHIPS_URL, token);
+  if (memberships.status === 0) {
+    return {
+      ok: false,
+      stage: "memberships",
+      message: `Cloudflare token preflight failed while checking memberships: ${memberships.error || "network error"}`
+    };
+  }
+
+  const membershipEval = evaluateCloudflareMembershipsResult(memberships.payload);
+  if (!memberships.ok || !membershipEval.ok) {
+    return {
+      ok: false,
+      stage: "memberships",
+      message: `Cloudflare memberships check failed: ${membershipEval.message}`
+    };
+  }
+
+  return {
+    ok: true,
+    stage: "ready",
+    message: membershipEval.message,
+    memberships: membershipEval.accounts || []
+  };
+}
+
+function buildWranglerCloudflareEnv({
+  apiToken,
+  accountId
+} = {}) {
+  const env = {};
+  const token = String(apiToken || "").trim();
+  if (token) env[CLOUDFLARE_API_TOKEN_ENV_NAME] = token;
+  const account = String(accountId || "").trim();
+  if (account) env[CLOUDFLARE_ACCOUNT_ID_ENV_NAME] = account;
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
+function formatCloudflareAccountOptions(accounts = []) {
+  return (accounts || []).map((entry) => `\`${entry.accountName}\`: \`${entry.accountId}\``);
+}
+
+export function hasNoDeployTargets(outputText = "") {
+  return /no deploy targets/i.test(String(outputText || ""));
+}
+
+function parseOptionalBoolean(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  return toBoolean(value, false);
+}
+
+function parseTomlStringField(text, key) {
+  const pattern = new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']\\s*$`, "m");
+  const match = String(text || "").match(pattern);
+  return match?.[1] ? String(match[1]).trim() : "";
+}
+
+function topLevelTomlLineInfo(text = "") {
+  const lines = String(text || "").split(/\r?\n/g);
+  const info = [];
+  let currentSection = "";
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (/^\s*\[.*\]\s*$/.test(line)) {
+      currentSection = trimmed;
+    }
+    info.push({
+      index,
+      line,
+      trimmed,
+      section: currentSection
+    });
+  }
+
+  return info;
+}
+
+export function hasWranglerDeployTargetConfigured(tomlText = "") {
+  const info = topLevelTomlLineInfo(tomlText);
+
+  const hasTopLevelWorkersDev = info.some((entry) =>
+    entry.section === "" && /^\s*workers_dev\s*=\s*true\s*$/i.test(entry.line)
+  );
+  if (hasTopLevelWorkersDev) return true;
+
+  const hasTopLevelRoute = info.some((entry) =>
+    entry.section === "" && /^\s*route\s*=\s*["'][^"']+["']\s*$/i.test(entry.line)
+  );
+  if (hasTopLevelRoute) return true;
+
+  const hasTopLevelRoutes = info.some((entry) =>
+    entry.section === "" && /^\s*routes\s*=\s*\[/i.test(entry.line)
+  );
+  if (hasTopLevelRoutes) return true;
+
+  return false;
+}
+
+function stripNonTopLevelRouteDeclarations(text = "") {
+  const lines = String(text || "").split(/\r?\n/g);
+  const output = [];
+  let currentSection = "";
+  let skippingRoutesArray = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (/^\s*\[.*\]\s*$/.test(line)) {
+      currentSection = trimmed;
+      skippingRoutesArray = false;
+      output.push(line);
+      continue;
+    }
+
+    if (currentSection && /^\s*route\s*=/.test(line)) {
+      continue;
+    }
+
+    if (currentSection && /^\s*routes\s*=\s*\[/.test(line)) {
+      skippingRoutesArray = true;
+      if (line.includes("]")) {
+        skippingRoutesArray = false;
+      }
+      continue;
+    }
+
+    if (skippingRoutesArray) {
+      if (trimmed.includes("]")) {
+        skippingRoutesArray = false;
+      }
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  return output.join("\n");
+}
+
+function insertTopLevelBlockBeforeFirstSection(text = "", block = "") {
+  const source = String(text || "");
+  const blockText = String(block || "").trim();
+  if (!blockText) return source;
+
+  const lines = source.split(/\r?\n/g);
+  const firstSectionIndex = lines.findIndex((line) => /^\s*\[.*\]\s*$/.test(line));
+  if (firstSectionIndex < 0) {
+    const prefix = source.trimEnd();
+    return `${prefix}${prefix ? "\n" : ""}${blockText}\n`;
+  }
+
+  const before = lines.slice(0, firstSectionIndex).join("\n").trimEnd();
+  const after = lines.slice(firstSectionIndex).join("\n").trimStart();
+  return `${before}${before ? "\n" : ""}${blockText}\n\n${after}\n`;
+}
+
+function upsertTomlBooleanField(text, key, value) {
+  const normalized = String(text || "");
+  const replacement = `${key} = ${value ? "true" : "false"}`;
+  if (new RegExp(`^\\s*${key}\\s*=`, "m").test(normalized)) {
+    return normalized.replace(new RegExp(`^\\s*${key}\\s*=.*$`, "m"), replacement);
+  }
+  return `${normalized.trimEnd()}\n${replacement}\n`;
+}
+
+function stripTopLevelRouteDeclarations(text = "") {
+  const lines = String(text || "").split(/\r?\n/g);
+  const output = [];
+  let currentSection = "";
+  let skippingRoutesArray = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (/^\s*\[.*\]\s*$/.test(line)) {
+      currentSection = trimmed;
+      skippingRoutesArray = false;
+      output.push(line);
+      continue;
+    }
+
+    if (!currentSection && /^\s*route\s*=/.test(line)) {
+      continue;
+    }
+
+    if (!currentSection && /^\s*routes\s*=\s*\[/.test(line)) {
+      skippingRoutesArray = true;
+      if (line.includes("]")) {
+        skippingRoutesArray = false;
+      }
+      continue;
+    }
+
+    if (skippingRoutesArray) {
+      if (trimmed.includes("]")) {
+        skippingRoutesArray = false;
+      }
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  return output.join("\n");
+}
+
+export function normalizeWranglerRoutePattern(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  let candidate = raw;
+  if (/^https?:\/\//i.test(candidate)) {
+    try {
+      const parsed = new URL(candidate);
+      candidate = `${parsed.hostname}${parsed.pathname || "/"}`;
+    } catch {
+      return "";
+    }
+  }
+
+  if (candidate.startsWith("/")) return "";
+  if (!candidate.includes("*")) {
+    if (candidate.endsWith("/")) candidate = `${candidate}*`;
+    else if (!candidate.includes("/")) candidate = `${candidate}/*`;
+  }
+
+  return candidate;
+}
+
+export function buildDefaultWranglerTomlForDeploy({
+  name = "llm-router-route",
+  main = "src/index.js",
+  compatibilityDate = "2024-01-01",
+  useWorkersDev = false,
+  routePattern = "",
+  zoneName = ""
+} = {}) {
+  const lines = [
+    `name = "${String(name || "llm-router-route")}"`,
+    `main = "${String(main || "src/index.js")}"`,
+    `compatibility_date = "${String(compatibilityDate || "2024-01-01")}"`,
+    `workers_dev = ${useWorkersDev ? "true" : "false"}`
+  ];
+
+  const normalizedPattern = normalizeWranglerRoutePattern(routePattern);
+  const normalizedZone = String(zoneName || "").trim();
+  if (!useWorkersDev && normalizedPattern && normalizedZone) {
+    lines.push("routes = [");
+    lines.push(`  { pattern = "${normalizedPattern}", zone_name = "${normalizedZone}" }`);
+    lines.push("]");
+  }
+
+  lines.push("preview_urls = false");
+  lines.push("");
+  lines.push("[vars]");
+  lines.push('ENVIRONMENT = "production"');
+  lines.push("");
+  return `${lines.join("\n")}`;
+}
+
+export function applyWranglerDeployTargetToToml(existingToml, {
+  useWorkersDev = false,
+  routePattern = "",
+  zoneName = "",
+  replaceExistingTarget = false
+} = {}) {
+  let next = String(existingToml || "");
+  next = stripNonTopLevelRouteDeclarations(next);
+  if (replaceExistingTarget) {
+    next = stripTopLevelRouteDeclarations(next);
+  }
+  next = upsertTomlBooleanField(next, "workers_dev", useWorkersDev);
+
+  if (!useWorkersDev) {
+    const normalizedPattern = normalizeWranglerRoutePattern(routePattern);
+    const normalizedZone = String(zoneName || "").trim();
+    if (normalizedPattern && normalizedZone && (replaceExistingTarget || !hasWranglerDeployTargetConfigured(next))) {
+      const routeBlock = `routes = [\n  { pattern = "${normalizedPattern}", zone_name = "${normalizedZone}" }\n]`;
+      next = insertTopLevelBlockBeforeFirstSection(next, routeBlock);
+    }
+  }
+
+  if (!/^\s*preview_urls\s*=/mi.test(next)) {
+    next = `${next.trimEnd()}\npreview_urls = false\n`;
+  }
+
+  return `${next.trimEnd()}\n`;
+}
+
+async function createTemporaryWranglerConfigFile(projectDir, tomlText) {
+  await fsPromises.mkdir(projectDir, { recursive: true });
+  const suffix = `${Date.now()}-${randomBytes(4).toString("hex")}`;
+  const wranglerConfigPath = path.join(projectDir, `.llm-router.deploy.${suffix}.wrangler.toml`);
+  await fsPromises.writeFile(wranglerConfigPath, String(tomlText || ""), "utf8");
+
+  let cleaned = false;
+  return {
+    wranglerConfigPath,
+    async cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        await fsPromises.unlink(wranglerConfigPath);
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") {
+          throw error;
+        }
+      }
+    }
+  };
+}
+
+async function prepareWranglerDeployConfig(context, {
+  projectDir,
+  args = {}
+} = {}) {
+  const wranglerPath = path.join(projectDir, "wrangler.toml");
+  const line = typeof context?.terminal?.line === "function"
+    ? context.terminal.line.bind(context.terminal)
+    : console.log;
+
+  let exists = false;
+  let currentToml = "";
+  try {
+    currentToml = await fsPromises.readFile(wranglerPath, "utf8");
+    exists = true;
+  } catch {
+    exists = false;
+    currentToml = "";
+  }
+
+  const workersDevArg = parseOptionalBoolean(readArg(args, ["workers-dev", "workersDev"], undefined));
+  const zoneNameArg = String(readArg(args, ["zone-name", "zoneName"], "") || "").trim();
+  const routePatternArgRaw = String(readArg(args, ["route-pattern", "routePattern"], "") || "").trim();
+  const domainArgRaw = String(readArg(args, ["domain"], "") || "").trim();
+  const routePatternArg = normalizeWranglerRoutePattern(routePatternArgRaw || domainArgRaw);
+  const hasExistingTarget = exists && hasWranglerDeployTargetConfigured(currentToml);
+  const hasExplicitTargetArgs = workersDevArg !== undefined || Boolean(routePatternArg) || Boolean(zoneNameArg);
+
+  if (workersDevArg === undefined && ((routePatternArg && !zoneNameArg) || (!routePatternArg && zoneNameArg))) {
+    return {
+      ok: false,
+      errorMessage: "Custom route deploy target requires both --route-pattern (or --domain) and --zone-name."
+    };
+  }
+
+  if (hasExistingTarget && !hasExplicitTargetArgs) {
+    const tempConfig = await createTemporaryWranglerConfigFile(projectDir, currentToml);
+    return {
+      ok: true,
+      wranglerPath,
+      wranglerConfigPath: tempConfig.wranglerConfigPath,
+      cleanup: tempConfig.cleanup,
+      changed: false,
+      message: ""
+    };
+  }
+
+  let useWorkersDev = workersDevArg === true;
+  let routePattern = routePatternArg;
+  let zoneName = zoneNameArg;
+
+  if (workersDevArg === false && (!routePattern || !zoneName)) {
+    return {
+      ok: false,
+      errorMessage: "workers-dev=false requires both --route-pattern and --zone-name."
+    };
+  }
+
+  if (workersDevArg !== true && (!routePattern || !zoneName)) {
+    if (!canPrompt()) {
+      return {
+        ok: false,
+        errorMessage: [
+          "Wrangler deploy target is not configured.",
+          "Provide one of:",
+          "- --workers-dev=true (quick public workers.dev URL), or",
+          "- --route-pattern=router.example.com/* --zone-name=example.com (custom domain route)."
+        ].join("\n")
+      };
+    }
+
+    const targetMode = await context.prompts.select({
+      message: "No deploy target found. Choose deploy target mode",
+      options: [
+        { value: "workers-dev", label: "Use workers.dev URL (quick start)" },
+        { value: "custom-route", label: "Use custom domain route (production)" }
+      ]
+    });
+
+    if (targetMode === "workers-dev") {
+      useWorkersDev = true;
+      routePattern = "";
+      zoneName = "";
+    } else {
+      const promptedDomain = await context.prompts.text({
+        message: "Route domain or pattern (example: router.example.com or router.example.com/*)",
+        required: true,
+        validate: (value) => {
+          const normalized = normalizeWranglerRoutePattern(value);
+          if (!normalized) return "Enter a valid domain or route pattern.";
+          return undefined;
+        }
+      });
+      const promptedZone = await context.prompts.text({
+        message: "Zone name (example: example.com)",
+        required: true,
+        validate: (value) => String(value || "").trim() ? undefined : "Zone name is required."
+      });
+      useWorkersDev = false;
+      routePattern = normalizeWranglerRoutePattern(promptedDomain);
+      zoneName = String(promptedZone || "").trim();
+    }
+  }
+
+  const nextToml = exists
+    ? applyWranglerDeployTargetToToml(currentToml, {
+      useWorkersDev,
+      routePattern,
+      zoneName,
+      replaceExistingTarget: hasExplicitTargetArgs
+    })
+    : buildDefaultWranglerTomlForDeploy({
+      name: parseTomlStringField(currentToml, "name") || "llm-router-route",
+      main: parseTomlStringField(currentToml, "main") || "src/index.js",
+      compatibilityDate: parseTomlStringField(currentToml, "compatibility_date") || "2024-01-01",
+      useWorkersDev,
+      routePattern,
+      zoneName
+    });
+
+  const tempConfig = await createTemporaryWranglerConfigFile(projectDir, nextToml);
+
+  if (useWorkersDev) {
+    line("Prepared temporary deploy target: workers_dev=true");
+  } else {
+    line(`Prepared temporary deploy target: route=${routePattern} zone=${zoneName}`);
+  }
+
+  return {
+    ok: true,
+    wranglerPath,
+    wranglerConfigPath: tempConfig.wranglerConfigPath,
+    cleanup: tempConfig.cleanup,
+    changed: true,
+    message: useWorkersDev
+      ? "Using workers.dev deploy target (temporary config)."
+      : `Using custom route deploy target (${routePattern}) with temporary config.`
+  };
+}
+
+function parseJsonSafely(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function collectCloudflareTierSignals(value, out = [], depth = 0, parentKey = "") {
+  if (depth > 6 || value === null || value === undefined) return out;
+
+  if (typeof value === "string") {
+    if (/(plan|tier|subscription|type|account|membership|name)/i.test(parentKey)) {
+      const normalized = value.trim().toLowerCase();
+      if (normalized) out.push(normalized);
+    }
+    return out;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectCloudflareTierSignals(item, out, depth + 1, parentKey);
+    }
+    return out;
+  }
+
+  if (typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      collectCloudflareTierSignals(child, out, depth + 1, key);
+    }
+  }
+
+  return out;
+}
+
+export function inferCloudflareTierFromWhoami(payload) {
+  if (!payload || typeof payload !== "object") {
+    return {
+      tier: "unknown",
+      reason: "invalid-payload",
+      signals: []
+    };
+  }
+
+  if (payload.loggedIn === false) {
+    return {
+      tier: "unknown",
+      reason: "not-logged-in",
+      signals: []
+    };
+  }
+
+  const signals = [...new Set(collectCloudflareTierSignals(payload))]
+    .slice(0, 12);
+  const freeSignals = signals.filter((entry) => CLOUDFLARE_FREE_TIER_PATTERN.test(entry));
+  const paidSignals = signals.filter((entry) => CLOUDFLARE_PAID_TIER_PATTERN.test(entry));
+
+  if (freeSignals.length > 0 && paidSignals.length > 0) {
+    return {
+      tier: "unknown",
+      reason: "ambiguous-tier",
+      signals
+    };
+  }
+
+  if (freeSignals.length > 0) {
+    return {
+      tier: "free",
+      reason: "detected-free",
+      signals
+    };
+  }
+
+  if (paidSignals.length > 0) {
+    return {
+      tier: "paid",
+      reason: "detected-paid",
+      signals
+    };
+  }
+
+  return {
+    tier: "unknown",
+    reason: "tier-not-found",
+    signals
+  };
+}
+
+function detectCloudflareTierViaWrangler(projectDir, cfEnv = "", apiToken = "", accountId = "") {
+  const args = ["whoami", "--json"];
+  if (cfEnv) args.push("--env", cfEnv);
+
+  const result = runWranglerWithNpx(args, {
+    cwd: projectDir,
+    envOverrides: buildWranglerCloudflareEnv({
+      apiToken,
+      accountId
+    })
+  });
+  const parsed = parseJsonSafely(result.stdout) || parseJsonSafely(result.stderr);
+  if (!parsed) {
+    const errorText = `${result.stderr || ""}\n${result.stdout || ""}`.toLowerCase();
+    const reason = errorText.includes("unknown argument: json")
+      ? "whoami-json-not-supported"
+      : (result.ok ? "whoami-unparseable" : "whoami-failed");
+    return {
+      tier: "unknown",
+      reason,
+      signals: [],
+      source: "npx wrangler whoami --json"
+    };
+  }
+
+  return {
+    ...inferCloudflareTierFromWhoami(parsed),
+    source: "npx wrangler whoami --json"
+  };
+}
+
+export function shouldConfirmLargeWorkerConfigDeploy({ payloadBytes, tier }) {
+  if (!Number.isFinite(payloadBytes)) return false;
+  if (payloadBytes <= CLOUDFLARE_FREE_SECRET_SIZE_LIMIT_BYTES) return false;
+  return String(tier || "unknown") !== "paid";
+}
+
+function formatCloudflareTierLabel(tierReport) {
+  if (tierReport?.tier === "free") return "free";
+  if (tierReport?.tier === "paid") return "paid";
+  return "unknown";
+}
+
+function buildLargeWorkerConfigWarningLines({ payloadBytes, tierReport }) {
+  const lines = [
+    `LLM_ROUTER_CONFIG_JSON payload is ${payloadBytes} bytes, above Cloudflare Free tier limit (${CLOUDFLARE_FREE_SECRET_SIZE_LIMIT_BYTES} bytes).`
+  ];
+
+  if (tierReport?.tier === "free") {
+    lines.push("Detected Cloudflare tier: free.");
+  } else if (tierReport?.tier === "paid") {
+    lines.push("Detected Cloudflare tier: paid (no free-tier block expected).");
+  } else {
+    lines.push("Could not reliably determine Cloudflare tier.");
+    lines.push(`Tier check reason: ${tierReport?.reason || "unknown"}.`);
+  }
+
+  return lines;
 }
 
 function runNpmInstallLatest(packageName) {
@@ -1027,10 +1973,9 @@ async function resolveUpsertInput(context, existingConfig) {
     initialValue: false
   }) : true;
 
-  const apiKey = (baseApiKey || (!askReplaceKey ? selectedExisting?.apiKey : "")) || await context.prompts.text({
+  const apiKey = (baseApiKey || (!askReplaceKey ? selectedExisting?.apiKey : "")) || await promptSecretInput(context, {
     message: "Provider API key",
     required: true,
-    placeholder: "sk-or-v1-..., sk-ant-api03-..., or sk-...",
     validate: (value) => {
       const candidate = String(value || "").trim();
       if (!candidate) return "Provider API key is required.";
@@ -1039,7 +1984,7 @@ async function resolveUpsertInput(context, existingConfig) {
   });
 
   const endpointsInput = await context.prompts.text({
-    message: "Provider endpoints (comma / ; / space separated; multiline paste supported)",
+    message: "Provider endpoints (comma / ; / space / newline separated; multiline paste supported)",
     required: true,
     initialValue: baseEndpoints.join(","),
     paste: true,
@@ -1049,7 +1994,7 @@ async function resolveUpsertInput(context, existingConfig) {
   maybeReportInputCleanup(context, "endpoint", endpointsInput, endpoints);
 
   const modelsInput = await context.prompts.text({
-    message: "Provider models (comma / ; / space separated; multiline paste supported)",
+    message: "Provider models (comma / ; / space / newline separated; multiline paste supported)",
     required: true,
     initialValue: baseModels,
     paste: true,
@@ -1557,15 +2502,37 @@ async function doSetModelFallbacks(context) {
 }
 
 async function doSetMasterKey(context) {
-  const configPath = readArg(context.args, ["config", "configPath"], getDefaultConfigPath());
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
   const config = await readConfigFile(configPath);
-  let masterKey = String(readArg(context.args, ["master-key", "masterKey"], "") || "");
+  let masterKey = String(readArg(args, ["master-key", "masterKey"], "") || "");
+  const generateMasterKey = toBoolean(readArg(args, ["generate-master-key", "generateMasterKey"], false), false);
+  const generatedLength = readArg(args, ["master-key-length", "masterKeyLength"], DEFAULT_GENERATED_MASTER_KEY_LENGTH);
+  const generatedPrefix = readArg(args, ["master-key-prefix", "masterKeyPrefix"], "gw_");
+  let keyGenerated = false;
+
+  if (!masterKey && generateMasterKey) {
+    masterKey = generateStrongMasterKey({ length: generatedLength, prefix: generatedPrefix });
+    keyGenerated = true;
+  }
 
   if (canPrompt() && !masterKey) {
-    masterKey = await context.prompts.text({
-      message: "Worker master key",
-      required: true
+    const autoGenerate = await context.prompts.confirm({
+      message: "Generate a strong master key automatically?",
+      initialValue: true
     });
+    if (autoGenerate) {
+      masterKey = generateStrongMasterKey({
+        length: generatedLength,
+        prefix: generatedPrefix
+      });
+      keyGenerated = true;
+    } else {
+      masterKey = await context.prompts.text({
+        message: "Worker master key",
+        required: true
+      });
+    }
   }
 
   if (!masterKey) {
@@ -1578,7 +2545,10 @@ async function doSetMasterKey(context) {
     ok: true,
     mode: context.mode,
     exitCode: EXIT_SUCCESS,
-    data: `Updated master key in ${configPath} (${maskSecret(masterKey)}).`
+    data: [
+      `Updated master key in ${configPath} (${maskSecret(masterKey)}).`,
+      keyGenerated ? `Generated key (copy now): ${masterKey}` : ""
+    ].filter(Boolean).join("\n")
   };
 }
 
@@ -1930,9 +2900,152 @@ async function runDeployAction(context) {
   const projectDir = path.resolve(readArg(args, ["project-dir", "projectDir"], process.cwd()));
   const dryRun = toBoolean(readArg(args, ["dry-run", "dryRun"], false), false);
   const exportOnly = toBoolean(readArg(args, ["export-only", "exportOnly"], false), false);
+  const generateMasterKey = toBoolean(readArg(args, ["generate-master-key", "generateMasterKey"], false), false);
+  const generatedLength = readArg(args, ["master-key-length", "masterKeyLength"], DEFAULT_GENERATED_MASTER_KEY_LENGTH);
+  const generatedPrefix = readArg(args, ["master-key-prefix", "masterKeyPrefix"], "gw_");
+  let allowWeakMasterKey = toBoolean(readArg(args, ["allow-weak-master-key", "allowWeakMasterKey"], false), false);
+  const allowLargeConfig = toBoolean(readArg(args, ["allow-large-config", "allowLargeConfig"], false), false);
   const outPath = String(readArg(args, ["out", "output"], "") || "");
   const cfEnv = String(readArg(args, ["env"], "") || "");
+  const argAccountId = String(readArg(args, ["account-id", "accountId"], "") || "").trim();
   let masterKey = String(readArg(args, ["master-key", "masterKey"], "") || "");
+  let generatedDeployMasterKey = false;
+  let wranglerTargetMessage = "";
+  const requiresCloudflareToken = !dryRun && !exportOnly;
+  const envToken = resolveCloudflareApiTokenFromEnv(process.env);
+  let cloudflareApiToken = envToken.token;
+  let cloudflareApiTokenSource = envToken.source;
+  const envAccountId = String(process.env?.[CLOUDFLARE_ACCOUNT_ID_ENV_NAME] || "").trim();
+  let cloudflareAccountId = argAccountId || envAccountId;
+  const line = typeof context?.terminal?.line === "function"
+    ? context.terminal.line.bind(context.terminal)
+    : console.log;
+  let wranglerConfigPath = "";
+  let cleanupWranglerConfig = null;
+
+  try {
+
+  if (requiresCloudflareToken && !cloudflareApiToken) {
+    const tokenGuide = buildCloudflareApiTokenSetupGuide();
+    if (canPrompt()) {
+      line(tokenGuide);
+      cloudflareApiToken = await promptSecretInput(context, {
+        message: `Cloudflare API token (${CLOUDFLARE_API_TOKEN_ENV_NAME})`,
+        required: true,
+        validate: validateCloudflareApiTokenInput
+      });
+      cloudflareApiTokenSource = "prompt";
+    } else {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: [
+          tokenGuide,
+          `Set ${CLOUDFLARE_API_TOKEN_ENV_NAME} and re-run deploy.`
+        ].join("\n")
+      };
+    }
+  }
+
+  if (requiresCloudflareToken) {
+    let preflight = await preflightCloudflareApiToken(cloudflareApiToken);
+    let attempts = 1;
+    while (!preflight.ok && canPrompt() && cloudflareApiTokenSource === "prompt" && attempts < 3) {
+      const retry = await context.prompts.confirm({
+        message: `${preflight.message} Enter a different Cloudflare API token?`,
+        initialValue: true
+      });
+      if (!retry) break;
+
+      cloudflareApiToken = await promptSecretInput(context, {
+        message: `Cloudflare API token (${CLOUDFLARE_API_TOKEN_ENV_NAME})`,
+        required: true,
+        validate: validateCloudflareApiTokenInput
+      });
+      cloudflareApiTokenSource = "prompt";
+      attempts += 1;
+      preflight = await preflightCloudflareApiToken(cloudflareApiToken);
+    }
+
+    if (!preflight.ok) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: buildCloudflareApiTokenTroubleshooting(preflight.message)
+      };
+    }
+
+    const availableAccounts = Array.isArray(preflight.memberships) ? preflight.memberships : [];
+    if (cloudflareAccountId) {
+      const matched = availableAccounts.find((entry) => entry.accountId === cloudflareAccountId);
+      if (!matched && availableAccounts.length > 0) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: [
+            `Configured ${CLOUDFLARE_ACCOUNT_ID_ENV_NAME} (${cloudflareAccountId}) is not available for this token.`,
+            "Available accounts:",
+            ...formatCloudflareAccountOptions(availableAccounts)
+          ].join("\n")
+        };
+      }
+    } else if (availableAccounts.length === 1) {
+      cloudflareAccountId = availableAccounts[0].accountId;
+      line(`Using Cloudflare account ${availableAccounts[0].accountName} (${cloudflareAccountId}) from token memberships.`);
+    } else if (availableAccounts.length > 1) {
+      if (canPrompt()) {
+        const selectedAccount = await context.prompts.select({
+          message: "Multiple Cloudflare accounts found. Select account for deploy",
+          options: availableAccounts.map((entry) => ({
+            value: entry.accountId,
+            label: `${entry.accountName} (${entry.accountId})`
+          }))
+        });
+        cloudflareAccountId = String(selectedAccount || "").trim();
+      } else {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: [
+            "More than one Cloudflare account is available for this token.",
+            `Set --account-id=<id> or ${CLOUDFLARE_ACCOUNT_ID_ENV_NAME}=<id>.`,
+            "Available accounts:",
+            ...formatCloudflareAccountOptions(availableAccounts)
+          ].join("\n")
+        };
+      }
+    }
+
+    line(`Cloudflare token preflight passed (${cloudflareApiTokenSource === "prompt" ? "from prompt" : `from ${cloudflareApiTokenSource}`}).`);
+
+    const targetResolution = await prepareWranglerDeployConfig(context, {
+      projectDir,
+      args
+    });
+    if (!targetResolution.ok) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: targetResolution.errorMessage || "Failed to configure wrangler deploy target."
+      };
+    }
+    wranglerConfigPath = String(targetResolution.wranglerConfigPath || "").trim();
+    cleanupWranglerConfig = typeof targetResolution.cleanup === "function"
+      ? targetResolution.cleanup
+      : null;
+    wranglerTargetMessage = targetResolution.message || "";
+  }
+
+  const wranglerEnvOverrides = buildWranglerCloudflareEnv({
+    apiToken: cloudflareApiToken,
+    accountId: cloudflareAccountId
+  });
+  const wranglerConfigArgs = wranglerConfigPath ? ["--config", wranglerConfigPath] : [];
 
   if (canPrompt() && !masterKey) {
     const ask = await context.prompts.confirm({
@@ -1945,8 +3058,42 @@ async function runDeployAction(context) {
   }
 
   const config = await readConfigFile(configPath);
-  const payload = buildWorkerConfigPayload(config, { masterKey: masterKey || config.masterKey });
+  if (!masterKey && !config.masterKey && generateMasterKey) {
+    masterKey = generateStrongMasterKey({
+      length: generatedLength,
+      prefix: generatedPrefix
+    });
+    generatedDeployMasterKey = true;
+  }
+
+  const effectiveMasterKey = String(masterKey || config.masterKey || "");
+  const keyCheck = await ensureStrongWorkerMasterKey(context, effectiveMasterKey, { allowWeakMasterKey });
+  if (!keyCheck.ok) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: keyCheck.errorMessage
+    };
+  }
+  allowWeakMasterKey = keyCheck.allowWeakMasterKey === true;
+
+  const payload = buildWorkerConfigPayload(config, { masterKey: effectiveMasterKey });
   const payloadJson = JSON.stringify(payload);
+  const payloadBytes = Buffer.byteLength(payloadJson, "utf8");
+  const tierReport = payloadBytes > CLOUDFLARE_FREE_SECRET_SIZE_LIMIT_BYTES
+    ? detectCloudflareTierViaWrangler(projectDir, cfEnv, cloudflareApiToken, cloudflareAccountId)
+    : { tier: "unknown", reason: "size-within-free-limit", signals: [] };
+  const mustConfirmLargeConfig = shouldConfirmLargeWorkerConfigDeploy({
+    payloadBytes,
+    tier: tierReport.tier
+  });
+  const largeConfigWarningLines = mustConfirmLargeConfig
+    ? buildLargeWorkerConfigWarningLines({
+      payloadBytes,
+      tierReport
+    })
+    : [];
 
   if (outPath || exportOnly) {
     const finalOut = outPath || path.resolve(process.cwd(), ".llm-router.worker.json");
@@ -1960,9 +3107,13 @@ async function runDeployAction(context) {
         mode: context.mode,
         exitCode: EXIT_SUCCESS,
         data: [
+          ...largeConfigWarningLines,
+          mustConfirmLargeConfig
+            ? "Manual deploy may fail on Cloudflare Free tier unless you reduce config size."
+            : "",
           `Exported worker config to ${resolvedOut}`,
           `wrangler secret put LLM_ROUTER_CONFIG_JSON${cfEnv ? ` --env ${cfEnv}` : ""} < ${resolvedOut}`
-        ].join("\n")
+        ].filter(Boolean).join("\n")
       };
     }
   }
@@ -1974,12 +3125,53 @@ async function runDeployAction(context) {
       exitCode: EXIT_SUCCESS,
       data: [
         "Dry run (no deployment executed).",
+        allowWeakMasterKey ? "WARNING: weak master key override enabled." : "",
+        ...largeConfigWarningLines,
+        mustConfirmLargeConfig
+          ? "Interactive deploy requires explicit confirmation (default: No)."
+          : "",
+        mustConfirmLargeConfig
+          ? "Use --allow-large-config=true to bypass this check in non-interactive mode."
+          : "",
+        generatedDeployMasterKey ? "Generated a deploy-time master key (not written to local config)." : "",
         `projectDir=${projectDir}`,
-        `wrangler secret put LLM_ROUTER_CONFIG_JSON${cfEnv ? ` --env ${cfEnv}` : ""}`,
-        `wrangler deploy${cfEnv ? ` --env ${cfEnv}` : ""}`,
-        `Payload bytes=${Buffer.byteLength(payloadJson, "utf8")}`
-      ].join("\n")
+        cloudflareApiTokenSource !== "none"
+          ? `cloudflareApiToken=${cloudflareApiTokenSource === "prompt" ? "provided-via-prompt" : `from-${cloudflareApiTokenSource}`}`
+          : "",
+        cloudflareAccountId ? `cloudflareAccountId=${cloudflareAccountId}` : "",
+        `cloudflareTier=${formatCloudflareTierLabel(tierReport)} (${tierReport.reason || "unknown"})`,
+        `wrangler${wranglerConfigPath ? ` --config ${wranglerConfigPath}` : ""} secret put LLM_ROUTER_CONFIG_JSON${cfEnv ? ` --env ${cfEnv}` : ""}`,
+        `wrangler${wranglerConfigPath ? ` --config ${wranglerConfigPath}` : ""} deploy${cfEnv ? ` --env ${cfEnv}` : ""}`,
+        `Payload bytes=${payloadBytes}`
+      ].filter(Boolean).join("\n")
     };
+  }
+
+  if (mustConfirmLargeConfig && !allowLargeConfig) {
+    if (canPrompt()) {
+      const proceed = await context.prompts.confirm({
+        message: `${largeConfigWarningLines.join(" ")} Continue deploy anyway?`,
+        initialValue: false
+      });
+      if (!proceed) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_FAILURE,
+          errorMessage: "Deployment cancelled because oversized worker config was not confirmed."
+        };
+      }
+    } else {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: [
+          ...largeConfigWarningLines,
+          "Non-interactive mode requires --allow-large-config=true to continue deployment."
+        ].filter(Boolean).join("\n")
+      };
+    }
   }
 
   if (canPrompt()) {
@@ -1993,9 +3185,10 @@ async function runDeployAction(context) {
   }
 
   const envArgs = cfEnv ? ["--env", cfEnv] : [];
-  const secretResult = runWrangler(["secret", "put", "LLM_ROUTER_CONFIG_JSON", ...envArgs], {
+  const secretResult = runWrangler([...wranglerConfigArgs, "secret", "put", "LLM_ROUTER_CONFIG_JSON", ...envArgs], {
     cwd: projectDir,
-    input: payloadJson
+    input: payloadJson,
+    envOverrides: wranglerEnvOverrides
   });
   if (!secretResult.ok) {
     return {
@@ -2010,7 +3203,10 @@ async function runDeployAction(context) {
     };
   }
 
-  const deployResult = runWrangler(["deploy", ...envArgs], { cwd: projectDir });
+  const deployResult = runWrangler([...wranglerConfigArgs, "deploy", ...envArgs], {
+    cwd: projectDir,
+    envOverrides: wranglerEnvOverrides
+  });
   if (!deployResult.ok) {
     return {
       ok: false,
@@ -2024,16 +3220,43 @@ async function runDeployAction(context) {
     };
   }
 
+  const deploySummary = [deployResult.stdout, deployResult.stderr].filter(Boolean).join("\n");
+  if (hasNoDeployTargets(deploySummary)) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: [
+        "Worker upload succeeded, but no deploy target is configured.",
+        "Set one deploy target and re-run:",
+        "- `--workers-dev=true`, or",
+        "- `--route-pattern=router.example.com/* --zone-name=example.com` (or `--domain=router.example.com`).",
+        deploySummary.trim()
+      ].filter(Boolean).join("\n")
+    };
+  }
+
   return {
     ok: true,
     mode: context.mode,
     exitCode: EXIT_SUCCESS,
     data: [
       "Cloudflare deployment completed.",
+      generatedDeployMasterKey ? "Generated a deploy-time master key. Persist it with `llm-router config --operation=set-master-key --master-key=...` if needed." : "",
+      wranglerTargetMessage,
       secretResult.stdout.trim(),
       deployResult.stdout.trim()
     ].filter(Boolean).join("\n")
   };
+  } finally {
+    if (typeof cleanupWranglerConfig === "function") {
+      try {
+        await cleanupWranglerConfig();
+      } catch {
+        // best-effort cleanup for temporary wrangler config file
+      }
+    }
+  }
 }
 
 function parseWranglerSecretListOutput(text) {
@@ -2075,7 +3298,12 @@ async function runWorkerKeyAction(context) {
   const cfEnv = String(readArg(args, ["env"], "") || "");
   const dryRun = toBoolean(readArg(args, ["dry-run", "dryRun"], false), false);
   const useConfigKey = toBoolean(readArg(args, ["use-config-key", "useConfigKey"], true), true);
+  const generateMasterKey = toBoolean(readArg(args, ["generate-master-key", "generateMasterKey"], false), false);
+  const generatedLength = readArg(args, ["master-key-length", "masterKeyLength"], DEFAULT_GENERATED_MASTER_KEY_LENGTH);
+  const generatedPrefix = readArg(args, ["master-key-prefix", "masterKeyPrefix"], "gw_");
+  let allowWeakMasterKey = toBoolean(readArg(args, ["allow-weak-master-key", "allowWeakMasterKey"], false), false);
   let masterKey = String(readArg(args, ["master-key", "masterKey"], "") || "");
+  let keyGenerated = false;
 
   if (!masterKey && useConfigKey) {
     try {
@@ -2086,11 +3314,31 @@ async function runWorkerKeyAction(context) {
     }
   }
 
-  if (canPrompt() && !masterKey) {
-    masterKey = await context.prompts.text({
-      message: "New worker master key (LLM_ROUTER_MASTER_KEY)",
-      required: true
+  if (!masterKey && generateMasterKey) {
+    masterKey = generateStrongMasterKey({
+      length: generatedLength,
+      prefix: generatedPrefix
     });
+    keyGenerated = true;
+  }
+
+  if (canPrompt() && !masterKey) {
+    const autoGenerate = await context.prompts.confirm({
+      message: "Generate a strong worker master key automatically?",
+      initialValue: true
+    });
+    if (autoGenerate) {
+      masterKey = generateStrongMasterKey({
+        length: generatedLength,
+        prefix: generatedPrefix
+      });
+      keyGenerated = true;
+    } else {
+      masterKey = await context.prompts.text({
+        message: "New worker master key (LLM_ROUTER_MASTER_KEY)",
+        required: true
+      });
+    }
   }
 
   if (!masterKey) {
@@ -2101,6 +3349,17 @@ async function runWorkerKeyAction(context) {
       errorMessage: "master-key is required (or set one in local config and use --use-config-key=true)."
     };
   }
+
+  const keyCheck = await ensureStrongWorkerMasterKey(context, masterKey, { allowWeakMasterKey });
+  if (!keyCheck.ok) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: keyCheck.errorMessage
+    };
+  }
+  allowWeakMasterKey = keyCheck.allowWeakMasterKey === true;
 
   const envArgs = cfEnv ? ["--env", cfEnv] : [];
   let exists = null;
@@ -2117,6 +3376,8 @@ async function runWorkerKeyAction(context) {
       exitCode: EXIT_SUCCESS,
       data: [
         "Dry run (no secret update executed).",
+        allowWeakMasterKey ? "WARNING: weak master key override enabled." : "",
+        keyGenerated ? "Generated key for this operation." : "",
         `projectDir=${projectDir}`,
         cfEnv ? `env=${cfEnv}` : "",
         `target=LLM_ROUTER_MASTER_KEY (${exists === null ? "existence unknown" : (exists ? "exists" : "missing")})`,
@@ -2162,6 +3423,7 @@ async function runWorkerKeyAction(context) {
       cfEnv ? `env=${cfEnv}` : "",
       `projectDir=${projectDir}`,
       `masterKey=${maskSecret(masterKey)}`,
+      keyGenerated ? `Generated key (copy now): ${masterKey}` : "",
       putResult.stdout.trim()
     ].filter(Boolean).join("\n")
   };
@@ -2177,12 +3439,12 @@ const routerModule = {
       tui: { steps: ["start-server"] },
       commandline: { requiredArgs: [], optionalArgs: ["host", "port", "config", "watch-config", "watch-binary", "require-auth"] },
       help: {
-        summary: "Start local llm-router on localhost. Auto-restarts on config changes and auto-relaunches after llm-router upgrades.",
+        summary: "Start local llm-router on localhost. Hot-reloads config in memory and auto-relaunches after llm-router upgrades.",
         args: [
           { name: "host", required: false, description: "Listen host.", example: "--host=127.0.0.1" },
           { name: "port", required: false, description: "Listen port.", example: "--port=8787" },
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" },
-          { name: "watch-config", required: false, description: "Auto-restart on config changes.", example: "--watch-config=true" },
+          { name: "watch-config", required: false, description: "Hot-reload config in memory without process restart.", example: "--watch-config=true" },
           { name: "watch-binary", required: false, description: "Watch for llm-router upgrades and relaunch the latest version.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require local API auth using config.masterKey.", example: "--require-auth=true" }
         ],
@@ -2283,6 +3545,9 @@ const routerModule = {
           "skip-probe",
           "set-master-key",
           "master-key",
+          "generate-master-key",
+          "master-key-length",
+          "master-key-prefix",
           "model",
           "fallback-models",
           "fallbacks",
@@ -2300,12 +3565,12 @@ const routerModule = {
           { name: "operation", required: false, description: "Config operation (optional; prompts if omitted).", example: "--operation=upsert-provider" },
           { name: "provider-id", required: false, description: "Provider id (slug/camelCase).", example: "--provider-id=openrouter" },
           { name: "name", required: false, description: "Provider Friendly Name (must be unique; shown in management screen).", example: "--name=OpenRouter Primary" },
-          { name: "endpoints", required: false, description: "Provider endpoint candidates for auto-probe (comma/semicolon/space separated; TUI supports multiline paste).", example: "--endpoints=https://ramclouds.me,https://ramclouds.me/v1" },
+          { name: "endpoints", required: false, description: "Provider endpoint candidates for auto-probe (comma/semicolon/space/newline separated; TUI supports multiline paste).", example: "--endpoints=https://ramclouds.me,https://ramclouds.me/v1" },
           { name: "base-url", required: false, description: "Provider base URL.", example: "--base-url=https://openrouter.ai/api/v1" },
           { name: "openai-base-url", required: false, description: "OpenAI endpoint base URL (format-specific override).", example: "--openai-base-url=https://ramclouds.me/v1" },
           { name: "claude-base-url", required: false, description: "Anthropic endpoint base URL (format-specific override).", example: "--claude-base-url=https://ramclouds.me" },
           { name: "api-key", required: false, description: "Provider API key.", example: "--api-key=sk-or-v1-..." },
-          { name: "models", required: false, description: "Model list (comma/semicolon/space separated; strips common log/error noise; TUI supports multiline paste).", example: "--models=gpt-4o,claude-3-5-sonnet-latest" },
+          { name: "models", required: false, description: "Model list (comma/semicolon/space/newline separated; strips common log/error noise; TUI supports multiline paste).", example: "--models=gpt-4o,claude-3-5-sonnet-latest" },
           { name: "model", required: false, description: "Single model id (used by remove-model).", example: "--model=gpt-4o" },
           { name: "fallback-models", required: false, description: "Qualified fallback models for set-model-fallbacks (comma/semicolon/space separated).", example: "--fallback-models=openrouter/gpt-4o,anthropic/claude-3-7-sonnet" },
           { name: "clear-fallbacks", required: false, description: "Clear all fallback models for set-model-fallbacks.", example: "--clear-fallbacks=true" },
@@ -2313,6 +3578,9 @@ const routerModule = {
           { name: "headers", required: false, description: "Custom provider headers as JSON object (default User-Agent applied when omitted).", example: "--headers={\"User-Agent\":\"Mozilla/5.0\"}" },
           { name: "skip-probe", required: false, description: "Skip live endpoint/model probe.", example: "--skip-probe=true" },
           { name: "master-key", required: false, description: "Worker auth token.", example: "--master-key=my-token" },
+          { name: "generate-master-key", required: false, description: "Generate a strong master key automatically (set-master-key flow).", example: "--generate-master-key=true" },
+          { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
+          { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
           { name: "watch-binary", required: false, description: "For startup-install: detect llm-router upgrades and auto-relaunch under OS startup.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require masterKey auth for local start/startup-install.", example: "--require-auth=true" },
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" }
@@ -2341,15 +3609,44 @@ const routerModule = {
       tui: { steps: ["validate", "confirm", "deploy"] },
       commandline: {
         requiredArgs: [],
-        optionalArgs: ["mode", "config", "project-dir", "master-key", "env", "dry-run", "export-only", "out"]
+        optionalArgs: [
+          "mode",
+          "config",
+          "project-dir",
+          "master-key",
+          "account-id",
+          "workers-dev",
+          "route-pattern",
+          "zone-name",
+          "domain",
+          "generate-master-key",
+          "master-key-length",
+          "master-key-prefix",
+          "allow-weak-master-key",
+          "allow-large-config",
+          "env",
+          "dry-run",
+          "export-only",
+          "out"
+        ]
       },
       help: {
         summary: "Export worker config and/or deploy to Cloudflare Worker with Wrangler.",
         args: [
           { name: "mode", required: false, description: "Optional compatibility flag (ignored).", example: "--mode=run" },
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" },
-          { name: "project-dir", required: false, description: "Directory containing wrangler.toml.", example: "--project-dir=./route" },
+          { name: "project-dir", required: false, description: "Worker project directory (uses wrangler.toml as optional base).", example: "--project-dir=./route" },
           { name: "master-key", required: false, description: "Override master key for deployment payload.", example: "--master-key=prod-token" },
+          { name: "account-id", required: false, description: "Cloudflare account id override (useful for multi-account tokens).", example: "--account-id=03819f97b5cb3101faecbbcb6019c4cc" },
+          { name: "workers-dev", required: false, description: "Use workers.dev deploy target in temporary runtime config.", example: "--workers-dev=true" },
+          { name: "route-pattern", required: false, description: "Route pattern for custom domain target (temporary runtime config).", example: "--route-pattern=router.example.com/*" },
+          { name: "zone-name", required: false, description: "Cloudflare zone name for route target (temporary runtime config).", example: "--zone-name=example.com" },
+          { name: "domain", required: false, description: "Convenience alias for route host (auto-converted to <domain>/*).", example: "--domain=router.example.com" },
+          { name: "generate-master-key", required: false, description: "Generate a strong master key when config has no master key.", example: "--generate-master-key=true" },
+          { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
+          { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
+          { name: "allow-weak-master-key", required: false, description: "Allow weak master key (not recommended).", example: "--allow-weak-master-key=true" },
+          { name: "allow-large-config", required: false, description: "Bypass oversized Free-tier secret confirmation (useful in CI).", example: "--allow-large-config=true" },
           { name: "env", required: false, description: "Wrangler environment.", example: "--env=production" },
           { name: "dry-run", required: false, description: "Print commands only.", example: "--dry-run=true" },
           { name: "export-only", required: false, description: "Only export config JSON, no deploy.", example: "--export-only=true" },
@@ -2358,7 +3655,12 @@ const routerModule = {
         examples: [
           "llm-router deploy",
           "llm-router deploy --dry-run=true",
+          "llm-router deploy --account-id=03819f97b5cb3101faecbbcb6019c4cc",
+          "llm-router deploy --workers-dev=true",
+          "llm-router deploy --route-pattern=router.example.com/* --zone-name=example.com",
+          "llm-router deploy --generate-master-key=true",
           "llm-router deploy --export-only=true --out=.llm-router.worker.json",
+          "llm-router deploy --allow-large-config=true",
           "llm-router deploy --env=production"
         ],
         useCases: [
@@ -2378,12 +3680,27 @@ const routerModule = {
       tui: { steps: ["key-input", "confirm", "secret-put"] },
       commandline: {
         requiredArgs: [],
-        optionalArgs: ["config", "project-dir", "master-key", "use-config-key", "env", "dry-run"]
+        optionalArgs: [
+          "config",
+          "project-dir",
+          "master-key",
+          "generate-master-key",
+          "master-key-length",
+          "master-key-prefix",
+          "allow-weak-master-key",
+          "use-config-key",
+          "env",
+          "dry-run"
+        ]
       },
       help: {
         summary: "Fast master-key rotation/update on Cloudflare Worker using LLM_ROUTER_MASTER_KEY secret (runtime override).",
         args: [
           { name: "master-key", required: false, description: "New worker master key. If omitted, reads local config when allowed.", example: "--master-key=prod-token-v2" },
+          { name: "generate-master-key", required: false, description: "Generate a strong worker master key automatically.", example: "--generate-master-key=true" },
+          { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
+          { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
+          { name: "allow-weak-master-key", required: false, description: "Allow weak master key (not recommended).", example: "--allow-weak-master-key=true" },
           { name: "use-config-key", required: false, description: "Read key from local config if --master-key is omitted.", example: "--use-config-key=true" },
           { name: "config", required: false, description: "Path to local config file.", example: "--config=~/.llm-router.json" },
           { name: "project-dir", required: false, description: "Directory containing wrangler.toml.", example: "--project-dir=./route" },
@@ -2392,6 +3709,7 @@ const routerModule = {
         ],
         examples: [
           "llm-router worker-key --master-key=prod-token-v2",
+          "llm-router worker-key --generate-master-key=true",
           "llm-router worker-key --env=production --master-key=rotated-key",
           "llm-router worker-key --use-config-key=true"
         ],

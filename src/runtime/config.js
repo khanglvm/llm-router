@@ -41,13 +41,41 @@ function slugifyId(value, fallback = "provider") {
   return slug || fallback;
 }
 
+function sanitizeEndpointUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return "";
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return "";
+  }
+
+  // Explicitly drop auth/hash components from persisted endpoint URLs.
+  parsed.username = "";
+  parsed.password = "";
+  parsed.hash = "";
+  return parsed.toString();
+}
+
 function normalizeAuthConfig(rawAuth) {
   if (!rawAuth || typeof rawAuth !== "object") return null;
   const type = rawAuth.type || rawAuth.kind;
   if (!type) return null;
+  const headerName = typeof rawAuth.headerName === "string"
+    ? rawAuth.headerName.trim()
+    : (typeof rawAuth.header === "string" ? rawAuth.header.trim() : "");
+  if (headerName && /[\r\n]/.test(headerName)) {
+    return null;
+  }
   return {
     type,
-    headerName: rawAuth.headerName || rawAuth.header || undefined,
+    headerName: headerName || undefined,
     prefix: rawAuth.prefix || undefined
   };
 }
@@ -112,10 +140,10 @@ function sanitizeModelFallbackReferences(providers) {
 function normalizeBaseUrlByFormat(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const out = {};
-  const openai = typeof value.openai === "string" ? value.openai.trim() : "";
+  const openai = typeof value.openai === "string" ? sanitizeEndpointUrl(value.openai) : "";
   const claude =
-    typeof value.claude === "string" ? value.claude.trim()
-      : (typeof value.anthropic === "string" ? value.anthropic.trim() : "");
+    typeof value.claude === "string" ? sanitizeEndpointUrl(value.claude)
+      : (typeof value.anthropic === "string" ? sanitizeEndpointUrl(value.anthropic) : "");
 
   if (openai) out[FORMATS.OPENAI] = openai;
   if (claude) out[FORMATS.CLAUDE] = claude;
@@ -134,7 +162,7 @@ function normalizeProvider(provider, index = 0) {
     provider["endpoint-by-format"] ||
     provider.endpoints
   );
-  const explicitBaseUrl = String(provider.baseUrl || provider["base-url"] || provider.endpoint || "").trim();
+  const explicitBaseUrl = sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "");
   const rawFormat = provider.format || provider.responseFormat || provider["response-format"];
   const preferredFormat = [FORMATS.OPENAI, FORMATS.CLAUDE].includes(rawFormat) ? rawFormat : undefined;
   const endpointFormats = baseUrlByFormat ? Object.keys(baseUrlByFormat) : [];
@@ -276,7 +304,7 @@ export function resolveProviderFormat(provider, sourceFormat = undefined) {
 }
 
 export function resolveProviderUrl(provider, targetFormat) {
-  const baseUrl = String(provider?.baseUrlByFormat?.[targetFormat] || provider?.baseUrl || "").trim().replace(/\/+$/, "");
+  const baseUrl = sanitizeEndpointUrl(provider?.baseUrlByFormat?.[targetFormat] || provider?.baseUrl || "").replace(/\/+$/, "");
   if (!baseUrl) return "";
   const isVersionedApiRoot = /\/v\d+(?:\.\d+)?$/i.test(baseUrl);
 
@@ -314,13 +342,27 @@ function hasHeaderName(headers, name) {
 function normalizeCustomHeaders(rawHeaders) {
   const out = {};
   let userAgentExplicitlyDisabled = false;
+  const blockedHeaders = new Set([
+    "connection",
+    "content-length",
+    "host",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade"
+  ]);
 
   if (!rawHeaders || typeof rawHeaders !== "object" || Array.isArray(rawHeaders)) {
     return { headers: out, userAgentExplicitlyDisabled };
   }
 
   for (const [name, value] of Object.entries(rawHeaders)) {
+    if (typeof name !== "string" || !name.trim()) continue;
+    if (/[\r\n]/.test(name)) continue;
     const lower = name.toLowerCase();
+    if (blockedHeaders.has(lower)) continue;
     const isUserAgent = lower === "user-agent";
 
     if (value === undefined || value === null || value === false) {
@@ -329,6 +371,7 @@ function normalizeCustomHeaders(rawHeaders) {
     }
 
     const text = String(value);
+    if (/[\r\n]/.test(text)) continue;
     if (!text && isUserAgent) {
       userAgentExplicitlyDisabled = true;
       continue;

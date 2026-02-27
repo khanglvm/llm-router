@@ -1,6 +1,8 @@
 name = "llm-router-route"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
+workers_dev = false
+preview_urls = false
 
 # No custom routes are defined by default.
 # Configure routes/domains per environment in your own deployment setup.

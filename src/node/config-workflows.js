@@ -37,7 +37,7 @@ function normalizeBaseUrlByFormatInput(input) {
 export function parseModelListInput(raw) {
   if (!raw) return [];
   if (Array.isArray(raw)) return dedupe(raw);
-  return dedupe(String(raw).split(/[,\n]/g));
+  return dedupe(String(raw).split(/[,\n;\s]+/g));
 }
 
 function normalizeModelArray(models) {

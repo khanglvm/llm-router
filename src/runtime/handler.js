@@ -3,1129 +3,44 @@
  */
 
 import {
-  buildProviderHeaders,
   configHasProvider,
-  listConfiguredModels,
   normalizeRuntimeConfig,
-  resolveProviderUrl,
   resolveRequestModel
 } from "./config.js";
-import { FORMATS, initState, needsTranslation, translateRequest, translateResponse } from "../translator/index.js";
+import { FORMATS } from "../translator/index.js";
+import { shouldEnforceWorkerAuth, validateAuth } from "./handler/auth.js";
+import { loadRuntimeConfig, getCachedModelList } from "./handler/config-loading.js";
 import {
-  claudeEventToOpenAIChunks,
-  claudeToOpenAINonStreamResponse,
-  initClaudeToOpenAIState
-} from "../translator/response/claude-to-openai.js";
-
-function withCorsHeaders(headers = {}) {
-  return {
-    ...headers,
-    "Access-Control-Allow-Origin": "*"
-  };
-}
-
-const HOP_BY_HOP_HEADERS = [
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade"
-];
-
-const DEFAULT_FALLBACK_CIRCUIT_FAILURES = 2;
-const DEFAULT_FALLBACK_CIRCUIT_COOLDOWN_MS = 30_000;
-const DEFAULT_ORIGIN_RETRY_ATTEMPTS = 3;
-const DEFAULT_ORIGIN_RETRY_BASE_DELAY_MS = 250;
-const DEFAULT_ORIGIN_RETRY_MAX_DELAY_MS = 3_000;
-const DEFAULT_ORIGIN_FALLBACK_COOLDOWN_MS = 45_000;
-const DEFAULT_ORIGIN_RATE_LIMIT_COOLDOWN_MS = 30_000;
-const DEFAULT_ORIGIN_BILLING_COOLDOWN_MS = 15 * 60_000;
-const DEFAULT_ORIGIN_AUTH_COOLDOWN_MS = 10 * 60_000;
-const DEFAULT_ORIGIN_POLICY_COOLDOWN_MS = 2 * 60_000;
-const ERROR_TEXT_SCAN_LIMIT = 4_096;
-const BILLING_HINTS = [
-  "insufficient_quota",
-  "insufficient quota",
-  "insufficient balance",
-  "insufficient credits",
-  "not enough credits",
-  "out of credits",
-  "payment required",
-  "billing hard limit",
-  "quota exceeded"
-];
-const AUTH_HINTS = [
-  "invalid api key",
-  "incorrect api key",
-  "api key not valid",
-  "authentication",
-  "unauthorized",
-  "permission denied",
-  "forbidden"
-];
-const POLICY_HINTS = [
-  "moderation",
-  "policy_violation",
-  "content policy",
-  "safety",
-  "unsafe",
-  "flagged"
-];
-const fallbackCircuitState = new Map();
-
-function sanitizePassthroughHeaders(headers) {
-  // Node fetch/undici transparently decodes compressed upstream responses
-  // but keeps content-encoding/content-length headers, which breaks clients
-  // that attempt to decompress the forwarded payload again.
-  headers.delete("content-encoding");
-  headers.delete("content-length");
-  for (const name of HOP_BY_HOP_HEADERS) {
-    headers.delete(name);
-  }
-}
-
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: withCorsHeaders({
-      "Content-Type": "application/json"
-    })
-  });
-}
-
-function corsResponse() {
-  return new Response(null, {
-    headers: withCorsHeaders({
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version"
-    })
-  });
-}
-
-function passthroughResponseWithCors(response, overrideHeaders = undefined) {
-  const headers = new Headers(response.headers);
-  sanitizePassthroughHeaders(headers);
-  headers.set("Access-Control-Allow-Origin", "*");
-
-  if (overrideHeaders && typeof overrideHeaders === "object") {
-    for (const [name, value] of Object.entries(overrideHeaders)) {
-      if (value === undefined || value === null) continue;
-      headers.set(name, String(value));
-    }
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
-
-function parseAuthToken(request) {
-  const authHeader = request.headers.get("Authorization");
-  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
-  if (authHeader && !authHeader.startsWith("Bearer ")) return authHeader;
-  return request.headers.get("x-api-key");
-}
-
-function validateAuth(request, config, options = {}) {
-  if (options.ignoreAuth === true) return true;
-  const requiredToken = config.masterKey;
-  if (!requiredToken) return true;
-  const providedToken = parseAuthToken(request);
-  return providedToken === requiredToken;
-}
-
-function shouldEnforceWorkerAuth(options = {}) {
-  return options.ignoreAuth !== true;
-}
-
-function looksNormalizedConfig(config) {
-  return Boolean(
-    config &&
-    typeof config === "object" &&
-    Array.isArray(config.providers) &&
-    Number.isFinite(config.version)
-  );
-}
-
-async function loadRuntimeConfig(getConfig, env) {
-  const raw = await getConfig(env);
-  return looksNormalizedConfig(raw) ? raw : normalizeRuntimeConfig(raw);
-}
-
-function shouldRetryStatus(status) {
-  return status === 408 || status === 409 || status === 429 || status >= 500;
-}
-
-function toNonNegativeInteger(value, fallback) {
-  if (value === undefined || value === null || value === "") return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-  return parsed;
-}
-
-function toBoolean(value, fallback = false) {
-  if (value === undefined || value === null || value === "") return fallback;
-  const normalized = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
-  return fallback;
-}
-
-function sleep(ms) {
-  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function parseRetryAfterMs(rawValue, now = Date.now()) {
-  if (!rawValue) return 0;
-
-  const seconds = Number.parseInt(String(rawValue).trim(), 10);
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(seconds * 1000, 24 * 60 * 60 * 1000);
-  }
-
-  const parsedAt = Date.parse(String(rawValue).trim());
-  if (!Number.isFinite(parsedAt)) return 0;
-  return Math.min(Math.max(0, parsedAt - now), 24 * 60 * 60 * 1000);
-}
-
-function resolveRetryPolicy(env = {}) {
-  const originRetryAttemptsRaw = toNonNegativeInteger(
-    env?.LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS,
-    DEFAULT_ORIGIN_RETRY_ATTEMPTS
-  );
-  const originRetryAttempts = Math.min(Math.max(originRetryAttemptsRaw, 1), 10);
-
-  const originRetryBaseDelayMs = Math.max(
-    0,
-    toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_RETRY_BASE_DELAY_MS,
-      DEFAULT_ORIGIN_RETRY_BASE_DELAY_MS
-    )
-  );
-  const originRetryMaxDelayMs = Math.max(
-    originRetryBaseDelayMs,
-    toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_RETRY_MAX_DELAY_MS,
-      DEFAULT_ORIGIN_RETRY_MAX_DELAY_MS
-    )
-  );
-
-  return {
-    originRetryAttempts,
-    originRetryBaseDelayMs,
-    originRetryMaxDelayMs,
-    originFallbackCooldownMs: toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_FALLBACK_COOLDOWN_MS,
-      DEFAULT_ORIGIN_FALLBACK_COOLDOWN_MS
-    ),
-    originRateLimitCooldownMs: toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_RATE_LIMIT_COOLDOWN_MS,
-      DEFAULT_ORIGIN_RATE_LIMIT_COOLDOWN_MS
-    ),
-    originBillingCooldownMs: toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_BILLING_COOLDOWN_MS,
-      DEFAULT_ORIGIN_BILLING_COOLDOWN_MS
-    ),
-    originAuthCooldownMs: toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_AUTH_COOLDOWN_MS,
-      DEFAULT_ORIGIN_AUTH_COOLDOWN_MS
-    ),
-    originPolicyCooldownMs: toNonNegativeInteger(
-      env?.LLM_ROUTER_ORIGIN_POLICY_COOLDOWN_MS,
-      DEFAULT_ORIGIN_POLICY_COOLDOWN_MS
-    ),
-    allowPolicyFallback: toBoolean(env?.LLM_ROUTER_ALLOW_POLICY_FALLBACK, false)
-  };
-}
-
-function computeRetryDelayMs(attemptNumber, policy) {
-  const exponent = Math.max(0, attemptNumber - 1);
-  const exponential = policy.originRetryBaseDelayMs * (2 ** exponent);
-  const capped = Math.min(exponential, policy.originRetryMaxDelayMs);
-  const jitterMultiplier = 0.5 + (Math.random() * 0.5);
-  return Math.max(0, Math.round(capped * jitterMultiplier));
-}
-
-function hasAnyHint(text, hints) {
-  if (!text) return false;
-  for (const hint of hints) {
-    if (text.includes(hint)) return true;
-  }
-  return false;
-}
-
-function resolveFallbackCircuitPolicy(env = {}) {
-  return {
-    failureThreshold: toNonNegativeInteger(
-      env?.LLM_ROUTER_FALLBACK_CIRCUIT_FAILURES,
-      DEFAULT_FALLBACK_CIRCUIT_FAILURES
-    ),
-    cooldownMs: toNonNegativeInteger(
-      env?.LLM_ROUTER_FALLBACK_CIRCUIT_COOLDOWN_MS,
-      DEFAULT_FALLBACK_CIRCUIT_COOLDOWN_MS
-    )
-  };
-}
-
-function isFallbackCircuitEnabled(policy) {
-  return Number.isFinite(policy?.failureThreshold) &&
-    Number.isFinite(policy?.cooldownMs) &&
-    policy.failureThreshold > 0 &&
-    policy.cooldownMs > 0;
-}
-
-function candidateCircuitKey(candidate) {
-  const model = candidate?.requestModelId || `${candidate?.providerId || "unknown"}/${candidate?.modelId || "unknown"}`;
-  const format = candidate?.targetFormat || "unknown";
-  return `${model}@${format}`;
-}
-
-function getCandidateCircuitSnapshot(candidate, now = Date.now()) {
-  const key = candidateCircuitKey(candidate);
-  const state = fallbackCircuitState.get(key);
-  if (!state) {
-    return { key, isOpen: false, openUntil: 0 };
-  }
-  const openUntil = Number.isFinite(state.openUntil) ? Number(state.openUntil) : 0;
-  return {
-    key,
-    isOpen: openUntil > now,
-    openUntil
-  };
-}
-
-function orderCandidatesByCircuit(candidates, policy, now = Date.now()) {
-  const ranked = (candidates || []).map((candidate, originalIndex) => ({
-    candidate,
-    originalIndex,
-    circuit: getCandidateCircuitSnapshot(candidate, now)
-  }));
-
-  if (!isFallbackCircuitEnabled(policy) || ranked.length <= 1) {
-    return ranked;
-  }
-
-  ranked.sort((left, right) => {
-    if (left.circuit.isOpen !== right.circuit.isOpen) {
-      return left.circuit.isOpen ? 1 : -1;
-    }
-    if (left.circuit.isOpen && right.circuit.isOpen && left.circuit.openUntil !== right.circuit.openUntil) {
-      return left.circuit.openUntil - right.circuit.openUntil;
-    }
-    return left.originalIndex - right.originalIndex;
-  });
-  return ranked;
-}
-
-function markCandidateSuccess(candidate) {
-  fallbackCircuitState.delete(candidateCircuitKey(candidate));
-}
-
-function markCandidateFailure(candidate, result, policy, options = {}) {
-  const now = options?.now ?? Date.now();
-  const trackFailure = options?.trackFailure !== false;
-  const key = candidateCircuitKey(candidate);
-  if (!trackFailure) {
-    fallbackCircuitState.delete(key);
-    return;
-  }
-
-  if (!isFallbackCircuitEnabled(policy)) {
-    fallbackCircuitState.delete(key);
-    return;
-  }
-
-  if (!result?.retryable) {
-    fallbackCircuitState.delete(key);
-    return;
-  }
-
-  const prior = fallbackCircuitState.get(key);
-  const resetAfterCooldown = prior && Number.isFinite(prior.openUntil) && prior.openUntil <= now;
-  const previousFailures = resetAfterCooldown ? 0 : (prior?.consecutiveRetryableFailures || 0);
-  const consecutiveRetryableFailures = previousFailures + 1;
-
-  fallbackCircuitState.set(key, {
-    consecutiveRetryableFailures,
-    openUntil: consecutiveRetryableFailures >= policy.failureThreshold
-      ? now + policy.cooldownMs
-      : 0,
-    lastFailureAt: now,
-    lastFailureStatus: result.status
-  });
-}
-
-function setCandidateCooldown(candidate, cooldownMs, policy, status, now = Date.now()) {
-  if (!isFallbackCircuitEnabled(policy)) return;
-  if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return;
-
-  const key = candidateCircuitKey(candidate);
-  const prior = fallbackCircuitState.get(key) || {};
-  const priorOpenUntil = Number.isFinite(prior.openUntil) ? Number(prior.openUntil) : 0;
-  const openUntil = Math.max(priorOpenUntil, now + cooldownMs);
-
-  fallbackCircuitState.set(key, {
-    consecutiveRetryableFailures: prior?.consecutiveRetryableFailures || 0,
-    openUntil,
-    lastFailureAt: now,
-    lastFailureStatus: status
-  });
-}
-
-function parseJsonSafely(rawText) {
-  if (!rawText) return null;
-  try {
-    return JSON.parse(rawText);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeOpenAIContent(content) {
-  if (typeof content === "string") {
-    return [{ type: "text", text: content }];
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .map((item) => {
-        if (!item || typeof item !== "object") return null;
-        if (item.type === "text" && typeof item.text === "string") {
-          return { type: "text", text: item.text };
-        }
-        if (item.type === "input_text" && typeof item.text === "string") {
-          return { type: "text", text: item.text };
-        }
-        return null;
-      })
-      .filter(Boolean);
-  }
-
-  return [];
-}
-
-function safeParseToolArguments(rawArguments) {
-  if (!rawArguments || typeof rawArguments !== "string") return {};
-  try {
-    return JSON.parse(rawArguments);
-  } catch {
-    return {};
-  }
-}
-
-function convertOpenAINonStreamToClaude(result, fallbackModel = "unknown") {
-  const choice = result?.choices?.[0];
-  const message = choice?.message || {};
-  const content = [
-    ...normalizeOpenAIContent(message.content)
-  ];
-
-  if (Array.isArray(message.tool_calls)) {
-    for (let index = 0; index < message.tool_calls.length; index += 1) {
-      const call = message.tool_calls[index];
-      if (!call || typeof call !== "object") continue;
-      content.push({
-        type: "tool_use",
-        id: call.id || `tool_${index}`,
-        name: call.function?.name || "tool",
-        input: safeParseToolArguments(call.function?.arguments)
-      });
-    }
-  }
-
-  if (content.length === 0) {
-    content.push({ type: "text", text: "" });
-  }
-
-  return {
-    id: result?.id || `msg_${Date.now()}`,
-    type: "message",
-    role: "assistant",
-    model: result?.model || fallbackModel,
-    content,
-    stop_reason: convertOpenAIFinishReason(choice?.finish_reason),
-    stop_sequence: null,
-    usage: {
-      input_tokens: result?.usage?.prompt_tokens || 0,
-      output_tokens: result?.usage?.completion_tokens || 0
-    }
-  };
-}
-
-function convertOpenAIFinishReason(reason) {
-  switch (reason) {
-    case "tool_calls":
-      return "tool_use";
-    case "length":
-      return "max_tokens";
-    case "stop":
-    default:
-      return "end_turn";
-  }
-}
-
-function formatClaudeEvent(event) {
-  const eventType = event.type || "message";
-  return `event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`;
-}
-
-function handleOpenAIStreamToClaude(response) {
-  const state = initState(FORMATS.CLAUDE);
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  let buffer = "";
-
-  const transformStream = new TransformStream({
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
-        const data = trimmed.slice(5).trim();
-
-        if (data === "[DONE]") {
-          controller.enqueue(encoder.encode("event: message_stop\ndata: {}\n\n"));
-          continue;
-        }
-
-        try {
-          const parsed = JSON.parse(data);
-          const translated = translateResponse(FORMATS.OPENAI, FORMATS.CLAUDE, parsed, state);
-          for (const event of translated) {
-            controller.enqueue(encoder.encode(formatClaudeEvent(event)));
-          }
-        } catch (error) {
-          console.error("[Stream] Failed parsing OpenAI chunk:", error instanceof Error ? error.message : String(error));
-        }
-      }
-    }
-  });
-
-  return new Response(response.body.pipeThrough(transformStream), {
-    headers: withCorsHeaders({
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive"
-    })
-  });
-}
-
-function formatOpenAIChunkSse(chunk) {
-  return `data: ${JSON.stringify(chunk)}\n\n`;
-}
-
-function parseSseBlock(block) {
-  let eventType = "message";
-  const dataLines = [];
-
-  for (const rawLine of block.split("\n")) {
-    const line = rawLine.trimEnd();
-    if (!line) continue;
-    if (line.startsWith("event:")) {
-      eventType = line.slice(6).trim();
-      continue;
-    }
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice(5).trimStart());
-    }
-  }
-
-  return {
-    eventType,
-    data: dataLines.join("\n").trim()
-  };
-}
-
-function handleClaudeStreamToOpenAI(response) {
-  const state = initClaudeToOpenAIState();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  let buffer = "";
-  let doneSent = false;
-
-  const transformStream = new TransformStream({
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
-
-      let boundaryIndex;
-      while ((boundaryIndex = buffer.indexOf("\n\n")) >= 0) {
-        const block = buffer.slice(0, boundaryIndex);
-        buffer = buffer.slice(boundaryIndex + 2);
-        if (!block.trim()) continue;
-
-        const parsedBlock = parseSseBlock(block);
-        if (!parsedBlock.data) continue;
-
-        if (parsedBlock.data === "[DONE]") {
-          if (!doneSent) {
-            doneSent = true;
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          }
-          continue;
-        }
-
-        let payload;
-        try {
-          payload = JSON.parse(parsedBlock.data);
-        } catch (error) {
-          console.error("[Stream] Failed parsing Claude chunk:", error instanceof Error ? error.message : String(error));
-          continue;
-        }
-
-        const translatedChunks = claudeEventToOpenAIChunks(parsedBlock.eventType, payload, state);
-        for (const translated of translatedChunks) {
-          if (translated === "[DONE]") {
-            if (!doneSent) {
-              doneSent = true;
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-            }
-            continue;
-          }
-          controller.enqueue(encoder.encode(formatOpenAIChunkSse(translated)));
-        }
-      }
-    },
-
-    flush(controller) {
-      if (!doneSent) {
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      }
-    }
-  });
-
-  return new Response(response.body.pipeThrough(transformStream), {
-    headers: withCorsHeaders({
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive"
-    })
-  });
-}
-
-async function toProviderError(response) {
-  const raw = await response.text();
-  const parsed = parseJsonSafely(raw);
-  const message =
-    parsed?.error?.message ||
-    parsed?.error?.code ||
-    parsed?.error?.type ||
-    parsed?.error ||
-    parsed?.code ||
-    parsed?.type ||
-    parsed?.message ||
-    raw ||
-    `Provider request failed with status ${response.status}`;
-
-  return {
-    raw,
-    payload: {
-      type: "error",
-      error: {
-        type: "api_error",
-        message
-      }
-    }
-  };
-}
-
-async function readProviderErrorHint(result) {
-  if (!(result?.upstreamResponse instanceof Response)) return "";
-  try {
-    const raw = await result.upstreamResponse.clone().text();
-    if (!raw) return "";
-    const limitedRaw = raw.slice(0, ERROR_TEXT_SCAN_LIMIT);
-    const parsed = parseJsonSafely(limitedRaw);
-    const fragments = [
-      parsed?.error?.code,
-      parsed?.error?.type,
-      parsed?.error?.message,
-      parsed?.error,
-      parsed?.code,
-      parsed?.type,
-      parsed?.message,
-      limitedRaw
-    ];
-    return fragments
-      .filter((entry) => entry !== undefined && entry !== null)
-      .map((entry) => String(entry).toLowerCase())
-      .join(" ");
-  } catch {
-    return "";
-  }
-}
-
-async function classifyFailureResult(result, retryPolicy) {
-  const status = Number.isFinite(result?.status) ? Number(result.status) : 0;
-  const retryAfterMs = parseRetryAfterMs(result?.upstreamResponse?.headers?.get("retry-after"));
-
-  if (result?.errorKind === "configuration_error") {
-    return {
-      category: "configuration_error",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: retryPolicy.originFallbackCooldownMs
-    };
-  }
-
-  if (result?.errorKind === "not_supported_error") {
-    return {
-      category: "not_supported_error",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: 0
-    };
-  }
-
-  if (result?.errorKind === "network_error") {
-    return {
-      category: "network_error",
-      retryable: true,
-      retryOrigin: true,
-      allowFallback: true,
-      originCooldownMs: 0
-    };
-  }
-
-  if (status === 429) {
-    const rateLimitCooldown = retryAfterMs > 0 ? retryAfterMs : retryPolicy.originRateLimitCooldownMs;
-    return {
-      category: "rate_limited",
-      retryable: true,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: rateLimitCooldown
-    };
-  }
-
-  if (status === 402) {
-    return {
-      category: "billing_exhausted",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: retryPolicy.originBillingCooldownMs
-    };
-  }
-
-  if (status === 401) {
-    return {
-      category: "auth_failed",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: retryPolicy.originAuthCooldownMs
-    };
-  }
-
-  if (status === 403) {
-    const hintText = await readProviderErrorHint(result);
-    if (hasAnyHint(hintText, BILLING_HINTS)) {
-      return {
-        category: "billing_exhausted",
-        retryable: false,
-        retryOrigin: false,
-        allowFallback: true,
-        originCooldownMs: retryPolicy.originBillingCooldownMs
-      };
-    }
-
-    if (hasAnyHint(hintText, POLICY_HINTS)) {
-      return {
-        category: "policy_blocked",
-        retryable: false,
-        retryOrigin: false,
-        allowFallback: retryPolicy.allowPolicyFallback,
-        originCooldownMs: retryPolicy.originPolicyCooldownMs
-      };
-    }
-
-    if (hasAnyHint(hintText, AUTH_HINTS)) {
-      return {
-        category: "auth_failed",
-        retryable: false,
-        retryOrigin: false,
-        allowFallback: true,
-        originCooldownMs: retryPolicy.originAuthCooldownMs
-      };
-    }
-
-    return {
-      category: "forbidden",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: retryPolicy.originAuthCooldownMs
-    };
-  }
-
-  if (status === 404 || status === 410) {
-    return {
-      category: "not_found",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: true,
-      originCooldownMs: retryPolicy.originFallbackCooldownMs
-    };
-  }
-
-  if (status === 408 || status === 409 || status >= 500) {
-    return {
-      category: "temporary_error",
-      retryable: true,
-      retryOrigin: true,
-      allowFallback: true,
-      originCooldownMs: retryAfterMs
-    };
-  }
-
-  if ([400, 413, 422].includes(status)) {
-    return {
-      category: "invalid_request",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: false,
-      originCooldownMs: 0
-    };
-  }
-
-  if (status >= 400 && status < 500) {
-    return {
-      category: "client_error",
-      retryable: false,
-      retryOrigin: false,
-      allowFallback: false,
-      originCooldownMs: 0
-    };
-  }
-
-  return {
-    category: "unknown_error",
-    retryable: false,
-    retryOrigin: false,
-    allowFallback: true,
-    originCooldownMs: 0
-  };
-}
-
-async function buildFailureResponse(result) {
-  if (result?.response instanceof Response) return result.response;
-
-  if (result?.upstreamResponse instanceof Response) {
-    if (!result.translateError) {
-      return passthroughResponseWithCors(result.upstreamResponse);
-    }
-    const providerError = await toProviderError(result.upstreamResponse);
-    return jsonResponse(providerError.payload, result.upstreamResponse.status);
-  }
-
-  const fallbackStatus = Number.isFinite(result?.status) ? Number(result.status) : 503;
-  return jsonResponse({
-    type: "error",
-    error: {
-      type: "api_error",
-      message: `Provider request failed with status ${fallbackStatus}.`
-    }
-  }, fallbackStatus);
-}
-
-function normalizePath(pathname) {
-  if (!pathname) return "/";
-  if (pathname.length > 1 && pathname.endsWith("/")) {
-    return pathname.slice(0, -1);
-  }
-  return pathname;
-}
-
-function resolveApiRoute(pathname, method) {
-  const path = normalizePath(pathname);
-  const isGet = method === "GET";
-  const isPost = method === "POST";
-
-  if (isGet && ["/anthropic/v1/models", "/anthropic/models"].includes(path)) {
-    return { type: "models", sourceFormat: FORMATS.CLAUDE };
-  }
-
-  if (isGet && ["/openai/v1/models", "/openai/models"].includes(path)) {
-    return { type: "models", sourceFormat: FORMATS.OPENAI };
-  }
-
-  if (isGet && ["/v1/models", "/models"].includes(path)) {
-    return { type: "models", sourceFormat: "auto" };
-  }
-
-  if (isPost && ["/v1/messages", "/messages", "/anthropic", "/anthropic/v1/messages", "/anthropic/messages"].includes(path)) {
-    return { type: "route", sourceFormat: FORMATS.CLAUDE };
-  }
-
-  if (isPost && ["/v1/chat/completions", "/chat/completions", "/openai", "/openai/v1/chat/completions", "/openai/chat/completions"].includes(path)) {
-    return { type: "route", sourceFormat: FORMATS.OPENAI };
-  }
-
-  // Unified root endpoint: infer user format from request payload/headers.
-  if (isPost && ["/", "/v1", "/route", "/router"].includes(path)) {
-    return { type: "route", sourceFormat: "auto" };
-  }
-
-  return null;
-}
-
-function detectUserRequestFormat(request, body, fallback = FORMATS.CLAUDE) {
-  const anthropicHeader = request.headers.get("anthropic-version") || request.headers.get("Anthropic-Version");
-  if (anthropicHeader) return FORMATS.CLAUDE;
-
-  if (!body || typeof body !== "object") return fallback;
-
-  if (body.anthropic_version || body.anthropicVersion) return FORMATS.CLAUDE;
-  if (body.max_completion_tokens !== undefined || body.response_format !== undefined || body.n !== undefined) {
-    return FORMATS.OPENAI;
-  }
-
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    for (const tool of body.tools) {
-      if (!tool || typeof tool !== "object") continue;
-      if (tool.input_schema) return FORMATS.CLAUDE;
-      if (tool.type === "function" || tool.function) return FORMATS.OPENAI;
-    }
-  }
-
-  if (body.tool_choice) {
-    if (typeof body.tool_choice === "string") {
-      if (["required", "none"].includes(body.tool_choice)) return FORMATS.OPENAI;
-    } else if (typeof body.tool_choice === "object") {
-      if (body.tool_choice.type === "function") return FORMATS.OPENAI;
-      if (body.tool_choice.type === "any" || body.tool_choice.type === "tool") return FORMATS.CLAUDE;
-    }
-  }
-
-  if (Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
-      if (!msg || typeof msg !== "object") continue;
-      if (msg.role === "tool" || msg.tool_call_id || Array.isArray(msg.tool_calls)) {
-        return FORMATS.OPENAI;
-      }
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (!block || typeof block !== "object") continue;
-          if (["tool_use", "tool_result", "thinking", "redacted_thinking"].includes(block.type)) {
-            return FORMATS.CLAUDE;
-          }
-          if (["image_url", "input_text", "input_image"].includes(block.type)) {
-            return FORMATS.OPENAI;
-          }
-        }
-      }
-    }
-  }
-
-  if (body.system !== undefined) return FORMATS.CLAUDE;
-
-  return fallback;
-}
-
-function isStreamingEnabled(sourceFormat, body) {
-  if (sourceFormat === FORMATS.OPENAI) {
-    return Boolean(body?.stream);
-  }
-  // Follow Anthropic-compatible semantics: stream only when explicitly true.
-  // Some clients omit `stream` on follow-up/tool turns and expect JSON responses.
-  return body?.stream === true;
-}
-
-function enrichErrorMessage(error, candidate, isFallback) {
-  const prefix = `${candidate.providerId}/${candidate.modelId}`;
-  if (isFallback) {
-    return `[fallback ${prefix}] ${error}`;
-  }
-  return `[${prefix}] ${error}`;
-}
-
-async function makeProviderCall({
-  body,
-  sourceFormat,
-  stream,
-  candidate,
-  env
-}) {
-  const provider = candidate.provider;
-  const targetFormat = candidate.targetFormat;
-  const translate = needsTranslation(sourceFormat, targetFormat);
-
-  let providerBody = { ...body };
-  if (translate) {
-    providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
-  }
-  providerBody.model = candidate.backend;
-
-  const providerUrl = resolveProviderUrl(provider, targetFormat);
-  const headers = buildProviderHeaders(provider, env, targetFormat);
-
-  if (!providerUrl) {
-    return {
-      ok: false,
-      status: 500,
-      retryable: false,
-      errorKind: "configuration_error",
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "configuration_error",
-          message: `Provider ${provider.id} has invalid baseUrl.`
-        }
-      }, 500)
-    };
-  }
-
-  let response;
-  try {
-    response = await fetch(providerUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(providerBody)
-    });
-  } catch (error) {
-    return {
-      ok: false,
-      status: 503,
-      retryable: true,
-      errorKind: "network_error",
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: `Provider network error: ${error instanceof Error ? error.message : String(error)}`
-        }
-      }, 503)
-    };
-  }
-
-  if (!response.ok) {
-    return {
-      ok: false,
-      status: response.status,
-      retryable: shouldRetryStatus(response.status),
-      upstreamResponse: response,
-      translateError: translate
-    };
-  }
-
-  if (stream) {
-    if (!translate) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: passthroughResponseWithCors(response, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive"
-        })
-      };
-    }
-
-    if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: handleOpenAIStreamToClaude(response)
-      };
-    }
-
-    if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: handleClaudeStreamToOpenAI(response)
-      };
-    }
-
-    return {
-      ok: false,
-      status: 501,
-      retryable: false,
-      errorKind: "not_supported_error",
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "not_supported_error",
-          message: `Streaming translation from ${targetFormat} to ${sourceFormat} is not implemented.`
-        }
-      }, 501)
-    };
-  }
-
-  if (!translate) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: passthroughResponseWithCors(response)
-    };
-  }
-
-  const raw = await response.text();
-  const parsed = parseJsonSafely(raw);
-  if (!parsed) {
-    return {
-      ok: false,
-      status: 502,
-      retryable: true,
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: "Provider returned invalid JSON."
-        }
-      }, 502)
-    };
-  }
-
-  if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: jsonResponse(convertOpenAINonStreamToClaude(parsed, candidate.backend))
-    };
-  }
-
-  if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: jsonResponse(claudeToOpenAINonStreamResponse(parsed))
-    };
-  }
-
-  return {
-    ok: false,
-    status: 501,
-    retryable: false,
-    errorKind: "not_supported_error",
-    response: jsonResponse({
-      type: "error",
-      error: {
-        type: "not_supported_error",
-        message: `Non-stream translation from ${targetFormat} to ${sourceFormat} is not implemented.`
-      }
-    }, 501)
-  };
-}
+  buildFailureResponse,
+  makeProviderCall
+} from "./handler/provider-call.js";
+import { corsResponse, jsonResponse } from "./handler/http.js";
+import {
+  detectUserRequestFormat,
+  isJsonRequest,
+  isStreamingEnabled,
+  normalizePath,
+  parseJsonBodyWithLimit,
+  resolveApiRoute,
+  resolveMaxRequestBodyBytes
+} from "./handler/request.js";
+import {
+  isRequestFromAllowedIp,
+  resolveAllowedOrigin,
+  withRequestCors
+} from "./handler/network-guards.js";
+import {
+  classifyFailureResult,
+  computeRetryDelayMs,
+  enrichErrorMessage,
+  markCandidateFailure,
+  markCandidateSuccess,
+  orderCandidatesByCircuit,
+  resolveFallbackCircuitPolicy,
+  resolveRetryPolicy,
+  setCandidateCooldown
+} from "./handler/fallback.js";
+import { sleep } from "./handler/utils.js";
 
 async function handleRouteRequest(request, env, getConfig, sourceFormatHint, options = {}) {
   let config;
@@ -1151,14 +66,23 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     }, 503);
   }
 
-  if (!validateAuth(request, config, options)) {
+  if (options.authValidated !== true && !validateAuth(request, config, options)) {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
 
+  const hasContentType = Boolean(request.headers.get("content-type"));
+  if (hasContentType && !isJsonRequest(request)) {
+    return jsonResponse({ error: "Unsupported Media Type. Use application/json." }, 415);
+  }
+
+  const maxRequestBodyBytes = resolveMaxRequestBodyBytes(env);
   let body;
   try {
-    body = await request.json();
-  } catch {
+    body = await parseJsonBodyWithLimit(request, maxRequestBodyBytes);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "REQUEST_BODY_TOO_LARGE") {
+      return jsonResponse({ error: "Request body too large" }, 413);
+    }
     return jsonResponse({ error: "Invalid JSON" }, 400);
   }
 
@@ -1279,38 +203,49 @@ export function createFetchHandler(options) {
 
   return async function fetchHandler(request, env = {}, ctx) {
     const url = new URL(request.url);
+    const respond = (response, corsOptions = {}) => withRequestCors(response, request, env, corsOptions);
     let preloadedConfig = null;
+    let authValidated = false;
+
+    if (!isRequestFromAllowedIp(request, env)) {
+      return respond(jsonResponse({ error: "Forbidden" }, 403));
+    }
 
     if (request.method === "OPTIONS") {
-      return corsResponse();
+      const allowedOrigin = resolveAllowedOrigin(request, env);
+      if (request.headers.get("origin") && !allowedOrigin) {
+        return new Response(null, { status: 403 });
+      }
+      return respond(corsResponse(), { isPreflight: true, allowedOrigin });
     }
 
     if (shouldEnforceWorkerAuth(options)) {
       try {
         preloadedConfig = await loadRuntimeConfig(options.getConfig, env);
       } catch (error) {
-        return jsonResponse({
+        return respond(jsonResponse({
           type: "error",
           error: {
             type: "configuration_error",
             message: `Failed reading runtime config: ${error instanceof Error ? error.message : String(error)}`
           }
-        }, 500);
+        }, 500));
       }
 
       if (!preloadedConfig.masterKey) {
-        return jsonResponse({
+        return respond(jsonResponse({
           type: "error",
           error: {
             type: "configuration_error",
             message: "Worker masterKey is required. Set config.masterKey or LLM_ROUTER_MASTER_KEY."
           }
-        }, 503);
+        }, 503));
       }
 
       if (!validateAuth(request, preloadedConfig, options)) {
-        return jsonResponse({ error: "Unauthorized" }, 401);
+        return respond(jsonResponse({ error: "Unauthorized" }, 401));
       }
+      authValidated = true;
     }
 
     if (url.pathname === "/health") {
@@ -1321,15 +256,15 @@ export function createFetchHandler(options) {
         config = normalizeRuntimeConfig({});
       }
 
-      return jsonResponse({
+      return respond(jsonResponse({
         status: "ok",
         timestamp: new Date().toISOString(),
         providers: (config.providers || []).length
-      });
+      }));
     }
 
     if (request.method === "GET" && normalizePath(url.pathname) === "/") {
-      return jsonResponse({
+      return respond(jsonResponse({
         name: "llm-router",
         status: "ok",
         endpoints: {
@@ -1337,27 +272,30 @@ export function createFetchHandler(options) {
           anthropic: ["/anthropic", "/anthropic/v1/messages"],
           openai: ["/openai", "/openai/v1/chat/completions"]
         }
-      });
+      }));
     }
 
     const route = resolveApiRoute(url.pathname, request.method);
     if (route?.type === "models") {
       const config = preloadedConfig || await loadRuntimeConfig(options.getConfig, env);
-      return jsonResponse({
+      return respond(jsonResponse({
         object: "list",
-        data: listConfiguredModels(config, {
-          endpointFormat: route.sourceFormat === "auto" ? undefined : route.sourceFormat
-        })
-      });
+        data: getCachedModelList(
+          config,
+          route.sourceFormat === "auto" ? undefined : route.sourceFormat
+        )
+      }));
     }
 
     if (route?.type === "route") {
-      return handleRouteRequest(request, env, options.getConfig, route.sourceFormat, {
+      const routeResponse = await handleRouteRequest(request, env, options.getConfig, route.sourceFormat, {
         ...options,
-        preloadedConfig
+        preloadedConfig,
+        authValidated
       });
+      return respond(routeResponse);
     }
 
-    return jsonResponse({ error: "Not found" }, 404);
+    return respond(jsonResponse({ error: "Not found" }, 404));
   };
 }

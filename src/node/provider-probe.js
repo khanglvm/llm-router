@@ -609,7 +609,7 @@ function normalizeEndpointList(rawEndpoints, fallbackBaseUrl = "") {
   if (Array.isArray(rawEndpoints)) {
     values.push(...rawEndpoints);
   } else if (typeof rawEndpoints === "string") {
-    values.push(...rawEndpoints.split(/[,\n]/g));
+    values.push(...rawEndpoints.split(/[,\n;\s]+/g));
   }
   if (fallbackBaseUrl) values.push(fallbackBaseUrl);
   return dedupeStrings(values);

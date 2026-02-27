@@ -1,0 +1,43 @@
+# Tests
+*.test.js
+*.test.ts
+*.spec.js
+*.spec.ts
+test/
+tests/
+__tests__/
+scripts/
+
+# Examples and demos
+example/
+examples/
+demo/
+demos/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Local development
+.env*
+!.env.example
+!.env.*.example
+.wrangler/
+*.log
+
+# Deployment artifacts
+.llm-router.deploy.*.wrangler.toml
+.llm-router.worker.json
+.llm-router.runtime.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+.DS_Store

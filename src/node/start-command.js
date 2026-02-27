@@ -1,5 +1,5 @@
 import path from "node:path";
-import { watch as fsWatch, existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { configFileExists, getDefaultConfigPath, readConfigFile } from "./config-store.js";
 import { clearRuntimeState, writeRuntimeState } from "./instance-state.js";
@@ -309,9 +309,36 @@ export async function runStartCommand(options = {}) {
     };
   }
 
+  const buildLocalServerOptions = () => ({
+    port,
+    host,
+    configPath,
+    watchConfig,
+    requireAuth,
+    validateConfig: (nextConfig) => {
+      if (!configHasProvider(nextConfig)) {
+        return "Config has no enabled providers.";
+      }
+      if (requireAuth && !nextConfig.masterKey) {
+        return "masterKey is missing while --require-auth=true.";
+      }
+      return "";
+    },
+    onConfigReload: (nextConfig, reason) => {
+      if (reason === "startup") return;
+      line(`Config hot-reloaded in memory (${reason}).`);
+      if (!configHasProvider(nextConfig)) {
+        error("Reloaded config has no enabled providers.");
+      }
+    },
+    onConfigReloadError: (reloadError, reason) => {
+      error(`Config reload ignored (${reason}): ${reloadError instanceof Error ? reloadError.message : String(reloadError)}`);
+    }
+  });
+
   let server;
   try {
-    server = await startLocalRouteServer({ port, host, configPath, requireAuth });
+    server = await startLocalRouteServer(buildLocalServerOptions());
   } catch (startError) {
     if (startError?.code !== "EADDRINUSE") {
       return {
@@ -331,7 +358,7 @@ export async function runStartCommand(options = {}) {
     }
 
     try {
-      server = await startLocalRouteServer({ port, host, configPath, requireAuth });
+      server = await startLocalRouteServer(buildLocalServerOptions());
       line(`Port ${port} reclaimed successfully.`);
     } catch (retryError) {
       return {
@@ -348,14 +375,11 @@ export async function runStartCommand(options = {}) {
     line(row);
   }
   line(`Local auth: ${requireAuth ? "required (masterKey)" : "disabled"}`);
-  line(`Config watch auto-restart: ${watchConfig ? "enabled" : "disabled"}`);
+  line(`Config hot reload: ${watchConfig ? "enabled" : "disabled"} (in-memory, no process restart)`);
   line(`Binary update watch: ${watchBinary ? "enabled" : "disabled"}${managedByStartup ? " (startup-managed auto-restart)" : ""}`);
   line("Press Ctrl+C to stop.");
 
   let shuttingDown = false;
-  let restarting = false;
-  let debounceTimer = null;
-  let watcher = null;
   let binaryWatchTimer = null;
   let binaryState = watchBinary && cliPathForWatch ? snapshotCliVersionState(cliPathForWatch) : null;
   let binaryNoticeSent = false;
@@ -387,50 +411,6 @@ export async function runStartCommand(options = {}) {
     await new Promise((resolve) => active.close(() => resolve()));
   };
 
-  const restartServer = async (reason) => {
-    if (restarting || shuttingDown) return;
-    restarting = true;
-    try {
-      const latestConfig = await readConfigFile(configPath);
-      if (!configHasProvider(latestConfig)) {
-        error(`Config changed (${reason}) but has no providers. Keeping current server.`);
-        return;
-      }
-      if (requireAuth && !latestConfig.masterKey) {
-        error(`Config changed (${reason}) but masterKey is missing while local auth is required. Keeping current server.`);
-        return;
-      }
-
-      await closeServer();
-      server = await startLocalRouteServer({ port, host, configPath, requireAuth });
-      line(`Restarted llm-router after config change (${reason})`);
-    } catch (restartError) {
-      error(`Failed to restart after config change: ${restartError instanceof Error ? restartError.message : String(restartError)}`);
-    } finally {
-      restarting = false;
-    }
-  };
-
-  if (watchConfig) {
-    const configDir = path.dirname(configPath);
-    const configFile = path.basename(configPath);
-    try {
-      watcher = fsWatch(configDir, (eventType, filename) => {
-        if (shuttingDown) return;
-        if (!filename) return;
-        if (String(filename) !== configFile) return;
-
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          debounceTimer = null;
-          void restartServer(eventType || "change");
-        }, 300);
-      });
-    } catch (watchError) {
-      error(`Config watch disabled: ${watchError instanceof Error ? watchError.message : String(watchError)}`);
-    }
-  }
-
   let resolveDone;
   const donePromise = new Promise((resolve) => {
     resolveDone = resolve;
@@ -440,8 +420,6 @@ export async function runStartCommand(options = {}) {
       if (shuttingDown) return;
       shuttingDown = true;
       try {
-        if (debounceTimer) clearTimeout(debounceTimer);
-        watcher?.close?.();
         if (binaryWatchTimer) clearInterval(binaryWatchTimer);
       } catch {
         // ignore
@@ -453,7 +431,7 @@ export async function runStartCommand(options = {}) {
 
   if (watchBinary && binaryState) {
     binaryWatchTimer = setInterval(() => {
-      if (shuttingDown || restarting || binaryRelaunching) return;
+      if (shuttingDown || binaryRelaunching) return;
       const nextState = snapshotCliVersionState(binaryState.cliPath);
       const changed =
         nextState.realpath !== binaryState.realpath ||
