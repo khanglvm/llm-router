@@ -90,6 +90,7 @@ const MODEL_ROUTING_STRATEGY_OPTIONS = [
 const MODEL_ALIAS_STRATEGIES = MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => option.value);
 const DEFAULT_PROBE_REQUESTS_PER_MINUTE = 30;
 const DEFAULT_PROBE_MAX_RATE_LIMIT_RETRIES = 3;
+const DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS = 6000;
 const RATE_LIMIT_WINDOW_UNIT_ALIASES = new Map([
   ["s", "second"],
   ["sec", "second"],
@@ -4659,6 +4660,497 @@ async function runUpdateAction(context) {
   };
 }
 
+function toHomeRelativePath(value) {
+  const input = String(value || "").trim();
+  const home = String(process.env.HOME || "").trim();
+  if (!input || !home) return input;
+  if (!input.startsWith(`${home}/`)) return input;
+  return `~${input.slice(home.length)}`;
+}
+
+function collectEnabledModelRefsFromConfig(config) {
+  const providers = (config?.providers || []).filter((provider) => provider && provider.enabled !== false);
+  const refs = [];
+  for (const provider of providers) {
+    const providerId = String(provider?.id || "").trim();
+    if (!providerId) continue;
+    for (const model of (provider.models || [])) {
+      if (!model || model.enabled === false) continue;
+      const modelId = String(model.id || "").trim();
+      if (!modelId) continue;
+      refs.push(`${providerId}/${modelId}`);
+    }
+  }
+  return dedupeList(refs);
+}
+
+function quoteShellSingle(value) {
+  return `'${String(value || "").replace(/'/g, "'\"'\"'")}'`;
+}
+
+function buildCurlGuideCommand(url, {
+  method = "GET",
+  headers = [],
+  jsonBody
+} = {}) {
+  const parts = ["curl -sS"];
+  if (String(method || "").toUpperCase() !== "GET") {
+    parts.push(`-X ${String(method || "").toUpperCase()}`);
+  }
+  for (const header of headers) {
+    parts.push(`-H ${quoteShellSingle(header)}`);
+  }
+  if (jsonBody !== undefined) {
+    parts.push("-H 'content-type: application/json'");
+    parts.push(`--data ${quoteShellSingle(JSON.stringify(jsonBody))}`);
+  }
+  parts.push(quoteShellSingle(url));
+  return parts.join(" ");
+}
+
+async function runGatewayHttpProbe({
+  url,
+  method = "GET",
+  headers = {},
+  jsonBody,
+  timeoutMs = DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS
+} = {}) {
+  const requestHeaders = { ...(headers || {}) };
+  const requestInit = {
+    method: String(method || "GET").toUpperCase(),
+    headers: requestHeaders
+  };
+
+  if (jsonBody !== undefined) {
+    if (!requestHeaders["content-type"] && !requestHeaders["Content-Type"]) {
+      requestHeaders["content-type"] = "application/json";
+    }
+    requestInit.body = JSON.stringify(jsonBody);
+  }
+
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    requestInit.signal = AbortSignal.timeout(timeoutMs);
+  }
+
+  try {
+    const response = await fetch(url, requestInit);
+    const rawText = await response.text();
+    return {
+      ok: response.ok,
+      status: response.status,
+      payload: parseJsonSafely(rawText),
+      rawText: String(rawText || "").trim().slice(0, 280)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      payload: null,
+      rawText: "",
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function summarizeProbeMessage(probe) {
+  if (!probe) return "";
+  if (probe.error) return String(probe.error);
+  const payloadError = probe.payload?.error;
+  if (typeof payloadError === "string") return payloadError.trim();
+  if (payloadError && typeof payloadError === "object") {
+    if (payloadError.message) return String(payloadError.message).trim();
+    if (payloadError.type) return String(payloadError.type).trim();
+  }
+  if (probe.rawText) return String(probe.rawText).trim().slice(0, 140);
+  return "";
+}
+
+function formatProbeStatusLabel(probe, {
+  passStatuses = [200],
+  passWhenStatusIsNot = null
+} = {}) {
+  if (!probe) return "not-run";
+  if (probe.error) return `error (${probe.error})`;
+  const status = Number(probe.status || 0);
+  const isPass = passWhenStatusIsNot !== null
+    ? status !== passWhenStatusIsNot
+    : passStatuses.includes(status);
+  const message = summarizeProbeMessage(probe);
+  if (message) return `${isPass ? "pass" : "fail"} (status=${status}; ${message})`;
+  return `${isPass ? "pass" : "fail"} (status=${status})`;
+}
+
+async function runAiHelpGatewayLiveTests({
+  runtimeState,
+  authToken = "",
+  probeModel = "",
+  timeoutMs = DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS
+} = {}) {
+  if (!runtimeState) {
+    return {
+      ran: false,
+      reason: "local-server-not-running",
+      baseUrl: "",
+      tests: {}
+    };
+  }
+
+  const baseUrl = `http://${runtimeState.host}:${runtimeState.port}`;
+  const token = String(authToken || "").trim();
+  const headers = token
+    ? {
+        Authorization: `Bearer ${token}`,
+        "x-api-key": token
+      }
+    : {};
+
+  const modelId = String(probeModel || "").trim() || "chat.default";
+  const [health, openaiModels, claudeModels, codexResponses] = await Promise.all([
+    runGatewayHttpProbe({
+      url: `${baseUrl}/health`,
+      method: "GET",
+      headers,
+      timeoutMs
+    }),
+    runGatewayHttpProbe({
+      url: `${baseUrl}/openai/v1/models`,
+      method: "GET",
+      headers,
+      timeoutMs
+    }),
+    runGatewayHttpProbe({
+      url: `${baseUrl}/anthropic/v1/models`,
+      method: "GET",
+      headers,
+      timeoutMs
+    }),
+    runGatewayHttpProbe({
+      url: `${baseUrl}/openai/v1/responses`,
+      method: "POST",
+      headers,
+      jsonBody: {
+        model: modelId,
+        input: "ping"
+      },
+      timeoutMs
+    })
+  ]);
+
+  return {
+    ran: true,
+    reason: "completed",
+    baseUrl,
+    tests: {
+      health,
+      openaiModels,
+      claudeModels,
+      codexResponses
+    }
+  };
+}
+
+async function runAiHelpAction(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const skipLiveTest = toBoolean(readArg(args, ["skip-live-test", "skipLiveTest"], false), false);
+  const liveTestTimeoutMs = toPositiveInteger(
+    readArg(args, ["live-test-timeout-ms", "liveTestTimeoutMs"], DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS),
+    DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS,
+    { min: 500, max: 60_000 }
+  );
+  const explicitGatewayAuthToken = String(readArg(args, ["gateway-auth-token", "gatewayAuthToken"], "") || "").trim();
+  const config = await readConfigFile(configPath);
+
+  const providers = (config.providers || []).filter((provider) => provider && provider.enabled !== false);
+  const providerCount = providers.length;
+  const modelCount = providers.reduce((sum, provider) => {
+    const count = (provider.models || []).filter((model) => model && model.enabled !== false).length;
+    return sum + count;
+  }, 0);
+
+  const aliasEntries = Object.entries(config.modelAliases || {});
+  const aliasCount = aliasEntries.length;
+  const aliasStrategySummary = aliasEntries
+    .map(([aliasId, alias]) => `${aliasId}:${alias?.strategy || "ordered"}`)
+    .join(", ") || "(none)";
+  const rateLimitBucketCount = providers.reduce((sum, provider) => sum + (provider.rateLimits || []).length, 0);
+  const defaultModel = String(config.defaultModel || "smart");
+  const hasMasterKey = Boolean(String(config.masterKey || "").trim());
+
+  let runtimeState = null;
+  try {
+    runtimeState = await getActiveRuntimeState();
+  } catch {
+    runtimeState = null;
+  }
+  const serverRunning = Boolean(runtimeState);
+  const runtimeRequiresAuth = Boolean(runtimeState?.requireAuth);
+
+  let runtimeConfig = null;
+  const runtimeConfigPath = String(runtimeState?.configPath || "").trim();
+  if (runtimeConfigPath && runtimeConfigPath !== configPath) {
+    try {
+      runtimeConfig = await readConfigFile(runtimeConfigPath);
+    } catch {
+      runtimeConfig = null;
+    }
+  }
+
+  const runtimeMasterKey = String(runtimeConfig?.masterKey || "").trim();
+  const gatewayAuthToken = explicitGatewayAuthToken
+    || (runtimeConfigPath && runtimeConfigPath !== configPath ? runtimeMasterKey : "")
+    || String(config.masterKey || "").trim()
+    || runtimeMasterKey;
+
+  const directModelRefs = collectEnabledModelRefsFromConfig(config);
+  const aliasIds = aliasEntries.map(([aliasId]) => aliasId);
+  const modelDecisionOptions = dedupeList([
+    defaultModel && defaultModel !== "smart" ? defaultModel : "",
+    ...aliasIds,
+    ...directModelRefs
+  ]);
+  const probeModel = modelDecisionOptions[0] || "chat.default";
+
+  let liveTest = {
+    ran: false,
+    reason: skipLiveTest ? "skipped-by-flag" : "local-server-not-running",
+    baseUrl: serverRunning ? `http://${runtimeState.host}:${runtimeState.port}` : "",
+    tests: {}
+  };
+  if (!skipLiveTest && serverRunning) {
+    liveTest = await runAiHelpGatewayLiveTests({
+      runtimeState,
+      authToken: gatewayAuthToken,
+      probeModel,
+      timeoutMs: liveTestTimeoutMs
+    });
+  }
+
+  const healthProbe = liveTest.tests?.health || null;
+  const openaiModelsProbe = liveTest.tests?.openaiModels || null;
+  const claudeModelsProbe = liveTest.tests?.claudeModels || null;
+  const codexResponsesProbe = liveTest.tests?.codexResponses || null;
+
+  const claudePatchGate = !liveTest.ran
+    ? "pending-live-test"
+    : (claudeModelsProbe?.status === 200 ? "ready" : "blocked");
+  const openCodePatchGate = !liveTest.ran
+    ? "pending-live-test"
+    : (openaiModelsProbe?.status === 200 ? "ready" : "blocked");
+  let codexPatchGate = "pending-live-test";
+  if (liveTest.ran) {
+    if (codexResponsesProbe?.error) {
+      codexPatchGate = "blocked";
+    } else if (codexResponsesProbe?.status === 404) {
+      codexPatchGate = "blocked-responses-endpoint-missing";
+    } else if ([401, 403].includes(Number(codexResponsesProbe?.status || 0))) {
+      codexPatchGate = "blocked-auth";
+    } else {
+      codexPatchGate = "ready";
+    }
+  }
+
+  const suggestions = [];
+  if (providerCount === 0) {
+    suggestions.push("Add first provider with at least one model. Run: llm-router config --operation=upsert-provider --provider-id=<id> --name=\"<name>\" --base-url=<url> --api-key=<key> --models=<model1,model2>");
+  } else {
+    const providersWithoutModels = providers
+      .filter((provider) => (provider.models || []).filter((model) => model && model.enabled !== false).length === 0)
+      .map((provider) => provider.id);
+    if (providersWithoutModels.length > 0) {
+      suggestions.push(`Add models to provider(s) with empty model list: ${providersWithoutModels.join(", ")}. Run: llm-router config --operation=upsert-provider --provider-id=<id> --models=<model1,model2>`);
+    }
+  }
+
+  if (modelCount > 0 && aliasCount === 0) {
+    suggestions.push("Create a model alias/group for stable app routing. Run: llm-router config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=<provider/model,...>");
+  }
+
+  if (aliasCount > 0) {
+    const nonAutoAliases = aliasEntries
+      .filter(([, alias]) => String(alias?.strategy || "ordered") !== "auto")
+      .map(([aliasId]) => aliasId);
+    if (nonAutoAliases.length > 0) {
+      suggestions.push(`Review load-balancer strategy for alias(es): ${nonAutoAliases.join(", ")}. Recommended default: auto.`);
+    }
+  }
+
+  if (providerCount > 0 && rateLimitBucketCount === 0) {
+    suggestions.push("Add at least one provider rate-limit bucket for quota safety. Run: llm-router config --operation=set-provider-rate-limits --provider-id=<id> --bucket-name=\"Monthly cap\" --bucket-models=all --bucket-requests=<n> --bucket-window=month:1");
+  }
+
+  if (!hasMasterKey) {
+    suggestions.push("Set master key for authenticated access. Run: llm-router config --operation=set-master-key --generate-master-key=true");
+  }
+
+  if (!serverRunning) {
+    suggestions.push(`Start local proxy server. Run: llm-router start${hasMasterKey ? " --require-auth=true" : ""}`);
+  } else {
+    suggestions.push(`Local proxy is running on http://${runtimeState.host}:${runtimeState.port}. Apply config changes with llm-router config; updates hot-reload automatically.`);
+  }
+
+  if (serverRunning && skipLiveTest) {
+    suggestions.push("Run live llm-router API test before patching coding-tool config. Re-run: llm-router ai-help --skip-live-test=false");
+  }
+
+  if (liveTest.ran && claudePatchGate !== "ready") {
+    suggestions.push("Claude/OpenCode patch gate is blocked. Fix llm-router auth/provider/model readiness, then re-run llm-router ai-help.");
+  }
+  if (liveTest.ran && codexPatchGate === "blocked-responses-endpoint-missing") {
+    suggestions.push("Codex CLI requires OpenAI Responses API. Current llm-router endpoint does not expose /openai/v1/responses; do not patch Codex until this gate is resolved.");
+  }
+
+  if (suggestions.length === 0) {
+    suggestions.push("No blocking setup gaps detected. Review routing summary with: llm-router config --operation=list-routing");
+  }
+
+  const runtimeConfigPathForDisplay = runtimeConfigPath ? toHomeRelativePath(runtimeConfigPath) : "";
+  const gatewayBaseUrlForGuide = liveTest.baseUrl || (serverRunning ? `http://${runtimeState.host}:${runtimeState.port}` : "http://127.0.0.1:8787");
+  const authGuideHeaders = runtimeRequiresAuth ? ["Authorization: Bearer <master_key>"] : [];
+
+  const lines = [
+    "# AI-HELP",
+    "ENTITY: llm-router",
+    "MODE: cli-automation",
+    "PROFILE: agent-guide-v2",
+    "",
+    "## INTRO",
+    "Use this output as an AI-agent operating brief for llm-router.",
+    "The agent should auto-discover commands, inspect current state, configure llm-router on your behalf, run live API gates, and only then patch coding tool configs.",
+    "",
+    "## WHAT AGENT CAN DO WITH LLM-ROUTER",
+    "- explain llm-router capabilities and current setup readiness",
+    "- set provider, model list, model alias/group, and rate-limit buckets via CLI",
+    "- validate local llm-router endpoint health/model-list/routes with real API probes",
+    "- patch coding tools (Claude Code, Codex CLI, OpenCode) after pre-patch gates pass",
+    "",
+    "## DISCOVERY COMMANDS",
+    "- llm-router -h",
+    "- llm-router config -h",
+    "- llm-router start -h",
+    "- llm-router deploy -h",
+    "",
+    "## CURRENT STATE",
+    `- config_path=${configPath}`,
+    `- providers=${providerCount}`,
+    `- models=${modelCount}`,
+    `- model_aliases=${aliasCount}`,
+    `- alias_strategies=${aliasStrategySummary}`,
+    `- rate_limit_buckets=${rateLimitBucketCount}`,
+    `- default_model=${defaultModel}`,
+    `- master_key_configured=${hasMasterKey}`,
+    `- local_server_running=${serverRunning}`,
+    serverRunning ? `- local_server_endpoint=http://${runtimeState.host}:${runtimeState.port}` : "",
+    runtimeState ? `- local_server_require_auth=${runtimeRequiresAuth}` : "",
+    runtimeConfigPathForDisplay ? `- local_server_config_path=${runtimeConfigPathForDisplay}` : "",
+    "",
+    "## MODEL/GROUP DECISION INPUT (REQUIRED BEFORE PATCHING TOOL CONFIG)",
+    "- Ask user to choose target_tool: claude-code | codex-cli | opencode",
+    "- Ask user to choose target_model_or_group for that tool",
+    `- available_alias_groups=${aliasIds.join(", ") || "(none)"}`,
+    `- available_direct_models=${directModelRefs.join(", ") || "(none)"}`,
+    `- decision_options_preview=${modelDecisionOptions.slice(0, 12).join(", ") || "(none)"}`,
+    "- If user chooses an alias/group, keep alias id unchanged so llm-router balancing still works.",
+    "",
+    "## PRE-PATCH API GATE (MUST PASS BEFORE EDITING TOOL CONFIG)",
+    `- live_test_mode=${skipLiveTest ? "skipped-by-flag" : (liveTest.ran ? "executed" : "pending-local-server")}`,
+    `- live_test_timeout_ms=${liveTestTimeoutMs}`,
+    `- gateway_base_url=${gatewayBaseUrlForGuide}`,
+    `- health_probe=${liveTest.ran ? formatProbeStatusLabel(healthProbe, { passStatuses: [200] }) : "not-run"}`,
+    `- openai_models_probe=${liveTest.ran ? formatProbeStatusLabel(openaiModelsProbe, { passStatuses: [200] }) : "not-run"}`,
+    `- claude_models_probe=${liveTest.ran ? formatProbeStatusLabel(claudeModelsProbe, { passStatuses: [200] }) : "not-run"}`,
+    `- codex_responses_probe=${liveTest.ran ? formatProbeStatusLabel(codexResponsesProbe, { passWhenStatusIsNot: 404 }) : "not-run"}`,
+    `- patch_gate_claude_code=${claudePatchGate}`,
+    `- patch_gate_opencode=${openCodePatchGate}`,
+    `- patch_gate_codex_cli=${codexPatchGate}`,
+    "- Rule: Do NOT patch any coding-tool config until required gate is ready.",
+    "",
+    "## LIVE TEST COMMANDS (RUN BEFORE PATCHING TOOL CONFIG)",
+    runtimeRequiresAuth ? "- export LLM_ROUTER_MASTER_KEY='<master_key>'" : "- Local auth currently disabled; auth header is optional.",
+    `- ${buildCurlGuideCommand(`${gatewayBaseUrlForGuide}/health`, { method: "GET", headers: authGuideHeaders })}`,
+    `- ${buildCurlGuideCommand(`${gatewayBaseUrlForGuide}/openai/v1/models`, { method: "GET", headers: authGuideHeaders })}`,
+    `- ${buildCurlGuideCommand(`${gatewayBaseUrlForGuide}/anthropic/v1/models`, { method: "GET", headers: authGuideHeaders })}`,
+    `- ${buildCurlGuideCommand(`${gatewayBaseUrlForGuide}/openai/v1/responses`, {
+      method: "POST",
+      headers: authGuideHeaders,
+      jsonBody: { model: "<target_model_or_group>", input: "ping" }
+    })}  # required for Codex CLI compatibility`,
+    "",
+    "## LLM-ROUTER CONFIG WORKFLOWS (CLI)",
+    "1. Upsert provider + models:",
+    "   llm-router config --operation=upsert-provider --provider-id=<id> --name=\"<name>\" --endpoints=<url1,url2> --api-key=<key> --models=<model1,model2>",
+    "2. Upsert model alias/group:",
+    "   llm-router config --operation=upsert-model-alias --alias-id=<alias> --strategy=auto --targets=<provider/model,...>",
+    "3. Set provider rate limit bucket:",
+    "   llm-router config --operation=set-provider-rate-limits --provider-id=<id> --bucket-name=\"Monthly cap\" --bucket-models=all --bucket-requests=<n> --bucket-window=month:1",
+    "4. Review final routing summary:",
+    "   llm-router config --operation=list-routing",
+    "",
+    "## CODING TOOL PATCH PLAYBOOK",
+    "### Claude Code",
+    "- patch_target_priority=.claude/settings.local.json (project) -> ~/.claude/settings.json (user)",
+    "- required_gate=patch_gate_claude_code=ready",
+    "- set env keys: ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL",
+    "```json",
+    "{",
+    "  \"env\": {",
+    `    \"ANTHROPIC_BASE_URL\": \"${gatewayBaseUrlForGuide}/anthropic\",`,
+    "    \"ANTHROPIC_AUTH_TOKEN\": \"<master_key>\",",
+    "    \"ANTHROPIC_MODEL\": \"<target_model_or_group>\"",
+    "  }",
+    "}",
+    "```",
+    "",
+    "### Codex CLI",
+    "- patch_target_priority=.codex/config.toml (project) -> ~/.codex/config.toml (user)",
+    "- required_gate=patch_gate_codex_cli=ready",
+    "- hard requirement: Codex uses OpenAI Responses API; /openai/v1/responses must be reachable",
+    "```toml",
+    "model_provider = \"llm_router\"",
+    "model = \"<target_model_or_group>\"",
+    "",
+    "[model_providers.llm_router]",
+    "name = \"llm-router\"",
+    `base_url = \"${gatewayBaseUrlForGuide}/openai/v1\"`,
+    "wire_api = \"responses\"",
+    "env_http_headers = { Authorization = \"LLM_ROUTER_AUTH_HEADER\" }",
+    "```",
+    "- export env before launching Codex: export LLM_ROUTER_AUTH_HEADER='Bearer <master_key>'",
+    "",
+    "### OpenCode",
+    "- patch_target_priority=./opencode.json (project) -> ~/.config/opencode/opencode.json (user)",
+    "- required_gate=patch_gate_opencode=ready",
+    "```json",
+    "{",
+    "  \"model\": \"<target_model_or_group>\",",
+    "  \"small_model\": \"<target_model_or_group>\",",
+    "  \"provider\": {",
+    "    \"llm-router\": {",
+    "      \"options\": {",
+    `        \"baseURL\": \"${gatewayBaseUrlForGuide}/openai\",`,
+    "        \"apiKey\": \"<master_key>\"",
+    "      }",
+    "    }",
+    "  }",
+    "}",
+    "```",
+    "",
+    "## NEXT SUGGESTIONS",
+    ...suggestions.map((item, index) => `${index + 1}. ${item}`),
+    "",
+    "## UPDATE RULE",
+    "When local server is running, llm-router config changes are hot-reloaded in memory (no manual restart required).",
+    "Agent policy: always run live API gate checks first, then patch tool configs only after gate status is ready."
+  ].filter(Boolean);
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: lines.join("\n")
+  };
+}
+
 async function runDeployAction(context) {
   const args = context.args || {};
   const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
@@ -5351,6 +5843,44 @@ const routerModule = {
         keybindings: []
       },
       run: runUpdateAction
+    },
+    {
+      actionId: "ai-help",
+      description: "Print AI-agent guide with llm-router setup workflows, live API gates, and coding-tool patch playbooks.",
+      tui: { steps: ["print-ai-help"] },
+      commandline: {
+        requiredArgs: [],
+        optionalArgs: [
+          "config",
+          "skip-live-test",
+          "live-test-timeout-ms",
+          "gateway-auth-token"
+        ]
+      },
+      help: {
+        summary: "AI guide for setup + operation: state snapshot, provider/alias/rate-limit workflows, live gateway tests, and patch rules for Claude/Codex/OpenCode.",
+        args: [
+          { name: "config", required: false, description: "Path to config file used for state-aware suggestions.", example: "--config=~/.llm-router.json" },
+          { name: "skip-live-test", required: false, description: "Skip live llm-router API probes in ai-help output.", example: "--skip-live-test=true" },
+          { name: "live-test-timeout-ms", required: false, description: `HTTP timeout for ai-help live probes (default ${DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS}ms).`, example: "--live-test-timeout-ms=8000" },
+          { name: "gateway-auth-token", required: false, description: "Override auth token for live probes when runtime config differs from selected --config.", example: "--gateway-auth-token=gw_..." }
+        ],
+        examples: [
+          "llm-router ai-help",
+          "llm-router ai-help --config=~/.llm-router.json",
+          "llm-router ai-help --skip-live-test=true",
+          "llm-router ai-help --live-test-timeout-ms=8000"
+        ],
+        useCases: [
+          {
+            name: "agent setup brief",
+            description: "Generate a machine-readable operating guide so AI agents can configure llm-router, run pre-patch API gates, and patch tool configs safely.",
+            command: "llm-router ai-help"
+          }
+        ],
+        keybindings: []
+      },
+      run: runAiHelpAction
     },
     {
       actionId: "config",

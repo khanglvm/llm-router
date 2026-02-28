@@ -40,6 +40,10 @@ function getConfigAction() {
   return routerModule.actions.find((entry) => entry.actionId === "config");
 }
 
+function getAiHelpAction() {
+  return routerModule.actions.find((entry) => entry.actionId === "ai-help");
+}
+
 function createConfigContext(args) {
   return {
     args,
@@ -714,4 +718,42 @@ test("migrate-config creates backup and upgrades legacy config version", async (
 
   const entries = await fs.readdir(path.dirname(configPath));
   assert.ok(entries.some((name) => name.startsWith("config.json.bak.")));
+});
+
+test("ai-help action exists and includes discovery commands", async (t) => {
+  const aiHelpAction = getAiHelpAction();
+  assert.ok(aiHelpAction);
+
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const result = await aiHelpAction.run(createConfigContext({
+    config: configPath,
+    "skip-live-test": true
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /# AI-HELP/);
+  assert.match(String(result.data || ""), /llm-router -h/);
+  assert.match(String(result.data || ""), /llm-router config -h/);
+  assert.match(String(result.data || ""), /## PRE-PATCH API GATE/);
+  assert.match(String(result.data || ""), /## CODING TOOL PATCH PLAYBOOK/);
+  assert.match(String(result.data || ""), /patch_gate_codex_cli=/);
+});
+
+test("ai-help suggests first provider when config has none", async (t) => {
+  const aiHelpAction = getAiHelpAction();
+  assert.ok(aiHelpAction);
+
+  const configPath = await createTempConfigFile(t, {
+    version: 2,
+    providers: [],
+    modelAliases: {}
+  });
+
+  const result = await aiHelpAction.run(createConfigContext({
+    config: configPath,
+    "skip-live-test": true
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Add first provider with at least one model/);
 });

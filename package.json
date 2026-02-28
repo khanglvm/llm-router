@@ -1,6 +1,6 @@
 {
   "name": "@khanglvm/llm-router",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
   "type": "module",
   "main": "src/index.js",
