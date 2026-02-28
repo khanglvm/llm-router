@@ -1,7 +1,19 @@
 {
   "name": "@khanglvm/llm-router",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
+  "keywords": [
+    "llm-router",
+    "llm-gateway",
+    "ai-proxy",
+    "openai-compatible",
+    "anthropic-compatible",
+    "model-routing",
+    "fallback",
+    "load-balancing",
+    "cloudflare-workers",
+    "agent-infra"
+  ],
   "type": "module",
   "main": "src/index.js",
   "bin": {
