@@ -1,5 +1,5 @@
 import { promises as fsPromises } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { SnapTui, runPasswordPrompt } from "@levu/snap/dist/index.js";
@@ -12,6 +12,7 @@ import {
 import {
   configFileExists,
   getDefaultConfigPath,
+  migrateConfigFile,
   readConfigFile,
   removeProvider,
   writeConfigFile
@@ -27,11 +28,13 @@ import {
   stopProcessByPid
 } from "../node/instance-state.js";
 import {
+  CONFIG_VERSION,
   configHasProvider,
   DEFAULT_PROVIDER_USER_AGENT,
   maskSecret,
   PROVIDER_ID_PATTERN,
-  sanitizeConfigForDisplay
+  sanitizeConfigForDisplay,
+  validateRuntimeConfig
 } from "../runtime/config.js";
 
 const EXIT_SUCCESS = 0;
@@ -54,7 +57,64 @@ const CLOUDFLARE_API_TOKEN_GUIDE_URL = "https://developers.cloudflare.com/fundam
 const CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4";
 const CLOUDFLARE_VERIFY_TOKEN_URL = `${CLOUDFLARE_API_BASE_URL}/user/tokens/verify`;
 const CLOUDFLARE_MEMBERSHIPS_URL = `${CLOUDFLARE_API_BASE_URL}/memberships`;
+const CLOUDFLARE_ZONES_URL = `${CLOUDFLARE_API_BASE_URL}/zones`;
 const CLOUDFLARE_API_PREFLIGHT_TIMEOUT_MS = 10_000;
+const MODEL_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const MODEL_ROUTING_STRATEGY_OPTIONS = [
+  {
+    value: "auto",
+    label: "Auto",
+    hint: "Recommended set-and-forget mode. Uses quota, cooldown, and health signals to avoid rate limits."
+  },
+  {
+    value: "ordered",
+    label: "Ordered",
+    hint: "Try targets in the listed order. Move to the next one only when earlier targets are unavailable."
+  },
+  {
+    value: "round-robin",
+    label: "Round-robin",
+    hint: "Rotate evenly across eligible targets."
+  },
+  {
+    value: "weighted-rr",
+    label: "Weighted round-robin",
+    hint: "Rotate across eligible targets, but favor higher weights."
+  },
+  {
+    value: "quota-aware-weighted-rr",
+    label: "Quota-aware weighted round-robin",
+    hint: "Like weighted round-robin, but also shifts traffic away from targets nearing limits."
+  }
+];
+const MODEL_ALIAS_STRATEGIES = MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => option.value);
+const DEFAULT_PROBE_REQUESTS_PER_MINUTE = 30;
+const DEFAULT_PROBE_MAX_RATE_LIMIT_RETRIES = 3;
+const RATE_LIMIT_WINDOW_UNIT_ALIASES = new Map([
+  ["s", "second"],
+  ["sec", "second"],
+  ["second", "second"],
+  ["seconds", "second"],
+  ["m", "minute"],
+  ["min", "minute"],
+  ["minute", "minute"],
+  ["minutes", "minute"],
+  ["h", "hour"],
+  ["hr", "hour"],
+  ["hour", "hour"],
+  ["hours", "hour"],
+  ["d", "day"],
+  ["day", "day"],
+  ["days", "day"],
+  ["w", "week"],
+  ["wk", "week"],
+  ["week", "week"],
+  ["weeks", "week"],
+  ["mo", "month"],
+  ["mon", "month"],
+  ["month", "month"],
+  ["months", "month"]
+]);
 
 function canPrompt() {
   return Boolean(process.stdout.isTTY && process.stdin.isTTY);
@@ -80,6 +140,12 @@ function toNumber(value, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toPositiveInteger(value, fallback, { min = 1, max = 1_000_000 } = {}) {
+  const parsed = Math.floor(toNumber(value, Number.NaN));
+  if (!Number.isFinite(parsed) || parsed < min) return fallback;
+  return Math.min(parsed, max);
 }
 
 function clampMasterKeyLength(value) {
@@ -300,7 +366,7 @@ function normalizeEndpointToken(token) {
     .replace(/^(?:openaiBaseUrl|claudeBaseUrl|anthropicBaseUrl|baseUrl)\s*=\s*/i, "")
     .replace(/^url\s*=\s*/i, "");
 
-  const urlMatch = value.match(/https?:\/\/[^\s,;'"`<>()\]]+/i);
+  const urlMatch = value.match(/https?:\/\/[^\s,;'"`<>()\]]*?(?=(?:https?:\/\/)|[\s,;'"`<>()\]]|$)/i);
   if (urlMatch) value = urlMatch[0];
 
   // Common typo: missing colon after scheme.
@@ -321,11 +387,15 @@ function normalizeEndpointToken(token) {
   return /^https?:\/\/.+/i.test(value) ? value : "";
 }
 
-function parseEndpointListInput(raw) {
-  const text = Array.isArray(raw) ? raw.join("\n") : String(raw || "");
+function splitConcatenatedEndpointSchemes(text) {
+  return String(text || "").replace(/([A-Za-z0-9/_-])(https?:\/\/)/g, "$1\n$2");
+}
+
+export function parseEndpointListInput(raw) {
+  const text = splitConcatenatedEndpointSchemes(Array.isArray(raw) ? raw.join("\n") : String(raw || ""));
   const extracted = [];
 
-  const urlRegex = /https?:\/\/[^\s,;'"`<>()\]]+/gi;
+  const urlRegex = /https?:\/\/[^\s,;'"`<>()\]]*?(?=(?:https?:\/\/)|[\s,;'"`<>()\]]|$)/gi;
   for (const match of text.matchAll(urlRegex)) {
     extracted.push(match[0]);
   }
@@ -369,6 +439,11 @@ const MODEL_INPUT_NOISE_TOKENS = new Set([
   "skip",
   "ok",
   "tentative",
+  "listed",
+  "assigned",
+  "rate-limit",
+  "rate-limit-max-retries",
+  "runtime-error",
   "network-error",
   "format-mismatch",
   "model-unsupported",
@@ -459,6 +534,155 @@ function parseQualifiedModelListInput(raw) {
     .filter(Boolean));
 }
 
+function normalizeAliasTargetToken(token) {
+  const value = trimOuterPunctuation(token)
+    .replace(/[)\]}>.,;]+$/g, "")
+    .trim();
+  if (!value) return "";
+  if (value.includes("://")) return "";
+  if (/\s/.test(value)) return "";
+  return value;
+}
+
+function parseAliasTargetToken(token) {
+  const normalized = normalizeAliasTargetToken(token);
+  if (!normalized) return null;
+
+  const splitByWeight = (separator) => {
+    const index = normalized.lastIndexOf(separator);
+    if (index <= 0 || index >= normalized.length - 1) return null;
+    const refPart = normalized.slice(0, index).trim();
+    const weightPart = normalized.slice(index + 1).trim();
+    if (!refPart || !weightPart) return null;
+    const weight = Number(weightPart);
+    if (!Number.isFinite(weight) || weight <= 0) return null;
+    return {
+      ref: refPart,
+      weight
+    };
+  };
+
+  const fromAt = splitByWeight("@");
+  if (fromAt) return fromAt;
+  const fromColon = splitByWeight(":");
+  if (fromColon) return fromColon;
+  return { ref: normalized };
+}
+
+export function parseAliasTargetListInput(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    const entries = raw
+      .map((entry) => {
+        if (typeof entry === "string") return parseAliasTargetToken(entry);
+        if (!entry || typeof entry !== "object") return null;
+        const parsed = parseAliasTargetToken(entry.ref || entry.target || "");
+        if (!parsed) return null;
+        if (entry.weight !== undefined) {
+          const weight = Number(entry.weight);
+          if (!Number.isFinite(weight) || weight <= 0) return null;
+          parsed.weight = weight;
+        }
+        if (entry.metadata && typeof entry.metadata === "object" && !Array.isArray(entry.metadata)) {
+          parsed.metadata = entry.metadata;
+        }
+        return parsed;
+      })
+      .filter(Boolean);
+    return dedupeAliasTargets(entries);
+  }
+
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  if ((text.startsWith("[") && text.endsWith("]")) || (text.startsWith("{") && text.endsWith("}"))) {
+    try {
+      const parsed = JSON.parse(text);
+      const rows = Array.isArray(parsed) ? parsed : [parsed];
+      return parseAliasTargetListInput(rows);
+    } catch {
+      // Fall through to token parsing for forgiving CLI input.
+    }
+  }
+
+  const tokens = tokenizeLooseListInput(text);
+  const entries = tokens.map(parseAliasTargetToken).filter(Boolean);
+  return dedupeAliasTargets(entries);
+}
+
+function dedupeAliasTargets(targets) {
+  const seen = new Set();
+  const rows = [];
+  for (const target of (targets || [])) {
+    const ref = String(target?.ref || "").trim();
+    if (!ref || seen.has(ref)) continue;
+    seen.add(ref);
+    rows.push({
+      ref,
+      ...(Number.isFinite(target?.weight) && Number(target.weight) > 0 ? { weight: Number(target.weight) } : {}),
+      ...(target?.metadata && typeof target.metadata === "object" && !Array.isArray(target.metadata)
+        ? { metadata: target.metadata }
+        : {})
+    });
+  }
+  return rows;
+}
+
+function normalizeRateLimitModelSelectorToken(token) {
+  const value = trimOuterPunctuation(token)
+    .replace(/[)\]}>.,;:]+$/g, "")
+    .trim();
+  if (!value) return "";
+  if (value.includes("://")) return "";
+  if (/\s/.test(value)) return "";
+  if (value.toLowerCase() === "all") return "all";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)) return "";
+  return value;
+}
+
+function parseRateLimitModelSelectorsInput(raw) {
+  if (!raw) return [];
+  const tokens = tokenizeLooseListInput(raw);
+  return dedupeList(tokens.map(normalizeRateLimitModelSelectorToken).filter(Boolean));
+}
+
+function normalizeRateLimitWindowUnit(value) {
+  const key = String(value || "").trim().toLowerCase();
+  if (!key) return "";
+  return RATE_LIMIT_WINDOW_UNIT_ALIASES.get(key) || "";
+}
+
+export function parseRateLimitWindowInput(raw) {
+  if (!raw && raw !== 0) return null;
+
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const unit = normalizeRateLimitWindowUnit(raw.unit || raw.windowUnit || raw["window-unit"]);
+    const size = Number.parseInt(String(raw.size ?? raw.windowSize ?? raw["window-size"] ?? ""), 10);
+    if (!unit || !Number.isFinite(size) || size <= 0) return null;
+    return { unit, size };
+  }
+
+  const text = String(raw || "").trim();
+  if (!text) return null;
+
+  const unitFirst = text.match(/^([A-Za-z]+)\s*[:/x-]?\s*(\d+)$/);
+  if (unitFirst) {
+    const unit = normalizeRateLimitWindowUnit(unitFirst[1]);
+    const size = Number.parseInt(unitFirst[2], 10);
+    if (!unit || !Number.isFinite(size) || size <= 0) return null;
+    return { unit, size };
+  }
+
+  const sizeFirst = text.match(/^(\d+)\s*([A-Za-z]+)$/);
+  if (sizeFirst) {
+    const unit = normalizeRateLimitWindowUnit(sizeFirst[2]);
+    const size = Number.parseInt(sizeFirst[1], 10);
+    if (!unit || !Number.isFinite(size) || size <= 0) return null;
+    return { unit, size };
+  }
+
+  return null;
+}
+
 function maybeReportInputCleanup(context, label, rawValue, cleanedValues) {
   if (!canPrompt()) return;
   const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
@@ -490,6 +714,13 @@ function truncateLogText(value, max = 160) {
   return `${text.slice(0, max - 3)}...`;
 }
 
+function formatDurationMs(value) {
+  const ms = Math.max(0, Math.round(Number(value) || 0));
+  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`;
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${ms}ms`;
+}
+
 function describeModelCheckStatus(event) {
   const statusCode = Number(event.status || 0);
   const statusSuffix = statusCode > 0 ? ` (http ${statusCode})` : "";
@@ -498,6 +729,22 @@ function describeModelCheckStatus(event) {
   const outcome = String(event.outcome || "");
 
   if (event.confirmed) {
+    if (outcome === "already-assigned") {
+      return {
+        shortLabel: "assigned",
+        fullLabel: `assigned${statusSuffix}`,
+        detail,
+        isOk: true
+      };
+    }
+    if (outcome === "model-listed") {
+      return {
+        shortLabel: "listed",
+        fullLabel: `listed${statusSuffix}`,
+        detail,
+        isOk: true
+      };
+    }
     return {
       shortLabel: "ok",
       fullLabel: `ok${statusSuffix}`,
@@ -508,8 +755,24 @@ function describeModelCheckStatus(event) {
 
   if (outcome === "runtime-error") {
     return {
-      shortLabel: "tentative",
-      fullLabel: `tentative${statusSuffix}`,
+      shortLabel: "runtime-error",
+      fullLabel: `runtime-error${statusSuffix}`,
+      detail,
+      isOk: false
+    };
+  }
+  if (outcome === "rate-limit") {
+    return {
+      shortLabel: "rate-limit",
+      fullLabel: `rate-limit${statusSuffix}`,
+      detail,
+      isOk: false
+    };
+  }
+  if (outcome === "rate-limit-max-retries") {
+    return {
+      shortLabel: "rate-limit-max-retries",
+      fullLabel: `rate-limit-max-retries${statusSuffix}`,
       detail,
       isOk: false
     };
@@ -570,62 +833,7 @@ function probeProgressReporter(context) {
   const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : line;
   const success = typeof context?.terminal?.success === "function" ? context.terminal.success.bind(context.terminal) : line;
   const warn = typeof context?.terminal?.warn === "function" ? context.terminal.warn.bind(context.terminal) : line;
-  const interactiveTerminal = canPrompt();
-  const progress = interactiveTerminal && typeof SnapTui?.createProgress === "function" ? SnapTui.createProgress() : null;
-  const endpointSpinner = interactiveTerminal && typeof SnapTui?.createSpinner === "function" ? SnapTui.createSpinner() : null;
-  const PROGRESS_UI_MIN_UPDATE_MS = 120;
-  const SPINNER_UI_MIN_UPDATE_MS = 120;
-
   let lastProgressPrinted = -1;
-  let totalChecks = 0;
-  let matrixStarted = false;
-  let endpointSpinnerRunning = false;
-  let lastProgressUiUpdateAt = 0;
-  let lastProgressUiMessage = "";
-  let lastSpinnerUiUpdateAt = 0;
-  let lastSpinnerUiMessage = "";
-
-  const clearSpinnerForLog = () => {
-    if (!endpointSpinner || !endpointSpinnerRunning) return;
-    if (typeof endpointSpinner.clear === "function") {
-      endpointSpinner.clear();
-    }
-  };
-
-  const maybeLine = (message, { forceInteractive = false } = {}) => {
-    if (!interactiveTerminal || forceInteractive) {
-      clearSpinnerForLog();
-      line(message);
-    }
-  };
-
-  const setSpinnerMessage = (message, { force = false } = {}) => {
-    if (!endpointSpinner || !endpointSpinnerRunning) return;
-    const next = String(message || "").trim();
-    if (!next) return;
-    const now = Date.now();
-    if (!force) {
-      if (next === lastSpinnerUiMessage) return;
-      if (now - lastSpinnerUiUpdateAt < SPINNER_UI_MIN_UPDATE_MS) return;
-    }
-    endpointSpinner.message(next);
-    lastSpinnerUiMessage = next;
-    lastSpinnerUiUpdateAt = now;
-  };
-
-  const setProgressMessage = (message, { force = false } = {}) => {
-    if (!progress) return;
-    const next = String(message || "").trim();
-    if (!next) return;
-    const now = Date.now();
-    if (!force) {
-      if (next === lastProgressUiMessage) return;
-      if (now - lastProgressUiUpdateAt < PROGRESS_UI_MIN_UPDATE_MS) return;
-    }
-    progress.message(next);
-    lastProgressUiMessage = next;
-    lastProgressUiUpdateAt = now;
-  };
 
   return (event) => {
     if (!event || typeof event !== "object") return;
@@ -634,73 +842,40 @@ function probeProgressReporter(context) {
     if (phase === "matrix-start") {
       const endpointCount = Number(event.endpointCount || 0);
       const modelCount = Number(event.modelCount || 0);
-      totalChecks = endpointCount * modelCount * 2;
-      matrixStarted = true;
 
       info(`Auto-discovery started: ${endpointCount} endpoint(s) x ${modelCount} model(s).`);
-      progress?.start(`Auto-discovery progress: 0/${totalChecks || 0}`);
-      lastProgressUiMessage = `Auto-discovery progress: 0/${totalChecks || 0}`;
-      lastProgressUiUpdateAt = Date.now();
-      return;
-    }
-    if (phase === "endpoint-start") {
-      if (endpointSpinner && endpointSpinnerRunning) {
-        endpointSpinner.stop();
-      }
-      endpointSpinner?.start(`Endpoint ${event.endpointIndex || "?"}/${event.endpointCount || "?"}: ${event.endpoint}`);
-      endpointSpinnerRunning = Boolean(endpointSpinner);
-      lastSpinnerUiMessage = `Endpoint ${event.endpointIndex || "?"}/${event.endpointCount || "?"}: ${event.endpoint}`;
-      lastSpinnerUiUpdateAt = Date.now();
-      maybeLine(`[discover] Endpoint ${event.endpointIndex || "?"}/${event.endpointCount || "?"}: ${event.endpoint}`);
-      return;
-    }
-    if (phase === "endpoint-formats") {
-      const formats = Array.isArray(event.formatsToTest) && event.formatsToTest.length > 0
-        ? event.formatsToTest.join(", ")
-        : "(none)";
-      setSpinnerMessage(`Testing ${event.endpoint}: ${formats}`, { force: true });
-      maybeLine(`[discover] Testing formats for ${event.endpoint}: ${formats}`);
-      return;
-    }
-    if (phase === "format-start") {
-      setSpinnerMessage(`${event.endpoint} -> ${event.format} (${event.modelCount || 0} model checks)`, { force: true });
-      maybeLine(`[discover] ${event.endpoint} -> ${event.format} (${event.modelCount || 0} model checks)`);
       return;
     }
     if (phase === "model-check") {
       const completed = Number(event.completedChecks || 0);
       const total = Number(event.totalChecks || 0);
       if (completed <= 0 || total <= 0) return;
+      if (completed === lastProgressPrinted) return;
       const status = describeModelCheckStatus(event);
-      const shouldPrintLine = interactiveTerminal
-        ? (!status.isOk || completed === total)
-        : (!status.isOk || completed === total || completed - lastProgressPrinted >= 3);
-
-      if (matrixStarted) {
-        setProgressMessage(
-          `Auto-discovery progress: ${completed}/${total} (${event.model} on ${event.format} @ ${event.endpoint}: ${status.shortLabel})`,
-          { force: !status.isOk || completed === total }
-        );
-      }
-
-      if (shouldPrintLine) {
-        lastProgressPrinted = completed;
-        const detailSuffix = status.detail ? ` - ${status.detail}` : "";
-        maybeLine(
-          `[discover] Progress ${completed}/${total} - ${event.model} on ${event.format} @ ${event.endpoint}: ${status.fullLabel}${detailSuffix}`,
-          { forceInteractive: !status.isOk || completed === total }
-        );
-      }
+      lastProgressPrinted = completed;
+      const detailSuffix = status.detail ? ` - ${status.detail}` : "";
+      line(
+        `[discover] Progress ${completed}/${total} - ${event.model} on ${event.format} @ ${event.endpoint}: ${status.fullLabel}${detailSuffix}`
+      );
+      return;
+    }
+    if (phase === "rate-limit-wait") {
+      const retryAttempt = Number(event.retryAttempt || 0);
+      const maxRetries = Number(event.maxRetries || 0);
+      const waitLabel = formatDurationMs(event.waitMs || 0);
+      const reason = String(event.reason || "");
+      const retrySuffix = maxRetries > 0
+        ? ` retry ${Math.max(0, retryAttempt)}/${Math.max(0, maxRetries)}`
+        : "";
+      line(
+        `[discover] Waiting ${waitLabel} before next probe (${reason || "throttle"}) for ${event.model || "model"} on ${event.format || "format"} @ ${event.endpoint || "endpoint"}${retrySuffix}`
+      );
       return;
     }
     if (phase === "endpoint-done") {
       const formats = Array.isArray(event.workingFormats) && event.workingFormats.length > 0
         ? event.workingFormats.join(", ")
         : "(none)";
-      if (endpointSpinner && endpointSpinnerRunning) {
-        endpointSpinner.stop();
-        endpointSpinnerRunning = false;
-      }
       if (formats === "(none)") {
         warn(`[discover] Endpoint done: ${event.endpoint} working formats=${formats}`);
       } else {
@@ -708,29 +883,19 @@ function probeProgressReporter(context) {
       }
       return;
     }
-      if (phase === "matrix-done") {
+    if (phase === "matrix-done") {
       const openaiBase = event.baseUrlByFormat?.openai || "(none)";
       const claudeBase = event.baseUrlByFormat?.claude || "(none)";
       const formats = Array.isArray(event.workingFormats) && event.workingFormats.length > 0
         ? event.workingFormats.join(", ")
         : "(none)";
       const finalMessage = `Auto-discovery completed: working formats=${formats}, models=${event.supportedModelCount || 0}, openaiBase=${openaiBase}, claudeBase=${claudeBase}`;
-      if (endpointSpinner && endpointSpinnerRunning) {
-        endpointSpinner.stop();
-        endpointSpinnerRunning = false;
-      }
-      if (matrixStarted) {
-        progress?.stop(`Auto-discovery progress: ${event.supportedModelCount || 0} model(s) confirmed`);
-        lastProgressUiMessage = "";
-      }
       if (formats === "(none)") {
         warn(finalMessage);
       } else {
         success(finalMessage);
       }
-      matrixStarted = false;
-      totalChecks = 0;
-      lastSpinnerUiMessage = "";
+      lastProgressPrinted = -1;
     }
   };
 }
@@ -753,6 +918,90 @@ async function promptProviderFormat(context, {
   return context.prompts.select({ message, options });
 }
 
+async function runProbeManualFallback(context, {
+  probe,
+  selectedFormat,
+  effectiveOpenAIBaseUrl,
+  effectiveClaudeBaseUrl,
+  effectiveModels
+}) {
+  if (!canPrompt()) {
+    return {
+      selectedFormat,
+      effectiveOpenAIBaseUrl,
+      effectiveClaudeBaseUrl,
+      effectiveModels
+    };
+  }
+
+  const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+  const warn = typeof context?.terminal?.warn === "function" ? context.terminal.warn.bind(context.terminal) : null;
+
+  const scope = probe?.failureScope === "full" ? "full" : "partial";
+  warn?.(
+    scope === "full"
+      ? "Auto-discovery failed to detect a usable endpoint/model setup. Switching to manual fallback for unresolved items."
+      : "Auto-discovery completed partially. Switching to manual fallback for unresolved items."
+  );
+
+  const warnings = Array.isArray(probe?.warnings) ? probe.warnings.filter(Boolean) : [];
+  for (const message of warnings.slice(0, 3)) {
+    warn?.(`  - ${message}`);
+  }
+
+  const unresolvedModels = dedupeList(Array.isArray(probe?.unresolvedModels) ? probe.unresolvedModels : []);
+  const detectedModels = dedupeList(Array.isArray(probe?.models) ? probe.models : []);
+  let mergedModels = dedupeList(effectiveModels?.length ? effectiveModels : detectedModels);
+
+  if (unresolvedModels.length > 0) {
+    info?.(`Manual fallback needs unresolved model review (${unresolvedModels.length} item(s)).`);
+    const unresolvedInput = await context.prompts.text({
+      message: "Undetected models to add manually (comma / newline separated; leave blank to skip)",
+      initialValue: unresolvedModels.join("\n"),
+      paste: true,
+      multiline: true
+    });
+    const manualModels = parseProviderModelListInput(unresolvedInput);
+    maybeReportInputCleanup(context, "model", unresolvedInput, manualModels);
+    mergedModels = dedupeList([...detectedModels, ...manualModels]);
+  }
+
+  let openaiBase = String(effectiveOpenAIBaseUrl || "").trim();
+  if (!openaiBase) {
+    const openaiInput = await context.prompts.text({
+      message: "OpenAI-compatible endpoint for unresolved items (optional)",
+      initialValue: "",
+      paste: true
+    });
+    openaiBase = parseEndpointListInput(openaiInput)[0] || "";
+  }
+
+  let claudeBase = String(effectiveClaudeBaseUrl || "").trim();
+  if (!claudeBase) {
+    const claudeInput = await context.prompts.text({
+      message: "Anthropic-compatible endpoint for unresolved items (optional)",
+      initialValue: "",
+      paste: true
+    });
+    claudeBase = parseEndpointListInput(claudeInput)[0] || "";
+  }
+
+  let resolvedFormat = selectedFormat || probe?.preferredFormat || "";
+  if (!resolvedFormat) {
+    resolvedFormat = await promptProviderFormat(context, {
+      message: "Choose primary provider format for manual fallback",
+      initialFormat: resolvedFormat
+    });
+  }
+
+  return {
+    selectedFormat: resolvedFormat,
+    effectiveOpenAIBaseUrl: openaiBase,
+    effectiveClaudeBaseUrl: claudeBase,
+    effectiveModels: mergedModels
+  };
+}
+
 function slugifyId(value, fallback = "provider") {
   const slug = String(value || fallback)
     .trim()
@@ -764,34 +1013,126 @@ function slugifyId(value, fallback = "provider") {
     : slug;
 }
 
-function summarizeConfig(config, configPath, { includeSecrets = false } = {}) {
+function sanitizeRateLimitBucketName(value) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim();
+}
+
+function slugifyRateLimitBucketId(value, fallback = "bucket") {
+  const slug = String(value || fallback)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || fallback;
+}
+
+function resolveUniqueRateLimitBucketId(baseId, reservedIds) {
+  const normalizedBase = String(baseId || "").trim() || "bucket";
+  if (!(reservedIds instanceof Set)) return normalizedBase;
+  if (!reservedIds.has(normalizedBase)) return normalizedBase;
+  let suffix = 2;
+  let candidate = `${normalizedBase}-${suffix}`;
+  while (reservedIds.has(candidate)) {
+    suffix += 1;
+    candidate = `${normalizedBase}-${suffix}`;
+  }
+  return candidate;
+}
+
+function formatAliasTargetsForSummary(targets) {
+  return (targets || []).map((target) => {
+    const weight = Number.isFinite(target?.weight) ? `@${Number(target.weight)}` : "";
+    return `${target.ref}${weight}`;
+  }).join(", ") || "(none)";
+}
+
+function formatRateLimitWindowForSummary(window) {
+  const unit = String(window?.unit || "").trim();
+  const size = Number(window?.size || 0);
+  if (!unit || !Number.isFinite(size) || size <= 0) return "(invalid)";
+  return `${size}/${unit}`;
+}
+
+function formatRateLimitWindowForHuman(window) {
+  const unit = String(window?.unit || "").trim();
+  const size = Number(window?.size || 0);
+  if (!unit || !Number.isFinite(size) || size <= 0) return "(invalid)";
+  return `${size} ${size === 1 ? unit : `${unit}s`}`;
+}
+
+function summarizeRateLimitBucketCap(bucket) {
+  const requests = Number.parseInt(String(bucket?.requests ?? ""), 10);
+  const requestText = Number.isFinite(requests) && requests > 0 ? `${requests} req` : "(unset)";
+  return `${requestText} / ${formatRateLimitWindowForHuman(bucket?.window)}`;
+}
+
+function formatRateLimitBucketLabel(bucket, { includeId = false } = {}) {
+  const id = String(bucket?.id || "").trim();
+  const name = sanitizeRateLimitBucketName(bucket?.name);
+  const title = name || id || "(unnamed bucket)";
+  if (!includeId || !id || title === id) return title;
+  return `${title} (${id})`;
+}
+
+function formatRateLimitBucketScopeLabel(bucket) {
+  const models = dedupeList(bucket?.models || []);
+  if (models.includes("all")) return "all models";
+  return models.length > 0 ? models.join(", ") : "(none)";
+}
+
+export function summarizeConfig(config, configPath, { includeSecrets = false } = {}) {
   const target = includeSecrets ? config : sanitizeConfigForDisplay(config);
   const lines = [];
   lines.push(`Config: ${configPath}`);
+  lines.push(`Version: ${target.version || 1}`);
   lines.push(`Default model: ${target.defaultModel || "(not set)"}`);
   lines.push(`Master key: ${target.masterKey || "(not set)"}`);
 
   if (!target.providers || target.providers.length === 0) {
     lines.push("Providers: (none)");
-    return lines.join("\n");
+  } else {
+    lines.push("Providers:");
+    for (const provider of target.providers) {
+      lines.push(`- ${provider.id} (${provider.name})`);
+      lines.push(`  baseUrl=${provider.baseUrl}`);
+      if (provider.baseUrlByFormat?.openai) {
+        lines.push(`  openaiBaseUrl=${provider.baseUrlByFormat.openai}`);
+      }
+      if (provider.baseUrlByFormat?.claude) {
+        lines.push(`  claudeBaseUrl=${provider.baseUrlByFormat.claude}`);
+      }
+      lines.push(`  formats=${(provider.formats || []).join(", ") || provider.format || "unknown"}`);
+      lines.push(`  apiKey=${provider.apiKey || "(from env/hidden)"}`);
+      lines.push(`  models=${(provider.models || []).map((model) => {
+        const fallbacks = (model.fallbackModels || []).join("|");
+        return fallbacks ? `${model.id}{fallback:${fallbacks}}` : model.id;
+      }).join(", ") || "(none)"}`);
+
+      const rateLimits = provider.rateLimits || [];
+      if (rateLimits.length === 0) {
+        lines.push("  rateLimits=(none)");
+      } else {
+        lines.push("  rateLimits:");
+        for (const bucket of rateLimits) {
+          lines.push(
+            `    - ${formatRateLimitBucketLabel(bucket, { includeId: true })}: models=${formatRateLimitBucketScopeLabel(bucket)} cap=${summarizeRateLimitBucketCap(bucket)} window=${formatRateLimitWindowForSummary(bucket.window)}`
+          );
+        }
+      }
+    }
   }
 
-  lines.push("Providers:");
-  for (const provider of target.providers) {
-    lines.push(`- ${provider.id} (${provider.name})`);
-    lines.push(`  baseUrl=${provider.baseUrl}`);
-    if (provider.baseUrlByFormat?.openai) {
-      lines.push(`  openaiBaseUrl=${provider.baseUrlByFormat.openai}`);
+  const aliasEntries = Object.entries(target.modelAliases || {});
+  if (aliasEntries.length === 0) {
+    lines.push("Model aliases: (none)");
+  } else {
+    lines.push("Model aliases:");
+    for (const [aliasId, alias] of aliasEntries) {
+      lines.push(`- ${aliasId} strategy=${alias.strategy || "ordered"}`);
+      lines.push(`  targets=${formatAliasTargetsForSummary(alias.targets)}`);
+      lines.push(`  fallbackTargets=${formatAliasTargetsForSummary(alias.fallbackTargets)}`);
     }
-    if (provider.baseUrlByFormat?.claude) {
-      lines.push(`  claudeBaseUrl=${provider.baseUrlByFormat.claude}`);
-    }
-    lines.push(`  formats=${(provider.formats || []).join(", ") || provider.format || "unknown"}`);
-    lines.push(`  apiKey=${provider.apiKey || "(from env/hidden)"}`);
-    lines.push(`  models=${(provider.models || []).map((model) => {
-      const fallbacks = (model.fallbackModels || []).join("|");
-      return fallbacks ? `${model.id}{fallback:${fallbacks}}` : model.id;
-    }).join(", ") || "(none)"}`);
   }
 
   return lines.join("\n");
@@ -821,6 +1162,59 @@ function runCommand(command, args, { cwd, input, envOverrides } = {}) {
   };
 }
 
+function runCommandAsync(command, args, { cwd, input, envOverrides } = {}) {
+  const safeEnvOverrides = envOverrides && typeof envOverrides === "object"
+    ? envOverrides
+    : {};
+
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: {
+        ...process.env,
+        ...safeEnvOverrides,
+        FORCE_COLOR: "0"
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let spawnError = null;
+
+    if (child.stdout) {
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+    }
+
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+
+    child.on("close", (code) => {
+      resolve({
+        ok: code === 0,
+        status: Number.isInteger(code) ? code : 1,
+        stdout,
+        stderr,
+        error: spawnError
+      });
+    });
+
+    if (input !== undefined && input !== null) {
+      child.stdin.write(String(input));
+    }
+    child.stdin.end();
+  });
+}
+
 function runWrangler(args, { cwd, input, envOverrides } = {}) {
   const direct = runCommand("wrangler", args, { cwd, input, envOverrides });
   if (!direct.error) return direct;
@@ -829,9 +1223,12 @@ function runWrangler(args, { cwd, input, envOverrides } = {}) {
   return runCommand(npxCmd, ["wrangler", ...args], { cwd, input, envOverrides });
 }
 
-function runWranglerWithNpx(args, { cwd, input, envOverrides } = {}) {
+async function runWranglerAsync(args, { cwd, input, envOverrides } = {}) {
+  const direct = await runCommandAsync("wrangler", args, { cwd, input, envOverrides });
+  if (!direct.error) return direct;
+
   const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
-  return runCommand(npxCmd, ["wrangler", ...args], { cwd, input, envOverrides });
+  return runCommandAsync(npxCmd, ["wrangler", ...args], { cwd, input, envOverrides });
 }
 
 export function resolveCloudflareApiTokenFromEnv(env = process.env) {
@@ -1346,7 +1743,10 @@ async function createTemporaryWranglerConfigFile(projectDir, tomlText) {
 
 async function prepareWranglerDeployConfig(context, {
   projectDir,
-  args = {}
+  args = {},
+  cloudflareApiToken = "",
+  cloudflareAccountId = "",
+  wait = async (_label, fn) => fn()
 } = {}) {
   const wranglerPath = path.join(projectDir, "wrangler.toml");
   const line = typeof context?.terminal?.line === "function"
@@ -1427,23 +1827,56 @@ async function prepareWranglerDeployConfig(context, {
       routePattern = "";
       zoneName = "";
     } else {
-      const promptedDomain = await context.prompts.text({
-        message: "Route domain or pattern (example: router.example.com or router.example.com/*)",
+      const promptedHost = await context.prompts.text({
+        message: "Custom domain host (example: llm.example.com)",
         required: true,
         validate: (value) => {
+          const normalized = extractHostnameFromRoutePattern(value);
+          if (!normalized || !normalized.includes(".")) return "Enter a valid domain hostname.";
+          return undefined;
+        }
+      });
+
+      const normalizedHost = extractHostnameFromRoutePattern(promptedHost);
+      const suggestedRoutePattern = normalizeWranglerRoutePattern(`${normalizedHost}/*`);
+      const zones = cloudflareApiToken
+        ? await wait("Loading Cloudflare zones...", () => cloudflareListZones(cloudflareApiToken, cloudflareAccountId), { doneMessage: "Cloudflare zones loaded." })
+        : [];      const suggestedZoneFromApi = suggestZoneNameForHostname(normalizedHost, zones);
+      const suggestedZone = suggestedZoneFromApi || inferZoneNameFromHostname(normalizedHost);
+
+      const promptedRoute = await context.prompts.text({
+        message: "Route pattern (example: llm.example.com/*)",
+        required: true,
+        initialValue: suggestedRoutePattern,
+        validate: (value) => {
           const normalized = normalizeWranglerRoutePattern(value);
-          if (!normalized) return "Enter a valid domain or route pattern.";
+          if (!normalized) return "Enter a valid route pattern.";
           return undefined;
         }
       });
       const promptedZone = await context.prompts.text({
         message: "Zone name (example: example.com)",
         required: true,
+        initialValue: suggestedZone,
         validate: (value) => String(value || "").trim() ? undefined : "Zone name is required."
       });
       useWorkersDev = false;
-      routePattern = normalizeWranglerRoutePattern(promptedDomain);
+      routePattern = normalizeWranglerRoutePattern(promptedRoute);
       zoneName = String(promptedZone || "").trim();
+
+      const routeHost = extractHostnameFromRoutePattern(routePattern);
+      if (routeHost && zoneName && !isHostnameUnderZone(routeHost, zoneName)) {
+        const proceedMismatch = await context.prompts.confirm({
+          message: `Route host ${routeHost} does not appear under zone ${zoneName}. Continue anyway?`,
+          initialValue: false
+        });
+        if (!proceedMismatch) {
+          return {
+            ok: false,
+            errorMessage: "Cancelled due to route host and zone mismatch."
+          };
+        }
+      }
     }
   }
 
@@ -1469,6 +1902,11 @@ async function prepareWranglerDeployConfig(context, {
     line("Prepared temporary deploy target: workers_dev=true");
   } else {
     line(`Prepared temporary deploy target: route=${routePattern} zone=${zoneName}`);
+    line(buildCloudflareDnsManualGuide({
+      hostname: extractHostnameFromRoutePattern(routePattern),
+      zoneName,
+      routePattern
+    }));
   }
 
   return {
@@ -1477,12 +1915,106 @@ async function prepareWranglerDeployConfig(context, {
     wranglerConfigPath: tempConfig.wranglerConfigPath,
     cleanup: tempConfig.cleanup,
     changed: true,
+    routePattern,
+    zoneName,
+    useWorkersDev,
     message: useWorkersDev
       ? "Using workers.dev deploy target (temporary config)."
       : `Using custom route deploy target (${routePattern}) with temporary config.`
   };
 }
 
+
+function normalizeHostname(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "")
+    .replace(/:\d+$/, "")
+    .replace(/\.$/, "");
+}
+
+export function extractHostnameFromRoutePattern(value) {
+  const route = String(value || "").trim();
+  if (!route) return "";
+
+  if (/^https?:\/\//i.test(route)) {
+    try {
+      return normalizeHostname(new URL(route).hostname);
+    } catch {
+      return "";
+    }
+  }
+
+  const left = route.split("/")[0] || "";
+  return normalizeHostname(left.replace(/\*+$/g, ""));
+}
+
+export function inferZoneNameFromHostname(hostname) {
+  const host = normalizeHostname(hostname);
+  if (!host || !host.includes(".")) return "";
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length <= 2) return host;
+  return labels.slice(-2).join(".");
+}
+
+export function isHostnameUnderZone(hostname, zoneName) {
+  const host = normalizeHostname(hostname);
+  const zone = normalizeHostname(zoneName);
+  if (!host || !zone) return false;
+  return host === zone || host.endsWith(`.${zone}`);
+}
+
+export function suggestZoneNameForHostname(hostname, zones = []) {
+  const host = normalizeHostname(hostname);
+  if (!host) return "";
+
+  let best = "";
+  for (const zone of zones || []) {
+    const candidate = normalizeHostname(zone?.name || zone);
+    if (!candidate) continue;
+    if (host === candidate || host.endsWith(`.${candidate}`)) {
+      if (!best || candidate.length > best.length) {
+        best = candidate;
+      }
+    }
+  }
+  return best;
+}
+
+export function buildCloudflareDnsManualGuide({
+  hostname = "",
+  zoneName = "",
+  routePattern = ""
+} = {}) {
+  const host = normalizeHostname(hostname || extractHostnameFromRoutePattern(routePattern));
+  const zone = normalizeHostname(zoneName || inferZoneNameFromHostname(host));
+  const subdomain = host && zone && host.endsWith(`.${zone}`)
+    ? host.slice(0, -(`.${zone}`).length)
+    : "";
+  const label = subdomain || "<subdomain>";
+
+  return [
+    "Custom domain checklist:",
+    `- Route target: ${routePattern || `${host || "<host>"}/*`} (zone: ${zone || "<zone>"})`,
+    `- DNS: create/update CNAME \`${label}\` -> \`@\` in zone \`${zone || "<zone>"}\``,
+    "- Proxy status must be ON (orange cloud / proxied)",
+    host ? `- Verify DNS: dig +short ${host} @1.1.1.1` : "- Verify DNS: dig +short <host> @1.1.1.1",
+    host ? `- Verify HTTP: curl -I https://${host}/anthropic` : "- Verify HTTP: curl -I https://<host>/anthropic",
+    "- Claude base URL must NOT include :8787 for Cloudflare Worker deployments"
+  ].join("\n");
+}
+
+async function cloudflareListZones(token, accountId = "") {
+  const params = new URLSearchParams({ per_page: "50" });
+  if (accountId) params.set("account.id", accountId);
+  const result = await cloudflareApiGetJson(`${CLOUDFLARE_ZONES_URL}?${params.toString()}`, token);
+  if (!result.ok || !Array.isArray(result.payload?.result)) return [];
+  return result.payload.result
+    .map((zone) => ({ id: String(zone?.id || "").trim(), name: normalizeHostname(zone?.name || "") }))
+    .filter((zone) => zone.id && zone.name);
+}
 function parseJsonSafely(value) {
   const text = String(value || "").trim();
   if (!text) return null;
@@ -1852,6 +2384,299 @@ function setModelFallbacksInConfig(config, providerId, modelId, fallbackModels) 
   };
 }
 
+function normalizeModelAliasStrategy(strategy) {
+  const normalized = String(strategy || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "automatic" || normalized === "smart") return "auto";
+  return MODEL_ALIAS_STRATEGIES.includes(normalized) ? normalized : "";
+}
+
+function serializeStable(value) {
+  return JSON.stringify(value);
+}
+
+function formatConfigValidationError(errors) {
+  return (errors || []).map((line) => String(line || "").trim()).filter(Boolean).join(" ");
+}
+
+export function upsertModelAliasInConfig(config, {
+  aliasId,
+  strategy,
+  targets,
+  fallbackTargets,
+  clearFallbackTargets = false,
+  metadata
+}) {
+  const next = structuredClone(config);
+  const normalizedAliasId = String(aliasId || "").trim();
+  if (!normalizedAliasId) {
+    return { config: next, changed: false, reason: "alias-id is required." };
+  }
+  if (!MODEL_ALIAS_ID_PATTERN.test(normalizedAliasId)) {
+    return {
+      config: next,
+      changed: false,
+      reason: `Invalid alias-id '${normalizedAliasId}'. Use letters/numbers and . _ : - separators.`
+    };
+  }
+
+  next.modelAliases = next.modelAliases && typeof next.modelAliases === "object" && !Array.isArray(next.modelAliases)
+    ? next.modelAliases
+    : {};
+
+  const previousAlias = next.modelAliases[normalizedAliasId] || {};
+  const nextStrategy = strategy === undefined
+    ? normalizeModelAliasStrategy(previousAlias.strategy || "ordered") || "ordered"
+    : normalizeModelAliasStrategy(strategy);
+  if (!nextStrategy) {
+    return {
+      config: next,
+      changed: false,
+      reason: `Invalid model routing strategy '${strategy}'. Use one of: ${MODEL_ALIAS_STRATEGIES.join(", ")}.`
+    };
+  }
+
+  const nextTargets = targets === undefined
+    ? dedupeAliasTargets(previousAlias.targets || [])
+    : parseAliasTargetListInput(targets);
+  if (!Array.isArray(nextTargets) || nextTargets.length === 0) {
+    return {
+      config: next,
+      changed: false,
+      reason: "Alias targets are required. Use --targets='provider/model@weight,provider/model'."
+    };
+  }
+
+  const nextFallbackTargets = clearFallbackTargets
+    ? []
+    : (fallbackTargets === undefined
+      ? dedupeAliasTargets(previousAlias.fallbackTargets || [])
+      : parseAliasTargetListInput(fallbackTargets));
+
+  if (metadata !== undefined && (!metadata || typeof metadata !== "object" || Array.isArray(metadata))) {
+    return {
+      config: next,
+      changed: false,
+      reason: "alias-metadata must be a JSON object when provided."
+    };
+  }
+
+  const nextAlias = {
+    strategy: nextStrategy,
+    targets: nextTargets,
+    fallbackTargets: nextFallbackTargets,
+    ...(metadata !== undefined
+      ? { metadata }
+      : (previousAlias.metadata && typeof previousAlias.metadata === "object" && !Array.isArray(previousAlias.metadata)
+        ? { metadata: previousAlias.metadata }
+        : {}))
+  };
+
+  const previousSerialized = serializeStable(previousAlias);
+  const nextSerialized = serializeStable(nextAlias);
+  next.modelAliases[normalizedAliasId] = nextAlias;
+
+  const validationErrors = validateRuntimeConfig(next, { requireProvider: false, requireMasterKey: false });
+  if (validationErrors.length > 0) {
+    return {
+      config: config,
+      changed: false,
+      reason: formatConfigValidationError(validationErrors)
+    };
+  }
+
+  return {
+    config: next,
+    changed: previousSerialized !== nextSerialized,
+    reason: "",
+    aliasId: normalizedAliasId
+  };
+}
+
+export function removeModelAliasFromConfig(config, aliasId) {
+  const next = structuredClone(config);
+  const normalizedAliasId = String(aliasId || "").trim();
+  if (!normalizedAliasId) {
+    return { config: next, changed: false, reason: "alias-id is required." };
+  }
+  if (!next.modelAliases || typeof next.modelAliases !== "object" || Array.isArray(next.modelAliases)) {
+    return { config: next, changed: false, reason: "No model aliases configured." };
+  }
+  if (!Object.prototype.hasOwnProperty.call(next.modelAliases, normalizedAliasId)) {
+    return { config: next, changed: false, reason: `Alias '${normalizedAliasId}' not found.` };
+  }
+
+  delete next.modelAliases[normalizedAliasId];
+  if (next.defaultModel === normalizedAliasId) {
+    const fallbackProvider = (next.providers || [])[0];
+    const fallbackModel = (fallbackProvider?.models || [])[0];
+    next.defaultModel = fallbackProvider && fallbackModel
+      ? `${fallbackProvider.id}/${fallbackModel.id}`
+      : undefined;
+  }
+
+  return {
+    config: next,
+    changed: true,
+    reason: "",
+    aliasId: normalizedAliasId
+  };
+}
+
+function normalizeRateLimitBucketForConfig(rawBucket, { reservedIds } = {}) {
+  if (!rawBucket || typeof rawBucket !== "object" || Array.isArray(rawBucket)) {
+    return { bucket: null, reason: "bucket entry must be an object." };
+  }
+
+  const explicitId = String(rawBucket.id || "").trim();
+  const name = sanitizeRateLimitBucketName(rawBucket.name ?? rawBucket["bucket-name"]);
+  if ((rawBucket.name !== undefined || rawBucket["bucket-name"] !== undefined) && !name) {
+    return { bucket: null, reason: "bucket name cannot be empty." };
+  }
+
+  if (!explicitId && !name) {
+    return { bucket: null, reason: "bucket id or bucket name is required." };
+  }
+
+  const baseId = explicitId || slugifyRateLimitBucketId(name, "bucket");
+  const id = explicitId || resolveUniqueRateLimitBucketId(baseId, reservedIds);
+  reservedIds?.add(id);
+
+  const models = parseRateLimitModelSelectorsInput(rawBucket.models ?? rawBucket.model ?? rawBucket["model-selector"]);
+  if (models.length === 0) {
+    return { bucket: null, reason: `bucket '${id}' requires models (use 'all' or model ids).` };
+  }
+
+  const requests = Number.parseInt(String(rawBucket.requests ?? rawBucket.limit ?? ""), 10);
+  if (!Number.isFinite(requests) || requests <= 0) {
+    return { bucket: null, reason: `bucket '${id}' requests must be a positive integer.` };
+  }
+
+  const window = parseRateLimitWindowInput({
+    unit: rawBucket.window?.unit ?? rawBucket.windowUnit ?? rawBucket["window-unit"],
+    size: rawBucket.window?.size ?? rawBucket.windowSize ?? rawBucket["window-size"]
+  }) || parseRateLimitWindowInput(rawBucket.window);
+  if (!window) {
+    return { bucket: null, reason: `bucket '${id}' window is invalid. Use e.g. 'month:1' or '1 week'.` };
+  }
+
+  const metadata = rawBucket.metadata;
+  if (metadata !== undefined && (!metadata || typeof metadata !== "object" || Array.isArray(metadata))) {
+    return { bucket: null, reason: `bucket '${id}' metadata must be a JSON object when provided.` };
+  }
+
+  return {
+    bucket: {
+      id,
+      ...(name ? { name } : {}),
+      models,
+      requests,
+      window,
+      ...(metadata !== undefined ? { metadata } : {})
+    },
+    reason: ""
+  };
+}
+
+function parseRateLimitBucketListInput(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "object") return [raw];
+
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === "object") return [parsed];
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+export function setProviderRateLimitsInConfig(config, {
+  providerId,
+  buckets,
+  replaceBuckets = false,
+  removeBucketId = ""
+}) {
+  const next = structuredClone(config);
+  const normalizedProviderId = String(providerId || "").trim();
+  if (!normalizedProviderId) {
+    return { config: next, changed: false, reason: "provider-id is required." };
+  }
+
+  const provider = (next.providers || []).find((item) => item.id === normalizedProviderId);
+  if (!provider) {
+    return { config: next, changed: false, reason: `Provider '${normalizedProviderId}' not found.` };
+  }
+
+  const previousRateLimits = Array.isArray(provider.rateLimits) ? provider.rateLimits : [];
+  const currentById = new Map(previousRateLimits.map((bucket) => [bucket.id, bucket]));
+  const removeId = String(removeBucketId || "").trim();
+
+  if (removeId) {
+    if (!currentById.has(removeId)) {
+      return {
+        config: next,
+        changed: false,
+        reason: `Rate-limit bucket '${removeId}' not found on provider '${normalizedProviderId}'.`
+      };
+    }
+    currentById.delete(removeId);
+  } else {
+    const normalizedBuckets = [];
+    const reservedIds = replaceBuckets
+      ? new Set()
+      : new Set(currentById.keys());
+    for (const rawBucket of (buckets || [])) {
+      const normalized = normalizeRateLimitBucketForConfig(rawBucket, { reservedIds });
+      if (!normalized.bucket) {
+        return {
+          config: next,
+          changed: false,
+          reason: normalized.reason || "Invalid rate-limit bucket input."
+        };
+      }
+      normalizedBuckets.push(normalized.bucket);
+    }
+
+    if (normalizedBuckets.length === 0) {
+      return {
+        config: next,
+        changed: false,
+        reason: "At least one rate-limit bucket is required."
+      };
+    }
+
+    if (replaceBuckets) {
+      currentById.clear();
+    }
+    for (const bucket of normalizedBuckets) {
+      currentById.set(bucket.id, bucket);
+    }
+  }
+
+  provider.rateLimits = Array.from(currentById.values());
+  const validationErrors = validateRuntimeConfig(next, { requireProvider: false, requireMasterKey: false });
+  if (validationErrors.length > 0) {
+    return {
+      config,
+      changed: false,
+      reason: formatConfigValidationError(validationErrors)
+    };
+  }
+
+  return {
+    config: next,
+    changed: serializeStable(previousRateLimits) !== serializeStable(provider.rateLimits),
+    reason: "",
+    providerId: normalizedProviderId,
+    rateLimits: provider.rateLimits
+  };
+}
+
 function setMasterKeyInConfig(config, masterKey) {
   return {
     ...config,
@@ -1910,6 +2735,10 @@ async function resolveUpsertInput(context, existingConfig) {
   const baseFormats = parseModelListInput(readArg(args, ["formats"], (selectedExisting?.formats || []).join(",")));
   const hasHeadersArg = args.headers !== undefined;
   const baseHeaders = readArg(args, ["headers"], selectedExisting?.headers ? JSON.stringify(selectedExisting.headers) : "");
+  const baseProbeRequestsPerMinute = toPositiveInteger(
+    readArg(args, ["probe-rpm", "probe-requests-per-minute", "probeRequestsPerMinute"], DEFAULT_PROBE_REQUESTS_PER_MINUTE),
+    DEFAULT_PROBE_REQUESTS_PER_MINUTE
+  );
   const shouldProbe = !toBoolean(readArg(args, ["skip-probe", "skipProbe"], false), false);
   const setMasterKeyFlag = toBoolean(readArg(args, ["set-master-key", "setMasterKey"], false), false);
   const providedMasterKey = String(readArg(args, ["master-key", "masterKey"], "") || "");
@@ -1932,6 +2761,7 @@ async function resolveUpsertInput(context, existingConfig) {
       format: baseFormat,
       formats: baseFormats,
       headers: parsedHeaders,
+      probeRequestsPerMinute: baseProbeRequestsPerMinute,
       shouldProbe,
       setMasterKey: setMasterKeyFlag || Boolean(providedMasterKey),
       masterKey: providedMasterKey
@@ -1986,7 +2816,7 @@ async function resolveUpsertInput(context, existingConfig) {
   const endpointsInput = await context.prompts.text({
     message: "Provider endpoints (comma / ; / space / newline separated; multiline paste supported)",
     required: true,
-    initialValue: baseEndpoints.join(","),
+    initialValue: baseEndpoints.join("\n"),
     paste: true,
     multiline: true
   });
@@ -2016,6 +2846,24 @@ async function resolveUpsertInput(context, existingConfig) {
     message: "Auto-detect endpoint formats and model support via live probe?",
     initialValue: shouldProbe
   });
+  const warn = typeof context?.terminal?.warn === "function" ? context.terminal.warn.bind(context.terminal) : null;
+  let probeRequestsPerMinute = baseProbeRequestsPerMinute;
+  if (probe) {
+    warn?.("Auto-discovery sends real API requests and may consume paid provider usage.");
+    const rpmInput = await context.prompts.text({
+      message: `Provider probe request budget per minute (default ${DEFAULT_PROBE_REQUESTS_PER_MINUTE})`,
+      required: true,
+      initialValue: String(baseProbeRequestsPerMinute),
+      validate: (value) => {
+        const parsed = toPositiveInteger(value, Number.NaN);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          return "Enter a positive integer request-per-minute value.";
+        }
+        return undefined;
+      }
+    });
+    probeRequestsPerMinute = toPositiveInteger(rpmInput, DEFAULT_PROBE_REQUESTS_PER_MINUTE);
+  }
 
   let manualFormat = baseFormat;
   if (!probe) {
@@ -2050,6 +2898,7 @@ async function resolveUpsertInput(context, existingConfig) {
     format: probe ? "" : manualFormat,
     formats: baseFormats,
     headers: interactiveHeaders,
+    probeRequestsPerMinute,
     shouldProbe: probe,
     setMasterKey,
     masterKey
@@ -2117,6 +2966,10 @@ async function doUpsertProvider(context) {
   if (input.shouldProbe) {
     const startedAt = Date.now();
     const reportProgress = probeProgressReporter(context);
+    const probeRequestsPerMinute = toPositiveInteger(
+      input.probeRequestsPerMinute,
+      DEFAULT_PROBE_REQUESTS_PER_MINUTE
+    );
     const canRunMatrixProbe = endpointCandidates.length > 0 && effectiveModels.length > 0;
     if (canRunMatrixProbe) {
       probe = await probeProviderEndpointMatrix({
@@ -2124,6 +2977,8 @@ async function doUpsertProvider(context) {
         models: effectiveModels,
         apiKey: input.apiKey,
         headers: input.headers,
+        requestsPerMinute: probeRequestsPerMinute,
+        maxRateLimitRetries: DEFAULT_PROBE_MAX_RATE_LIMIT_RETRIES,
         onProgress: reportProgress
       });
       effectiveOpenAIBaseUrl = probe.baseUrlByFormat?.openai || effectiveOpenAIBaseUrl;
@@ -2157,8 +3012,38 @@ async function doUpsertProvider(context) {
       const tookMs = Date.now() - startedAt;
       line(`Auto-discovery finished in ${(tookMs / 1000).toFixed(1)}s.`);
     }
-
-    if (!probe.ok) {
+    selectedFormat = probe.preferredFormat || selectedFormat;
+    if (probe?.manualFallbackRecommended) {
+      if (!canPrompt()) {
+        const scope = probe?.failureScope === "full" ? "full" : "partial";
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_FAILURE,
+          errorMessage: scope === "full"
+            ? "Auto-discovery failed fully (no working endpoint/format detected). Re-run interactively for manual fallback or use --skip-probe=true with explicit endpoint/format."
+            : "Auto-discovery failed partially (some endpoint/model checks unresolved). Re-run interactively for manual fallback or use --skip-probe=true with explicit endpoint/model inputs."
+        };
+      }
+      const fallback = await runProbeManualFallback(context, {
+        probe,
+        selectedFormat,
+        effectiveOpenAIBaseUrl,
+        effectiveClaudeBaseUrl,
+        effectiveModels
+      });
+      selectedFormat = fallback.selectedFormat;
+      effectiveOpenAIBaseUrl = fallback.effectiveOpenAIBaseUrl;
+      effectiveClaudeBaseUrl = fallback.effectiveClaudeBaseUrl;
+      effectiveModels = fallback.effectiveModels;
+      effectiveBaseUrl =
+        (selectedFormat === "openai" ? effectiveOpenAIBaseUrl : "") ||
+        (selectedFormat === "claude" ? effectiveClaudeBaseUrl : "") ||
+        effectiveOpenAIBaseUrl ||
+        effectiveClaudeBaseUrl ||
+        effectiveBaseUrl ||
+        endpointCandidates[0];
+    } else if (!probe.ok) {
       if (canPrompt()) {
         const continueWithoutProbe = await context.prompts.confirm({
           message: "Probe failed to confirm working endpoint/model support. Save provider anyway?",
@@ -2185,8 +3070,6 @@ async function doUpsertProvider(context) {
           errorMessage: "Provider probe failed. Provide valid endpoints/models or use --skip-probe=true to force save."
         };
       }
-    } else {
-      selectedFormat = probe.preferredFormat || selectedFormat;
     }
   }
 
@@ -2266,6 +3149,74 @@ async function doListConfig(context) {
     mode: context.mode,
     exitCode: EXIT_SUCCESS,
     data: summarizeConfig(config, configPath)
+  };
+}
+
+async function doListRouting(context) {
+  return doListConfig(context);
+}
+
+async function doMigrateConfig(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const targetVersionRaw = readArg(args, ["target-version", "targetVersion"], CONFIG_VERSION);
+  const targetVersion = Number.parseInt(String(targetVersionRaw), 10);
+  const createBackup = toBoolean(readArg(args, ["create-backup", "createBackup", "backup"], true), true);
+
+  if (!Number.isFinite(targetVersion) || targetVersion <= 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `Invalid target-version '${targetVersionRaw}'.`
+    };
+  }
+
+  if (!(await configFileExists(configPath))) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `Config not found at ${configPath}.`
+    };
+  }
+
+  if (canPrompt()) {
+    const confirm = await context.prompts.confirm({
+      message: `Migrate config to version ${targetVersion}${createBackup ? " with backup" : ""}?`,
+      initialValue: true
+    });
+    if (!confirm) {
+      return { ok: false, mode: context.mode, exitCode: EXIT_FAILURE, errorMessage: "Cancelled." };
+    }
+  }
+
+  let migration;
+  try {
+    migration = await migrateConfigFile(configPath, {
+      targetVersion,
+      createBackup
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: [
+      migration.changed
+        ? `Migrated config ${migration.beforeVersion} -> ${migration.afterVersion}.`
+        : `Config already at target schema (version ${migration.afterVersion}).`,
+      migration.backupPath ? `backup=${migration.backupPath}` : "backup=(not created)",
+      `config=${configPath}`
+    ].join("\n")
   };
 }
 
@@ -2501,6 +3452,803 @@ async function doSetModelFallbacks(context) {
   };
 }
 
+async function doUpsertModelAlias(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const aliases = config.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+  let aliasId = String(readArg(args, ["alias-id", "aliasId", "alias"], "") || "").trim();
+  const strategyArg = readArg(args, ["strategy"], undefined);
+  const hasTargetsArg =
+    Object.prototype.hasOwnProperty.call(args, "targets") ||
+    Object.prototype.hasOwnProperty.call(args, "alias-targets") ||
+    Object.prototype.hasOwnProperty.call(args, "aliasTargets");
+  const hasFallbackTargetsArg =
+    Object.prototype.hasOwnProperty.call(args, "fallback-targets") ||
+    Object.prototype.hasOwnProperty.call(args, "fallbackTargets");
+  const clearFallbackTargets = toBoolean(readArg(args, ["clear-fallback-targets", "clearFallbackTargets"], false), false);
+  let targetsInput = hasTargetsArg ? (args.targets ?? args["alias-targets"] ?? args.aliasTargets ?? "") : undefined;
+  let fallbackTargetsInput = hasFallbackTargetsArg ? (args["fallback-targets"] ?? args.fallbackTargets ?? "") : undefined;
+  const hasAliasMetadataArg =
+    Object.prototype.hasOwnProperty.call(args, "alias-metadata") ||
+    Object.prototype.hasOwnProperty.call(args, "aliasMetadata");
+  const aliasMetadataRaw = hasAliasMetadataArg ? (args["alias-metadata"] ?? args.aliasMetadata ?? "") : undefined;
+  let aliasMetadata = undefined;
+  if (hasAliasMetadataArg) {
+    aliasMetadata = parseJsonObjectArg(aliasMetadataRaw, "--alias-metadata");
+  }
+
+  if (canPrompt()) {
+    const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+    const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+    info?.("A model alias lets you group models from multiple providers behind one model name.");
+    line?.("Routing strategy decides how requests are distributed across the alias targets.");
+
+    if (!aliasId) {
+      const aliasIds = Object.keys(aliases);
+      if (aliasIds.length > 0) {
+        const selected = await context.prompts.select({
+          message: "Model alias action",
+          options: [
+            { value: "__new__", label: "Create new alias" },
+            ...aliasIds.map((id) => ({
+              value: id,
+              label: `Edit ${id}`,
+              hint: `${(aliases[id]?.targets || []).length} target(s)`
+            }))
+          ]
+        });
+        if (selected !== "__new__") aliasId = selected;
+      }
+    }
+
+    const existingAlias = aliasId ? aliases[aliasId] : null;
+    if (!aliasId) {
+      aliasId = await context.prompts.text({
+        message: "Alias ID (e.g. chat.default)",
+        required: true,
+        validate: (value) => {
+          const candidate = String(value || "").trim();
+          if (!candidate) return "Alias ID is required.";
+          if (!MODEL_ALIAS_ID_PATTERN.test(candidate)) {
+            return "Use letters/numbers and . _ : - separators.";
+          }
+          return undefined;
+        }
+      });
+    }
+
+    const selectedStrategy = normalizeModelAliasStrategy(strategyArg || existingAlias?.strategy || "auto") || "auto";
+    const strategy = await context.prompts.select({
+      message: "Model alias routing strategy",
+      options: MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => ({
+        value: option.value,
+        label: option.label,
+        hint: option.hint
+      })),
+      initialValue: selectedStrategy
+    });
+
+    if (!hasTargetsArg) {
+      const defaultTargets = formatAliasTargetsForSummary(existingAlias?.targets || []);
+      targetsInput = await context.prompts.text({
+        message: "Alias targets (<ref>@<weight>, comma-separated)",
+        required: true,
+        initialValue: defaultTargets === "(none)" ? "" : defaultTargets,
+        placeholder: "openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2"
+      });
+    }
+
+    if (!clearFallbackTargets && !hasFallbackTargetsArg) {
+      const defaultFallbacks = formatAliasTargetsForSummary(existingAlias?.fallbackTargets || []);
+      fallbackTargetsInput = await context.prompts.text({
+        message: "Alias fallback targets (optional; same syntax)",
+        required: false,
+        initialValue: defaultFallbacks === "(none)" ? "" : defaultFallbacks,
+        placeholder: "openrouter/gpt-4o"
+      });
+    }
+
+    const updated = upsertModelAliasInConfig(config, {
+      aliasId,
+      strategy,
+      targets: targetsInput,
+      fallbackTargets: clearFallbackTargets ? [] : fallbackTargetsInput,
+      clearFallbackTargets,
+      metadata: aliasMetadata
+    });
+    if (!updated.changed && updated.reason) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: updated.reason
+      };
+    }
+
+    await writeConfigFile(updated.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: [
+        `Upserted model alias '${updated.aliasId || aliasId}'.`,
+        `targets=${formatAliasTargetsForSummary(updated.config.modelAliases?.[updated.aliasId || aliasId]?.targets)}`,
+        `fallbackTargets=${formatAliasTargetsForSummary(updated.config.modelAliases?.[updated.aliasId || aliasId]?.fallbackTargets)}`
+      ].join("\n")
+    };
+  }
+
+  const updated = upsertModelAliasInConfig(config, {
+    aliasId,
+    strategy: strategyArg,
+    targets: targetsInput,
+    fallbackTargets: clearFallbackTargets ? [] : fallbackTargetsInput,
+    clearFallbackTargets,
+    metadata: aliasMetadata
+  });
+
+  if (!updated.changed && updated.reason) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: updated.reason
+    };
+  }
+
+  await writeConfigFile(updated.config, configPath);
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: [
+      `Upserted model alias '${updated.aliasId || aliasId}'.`,
+      `targets=${formatAliasTargetsForSummary(updated.config.modelAliases?.[updated.aliasId || aliasId]?.targets)}`,
+      `fallbackTargets=${formatAliasTargetsForSummary(updated.config.modelAliases?.[updated.aliasId || aliasId]?.fallbackTargets)}`
+    ].join("\n")
+  };
+}
+
+async function doRemoveModelAlias(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  let aliasId = String(readArg(args, ["alias-id", "aliasId", "alias"], "") || "").trim();
+
+  const aliasEntries = Object.keys(config.modelAliases || {});
+  if (canPrompt() && !aliasId) {
+    if (aliasEntries.length === 0) {
+      return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: "No model aliases configured." };
+    }
+
+    aliasId = await context.prompts.select({
+      message: "Remove model alias",
+      options: aliasEntries.map((id) => ({
+        value: id,
+        label: id
+      }))
+    });
+  }
+
+  const removal = removeModelAliasFromConfig(config, aliasId);
+  if (!removal.changed) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: removal.reason
+    };
+  }
+
+  await writeConfigFile(removal.config, configPath);
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: `Removed model alias '${removal.aliasId}'.`
+  };
+}
+
+function printRateLimitBucketIntro(context) {
+  if (!canPrompt()) return;
+  const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  info?.("A bucket is a request cap for a time window.");
+  line?.("You can add multiple buckets to the same models, for example 40/minute and 600/6 hours.");
+}
+
+function buildProviderRateLimitReview(provider) {
+  const buckets = provider?.rateLimits || [];
+  if (buckets.length === 0) {
+    return `Provider '${provider?.id || "(unknown)"}' has no rate-limit buckets.`;
+  }
+
+  return [
+    `Rate-limit buckets for '${provider?.id || "(unknown)"}':`,
+    ...buckets.map((bucket) => `- ${formatRateLimitBucketLabel(bucket, { includeId: true })}: ${summarizeRateLimitBucketCap(bucket)} | scope=${formatRateLimitBucketScopeLabel(bucket)}`)
+  ].join("\n");
+}
+
+function buildRateLimitBucketPromptOptions(provider) {
+  return (provider?.rateLimits || []).map((bucket) => ({
+    value: bucket.id,
+    label: `${formatRateLimitBucketLabel(bucket)} (${summarizeRateLimitBucketCap(bucket)})`,
+    hint: formatRateLimitBucketScopeLabel(bucket)
+  }));
+}
+
+function buildRateLimitWindowUnitOptions(initialUnit = "") {
+  const options = [
+    { value: "minute", label: "Minute", hint: "Fixed to 1 minute" },
+    { value: "hour", label: "Hour(s)", hint: "Choose any positive hour count" },
+    { value: "week", label: "Week", hint: "Fixed to 1 week" },
+    { value: "month", label: "Month", hint: "Fixed to 1 month" }
+  ];
+  if (initialUnit === "day") {
+    options.push({ value: "day", label: "Day (legacy)", hint: "Retained for existing configs" });
+  }
+  if (initialUnit === "second") {
+    options.push({ value: "second", label: "Second (legacy)", hint: "Retained for existing configs" });
+  }
+  return options;
+}
+
+function printRateLimitBucketPreview(context, bucket) {
+  if (!canPrompt()) return;
+  const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  info?.("Bucket review:");
+  line?.(`  Name: ${formatRateLimitBucketLabel(bucket)}`);
+  line?.(`  Scope: ${formatRateLimitBucketScopeLabel(bucket)}`);
+  line?.(`  Cap: ${summarizeRateLimitBucketCap(bucket)}`);
+  line?.(`  Advanced detail: internal id = ${bucket.id}`);
+}
+
+async function promptRateLimitBucketWizard(context, {
+  provider,
+  initialBucket = null,
+  reservedIds = new Set()
+} = {}) {
+  const initialName = sanitizeRateLimitBucketName(initialBucket?.name || initialBucket?.id || "");
+  const providerModelIds = dedupeList((provider?.models || []).map((model) => model?.id));
+  const initialModels = dedupeList(initialBucket?.models || []);
+  const initialScope = initialModels.includes("all") || initialModels.length === 0 ? "all" : "selected";
+  const initialWindow = parseRateLimitWindowInput(initialBucket?.window) || { unit: "minute", size: 1 };
+  const initialUnit = String(initialWindow.unit || "").trim().toLowerCase() || "minute";
+  const initialSize = Number.parseInt(String(initialWindow.size ?? "1"), 10) || 1;
+
+  const name = await context.prompts.text({
+    message: "Bucket name",
+    required: true,
+    initialValue: initialName,
+    placeholder: "Minute cap",
+    validate: (value) => sanitizeRateLimitBucketName(value) ? undefined : "Bucket name is required."
+  });
+
+  const modelScope = await context.prompts.select({
+    message: "Bucket model scope",
+    options: [
+      { value: "all", label: "All models" },
+      { value: "selected", label: "Selected models" }
+    ],
+    initialValue: initialScope
+  });
+
+  let models = ["all"];
+  if (modelScope === "selected") {
+    if (providerModelIds.length === 0) {
+      return {
+        bucket: null,
+        reason: `Provider '${provider?.id || "(unknown)"}' has no models to choose from.`
+      };
+    }
+    models = await context.prompts.multiselect({
+      message: `Choose models for ${provider?.id || "provider"}`,
+      options: providerModelIds.map((modelId) => ({
+        value: modelId,
+        label: modelId
+      })),
+      initialValues: initialModels.filter((modelId) => modelId !== "all" && providerModelIds.includes(modelId)),
+      required: true
+    });
+  }
+
+  const requestsInput = await context.prompts.text({
+    message: "Request cap",
+    required: true,
+    initialValue: initialBucket?.requests !== undefined ? String(initialBucket.requests) : "",
+    placeholder: "40",
+    validate: (value) => {
+      const parsed = Number.parseInt(String(value ?? ""), 10);
+      return Number.isFinite(parsed) && parsed > 0 ? undefined : "Enter a positive integer.";
+    }
+  });
+
+  const windowUnit = await context.prompts.select({
+    message: "Window unit",
+    options: buildRateLimitWindowUnitOptions(initialUnit),
+    initialValue: initialUnit
+  });
+
+  let windowSize = 1;
+  if (windowUnit === "hour" || windowUnit === "day" || windowUnit === "second") {
+    const sizeInput = await context.prompts.text({
+      message: windowUnit === "hour" ? "How many hours?" : "Window size",
+      required: true,
+      initialValue: String(initialSize),
+      placeholder: windowUnit === "hour" ? "6" : "1",
+      validate: (value) => {
+        const parsed = Number.parseInt(String(value ?? ""), 10);
+        return Number.isFinite(parsed) && parsed > 0 ? undefined : "Enter a positive integer.";
+      }
+    });
+    windowSize = Number.parseInt(String(sizeInput), 10);
+  }
+
+  let bucketId = String(initialBucket?.id || "").trim();
+  if (initialBucket && name !== initialName && bucketId) {
+    const regenerateId = await context.prompts.confirm({
+      message: "Regenerate internal bucket id from the new name?",
+      initialValue: false
+    });
+    if (regenerateId) {
+      bucketId = "";
+    }
+  }
+
+  const previewReservedIds = new Set(reservedIds || []);
+  if (initialBucket?.id) {
+    previewReservedIds.delete(initialBucket.id);
+  }
+  const normalized = normalizeRateLimitBucketForConfig({
+    ...(bucketId ? { id: bucketId } : {}),
+    name,
+    models,
+    requests: requestsInput,
+    window: {
+      unit: windowUnit,
+      size: windowSize
+    }
+  }, {
+    reservedIds: previewReservedIds
+  });
+  if (!normalized.bucket) {
+    return normalized;
+  }
+
+  printRateLimitBucketPreview(context, normalized.bucket);
+  const confirm = await context.prompts.confirm({
+    message: initialBucket ? "Save bucket changes?" : "Create this bucket?",
+    initialValue: true
+  });
+  if (!confirm) {
+    return {
+      bucket: null,
+      reason: "Cancelled.",
+      cancelled: true
+    };
+  }
+
+  return normalized;
+}
+
+async function doSetProviderRateLimits(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  let providerId = String(readArg(args, ["provider-id", "providerId"], "") || "").trim();
+  let bucketId = String(readArg(args, ["bucket-id", "bucketId"], "") || "").trim();
+  let bucketName = sanitizeRateLimitBucketName(readArg(args, ["bucket-name", "bucketName"], ""));
+  let modelsInput = readArg(args, ["bucket-models", "models"], undefined);
+  let requestsInput = readArg(args, ["bucket-requests", "requests"], undefined);
+  let windowInput = readArg(args, ["bucket-window", "window"], undefined);
+  const removeBucket = toBoolean(readArg(args, ["remove-bucket", "removeBucket"], false), false);
+  const replaceBuckets = toBoolean(readArg(args, ["replace-rate-limits", "replaceRateLimits"], false), false);
+  const hasRateLimitsArg =
+    Object.prototype.hasOwnProperty.call(args, "rate-limits") ||
+    Object.prototype.hasOwnProperty.call(args, "rateLimits");
+  const rateLimitsRaw = hasRateLimitsArg ? (args["rate-limits"] ?? args.rateLimits ?? "") : undefined;
+  const parsedRateLimitBuckets = parseRateLimitBucketListInput(rateLimitsRaw);
+  if (hasRateLimitsArg && parsedRateLimitBuckets.length === 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "rate-limits must be a JSON object or JSON array."
+    };
+  }
+
+  if (canPrompt()) {
+    if (!providerId) {
+      if (!config.providers.length) {
+        return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: "No providers configured." };
+      }
+      providerId = await context.prompts.select({
+        message: "Select provider for rate-limit buckets",
+        options: config.providers.map((provider) => ({
+          value: provider.id,
+          label: provider.id,
+          hint: `${(provider.rateLimits || []).length} bucket(s)`
+        }))
+      });
+    }
+
+    const provider = config.providers.find((item) => item.id === providerId);
+    if (!provider) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: `Provider '${providerId}' not found.`
+      };
+    }
+
+    const hasDirectInputs = removeBucket ||
+      hasRateLimitsArg ||
+      replaceBuckets ||
+      !!bucketId ||
+      !!bucketName ||
+      modelsInput !== undefined ||
+      requestsInput !== undefined ||
+      windowInput !== undefined;
+
+    if (!hasDirectInputs) {
+      printRateLimitBucketIntro(context);
+      const action = await context.prompts.select({
+        message: "Rate-limit bucket action",
+        options: [
+          { value: "create", label: "Create bucket(s)" },
+          { value: "edit", label: "Edit existing bucket" },
+          { value: "remove", label: "Remove bucket" },
+          { value: "review", label: "Review current buckets" }
+        ]
+      });
+
+      if (action === "review") {
+        return {
+          ok: true,
+          mode: context.mode,
+          exitCode: EXIT_SUCCESS,
+          data: buildProviderRateLimitReview(provider)
+        };
+      }
+
+      if (action === "remove") {
+        const bucketOptions = buildRateLimitBucketPromptOptions(provider);
+        if (bucketOptions.length === 0) {
+          return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Provider '${providerId}' has no rate-limit buckets.` };
+        }
+
+        const selectedBucketId = await context.prompts.select({
+          message: `Remove rate-limit bucket from ${providerId}`,
+          options: bucketOptions
+        });
+        const selectedBucket = (provider.rateLimits || []).find((bucket) => bucket.id === selectedBucketId);
+        const confirm = await context.prompts.confirm({
+          message: `Remove '${formatRateLimitBucketLabel(selectedBucket)}'?`,
+          initialValue: false
+        });
+        if (!confirm) {
+          return { ok: false, mode: context.mode, exitCode: EXIT_FAILURE, errorMessage: "Cancelled." };
+        }
+
+        const removed = setProviderRateLimitsInConfig(config, {
+          providerId,
+          removeBucketId: selectedBucketId
+        });
+        if (!removed.changed) {
+          return {
+            ok: false,
+            mode: context.mode,
+            exitCode: EXIT_VALIDATION,
+            errorMessage: removed.reason
+          };
+        }
+        await writeConfigFile(removed.config, configPath);
+        return {
+          ok: true,
+          mode: context.mode,
+          exitCode: EXIT_SUCCESS,
+          data: `Removed rate-limit bucket '${formatRateLimitBucketLabel(selectedBucket, { includeId: true })}' from '${providerId}'.`
+        };
+      }
+
+      if (action === "edit") {
+        const bucketOptions = buildRateLimitBucketPromptOptions(provider);
+        if (bucketOptions.length === 0) {
+          return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Provider '${providerId}' has no rate-limit buckets.` };
+        }
+
+        const selectedBucketId = await context.prompts.select({
+          message: `Edit rate-limit bucket on ${providerId}`,
+          options: bucketOptions
+        });
+        const selectedBucket = (provider.rateLimits || []).find((bucket) => bucket.id === selectedBucketId);
+        if (!selectedBucket) {
+          return {
+            ok: false,
+            mode: context.mode,
+            exitCode: EXIT_VALIDATION,
+            errorMessage: `Rate-limit bucket '${selectedBucketId}' not found on provider '${providerId}'.`
+          };
+        }
+
+        const wizard = await promptRateLimitBucketWizard(context, {
+          provider,
+          initialBucket: selectedBucket,
+          reservedIds: new Set((provider.rateLimits || []).map((bucket) => bucket.id))
+        });
+        if (!wizard.bucket) {
+          if (wizard.cancelled) {
+            return { ok: false, mode: context.mode, exitCode: EXIT_FAILURE, errorMessage: wizard.reason || "Cancelled." };
+          }
+          return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: wizard.reason || "Invalid bucket input." };
+        }
+
+        const updated = setProviderRateLimitsInConfig(config, {
+          providerId,
+          buckets: [wizard.bucket]
+        });
+        if (!updated.changed && updated.reason) {
+          return {
+            ok: false,
+            mode: context.mode,
+            exitCode: EXIT_VALIDATION,
+            errorMessage: updated.reason
+          };
+        }
+        await writeConfigFile(updated.config, configPath);
+        return {
+          ok: true,
+          mode: context.mode,
+          exitCode: EXIT_SUCCESS,
+          data: [
+            `Updated rate-limit bucket '${formatRateLimitBucketLabel(wizard.bucket, { includeId: true })}' on '${providerId}'.`,
+            `bucketCount=${updated.rateLimits?.length || 0}`
+          ].join("\n")
+        };
+      }
+
+      const reservedIds = new Set((provider.rateLimits || []).map((bucket) => bucket.id));
+      const newBuckets = [];
+      let keepAdding = true;
+      while (keepAdding) {
+        const wizard = await promptRateLimitBucketWizard(context, {
+          provider,
+          reservedIds
+        });
+        if (!wizard.bucket) {
+          if (wizard.cancelled) {
+            if (newBuckets.length === 0) {
+              return { ok: false, mode: context.mode, exitCode: EXIT_FAILURE, errorMessage: wizard.reason || "Cancelled." };
+            }
+            break;
+          }
+          return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: wizard.reason || "Invalid bucket input." };
+        }
+
+        newBuckets.push(wizard.bucket);
+        reservedIds.add(wizard.bucket.id);
+        keepAdding = await context.prompts.confirm({
+          message: "Add another bucket?",
+          initialValue: false
+        });
+      }
+
+      if (newBuckets.length === 0) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: "At least one rate-limit bucket is required."
+        };
+      }
+
+      const updated = setProviderRateLimitsInConfig(config, {
+        providerId,
+        buckets: newBuckets,
+        replaceBuckets: false
+      });
+      if (!updated.changed && updated.reason) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: updated.reason
+        };
+      }
+      await writeConfigFile(updated.config, configPath);
+      return {
+        ok: true,
+        mode: context.mode,
+        exitCode: EXIT_SUCCESS,
+        data: [
+          `Updated rate-limit buckets for '${providerId}'.`,
+          `bucketCount=${updated.rateLimits?.length || 0}`
+        ].join("\n")
+      };
+    }
+
+    if (removeBucket) {
+      if (!bucketId) {
+        const bucketOptions = buildRateLimitBucketPromptOptions(provider);
+        if (bucketOptions.length === 0) {
+          return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Provider '${providerId}' has no rate-limit buckets.` };
+        }
+        bucketId = await context.prompts.select({
+          message: `Remove rate-limit bucket from ${providerId}`,
+          options: bucketOptions
+        });
+      }
+    } else if (!hasRateLimitsArg) {
+      if (!bucketId && !bucketName) {
+        bucketName = await context.prompts.text({
+          message: "Bucket name",
+          required: true,
+          placeholder: "Minute cap",
+          validate: (value) => sanitizeRateLimitBucketName(value) ? undefined : "Bucket name is required."
+        });
+      }
+
+      if (!modelsInput) {
+        const providerModelIds = dedupeList((provider.models || []).map((model) => model.id));
+        const initialScope = String(modelsInput || "").trim().toLowerCase() === "all" ? "all" : "selected";
+        const modelScope = await context.prompts.select({
+          message: "Bucket model scope",
+          options: [
+            { value: "all", label: "All models" },
+            { value: "selected", label: "Selected models" }
+          ],
+          initialValue: initialScope
+        });
+        if (modelScope === "all") {
+          modelsInput = "all";
+        } else if (providerModelIds.length === 0) {
+          return {
+            ok: false,
+            mode: context.mode,
+            exitCode: EXIT_VALIDATION,
+            errorMessage: `Provider '${providerId}' has no models to select.`
+          };
+        } else {
+          modelsInput = await context.prompts.multiselect({
+            message: `Choose models for ${providerId}`,
+            options: providerModelIds.map((modelId) => ({
+              value: modelId,
+              label: modelId
+            })),
+            required: true
+          });
+        }
+      }
+
+      if (!requestsInput) {
+        requestsInput = await context.prompts.text({
+          message: "Request cap",
+          required: true,
+          placeholder: "40",
+          validate: (value) => {
+            const parsed = Number.parseInt(String(value ?? ""), 10);
+            return Number.isFinite(parsed) && parsed > 0 ? undefined : "Enter a positive integer.";
+          }
+        });
+      }
+
+      if (!windowInput) {
+        const windowUnit = await context.prompts.select({
+          message: "Window unit",
+          options: buildRateLimitWindowUnitOptions("minute"),
+          initialValue: "minute"
+        });
+        let windowSize = 1;
+        if (windowUnit === "hour") {
+          const sizeInput = await context.prompts.text({
+            message: "How many hours?",
+            required: true,
+            placeholder: "6",
+            validate: (value) => {
+              const parsed = Number.parseInt(String(value ?? ""), 10);
+              return Number.isFinite(parsed) && parsed > 0 ? undefined : "Enter a positive integer.";
+            }
+          });
+          windowSize = Number.parseInt(String(sizeInput), 10);
+        }
+        windowInput = `${windowUnit}:${windowSize}`;
+      }
+    }
+  }
+
+  if (!providerId) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "provider-id is required."
+    };
+  }
+
+  if (removeBucket) {
+    if (!bucketId) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: "bucket-id is required when remove-bucket=true."
+      };
+    }
+
+    const removed = setProviderRateLimitsInConfig(config, {
+      providerId,
+      removeBucketId: bucketId
+    });
+    if (!removed.changed) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: removed.reason
+      };
+    }
+    await writeConfigFile(removed.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: `Removed rate-limit bucket '${bucketId}' from '${providerId}'.`
+    };
+  }
+
+  let buckets = parsedRateLimitBuckets;
+  if (!hasRateLimitsArg) {
+    const window = parseRateLimitWindowInput(windowInput);
+    const requests = Number.parseInt(String(requestsInput ?? ""), 10);
+    const models = parseRateLimitModelSelectorsInput(modelsInput);
+    if ((!bucketId && !bucketName) || !Number.isFinite(requests) || requests <= 0 || !window || models.length === 0) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: "bucket-id or bucket-name, models, requests, and valid window are required. Example: --bucket-window=month:1"
+      };
+    }
+    buckets = [{
+      ...(bucketId ? { id: bucketId } : {}),
+      ...(bucketName ? { name: bucketName } : {}),
+      models,
+      requests,
+      window
+    }];
+  }
+
+  const updated = setProviderRateLimitsInConfig(config, {
+    providerId,
+    buckets,
+    replaceBuckets
+  });
+  if (!updated.changed && updated.reason) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: updated.reason
+    };
+  }
+
+  await writeConfigFile(updated.config, configPath);
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: [
+      `Updated rate-limit buckets for '${providerId}'.`,
+      `bucketCount=${updated.rateLimits?.length || 0}`
+    ].join("\n")
+  };
+}
+
 async function doSetMasterKey(context) {
   const args = context.args || {};
   const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
@@ -2665,9 +4413,14 @@ async function resolveConfigOperation(context) {
         { value: "upsert-provider", label: "Add/Edit provider" },
         { value: "remove-provider", label: "Remove provider" },
         { value: "remove-model", label: "Remove model from provider" },
+        { value: "upsert-model-alias", label: "Add/Edit model alias" },
+        { value: "remove-model-alias", label: "Remove model alias" },
+        { value: "set-provider-rate-limits", label: "Manage provider rate-limit buckets" },
         { value: "set-model-fallbacks", label: "Set model silent-fallbacks" },
         { value: "set-master-key", label: "Set worker master key" },
+        { value: "migrate-config", label: "Migrate config schema version" },
         { value: "list", label: "Show config summary" },
+        { value: "list-routing", label: "Show routing summary" },
         { value: "startup-install", label: "Install OS startup" },
         { value: "startup-status", label: "Show OS startup status" },
         { value: "startup-uninstall", label: "Uninstall OS startup" }
@@ -2690,13 +4443,25 @@ async function runConfigAction(context) {
       return doRemoveProvider(context);
     case "remove-model":
       return doRemoveModel(context);
+    case "upsert-model-alias":
+    case "set-model-alias":
+      return doUpsertModelAlias(context);
+    case "remove-model-alias":
+      return doRemoveModelAlias(context);
+    case "set-provider-rate-limits":
+    case "set-rate-limits":
+      return doSetProviderRateLimits(context);
     case "set-model-fallbacks":
     case "set-model-fallback":
       return doSetModelFallbacks(context);
     case "set-master-key":
       return doSetMasterKey(context);
+    case "migrate-config":
+      return doMigrateConfig(context);
     case "list":
       return doListConfig(context);
+    case "list-routing":
+      return doListRouting(context);
     case "startup-install":
       return doStartupInstall(context);
     case "startup-uninstall":
@@ -2922,34 +4687,59 @@ async function runDeployAction(context) {
     : console.log;
   let wranglerConfigPath = "";
   let cleanupWranglerConfig = null;
+  let deployRoutePattern = "";
+  let deployZoneName = "";
+  let deployUsesWorkersDev = false;
+  const longTaskSpinner = canPrompt() && typeof SnapTui?.createSpinner === "function"
+    ? SnapTui.createSpinner()
+    : null;
+  const withLongTaskSpinner = async (label, fn, { doneMessage = "" } = {}) => {
+    if (!longTaskSpinner) {
+      line(label);
+      const result = await fn();
+      if (doneMessage) line(doneMessage);
+      return result;
+    }
+
+    longTaskSpinner.start(label);
+    try {
+      const result = await fn();
+      longTaskSpinner.stop(doneMessage || `${label} done`);
+      return result;
+    } catch (error) {
+      longTaskSpinner.error("Operation failed");
+      throw error;
+    }
+  };
 
   try {
-
-  if (requiresCloudflareToken && !cloudflareApiToken) {
-    const tokenGuide = buildCloudflareApiTokenSetupGuide();
-    if (canPrompt()) {
-      line(tokenGuide);
-      cloudflareApiToken = await promptSecretInput(context, {
-        message: `Cloudflare API token (${CLOUDFLARE_API_TOKEN_ENV_NAME})`,
-        required: true,
-        validate: validateCloudflareApiTokenInput
-      });
-      cloudflareApiTokenSource = "prompt";
-    } else {
-      return {
-        ok: false,
-        mode: context.mode,
-        exitCode: EXIT_VALIDATION,
-        errorMessage: [
-          tokenGuide,
-          `Set ${CLOUDFLARE_API_TOKEN_ENV_NAME} and re-run deploy.`
-        ].join("\n")
-      };
+    if (requiresCloudflareToken && !cloudflareApiToken) {
+      const tokenGuide = buildCloudflareApiTokenSetupGuide();
+      if (canPrompt()) {
+        line(tokenGuide);
+        cloudflareApiToken = await promptSecretInput(context, {
+          message: `Cloudflare API token (${CLOUDFLARE_API_TOKEN_ENV_NAME})`,
+          required: true,
+          validate: validateCloudflareApiTokenInput
+        });
+        cloudflareApiTokenSource = "prompt";
+      } else {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: [
+            tokenGuide,
+            `Set ${CLOUDFLARE_API_TOKEN_ENV_NAME} and re-run deploy.`
+          ].join("\n")
+        };
+      }
     }
-  }
 
   if (requiresCloudflareToken) {
-    let preflight = await preflightCloudflareApiToken(cloudflareApiToken);
+    let preflight = await withLongTaskSpinner("Verifying Cloudflare API token...", () => preflightCloudflareApiToken(cloudflareApiToken), {
+      doneMessage: "Cloudflare API token verified."
+    });
     let attempts = 1;
     while (!preflight.ok && canPrompt() && cloudflareApiTokenSource === "prompt" && attempts < 3) {
       const retry = await context.prompts.confirm({
@@ -2965,7 +4755,9 @@ async function runDeployAction(context) {
       });
       cloudflareApiTokenSource = "prompt";
       attempts += 1;
-      preflight = await preflightCloudflareApiToken(cloudflareApiToken);
+      preflight = await withLongTaskSpinner("Re-validating Cloudflare API token...", () => preflightCloudflareApiToken(cloudflareApiToken), {
+        doneMessage: "Cloudflare API token re-validated."
+      });
     }
 
     if (!preflight.ok) {
@@ -3024,7 +4816,10 @@ async function runDeployAction(context) {
 
     const targetResolution = await prepareWranglerDeployConfig(context, {
       projectDir,
-      args
+      args,
+      cloudflareApiToken,
+      cloudflareAccountId,
+      wait: withLongTaskSpinner
     });
     if (!targetResolution.ok) {
       return {
@@ -3039,6 +4834,9 @@ async function runDeployAction(context) {
       ? targetResolution.cleanup
       : null;
     wranglerTargetMessage = targetResolution.message || "";
+    deployRoutePattern = String(targetResolution.routePattern || "").trim();
+    deployZoneName = String(targetResolution.zoneName || "").trim();
+    deployUsesWorkersDev = targetResolution.useWorkersDev === true;
   }
 
   const wranglerEnvOverrides = buildWranglerCloudflareEnv({
@@ -3184,12 +4982,33 @@ async function runDeployAction(context) {
     }
   }
 
+  const deploySpinner = canPrompt() && typeof SnapTui?.createSpinner === "function"
+    ? SnapTui.createSpinner()
+    : null;
+  const withDeploySpinner = async (label, fn, { doneMessage = "" } = {}) => {
+    if (!deploySpinner) {
+      line(label);
+      const result = await fn();
+      if (doneMessage) line(doneMessage);
+      return result;
+    }
+    deploySpinner.start(label);
+    try {
+      const result = await fn();
+      deploySpinner.stop(doneMessage || `${label} done`);
+      return result;
+    } catch (error) {
+      deploySpinner.error("Deploy step failed");
+      throw error;
+    }
+  };
+
   const envArgs = cfEnv ? ["--env", cfEnv] : [];
-  const secretResult = runWrangler([...wranglerConfigArgs, "secret", "put", "LLM_ROUTER_CONFIG_JSON", ...envArgs], {
+  const secretResult = await withDeploySpinner("Uploading worker config secret via Wrangler...", () => runWranglerAsync([...wranglerConfigArgs, "secret", "put", "LLM_ROUTER_CONFIG_JSON", ...envArgs], {
     cwd: projectDir,
     input: payloadJson,
     envOverrides: wranglerEnvOverrides
-  });
+  }), { doneMessage: "Worker config secret uploaded." });
   if (!secretResult.ok) {
     return {
       ok: false,
@@ -3203,10 +5022,10 @@ async function runDeployAction(context) {
     };
   }
 
-  const deployResult = runWrangler([...wranglerConfigArgs, "deploy", ...envArgs], {
+  const deployResult = await withDeploySpinner("Deploying Cloudflare Worker via Wrangler...", () => runWranglerAsync([...wranglerConfigArgs, "deploy", ...envArgs], {
     cwd: projectDir,
     envOverrides: wranglerEnvOverrides
-  });
+  }), { doneMessage: "Cloudflare Worker deploy finished." });
   if (!deployResult.ok) {
     return {
       ok: false,
@@ -3236,6 +5055,17 @@ async function runDeployAction(context) {
     };
   }
 
+  const deployHost = extractHostnameFromRoutePattern(deployRoutePattern);
+  const postDeployGuide = !deployUsesWorkersDev && deployHost
+    ? [
+      "",
+      "Post-deploy checks:",
+      `- dig +short ${deployHost} @1.1.1.1`,
+      `- curl -I https://${deployHost}/anthropic`,
+      `- Claude Code base URL: https://${deployHost}/anthropic (no :8787)`
+    ].join("\n")
+    : "";
+
   return {
     ok: true,
     mode: context.mode,
@@ -3244,8 +5074,10 @@ async function runDeployAction(context) {
       "Cloudflare deployment completed.",
       generatedDeployMasterKey ? "Generated a deploy-time master key. Persist it with `llm-router config --operation=set-master-key --master-key=...` if needed." : "",
       wranglerTargetMessage,
+      deployZoneName ? `Deploy zone: ${deployZoneName}` : "",
       secretResult.stdout.trim(),
-      deployResult.stdout.trim()
+      deployResult.stdout.trim(),
+      postDeployGuide
     ].filter(Boolean).join("\n")
   };
   } finally {
@@ -3539,15 +5371,35 @@ const routerModule = {
           "anthropic-base-url",
           "api-key",
           "models",
+          "bucket-models",
+          "bucket-id",
+          "bucket-name",
+          "bucket-window",
+          "bucket-requests",
+          "rate-limits",
+          "remove-bucket",
+          "replace-rate-limits",
+          "alias-id",
+          "alias",
+          "targets",
+          "fallback-targets",
+          "clear-fallback-targets",
+          "alias-metadata",
+          "strategy",
           "format",
           "formats",
           "headers",
           "skip-probe",
+          "probe-rpm",
+          "probe-requests-per-minute",
           "set-master-key",
           "master-key",
           "generate-master-key",
           "master-key-length",
           "master-key-prefix",
+          "target-version",
+          "create-backup",
+          "backup",
           "model",
           "fallback-models",
           "fallbacks",
@@ -3560,7 +5412,7 @@ const routerModule = {
         ]
       },
       help: {
-        summary: "Manage providers/models, master key, and OS startup. TUI by default; commandline via --operation.",
+        summary: "Manage providers, model aliases, rate-limit buckets, master key, and OS startup. TUI by default; commandline via --operation.",
         args: [
           { name: "operation", required: false, description: "Config operation (optional; prompts if omitted).", example: "--operation=upsert-provider" },
           { name: "provider-id", required: false, description: "Provider id (slug/camelCase).", example: "--provider-id=openrouter" },
@@ -3574,13 +5426,30 @@ const routerModule = {
           { name: "model", required: false, description: "Single model id (used by remove-model).", example: "--model=gpt-4o" },
           { name: "fallback-models", required: false, description: "Qualified fallback models for set-model-fallbacks (comma/semicolon/space separated).", example: "--fallback-models=openrouter/gpt-4o,anthropic/claude-3-7-sonnet" },
           { name: "clear-fallbacks", required: false, description: "Clear all fallback models for set-model-fallbacks.", example: "--clear-fallbacks=true" },
+          { name: "alias-id", required: false, description: "Model alias id for upsert/remove alias operations.", example: "--alias-id=chat.default" },
+          { name: "strategy", required: false, description: "Model alias routing strategy: auto | ordered | round-robin | weighted-rr | quota-aware-weighted-rr.", example: "--strategy=auto" },
+          { name: "targets", required: false, description: "Model alias target list syntax: <ref>@<weight> (comma/semicolon/space/newline separated).", example: "--targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2" },
+          { name: "fallback-targets", required: false, description: "Model alias fallback target list with same syntax as --targets.", example: "--fallback-targets=openrouter/gpt-4o" },
+          { name: "clear-fallback-targets", required: false, description: "Clear alias fallback target list.", example: "--clear-fallback-targets=true" },
+          { name: "alias-metadata", required: false, description: "Optional alias metadata JSON object.", example: "--alias-metadata={\"owner\":\"router-team\"}" },
+          { name: "bucket-id", required: false, description: "Rate-limit bucket id for set-provider-rate-limits.", example: "--bucket-id=openrouter-all-month" },
+          { name: "bucket-name", required: false, description: "Friendly bucket name (id auto-generated when --bucket-id is omitted).", example: "--bucket-name=\"Monthly cap\"" },
+          { name: "bucket-models", required: false, description: "Bucket model selectors ('all' or comma-separated model ids).", example: "--bucket-models=all" },
+          { name: "bucket-requests", required: false, description: "Bucket request cap (positive integer).", example: "--bucket-requests=20000" },
+          { name: "bucket-window", required: false, description: "Bucket window syntax: <unit>:<size> or <size><unit>.", example: "--bucket-window=month:1" },
+          { name: "remove-bucket", required: false, description: "Remove bucket by --bucket-id in set-provider-rate-limits.", example: "--remove-bucket=true" },
+          { name: "replace-rate-limits", required: false, description: "Replace all provider buckets with provided entries.", example: "--replace-rate-limits=true" },
+          { name: "rate-limits", required: false, description: "Rate-limit bucket JSON object/array for bulk update.", example: "--rate-limits='[{\"id\":\"or-month\",\"models\":[\"all\"],\"requests\":20000,\"window\":{\"unit\":\"month\",\"size\":1}}]'" },
           { name: "format", required: false, description: "Manual format if probe is skipped.", example: "--format=openai" },
           { name: "headers", required: false, description: "Custom provider headers as JSON object (default User-Agent applied when omitted).", example: "--headers={\"User-Agent\":\"Mozilla/5.0\"}" },
           { name: "skip-probe", required: false, description: "Skip live endpoint/model probe.", example: "--skip-probe=true" },
+          { name: "probe-rpm", required: false, description: `Auto-discovery request budget per minute (default ${DEFAULT_PROBE_REQUESTS_PER_MINUTE}).`, example: "--probe-rpm=30" },
           { name: "master-key", required: false, description: "Worker auth token.", example: "--master-key=my-token" },
           { name: "generate-master-key", required: false, description: "Generate a strong master key automatically (set-master-key flow).", example: "--generate-master-key=true" },
           { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
           { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
+          { name: "target-version", required: false, description: "For migrate-config: target schema version.", example: "--target-version=2" },
+          { name: "create-backup", required: false, description: "For migrate-config: create backup before write.", example: "--create-backup=true" },
           { name: "watch-binary", required: false, description: "For startup-install: detect llm-router upgrades and auto-relaunch under OS startup.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require masterKey auth for local start/startup-install.", example: "--require-auth=true" },
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" }
@@ -3588,8 +5457,13 @@ const routerModule = {
         examples: [
           "llm-router config",
           "llm-router config --operation=upsert-provider --provider-id=ramclouds --name=RamClouds --api-key=sk-... --endpoints=https://ramclouds.me,https://ramclouds.me/v1 --models=claude-opus-4-6-thinking,gpt-5.3-codex",
+          "llm-router config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2 --fallback-targets=openrouter/gpt-4o",
+          "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-id=openrouter-all-month --bucket-models=all --bucket-requests=20000 --bucket-window=month:1",
+          "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-name=\"6-hours cap\" --bucket-models=all --bucket-requests=600 --bucket-window=hour:6",
+          "llm-router config --operation=migrate-config --target-version=2 --create-backup=true",
           "llm-router config --operation=set-model-fallbacks --provider-id=openrouter --model=gpt-4o --fallback-models=anthropic/claude-3-7-sonnet,openrouter/gpt-4.1-mini",
           "llm-router config --operation=remove-model --provider-id=openrouter --model=gpt-4o",
+          "llm-router config --operation=list-routing",
           "llm-router config --operation=startup-install"
         ],
         useCases: [

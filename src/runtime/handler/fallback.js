@@ -284,6 +284,16 @@ export async function classifyFailureResult(result, retryPolicy) {
     };
   }
 
+  if (result?.errorKind === "translation_error") {
+    return {
+      category: "invalid_request",
+      retryable: false,
+      retryOrigin: false,
+      allowFallback: false,
+      originCooldownMs: 0
+    };
+  }
+
   if (result?.errorKind === "network_error") {
     return {
       category: "network_error",

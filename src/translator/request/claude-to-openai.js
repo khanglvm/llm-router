@@ -4,6 +4,42 @@
 
 import { FORMATS } from "../formats.js";
 
+function cloneCacheControl(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const type = typeof value.type === "string" ? value.type.trim() : "";
+  if (!type) return undefined;
+  const next = { type };
+  if (typeof value.ttl === "string" && value.ttl.trim()) {
+    next.ttl = value.ttl.trim();
+  }
+  return next;
+}
+
+function convertClaudeSystemToOpenAIContent(system) {
+  if (!system) return null;
+  if (typeof system === "string") return system;
+  if (!Array.isArray(system)) return null;
+
+  const parts = [];
+  for (const block of system) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type !== "text" || typeof block.text !== "string") continue;
+    const cacheControl = cloneCacheControl(block.cache_control);
+    parts.push({
+      type: "text",
+      text: block.text,
+      ...(cacheControl ? { cache_control: cacheControl } : {})
+    });
+  }
+
+  if (parts.length === 0) return null;
+  const hasMetadata = parts.some((part) => Boolean(part.cache_control));
+  if (!hasMetadata && parts.length === 1) {
+    return parts[0].text;
+  }
+  return parts;
+}
+
 /**
  * Convert Claude request to OpenAI format
  */
@@ -25,17 +61,12 @@ export function claudeToOpenAIRequest(model, body, stream) {
   }
 
   // System message
-  if (body.system) {
-    const systemContent = Array.isArray(body.system)
-      ? body.system.map(s => s.text || "").join("\n")
-      : body.system;
-    
-    if (systemContent) {
-      result.messages.push({
-        role: "system",
-        content: systemContent
-      });
-    }
+  const systemContent = convertClaudeSystemToOpenAIContent(body.system);
+  if (systemContent !== null && systemContent !== "") {
+    result.messages.push({
+      role: "system",
+      content: systemContent
+    });
   }
 
   // Convert messages
@@ -57,19 +88,34 @@ export function claudeToOpenAIRequest(model, body, stream) {
 
   // Tools
   if (body.tools && Array.isArray(body.tools)) {
-    result.tools = body.tools.map(tool => ({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.input_schema || { type: "object", properties: {} }
-      }
-    }));
+    result.tools = body.tools.map(tool => {
+      const cacheControl = cloneCacheControl(tool.cache_control);
+      return {
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.input_schema || { type: "object", properties: {} }
+        },
+        ...(cacheControl ? { cache_control: cacheControl } : {})
+      };
+    });
   }
 
   // Tool choice
   if (body.tool_choice) {
     result.tool_choice = convertToolChoice(body.tool_choice);
+  }
+
+  if (typeof body.prompt_cache_key === "string" && body.prompt_cache_key.trim()) {
+    result.prompt_cache_key = body.prompt_cache_key.trim();
+  }
+  if (typeof body.prompt_cache_retention === "string" && body.prompt_cache_retention.trim()) {
+    result.prompt_cache_retention = body.prompt_cache_retention.trim();
+  }
+  const topLevelCacheControl = cloneCacheControl(body.cache_control);
+  if (topLevelCacheControl) {
+    result.cache_control = topLevelCacheControl;
   }
 
   return result;
@@ -129,16 +175,25 @@ function convertClaudeMessage(msg) {
     for (const block of msg.content) {
       switch (block.type) {
         case "text":
-          parts.push({ type: "text", text: block.text });
+          {
+            const cacheControl = cloneCacheControl(block.cache_control);
+            parts.push({
+              type: "text",
+              text: block.text,
+              ...(cacheControl ? { cache_control: cacheControl } : {})
+            });
+          }
           break;
 
         case "image":
           if (block.source?.type === "base64") {
+            const cacheControl = cloneCacheControl(block.cache_control);
             parts.push({
               type: "image_url",
               image_url: {
                 url: `data:${block.source.media_type};base64,${block.source.data}`
-              }
+              },
+              ...(cacheControl ? { cache_control: cacheControl } : {})
             });
           }
           break;
@@ -167,11 +222,15 @@ function convertClaudeMessage(msg) {
             resultContent = JSON.stringify(block.content);
           }
           
-          toolResults.push({
+          {
+            const cacheControl = cloneCacheControl(block.cache_control);
+            toolResults.push({
             role: "tool",
             tool_call_id: block.tool_use_id,
-            content: resultContent
+            content: resultContent,
+            ...(cacheControl ? { cache_control: cacheControl } : {})
           });
+          }
           break;
       }
     }
@@ -189,7 +248,8 @@ function convertClaudeMessage(msg) {
     if (toolCalls.length > 0) {
       const result = { role: "assistant" };
       if (parts.length > 0) {
-        result.content = parts.length === 1 && parts[0].type === "text" 
+        const hasMetadata = parts.some((part) => Boolean(part.cache_control));
+        result.content = parts.length === 1 && parts[0].type === "text" && !hasMetadata
           ? parts[0].text 
           : parts;
       }
@@ -198,9 +258,10 @@ function convertClaudeMessage(msg) {
     }
 
     if (parts.length > 0) {
+      const hasMetadata = parts.some((part) => Boolean(part.cache_control));
       return {
         role,
-        content: parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts
+        content: parts.length === 1 && parts[0].type === "text" && !hasMetadata ? parts[0].text : parts
       };
     }
     

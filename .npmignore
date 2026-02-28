@@ -3,9 +3,14 @@
 *.test.ts
 *.spec.js
 *.spec.ts
+**/*.test.js
+**/*.test.ts
+**/*.spec.js
+**/*.spec.ts
 test/
 tests/
 __tests__/
+**/__tests__/
 scripts/
 
 # Examples and demos

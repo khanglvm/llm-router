@@ -1,4 +1,5 @@
 import {
+  CONFIG_VERSION,
   listConfiguredModels,
   normalizeRuntimeConfig
 } from "../config.js";
@@ -16,7 +17,9 @@ function looksNormalizedConfig(config) {
 
 export async function loadRuntimeConfig(getConfig, env) {
   const raw = await getConfig(env);
-  return looksNormalizedConfig(raw) ? raw : normalizeRuntimeConfig(raw);
+  return looksNormalizedConfig(raw)
+    ? normalizeRuntimeConfig(raw, { migrateToVersion: CONFIG_VERSION })
+    : normalizeRuntimeConfig(raw, { migrateToVersion: CONFIG_VERSION });
 }
 
 export function getCachedModelList(config, endpointFormat) {

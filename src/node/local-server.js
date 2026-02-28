@@ -256,7 +256,8 @@ export async function startLocalRouteServer({
 
   const fetchHandler = createFetchHandler({
     ignoreAuth: !requireAuth,
-    getConfig: () => configStore.getConfig()
+    getConfig: () => configStore.getConfig(),
+    defaultStateStoreBackend: "file"
   });
 
   const fallbackHost = formatHostForUrl(host, port);
@@ -286,8 +287,13 @@ export async function startLocalRouteServer({
 
   const originalClose = server.close.bind(server);
   server.close = (callback) => {
-    configStore.close();
-    return originalClose(callback);
+    Promise.resolve()
+      .then(() => configStore.close())
+      .then(() => (typeof fetchHandler.close === "function" ? fetchHandler.close() : undefined))
+      .finally(() => {
+        originalClose(callback);
+      });
+    return server;
   };
 
   return server;

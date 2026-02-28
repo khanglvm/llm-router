@@ -11,6 +11,8 @@ import { claudeToOpenAINonStreamResponse } from "../../translator/response/claud
 import { shouldRetryStatus } from "./fallback.js";
 import { jsonResponse, passthroughResponseWithCors } from "./http.js";
 import { convertOpenAINonStreamToClaude, handleClaudeStreamToOpenAI, handleOpenAIStreamToClaude } from "./provider-translation.js";
+import { applyCachingMapping, mergeCachingHeaders } from "./cache-mapping.js";
+import { applyReasoningEffortMapping } from "./reasoning-effort.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
 
@@ -66,6 +68,7 @@ export async function makeProviderCall({
   sourceFormat,
   stream,
   candidate,
+  requestHeaders,
   env
 }) {
   const provider = candidate.provider;
@@ -74,12 +77,47 @@ export async function makeProviderCall({
 
   let providerBody = { ...body };
   if (translate) {
-    providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
+    try {
+      providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
+    } catch (error) {
+      return {
+        ok: false,
+        status: 400,
+        retryable: false,
+        errorKind: "translation_error",
+        response: jsonResponse({
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: `Request translation failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        }, 400)
+      };
+    }
   }
   providerBody.model = candidate.backend;
+  providerBody = applyCachingMapping({
+    originalBody: body,
+    providerBody,
+    sourceFormat,
+    targetFormat,
+    requestHeaders
+  });
+  providerBody = applyReasoningEffortMapping({
+    originalBody: body,
+    providerBody,
+    sourceFormat,
+    targetFormat,
+    targetModel: candidate.backend,
+    requestHeaders
+  });
 
   const providerUrl = resolveProviderUrl(provider, targetFormat);
-  const headers = buildProviderHeaders(provider, env, targetFormat);
+  const headers = mergeCachingHeaders(
+    buildProviderHeaders(provider, env, targetFormat),
+    requestHeaders,
+    targetFormat
+  );
 
   if (!providerUrl) {
     return {

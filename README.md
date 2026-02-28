@@ -14,6 +14,18 @@ It supports:
 npm i -g @khanglvm/llm-router
 ```
 
+## Versioning
+
+- Follows [Semantic Versioning](https://semver.org/).
+- Release notes live in [`CHANGELOG.md`](./CHANGELOG.md).
+- npm publishes are configured for the public registry package.
+
+Release checklist:
+- Update `README.md` if user-facing behavior changed.
+- Add a dated entry in `CHANGELOG.md`.
+- Bump the package version before publish.
+- Publish with `npm publish`.
+
 ## Quick Start
 
 ```bash
@@ -45,17 +57,34 @@ llm-router config \
   --format=openai \
   --skip-probe=true
 
-# 2) (Optional) Configure model fallback order
+# 2) (Optional) Configure model fallback order for direct provider/model requests
 llm-router config \
   --operation=set-model-fallbacks \
   --provider-id=openrouter \
   --model=claude-3-7-sonnet \
   --fallback-models=openrouter/gpt-4o
 
-# 3) Set master key (this is your gateway key for client apps)
+# 3) (Optional) Create a model alias with a routing strategy and weighted targets
+llm-router config \
+  --operation=upsert-model-alias \
+  --alias-id=chat.default \
+  --strategy=auto \
+  --targets=openrouter/claude-3-7-sonnet@2,openrouter/gpt-4o@1 \
+  --fallback-targets=openrouter/gpt-4o-mini
+
+# 4) (Optional) Add provider request-cap bucket (models: all)
+llm-router config \
+  --operation=set-provider-rate-limits \
+  --provider-id=openrouter \
+  --bucket-name="Monthly cap" \
+  --bucket-models=all \
+  --bucket-requests=20000 \
+  --bucket-window=month:1
+
+# 5) Set master key (this is your gateway key for client apps)
 llm-router config --operation=set-master-key --master-key=gw_your_gateway_key
 
-# 4) Start gateway with auth required
+# 6) Start gateway with auth required
 llm-router start --require-auth=true
 ```
 
@@ -79,6 +108,109 @@ Claude Code example (`~/.claude/settings.local.json`):
 - Auth and permission failures (`401` and relevant `403` cases): no retry; fallback to other providers/models when possible.
 - Policy/moderation blocks: no retry; cross-provider fallback is disabled by default (`LLM_ROUTER_ALLOW_POLICY_FALLBACK=false`).
 - Invalid client requests (`400`, `413`, `422`): no retry and no fallback short-circuit.
+
+## Model Alias Routing Strategies
+
+A model alias groups multiple models from different providers under one model name.
+
+Use `--strategy` when creating or updating a model alias:
+
+- `auto`: Recommended set-and-forget mode. Automatically routes using quota, cooldown, and health signals to reduce rate-limit failures.
+- `ordered`: Tries targets in list order.
+- `round-robin`: Rotates evenly across eligible targets.
+- `weighted-rr`: Rotates like round-robin, but favors higher weights.
+- `quota-aware-weighted-rr`: Weighted routing plus remaining-capacity awareness.
+
+Example:
+
+```bash
+llm-router config \
+  --operation=upsert-model-alias \
+  --alias-id=coding \
+  --strategy=auto \
+  --targets=rc/gpt-5.3-codex,zai/glm-5
+```
+
+Concrete model alias example with provider-specific caps:
+
+```bash
+llm-router config \
+  --operation=upsert-model-alias \
+  --alias-id=coding \
+  --strategy=auto \
+  --targets=rc/gpt-5.3-codex,zai/glm-5
+
+llm-router config \
+  --operation=set-provider-rate-limits \
+  --provider-id=rc \
+  --bucket-name="Minute cap" \
+  --bucket-models=gpt-5.3-codex \
+  --bucket-requests=60 \
+  --bucket-window=minute:1
+
+llm-router config \
+  --operation=set-provider-rate-limits \
+  --provider-id=zai \
+  --bucket-name="5-hours cap" \
+  --bucket-models=glm-5 \
+  --bucket-requests=600 \
+  --bucket-window=hour:5
+```
+
+## What Is A Bucket?
+
+A rate-limit bucket is a request cap for a time window.
+
+Examples:
+- `40 req / 1 minute`
+- `600 req / 6 hours`
+
+Multiple buckets can apply to the same model scope at the same time. A candidate is treated as exhausted if any matching bucket is exhausted.
+
+## TUI Bucket Walkthrough
+
+Use the config manager and select:
+- `Manage provider rate-limit buckets`
+- `Create bucket(s)`
+
+The TUI now guides you through:
+- Bucket name (friendly label)
+- Model scope (`all` or selected models with multiselect checkboxes)
+- Request cap
+- Window unit (`minute`, `hour(s)`, `week`, `month`)
+- Window size (hours support `N`, other preset units lock to `1`)
+- Review + optional add-another loop for combined policies
+
+Internal bucket ids are generated automatically from the name when omitted and shown as advanced detail in review.
+
+## Combined-Cap Recipe (`40/min` + `600/6h`)
+
+```bash
+llm-router config \
+  --operation=set-provider-rate-limits \
+  --provider-id=openrouter \
+  --bucket-name="Minute cap" \
+  --bucket-models=all \
+  --bucket-requests=40 \
+  --bucket-window=minute:1
+
+llm-router config \
+  --operation=set-provider-rate-limits \
+  --provider-id=openrouter \
+  --bucket-name="6-hours cap" \
+  --bucket-models=all \
+  --bucket-requests=600 \
+  --bucket-window=hour:6
+```
+
+This keeps both limits active together for the same model scope.
+
+## Rate-Limit Troubleshooting
+
+- Check routing decisions with `LLM_ROUTER_DEBUG_ROUTING=true` and inspect `x-llm-router-skipped-candidates`.
+- `quota-exhausted` means proactive pre-routing skip happened before an upstream call.
+- For provider `429`, cooldown is tracked from `Retry-After` when present, or from `LLM_ROUTER_ORIGIN_RATE_LIMIT_COOLDOWN_MS`.
+- Local mode persists state by default (file backend), while Worker defaults to in-memory state.
 
 ## Main Commands
 
@@ -104,7 +236,55 @@ llm-router config \
   --models=gpt-4o,claude-3-7-sonnet \
   --format=openai \
   --skip-probe=true
+
+llm-router config \
+  --operation=upsert-model-alias \
+  --alias-id=chat.default \
+  --strategy=auto \
+  --targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2 \
+  --fallback-targets=openrouter/gpt-4o
+
+llm-router config \
+  --operation=set-provider-rate-limits \
+  --provider-id=openrouter \
+  --bucket-name="Monthly cap" \
+  --bucket-models=all \
+  --bucket-requests=20000 \
+  --bucket-window=month:1
 ```
+
+Alias target syntax:
+- `--targets` / `--fallback-targets`: `<routeRef>@<weight>` or `<routeRef>:<weight>`
+- route refs: direct `provider/model` or alias id
+
+Routing strategy values:
+- `auto` (recommended)
+- `ordered`
+- `round-robin`
+- `weighted-rr`
+- `quota-aware-weighted-rr`
+
+Rate-limit bucket window syntax:
+- `--bucket-window=month:1`
+- `--bucket-window=1w`
+- `--bucket-window=7day`
+
+Routing summary:
+
+```bash
+llm-router config --operation=list-routing
+```
+
+Explicit schema migration with backup:
+
+```bash
+llm-router config --operation=migrate-config --target-version=2 --create-backup=true
+```
+
+Automatic version handling:
+- Local config loads with silent forward-migration to latest supported schema.
+- Migration is persisted automatically on read when possible (best-effort, no interactive prompt).
+- Future/newer version numbers do not fail only because of version mismatch; known fields are normalized best-effort.
 
 Set local auth key:
 
@@ -140,12 +320,11 @@ For multi-account tokens, set account explicitly in non-interactive runs:
 
 `llm-router deploy` resolves deploy target from CLI/TUI input (workers.dev or custom route), generates a temporary Wrangler config at runtime, deploys with `--config`, then removes that temporary file. Personal route/account details are not persisted back into repo `wrangler.toml`.
 
-You can pass deploy target directly in CLI:
-- `--workers-dev=true`
-- `--route-pattern=router.example.com/* --zone-name=example.com`
-- or shorthand `--domain=router.example.com --zone-name=example.com`
-
-### Option B: Explicit steps
+For custom domains, the deploy helper now prints a DNS checklist and connectivity commands. Common setup for `llm.example.com`:
+- Create a DNS record in Cloudflare for `llm` (usually `CNAME llm -> @`)
+- Set **Proxy status = Proxied** (orange cloud)
+- Use route target `--route-pattern=llm.example.com/* --zone-name=example.com`
+- Claude Code base URL should be `https://llm.example.com/anthropic` (**no `:8787`**; that port is local-only)
 
 ```bash
 llm-router deploy --export-only=true --out=.llm-router.worker.json
@@ -207,8 +386,21 @@ Minimal shape:
 
 ```json
 {
+  "version": 2,
   "masterKey": "local_or_worker_key",
-  "defaultModel": "openrouter/gpt-4o",
+  "defaultModel": "chat.default",
+  "modelAliases": {
+    "chat.default": {
+      "strategy": "auto",
+      "targets": [
+        { "ref": "openrouter/gpt-4o" },
+        { "ref": "anthropic/claude-3-5-haiku" }
+      ],
+      "fallbackTargets": [
+        { "ref": "openrouter/gpt-4o-mini" }
+      ]
+    }
+  },
   "providers": [
     {
       "id": "openrouter",
@@ -216,11 +408,28 @@ Minimal shape:
       "baseUrl": "https://openrouter.ai/api/v1",
       "apiKey": "sk-or-v1-...",
       "formats": ["openai"],
-      "models": [{ "id": "gpt-4o" }]
+      "models": [{ "id": "gpt-4o" }],
+      "rateLimits": [
+        {
+          "id": "openrouter-all-month",
+          "name": "Monthly cap",
+          "models": ["all"],
+          "requests": 20000,
+          "window": { "unit": "month", "size": 1 }
+        }
+      ]
     }
   ]
 }
 ```
+
+Direct vs model alias routing:
+- Direct route: request `model=provider/model` and optional model-level `fallbackModels` applies.
+- Model alias route: request `model=alias.id` (or set as `defaultModel`) and the model alias `targets` + `strategy` drive balancing. `auto` is the recommended default for new model aliases.
+
+State durability caveats:
+- Local Node (`llm-router start`): routing state defaults to file-backed local persistence, so cooldowns/caps survive restarts.
+- Cloudflare Worker: default state is in-memory per isolate for now; long-window counters are best-effort until a durable Worker backend is configured.
 
 ## Smoke Test
 

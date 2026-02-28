@@ -7,6 +7,21 @@ import { FORMATS } from "../translator/index.js";
 import { resolveProviderUrl } from "../runtime/config.js";
 
 const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_PROBE_REQUESTS_PER_MINUTE = 30;
+const DEFAULT_RATE_LIMIT_MAX_RETRIES = 3;
+const MIN_RATE_LIMIT_WAIT_MS = 250;
+
+function normalizePositiveInteger(value, fallback, { min = 1, max = 1_000_000 } = {}) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < min) return fallback;
+  return Math.min(parsed, max);
+}
+
+function sleep(ms) {
+  const waitMs = Number(ms);
+  if (!Number.isFinite(waitMs) || waitMs <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, waitMs));
+}
 
 function makeProviderShell(baseUrl) {
   return {
@@ -206,6 +221,36 @@ function getResultMessage(result) {
   return String(getErrorMessage(result.json, result.text) || "").trim();
 }
 
+function readHeader(headers, name) {
+  if (!headers || typeof headers !== "object") return "";
+  const direct = headers[name];
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  const target = String(name || "").toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key || "").toLowerCase() !== target) continue;
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function parseRetryAfterMs(headers) {
+  const retryAfter = readHeader(headers, "retry-after");
+  if (!retryAfter) return 0;
+
+  const asNumber = Number(retryAfter);
+  if (Number.isFinite(asNumber) && asNumber >= 0) {
+    return Math.round(asNumber * 1000);
+  }
+
+  const asDate = Date.parse(retryAfter);
+  if (Number.isFinite(asDate)) {
+    return Math.max(0, asDate - Date.now());
+  }
+
+  return 0;
+}
+
 function truncateMessage(value, max = 220) {
   const text = String(value || "").trim();
   if (!text) return "";
@@ -258,6 +303,24 @@ function isTransientModelRuntimeError(result, message) {
   return patterns.some((pattern) => pattern.test(text));
 }
 
+function isRateLimitResult(result, message) {
+  const status = Number(result?.status || 0);
+  if (status === 429) return true;
+
+  const text = String(message || "").toLowerCase();
+  if (!text) return false;
+  const patterns = [
+    /rate limit/,
+    /too many requests/,
+    /requests per minute/,
+    /rpm/,
+    /quota.*exceeded/,
+    /retry-after/,
+    /retry after/
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+}
+
 function classifyModelProbeResult(format, result) {
   const message = getResultMessage(result);
 
@@ -276,6 +339,16 @@ function classifyModelProbeResult(format, result) {
       confirmed: true,
       outcome: "ok",
       message: "ok"
+    };
+  }
+
+  if (isRateLimitResult(result, message)) {
+    return {
+      supported: false,
+      confirmed: false,
+      outcome: "rate-limit",
+      message: message || "Rate limit reached for this endpoint.",
+      retryAfterMs: parseRetryAfterMs(result.headers)
     };
   }
 
@@ -308,7 +381,7 @@ function classifyModelProbeResult(format, result) {
 
   if (isTransientModelRuntimeError(result, message)) {
     return {
-      supported: true,
+      supported: false,
       confirmed: false,
       outcome: "runtime-error",
       message: message || "Request reached endpoint but failed with transient runtime error."
@@ -371,8 +444,10 @@ async function probeModelForFormat({
 }) {
   const url = resolveProviderUrl(makeProviderShell(baseUrl), format);
   const authVariants = orderAuthVariants(makeAuthVariants(format, apiKey), preferredAuthType);
+  let requestCount = 0;
 
   for (const variant of authVariants) {
+    requestCount += 1;
     const headers = makeProbeHeaders(format, extraHeaders, variant.headers);
     const result = await safeFetchJson(url, {
       method: "POST",
@@ -391,7 +466,9 @@ async function probeModelForFormat({
         message: classified.outcome === "ok"
           ? "ok"
           : truncateMessage(classified.message || getResultMessage(result)),
-        error: result.error || null
+        error: result.error || null,
+        retryAfterMs: Number(classified.retryAfterMs || 0),
+        requestCount
       };
     }
 
@@ -407,7 +484,23 @@ async function probeModelForFormat({
         authType: variant.type,
         status: result.status,
         message: truncateMessage(classified.message),
-        error: result.error || null
+        error: result.error || null,
+        retryAfterMs: Number(classified.retryAfterMs || 0),
+        requestCount
+      };
+    }
+
+    if (classified.outcome === "rate-limit" || classified.outcome === "runtime-error" || classified.outcome === "unconfirmed") {
+      return {
+        supported: false,
+        confirmed: false,
+        outcome: classified.outcome,
+        authType: variant.type,
+        status: result.status,
+        message: truncateMessage(classified.message),
+        error: result.error || null,
+        retryAfterMs: Number(classified.retryAfterMs || 0),
+        requestCount
       };
     }
   }
@@ -419,7 +512,9 @@ async function probeModelForFormat({
     authType: null,
     status: 0,
     message: "Could not validate model support for this endpoint/format.",
-    error: null
+    error: null,
+    retryAfterMs: 0,
+    requestCount
   };
 }
 
@@ -615,34 +710,34 @@ function normalizeEndpointList(rawEndpoints, fallbackBaseUrl = "") {
   return dedupeStrings(values);
 }
 
+function endpointPreferenceScore(endpoint, format) {
+  const path = normalizeUrlPathForScoring(endpoint);
+  const looksVersioned = /\/v\d+(?:\.\d+)?$/i.test(path);
+  const hasOpenAIHint = /\/openai(?:\/|$)/i.test(path);
+  const hasAnthropicHint = /\/anthropic(?:\/|$)|\/claude(?:\/|$)/i.test(path);
+
+  if (format === FORMATS.OPENAI) {
+    if (hasOpenAIHint) return 100;
+    if (looksVersioned) return 90;
+    if (path === "/" || path === "") return 10;
+    return 50;
+  }
+  if (format === FORMATS.CLAUDE) {
+    if (hasAnthropicHint) return 100;
+    if (path === "/" || path === "") return 90;
+    if (looksVersioned) return 10;
+    return 50;
+  }
+  return 0;
+}
+
 function pickBestEndpointForFormat(endpointRows, format) {
-  const endpointPreferenceScore = (endpoint) => {
-    const path = normalizeUrlPathForScoring(endpoint);
-    const looksVersioned = /\/v\d+(?:\.\d+)?$/i.test(path);
-    const hasOpenAIHint = /\/openai(?:\/|$)/i.test(path);
-    const hasAnthropicHint = /\/anthropic(?:\/|$)|\/claude(?:\/|$)/i.test(path);
-
-    if (format === FORMATS.OPENAI) {
-      if (hasOpenAIHint) return 100;
-      if (looksVersioned) return 90;
-      if (path === "/" || path === "") return 10;
-      return 50;
-    }
-    if (format === FORMATS.CLAUDE) {
-      if (hasAnthropicHint) return 100;
-      if (path === "/" || path === "") return 90;
-      if (looksVersioned) return 10;
-      return 50;
-    }
-    return 0;
-  };
-
   const candidates = endpointRows
     .filter((row) => (row.workingFormats || []).includes(format))
     .map((row) => ({
       row,
       score: (row.modelsByFormat?.[format] || []).length,
-      pref: endpointPreferenceScore(row.endpoint)
+      pref: endpointPreferenceScore(row.endpoint, format)
     }))
     .sort((a, b) => {
       if (b.pref !== a.pref) return b.pref - a.pref;
@@ -650,6 +745,34 @@ function pickBestEndpointForFormat(endpointRows, format) {
       return 0;
     });
   return candidates[0]?.row || null;
+}
+
+function guessModelProbePreferredFormat(modelId) {
+  const id = String(modelId || "").trim().toLowerCase();
+  if (!id) return null;
+  if (id.includes("claude")) return FORMATS.CLAUDE;
+  if (id.includes("gpt")) return FORMATS.OPENAI;
+  return null;
+}
+
+function buildModelProbeCandidates(modelId, endpointRows) {
+  const preferredFormat = guessModelProbePreferredFormat(modelId);
+  const candidates = [];
+  for (const row of (endpointRows || [])) {
+    for (const format of (row.formatsToTest || [])) {
+      const preferredScore = preferredFormat && preferredFormat === format ? 1000 : 0;
+      candidates.push({
+        row,
+        format,
+        score: preferredScore + endpointPreferenceScore(row.endpoint, format)
+      });
+    }
+  }
+  return candidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.row.rowIndex !== b.row.rowIndex) return a.row.rowIndex - b.row.rowIndex;
+    return a.format.localeCompare(b.format);
+  });
 }
 
 function guessNativeModelFormat(modelId) {
@@ -680,6 +803,18 @@ export async function probeProviderEndpointMatrix(options) {
   const emitProgress = makeProgressEmitter(options?.onProgress);
   const apiKey = String(options?.apiKey || "").trim();
   const timeoutMs = Number.isFinite(options?.timeoutMs) ? Number(options.timeoutMs) : DEFAULT_TIMEOUT_MS;
+  const requestsPerMinute = normalizePositiveInteger(
+    options?.requestsPerMinute ?? options?.probeRequestsPerMinute,
+    DEFAULT_PROBE_REQUESTS_PER_MINUTE
+  );
+  const maxRateLimitRetries = normalizePositiveInteger(
+    options?.maxRateLimitRetries,
+    DEFAULT_RATE_LIMIT_MAX_RETRIES,
+    { min: 0, max: 10 }
+  );
+  const now = typeof options?.now === "function" ? options.now : () => Date.now();
+  const delay = typeof options?.sleep === "function" ? options.sleep : sleep;
+  const minProbeIntervalMs = Math.max(1, Math.ceil(60000 / Math.max(1, requestsPerMinute)));
   const extraHeaders = options?.headers && typeof options.headers === "object" && !Array.isArray(options.headers)
     ? options.headers
     : {};
@@ -698,13 +833,11 @@ export async function probeProviderEndpointMatrix(options) {
 
   const endpointRows = [];
   const modelFormatsMap = {};
+  const modelOwnerById = new Map();
+  const unresolvedModelSet = new Set(models);
+  const rateLimitFailures = [];
   const warnings = [];
-
-  let completedChecks = 0;
-  let totalChecks = 0;
-  for (const endpoint of endpoints) {
-    totalChecks += 2 * models.length;
-  }
+  let nextAllowedModelProbeAt = 0;
 
   for (let endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex += 1) {
     const endpoint = endpoints[endpointIndex];
@@ -751,21 +884,54 @@ export async function probeProviderEndpointMatrix(options) {
     });
 
     for (const format of formatsToTest) {
-      const workingModels = [];
-      modelsByFormat[format] = workingModels;
-      const preferredAuthType = endpointProbe.authByFormat?.[format]?.type;
+      modelsByFormat[format] = [];
+    }
 
-      emitProgress({
-        phase: "format-start",
-        endpoint,
-        format,
-        endpointIndex: endpointIndex + 1,
-        endpointCount: endpoints.length,
-        modelCount: models.length
-      });
+    endpointRows.push({
+      endpoint,
+      rowIndex: endpointIndex,
+      supportedFormats: dedupeStrings(initialSupportedFormats),
+      workingFormats: dedupeStrings(initialWorkingFormats),
+      preferredFormat: endpointProbe.preferredFormat,
+      authByFormat: rowAuthByFormat,
+      modelsByFormat,
+      modelChecks,
+      details: endpointProbe.details,
+      formatsToTest
+    });
+  }
 
-      for (const modelId of models) {
-        const check = await probeModelForFormat({
+  const totalChecks = models.length * endpointRows.reduce((sum, row) => sum + (row.formatsToTest?.length || 0), 0);
+  let completedChecks = 0;
+
+  for (const modelId of models) {
+    const candidates = buildModelProbeCandidates(modelId, endpointRows);
+    for (const candidate of candidates) {
+      const row = candidate.row;
+      const endpoint = row.endpoint;
+      const format = candidate.format;
+      const preferredAuthType = row.authByFormat?.[format]?.type;
+
+      let check = null;
+      let retriesUsed = 0;
+      while (true) {
+        const beforeCallMs = now();
+        const pacingWaitMs = Math.max(0, nextAllowedModelProbeAt - beforeCallMs);
+        if (pacingWaitMs > 0) {
+          emitProgress({
+            phase: "rate-limit-wait",
+            reason: "pacing",
+            endpoint,
+            format,
+            model: modelId,
+            waitMs: pacingWaitMs,
+            retryAttempt: retriesUsed,
+            maxRetries: maxRateLimitRetries
+          });
+          await delay(pacingWaitMs);
+        }
+
+        check = await probeModelForFormat({
           baseUrl: endpoint,
           format,
           apiKey,
@@ -774,73 +940,133 @@ export async function probeProviderEndpointMatrix(options) {
           extraHeaders,
           preferredAuthType
         });
-        modelChecks.push({
-          endpoint,
-          format,
-          model: modelId,
-          supported: check.supported,
-          confirmed: check.confirmed,
-          outcome: check.outcome,
-          status: check.status,
-          authType: check.authType,
-          message: check.message,
-          error: check.error
-        });
-        completedChecks += 1;
-        emitProgress({
-          phase: "model-check",
-          endpoint,
-          format,
-          model: modelId,
-          supported: check.supported,
-          confirmed: check.confirmed,
-          outcome: check.outcome,
-          status: check.status,
-          message: check.message,
-          error: check.error,
-          completedChecks,
-          totalChecks
-        });
 
-        if (!check.supported) continue;
-        workingModels.push(modelId);
-        if (!rowAuthByFormat[format] && check.authType) {
-          rowAuthByFormat[format] = { type: check.authType === "x-api-key" ? "x-api-key" : "bearer" };
+        const requestCount = Math.max(1, Number(check.requestCount || 1));
+        const anchor = Math.max(nextAllowedModelProbeAt, beforeCallMs);
+        nextAllowedModelProbeAt = anchor + (minProbeIntervalMs * requestCount);
+
+        if (check.outcome !== "rate-limit") break;
+
+        if (retriesUsed >= maxRateLimitRetries) {
+          check = {
+            ...check,
+            supported: false,
+            confirmed: false,
+            outcome: "rate-limit-max-retries",
+            message: `Rate limit persisted after ${maxRateLimitRetries} retries.`,
+            maxRateLimitRetriesExceeded: true
+          };
+          rateLimitFailures.push({
+            endpoint,
+            format,
+            model: modelId,
+            retries: retriesUsed,
+            status: check.status,
+            message: check.message
+          });
+          break;
         }
-        if (!modelFormatsMap[modelId]) modelFormatsMap[modelId] = new Set();
-        modelFormatsMap[modelId].add(format);
-      }
-    }
 
-    const inferredWorkingFormats = dedupeStrings(formatsToTest.filter((format) => (modelsByFormat[format] || []).length > 0));
+        retriesUsed += 1;
+        const retryWaitMs = Math.max(
+          minProbeIntervalMs,
+          Number(check.retryAfterMs || 0),
+          MIN_RATE_LIMIT_WAIT_MS
+        );
+        emitProgress({
+          phase: "rate-limit-wait",
+          reason: "rate-limit",
+          endpoint,
+          format,
+          model: modelId,
+          waitMs: retryWaitMs,
+          retryAttempt: retriesUsed,
+          maxRetries: maxRateLimitRetries,
+          status: check.status,
+          message: check.message
+        });
+        await delay(retryWaitMs);
+      }
+
+      if (!check) {
+        check = {
+          supported: false,
+          confirmed: false,
+          outcome: "unknown",
+          status: 0,
+          authType: null,
+          message: "Could not validate model support for this endpoint/format.",
+          error: null
+        };
+      }
+
+      row.modelChecks.push({
+        endpoint,
+        format,
+        model: modelId,
+        supported: check.supported,
+        confirmed: check.confirmed,
+        outcome: check.outcome,
+        status: check.status,
+        authType: check.authType,
+        message: check.message,
+        error: check.error
+      });
+      completedChecks += 1;
+      emitProgress({
+        phase: "model-check",
+        endpoint,
+        format,
+        model: modelId,
+        supported: check.supported,
+        confirmed: check.confirmed,
+        outcome: check.outcome,
+        status: check.status,
+        message: check.message,
+        error: check.error,
+        completedChecks,
+        totalChecks
+      });
+
+      if (!check.supported || !check.confirmed) continue;
+      row.modelsByFormat[format].push(modelId);
+      if (!row.authByFormat[format] && check.authType) {
+        row.authByFormat[format] = { type: check.authType === "x-api-key" ? "x-api-key" : "bearer" };
+      }
+      if (!modelFormatsMap[modelId]) modelFormatsMap[modelId] = new Set();
+      modelFormatsMap[modelId].add(format);
+      modelOwnerById.set(modelId, { endpoint, format, source: check.outcome || "probe-response" });
+      unresolvedModelSet.delete(modelId);
+      break;
+    }
+  }
+
+  for (const row of endpointRows) {
+    const inferredWorkingFormats = dedupeStrings([
+      ...(row.workingFormats || []),
+      ...(row.formatsToTest || []).filter((format) => (row.modelsByFormat?.[format] || []).length > 0)
+    ]);
     const inferredSupportedFormats = dedupeStrings([
-      ...initialSupportedFormats,
+      ...(row.supportedFormats || []),
       ...inferredWorkingFormats
     ]);
-
-    endpointRows.push({
-      endpoint,
-      supportedFormats: inferredSupportedFormats,
-      workingFormats: inferredWorkingFormats,
-      preferredFormat: endpointProbe.preferredFormat,
-      authByFormat: rowAuthByFormat,
-      modelsByFormat,
-      modelChecks,
-      details: endpointProbe.details
-    });
+    row.workingFormats = inferredWorkingFormats;
+    row.supportedFormats = inferredSupportedFormats;
 
     emitProgress({
       phase: "endpoint-done",
-      endpoint,
-      endpointIndex: endpointIndex + 1,
+      endpoint: row.endpoint,
+      endpointIndex: Number(row.rowIndex || 0) + 1,
       endpointCount: endpoints.length,
       workingFormats: inferredWorkingFormats,
-      modelsByFormat
+      modelsByFormat: row.modelsByFormat
     });
   }
 
-  const openaiEndpoint = pickBestEndpointForFormat(endpointRows, FORMATS.OPENAI);
-  const claudeEndpoint = pickBestEndpointForFormat(endpointRows, FORMATS.CLAUDE);
+  const resultRows = endpointRows.map(({ formatsToTest, rowIndex, ...row }) => row);
+
+  const openaiEndpoint = pickBestEndpointForFormat(resultRows, FORMATS.OPENAI);
+  const claudeEndpoint = pickBestEndpointForFormat(resultRows, FORMATS.CLAUDE);
 
   const baseUrlByFormat = {};
   if (openaiEndpoint) baseUrlByFormat[FORMATS.OPENAI] = openaiEndpoint.endpoint;
@@ -855,10 +1081,17 @@ export async function probeProviderEndpointMatrix(options) {
   }
 
   const workingFormats = Object.keys(baseUrlByFormat);
-  const formats = dedupeStrings(endpointRows.flatMap((row) => row.supportedFormats || []));
-  const modelSupport = Object.fromEntries(
-    Object.entries(modelFormatsMap).map(([model, formatsSet]) => [model, [...formatsSet]])
-  );
+  const formats = dedupeStrings(resultRows.flatMap((row) => row.supportedFormats || []));
+  const selectedEndpointByFormat = {};
+  if (openaiEndpoint) selectedEndpointByFormat[FORMATS.OPENAI] = openaiEndpoint.endpoint;
+  if (claudeEndpoint) selectedEndpointByFormat[FORMATS.CLAUDE] = claudeEndpoint.endpoint;
+  const confirmedModelSupportEntries = [];
+  for (const [modelId, owner] of modelOwnerById.entries()) {
+    const selectedEndpoint = selectedEndpointByFormat[owner.format];
+    if (!selectedEndpoint || owner.endpoint !== selectedEndpoint) continue;
+    confirmedModelSupportEntries.push([modelId, [owner.format]]);
+  }
+  const modelSupport = Object.fromEntries(confirmedModelSupportEntries);
   const preferredFormat =
     (workingFormats.includes(FORMATS.CLAUDE) && FORMATS.CLAUDE) ||
     (workingFormats.includes(FORMATS.OPENAI) && FORMATS.OPENAI) ||
@@ -872,12 +1105,30 @@ export async function probeProviderEndpointMatrix(options) {
       .filter(([, preferred]) => Boolean(preferred))
   );
   const supportedModels = dedupeStrings(Object.keys(modelSupport));
+  const unresolvedModels = dedupeStrings([
+    ...unresolvedModelSet,
+    ...models.filter((modelId) => !supportedModels.includes(modelId))
+  ]);
+  const manualFallbackRecommended =
+    rateLimitFailures.length > 0 ||
+    workingFormats.length === 0 ||
+    supportedModels.length === 0 ||
+    unresolvedModels.length > 0;
+  const failureScope = manualFallbackRecommended
+    ? (workingFormats.length > 0 ? "partial" : "full")
+    : "none";
 
   if (workingFormats.length === 0) {
     warnings.push("No working endpoint format detected with provided API key.");
   }
   if (supportedModels.length === 0) {
     warnings.push("No provided model was confirmed as working on the detected endpoints.");
+  }
+  if (rateLimitFailures.length > 0) {
+    warnings.push(`Rate limit retries were exhausted for ${rateLimitFailures.length} endpoint-model check(s).`);
+  }
+  if (unresolvedModels.length > 0) {
+    warnings.push(`${unresolvedModels.length} model(s) were not fully auto-discovered and require manual confirmation.`);
   }
 
   emitProgress({
@@ -899,7 +1150,13 @@ export async function probeProviderEndpointMatrix(options) {
     models: supportedModels,
     modelSupport,
     modelPreferredFormat,
-    endpointMatrix: endpointRows,
-    warnings
+    endpointMatrix: resultRows,
+    warnings,
+    unresolvedModels,
+    rateLimitFailures,
+    requestsPerMinute,
+    maxRateLimitRetries,
+    manualFallbackRecommended,
+    failureScope
   };
 }

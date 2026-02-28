@@ -7,7 +7,8 @@ import { createFetchHandler } from "./runtime/handler.js";
 import { runtimeConfigFromEnv } from "./runtime/config.js";
 
 const workerFetch = createFetchHandler({
-  getConfig: async (env) => runtimeConfigFromEnv(env)
+  getConfig: async (env) => runtimeConfigFromEnv(env),
+  defaultStateStoreBackend: "memory"
 });
 
 export default {
@@ -15,4 +16,3 @@ export default {
     return workerFetch(request, env, ctx);
   }
 };
-

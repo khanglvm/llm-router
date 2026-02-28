@@ -11,3 +11,9 @@ node_modules/
 .env.*
 !.env.example
 !.env.test-suite.example
+
+# Local working folders
+/tmp/
+/plans/
+/researches/
+/docs/
