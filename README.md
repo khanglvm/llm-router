@@ -150,6 +150,79 @@ Claude Code example (`~/.claude/settings.local.json`):
 }
 ```
 
+## Amp CLI Routing
+
+`llm-router` now recognizes Amp endpoint patterns:
+- `/api/internal`
+- `/api/provider/{provider}/...`
+
+Amp requests can be mapped in router config with `ampRouting`.
+
+Example:
+
+```json
+{
+  "defaultModel": "chat.default",
+  "ampRouting": {
+    "enabled": true,
+    "fallbackRoute": "chat.default",
+    "modeMap": {
+      "smart": "chat.default",
+      "deep": "chat.deep"
+    },
+    "agentMap": {
+      "review": "chat.review"
+    },
+    "agentModeMap": {
+      "review": {
+        "deep": "chat.review.deep"
+      }
+    },
+    "applicationMap": {
+      "cli execute mode": "chat.default"
+    },
+    "modelMap": {
+      "claude-haiku-4-5-20251001": "chat.default",
+      "google/gemini-3-pro-preview": "chat.default"
+    }
+  }
+}
+```
+
+Routing precedence for Amp requests:
+1. `agentModeMap`
+2. `modeMap`
+3. `agentMap`
+4. `applicationMap`
+5. `modelMap`
+6. `fallbackRoute`
+
+If no mapping is found, Amp traffic falls back to `smart` (which resolves to `defaultModel`).
+
+Set `"ampRouting": { "enabled": false }` to disable Amp overrides.
+
+Debugging Amp requests:
+- Set `LLM_ROUTER_DEBUG_AMP_CAPTURE=true` to emit redacted request-signature capture logs for Amp request families.
+- Set `LLM_ROUTER_DEBUG_ROUTING=true` to add route-debug headers to responses, including:
+  - `x-llm-router-amp-detected`
+  - `x-llm-router-amp-mode`
+  - `x-llm-router-amp-agent`
+  - `x-llm-router-amp-application`
+  - `x-llm-router-amp-requested-model`
+  - `x-llm-router-amp-matched-by`
+  - `x-llm-router-amp-matched-ref`
+
+Troubleshooting:
+- Amp request is not detected:
+  - Confirm the client is hitting `/api/internal` or `/api/provider/{provider}/...`.
+  - Confirm Amp headers such as `x-amp-client-application` are reaching `llm-router`.
+- Expected mode/agent mapping is not used:
+  - Current live Amp traffic may not send explicit mode/agent fields on every request.
+  - When mode/agent is absent, matching falls through to `applicationMap`, `modelMap`, then `fallbackRoute`.
+- Config fails validation:
+  - Every `ampRouting` target must resolve to an existing alias or valid `provider/model` ref.
+  - Unknown alias refs are rejected during config validation before runtime.
+
 ## Real-Time Update Experience
 
 When local server is running:

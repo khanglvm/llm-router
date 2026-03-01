@@ -449,8 +449,76 @@ function normalizeModelAliases(rawModelAliases) {
   };
 }
 
+function normalizeAmpRouteRefMap(rawMap, {
+  normalizeKey = (value) => String(value || "").trim()
+} = {}) {
+  if (!rawMap || typeof rawMap !== "object" || Array.isArray(rawMap)) return {};
+
+  const out = {};
+  for (const [rawKey, rawValue] of Object.entries(rawMap)) {
+    const key = normalizeKey(rawKey);
+    const ref = typeof rawValue === "string"
+      ? rawValue.trim()
+      : (typeof rawValue?.ref === "string" ? rawValue.ref.trim() : "");
+    if (!key || !ref) continue;
+    out[key] = ref;
+  }
+  return out;
+}
+
+function normalizeAmpAgentModeMap(rawMap) {
+  if (!rawMap || typeof rawMap !== "object" || Array.isArray(rawMap)) return {};
+
+  const out = {};
+  for (const [rawAgent, rawModes] of Object.entries(rawMap)) {
+    const agent = String(rawAgent || "").trim().toLowerCase();
+    if (!agent || !rawModes || typeof rawModes !== "object" || Array.isArray(rawModes)) continue;
+    const normalizedModes = normalizeAmpRouteRefMap(rawModes, {
+      normalizeKey: (value) => String(value || "").trim().toLowerCase()
+    });
+    if (Object.keys(normalizedModes).length === 0) continue;
+    out[agent] = normalizedModes;
+  }
+  return out;
+}
+
+function normalizeAmpRouting(rawAmpRouting) {
+  if (!rawAmpRouting || typeof rawAmpRouting !== "object" || Array.isArray(rawAmpRouting)) {
+    return undefined;
+  }
+
+  const fallbackRoute = typeof rawAmpRouting.fallbackRoute === "string"
+    ? rawAmpRouting.fallbackRoute.trim()
+    : (typeof rawAmpRouting["fallback-route"] === "string" ? rawAmpRouting["fallback-route"].trim() : "");
+
+  return {
+    enabled: rawAmpRouting.enabled !== false,
+    ...(fallbackRoute ? { fallbackRoute } : {}),
+    modeMap: normalizeAmpRouteRefMap(
+      rawAmpRouting.modeMap ?? rawAmpRouting["mode-map"] ?? rawAmpRouting.modes,
+      { normalizeKey: (value) => String(value || "").trim().toLowerCase() }
+    ),
+    agentMap: normalizeAmpRouteRefMap(
+      rawAmpRouting.agentMap ?? rawAmpRouting["agent-map"] ?? rawAmpRouting.agents,
+      { normalizeKey: (value) => String(value || "").trim().toLowerCase() }
+    ),
+    agentModeMap: normalizeAmpAgentModeMap(
+      rawAmpRouting.agentModeMap ?? rawAmpRouting["agent-mode-map"] ?? rawAmpRouting.agentModes
+    ),
+    applicationMap: normalizeAmpRouteRefMap(
+      rawAmpRouting.applicationMap ?? rawAmpRouting["application-map"] ?? rawAmpRouting.applications,
+      { normalizeKey: (value) => String(value || "").trim().toLowerCase() }
+    ),
+    modelMap: normalizeAmpRouteRefMap(
+      rawAmpRouting.modelMap ?? rawAmpRouting["model-map"] ?? rawAmpRouting.modelMappings ?? rawAmpRouting["model-mappings"]
+    ),
+    metadata: normalizeMetadataObject(rawAmpRouting.metadata)
+  };
+}
+
 function hasV2ConfigFields(raw, providers, modelAliases) {
   if (Object.keys(modelAliases || {}).length > 0) return true;
+  if (raw?.ampRouting || raw?.["amp-routing"]) return true;
   if ((providers || []).some((provider) => Array.isArray(provider.rateLimits) && provider.rateLimits.length > 0)) {
     return true;
   }
@@ -644,6 +712,7 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
   );
   const modelAliasResult = normalizeModelAliases(raw.modelAliases || raw["model-aliases"]);
   const modelAliases = modelAliasResult.aliases;
+  const ampRouting = normalizeAmpRouting(raw.ampRouting || raw["amp-routing"]);
 
   const masterKey = typeof raw.masterKey === "string"
     ? raw.masterKey
@@ -659,6 +728,7 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     defaultModel,
     providers,
     modelAliases,
+    ampRouting,
     metadata: raw.metadata && typeof raw.metadata === "object" ? raw.metadata : {}
   };
   Object.defineProperty(normalized, NORMALIZATION_ISSUES_SYMBOL, {
@@ -845,6 +915,55 @@ function validateModelAliases(config, routingIndex, errors) {
   detectAliasCycles(config, errors);
 }
 
+function validateAmpRouting(config, routingIndex, errors) {
+  const ampRouting = config?.ampRouting;
+  if (ampRouting === undefined) return;
+  if (!ampRouting || typeof ampRouting !== "object" || Array.isArray(ampRouting)) {
+    errors.push("Config.ampRouting must be an object.");
+    return;
+  }
+
+  const validateRef = (ref, context) => {
+    const parsed = parseRouteReference(ref);
+    if (parsed.type === "invalid") {
+      errors.push(`${context} has invalid ref '${ref}'.`);
+      return;
+    }
+    if (parsed.type === "direct") {
+      const resolved = routingIndex.modelByRef.get(parsed.ref) || routingIndex.modelByAliasRef.get(parsed.ref);
+      if (!resolved) {
+        errors.push(`${context} references unknown model '${parsed.ref}'.`);
+      }
+      return;
+    }
+    if (!routingIndex.aliasById.has(parsed.aliasId)) {
+      errors.push(`${context} references unknown alias '${parsed.aliasId}'.`);
+    }
+  };
+
+  if (typeof ampRouting.fallbackRoute === "string" && ampRouting.fallbackRoute.trim()) {
+    validateRef(ampRouting.fallbackRoute.trim(), "ampRouting.fallbackRoute");
+  }
+
+  for (const [mode, ref] of Object.entries(ampRouting.modeMap || {})) {
+    validateRef(ref, `ampRouting.modeMap.${mode}`);
+  }
+  for (const [agent, ref] of Object.entries(ampRouting.agentMap || {})) {
+    validateRef(ref, `ampRouting.agentMap.${agent}`);
+  }
+  for (const [application, ref] of Object.entries(ampRouting.applicationMap || {})) {
+    validateRef(ref, `ampRouting.applicationMap.${application}`);
+  }
+  for (const [model, ref] of Object.entries(ampRouting.modelMap || {})) {
+    validateRef(ref, `ampRouting.modelMap.${model}`);
+  }
+  for (const [agent, modeMap] of Object.entries(ampRouting.agentModeMap || {})) {
+    for (const [mode, ref] of Object.entries(modeMap || {})) {
+      validateRef(ref, `ampRouting.agentModeMap.${agent}.${mode}`);
+    }
+  }
+}
+
 export function validateRuntimeConfig(config, { requireMasterKey = false, requireProvider = false } = {}) {
   const errors = [];
 
@@ -888,6 +1007,7 @@ export function validateRuntimeConfig(config, { requireMasterKey = false, requir
   const routingIndex = getRoutingIndex(config);
   validateProviderRateLimits(config, routingIndex, errors);
   validateModelAliases(config, routingIndex, errors);
+  validateAmpRouting(config, routingIndex, errors);
 
   if (requireMasterKey && !config.masterKey) {
     errors.push("masterKey is required for worker deployment/export.");
@@ -913,12 +1033,23 @@ export function resolveProviderFormat(provider, sourceFormat = undefined) {
   return FORMATS.OPENAI;
 }
 
-export function resolveProviderUrl(provider, targetFormat) {
+export function resolveProviderUrl(provider, targetFormat, options = {}) {
   const baseUrl = sanitizeEndpointUrl(provider?.baseUrlByFormat?.[targetFormat] || provider?.baseUrl || "").replace(/\/+$/, "");
   if (!baseUrl) return "";
   const isVersionedApiRoot = /\/v\d+(?:\.\d+)?$/i.test(baseUrl);
+  const operation = String(options?.operation || "").trim().toLowerCase();
 
   if (targetFormat === FORMATS.OPENAI) {
+    if (operation === "responses") {
+      if (baseUrl.endsWith("/responses")) return baseUrl;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/responses`;
+      return `${baseUrl}/v1/responses`;
+    }
+    if (operation === "completions") {
+      if (baseUrl.endsWith("/completions")) return baseUrl;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/completions`;
+      return `${baseUrl}/v1/completions`;
+    }
     if (baseUrl.endsWith("/chat/completions")) return baseUrl;
     if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/chat/completions`;
     return `${baseUrl}/v1/chat/completions`;

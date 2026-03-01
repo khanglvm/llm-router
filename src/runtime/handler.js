@@ -21,6 +21,10 @@ import {
   buildFailureResponse,
   makeProviderCall
 } from "./handler/provider-call.js";
+import {
+  convertAmpGeminiRequestToOpenAI,
+  convertRouteResponseToAmpGemini
+} from "./handler/amp-gemini-bridge.js";
 import { corsResponse, jsonResponse } from "./handler/http.js";
 import {
   detectUserRequestFormat,
@@ -43,10 +47,29 @@ import {
   resolveFallbackCircuitPolicy,
   resolveRetryPolicy
 } from "./handler/fallback.js";
+import { buildAmpContext, resolveAmpRequestedModel } from "./handler/amp-routing.js";
 import { sleep, toBoolean, toNonNegativeInteger } from "./handler/utils.js";
 
 const ROUTE_DEBUG_MAX_LIST_ITEMS = 8;
 const ROUTE_DEBUG_MAX_HEADER_VALUE_LENGTH = 512;
+const AMP_CAPTURE_MAX_BODY_FIELDS = 40;
+const AMP_CAPTURE_MAX_BODY_VALUE_LENGTH = 160;
+const AMP_CAPTURE_MAX_MESSAGE_ROLES = 8;
+const AMP_CAPTURE_MAX_INPUT_ITEM_TYPES = 12;
+const AMP_CAPTURE_MAX_RAW_BODY_BYTES = 64 * 1024;
+const SENSITIVE_HEADER_PATTERN = /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key)$/i;
+const SENSITIVE_FIELD_PATTERN = /(api[_-]?key|auth|authorization|cookie|password|secret|token)/i;
+const AMP_CAPTURE_INTERESTING_PATH_PATTERN = /(^|\.)(agent|client|metadata|mode|source|tool|user[-_]?agent|thread|review|amp)(\.|$)/i;
+
+function readRuntimeEnvValue(env = {}, name) {
+  if (env && env[name] !== undefined && env[name] !== null && env[name] !== "") {
+    return env[name];
+  }
+  if (typeof process !== "undefined" && process?.env && process.env[name] !== undefined) {
+    return process.env[name];
+  }
+  return undefined;
+}
 
 function normalizeTimestamp(value, fallback = 0) {
   const parsed = Number(value);
@@ -117,9 +140,13 @@ function hasNextEligibleCandidate(entries, startIndex) {
 
 function isRoutingDebugEnabled(env = {}) {
   return toBoolean(
-    env?.LLM_ROUTER_DEBUG_ROUTING,
-    toBoolean(env?.LLM_ROUTER_DEBUG, false)
+    readRuntimeEnvValue(env, "LLM_ROUTER_DEBUG_ROUTING"),
+    toBoolean(readRuntimeEnvValue(env, "LLM_ROUTER_DEBUG"), false)
   );
+}
+
+function isAmpCaptureEnabled(env = {}) {
+  return toBoolean(readRuntimeEnvValue(env, "LLM_ROUTER_DEBUG_AMP_CAPTURE"), false);
 }
 
 function pushBounded(list, value, maxItems = ROUTE_DEBUG_MAX_LIST_ITEMS) {
@@ -128,7 +155,7 @@ function pushBounded(list, value, maxItems = ROUTE_DEBUG_MAX_LIST_ITEMS) {
   list.push(value);
 }
 
-function buildRouteDebugState(enabled, resolved) {
+function buildRouteDebugState(enabled, resolved, ampDebug = {}) {
   return {
     enabled,
     requestedModel: resolved?.requestedModel || "smart",
@@ -137,7 +164,14 @@ function buildRouteDebugState(enabled, resolved) {
     strategy: resolved?.routeStrategy || "ordered",
     selectedCandidate: "",
     skippedCandidates: [],
-    attempts: []
+    attempts: [],
+    ampDetected: toBoolean(ampDebug?.ampDetected, false),
+    ampMode: String(ampDebug?.ampMode || ""),
+    ampAgent: String(ampDebug?.ampAgent || ""),
+    ampApplication: String(ampDebug?.ampApplication || ""),
+    ampRequestedModel: String(ampDebug?.ampRequestedModel || ""),
+    ampMatchedBy: String(ampDebug?.ampMatchedBy || ""),
+    ampMatchedRef: String(ampDebug?.ampMatchedRef || "")
   };
 }
 
@@ -175,6 +209,249 @@ function toSafeHeaderValue(value) {
     : text;
 }
 
+function summarizeScalarValue(value) {
+  if (typeof value === "string") {
+    const trimmed = value.replace(/[\r\n]+/g, " ").trim();
+    if (!trimmed) return "";
+    return trimmed.length > AMP_CAPTURE_MAX_BODY_VALUE_LENGTH
+      ? trimmed.slice(0, AMP_CAPTURE_MAX_BODY_VALUE_LENGTH)
+      : trimmed;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (value === null) return null;
+  return undefined;
+}
+
+function sanitizeHeaderMap(headers) {
+  const result = {};
+  if (!headers || typeof headers.forEach !== "function") return result;
+
+  headers.forEach((value, name) => {
+    if (!name) return;
+    const normalizedName = String(name).trim().toLowerCase();
+    if (!normalizedName || SENSITIVE_HEADER_PATTERN.test(normalizedName)) return;
+    if (SENSITIVE_FIELD_PATTERN.test(normalizedName)) return;
+    const safeValue = toSafeHeaderValue(value);
+    if (!safeValue) return;
+    result[normalizedName] = safeValue;
+  });
+
+  return result;
+}
+
+function collectInterestingBodyFields(value, result, path = "", depth = 0) {
+  if (!value || depth > 4 || result.length >= AMP_CAPTURE_MAX_BODY_FIELDS) return;
+
+  if (Array.isArray(value)) {
+    if (path && AMP_CAPTURE_INTERESTING_PATH_PATTERN.test(path)) {
+      result.push({
+        path,
+        type: "array",
+        length: value.length
+      });
+    }
+
+    for (let index = 0; index < value.length; index += 1) {
+      const item = value[index];
+      const nextPath = path ? `${path}[${index}]` : `[${index}]`;
+      if (typeof item === "object" && item) {
+        collectInterestingBodyFields(item, result, nextPath, depth + 1);
+        if (result.length >= AMP_CAPTURE_MAX_BODY_FIELDS) return;
+        continue;
+      }
+
+      if (!AMP_CAPTURE_INTERESTING_PATH_PATTERN.test(nextPath)) continue;
+      const safeValue = summarizeScalarValue(item);
+      if (safeValue === undefined || safeValue === "") continue;
+      result.push({ path: nextPath, value: safeValue });
+      if (result.length >= AMP_CAPTURE_MAX_BODY_FIELDS) return;
+    }
+    return;
+  }
+
+  if (typeof value !== "object") {
+    if (!AMP_CAPTURE_INTERESTING_PATH_PATTERN.test(path)) return;
+    const safeValue = summarizeScalarValue(value);
+    if (safeValue === undefined || safeValue === "") return;
+    result.push({ path, value: safeValue });
+    return;
+  }
+
+  for (const [rawKey, child] of Object.entries(value)) {
+    const key = String(rawKey || "").trim();
+    if (!key) continue;
+    if (SENSITIVE_FIELD_PATTERN.test(key)) continue;
+    const nextPath = path ? `${path}.${key}` : key;
+
+    if (child && typeof child === "object") {
+      if (AMP_CAPTURE_INTERESTING_PATH_PATTERN.test(nextPath)) {
+        result.push({
+          path: nextPath,
+          type: Array.isArray(child) ? "array" : "object"
+        });
+        if (result.length >= AMP_CAPTURE_MAX_BODY_FIELDS) return;
+      }
+      collectInterestingBodyFields(child, result, nextPath, depth + 1);
+      if (result.length >= AMP_CAPTURE_MAX_BODY_FIELDS) return;
+      continue;
+    }
+
+    if (!AMP_CAPTURE_INTERESTING_PATH_PATTERN.test(nextPath)) continue;
+    const safeValue = summarizeScalarValue(child);
+    if (safeValue === undefined || safeValue === "") continue;
+    result.push({ path: nextPath, value: safeValue });
+    if (result.length >= AMP_CAPTURE_MAX_BODY_FIELDS) return;
+  }
+}
+
+function summarizeRequestBody(body) {
+  const topLevelKeys = body && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body)
+    : [];
+  const interestingFields = [];
+  collectInterestingBodyFields(body, interestingFields);
+
+  const summary = {
+    topLevelKeys,
+    interestingFields
+  };
+
+  if (Array.isArray(body?.messages)) {
+    summary.messageCount = body.messages.length;
+    summary.messageRoles = body.messages
+      .map((message) => message?.role)
+      .filter(Boolean)
+      .slice(0, AMP_CAPTURE_MAX_MESSAGE_ROLES);
+  }
+
+  if (Array.isArray(body?.input)) {
+    summary.inputItemCount = body.input.length;
+    summary.inputItemTypes = body.input
+      .map((item) => item?.type)
+      .filter(Boolean)
+      .slice(0, AMP_CAPTURE_MAX_INPUT_ITEM_TYPES);
+  }
+
+  if (typeof body?.model === "string" && body.model.trim()) {
+    summary.model = body.model.trim();
+  }
+
+  if (typeof body?.stream === "boolean") {
+    summary.stream = body.stream;
+  }
+
+  if (typeof body?.method === "string" && body.method.trim()) {
+    summary.method = body.method.trim();
+  }
+
+  if (Array.isArray(body?.params)) {
+    summary.paramsCount = body.params.length;
+    const firstParam = body.params[0];
+    if (firstParam && typeof firstParam === "object" && !Array.isArray(firstParam)) {
+      summary.firstParamKeys = Object.keys(firstParam).slice(0, 24);
+      if (typeof firstParam.mode === "string" && firstParam.mode.trim()) {
+        summary.mode = firstParam.mode.trim();
+      }
+      if (typeof firstParam.agent === "string" && firstParam.agent.trim()) {
+        summary.agent = firstParam.agent.trim();
+      }
+      if (typeof firstParam.type === "string" && firstParam.type.trim()) {
+        summary.paramType = firstParam.type.trim();
+      }
+    }
+  } else if (body?.params && typeof body.params === "object") {
+    summary.paramsKeys = Object.keys(body.params).slice(0, 24);
+    if (typeof body.params.mode === "string" && body.params.mode.trim()) {
+      summary.mode = body.params.mode.trim();
+    }
+    if (typeof body.params.agent === "string" && body.params.agent.trim()) {
+      summary.agent = body.params.agent.trim();
+    }
+  }
+
+  return summary;
+}
+
+function buildRequestCorrelationId(request) {
+  const headerValue = request?.headers?.get?.("x-request-id") || request?.headers?.get?.("x-correlation-id");
+  if (headerValue) return toSafeHeaderValue(headerValue);
+  return `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildAmpCaptureLogPayload(request, body, context = {}) {
+  const payload = {
+    type: "amp-capture",
+    stage: context.stage || "route",
+    timestamp: new Date().toISOString(),
+    requestId: context.requestId || buildRequestCorrelationId(request),
+    method: String(request?.method || "POST").toUpperCase(),
+    path: (() => {
+      try {
+        return new URL(String(request?.url || "")).pathname || "/";
+      } catch {
+        return "/";
+      }
+    })(),
+    contentType: toSafeHeaderValue(request?.headers?.get?.("content-type")),
+    userAgent: toSafeHeaderValue(request?.headers?.get?.("user-agent")),
+    sourceFormatHint: context.sourceFormatHint || "auto",
+    sourceFormat: context.sourceFormat || "unknown",
+    requestedModel: context.requestedModel || "",
+    headers: sanitizeHeaderMap(request?.headers),
+    body: summarizeRequestBody(body)
+  };
+
+  if (context.routeDetected) payload.routeDetected = context.routeDetected;
+  if (context.ampMode) payload.ampMode = context.ampMode;
+  if (context.ampAgent) payload.ampAgent = context.ampAgent;
+  if (context.ampApplication) payload.ampApplication = context.ampApplication;
+  if (context.ampMatchedBy) payload.ampMatchedBy = context.ampMatchedBy;
+  if (context.ampMatchedRef) payload.ampMatchedRef = context.ampMatchedRef;
+  if (context.ampResolvedRequestedModel) payload.ampResolvedRequestedModel = context.ampResolvedRequestedModel;
+  return payload;
+}
+
+function emitAmpCaptureLog(request, body, context = {}) {
+  const payload = buildAmpCaptureLogPayload(request, body, context);
+  console.error(`[llm-router][amp-capture] ${JSON.stringify(payload)}`);
+}
+
+async function parseCaptureBodyFromRequest(request) {
+  if (!(request instanceof Request)) return null;
+  const method = String(request.method || "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return null;
+
+  const contentType = String(request.headers.get("content-type") || "").toLowerCase();
+  if (!contentType.includes("application/json")) return null;
+
+  try {
+    const cloned = request.clone();
+    const raw = await cloned.text();
+    if (!raw || !raw.trim()) return null;
+    if (raw.length > AMP_CAPTURE_MAX_RAW_BODY_BYTES) {
+      return { _captureTruncated: true, _rawBytes: raw.length };
+    }
+    return JSON.parse(raw);
+  } catch {
+    return { _captureParseError: true };
+  }
+}
+
+async function emitIncomingAmpCaptureLog(request, context = {}) {
+  const body = await parseCaptureBodyFromRequest(request);
+  const payload = {
+    ...buildAmpCaptureLogPayload(request, body, {
+      ...context,
+      stage: context.stage || "incoming"
+    }),
+    routeDetected: context.routeDetected || "unknown"
+  };
+
+  console.error(`[llm-router][amp-capture] ${JSON.stringify(payload)}`);
+}
+
 function withRouteDebugHeaders(response, debugState) {
   if (!debugState?.enabled || !(response instanceof Response)) {
     return response;
@@ -201,11 +478,134 @@ function withRouteDebugHeaders(response, debugState) {
     headers.set("x-llm-router-attempts", attempts);
   }
 
+  if (debugState.ampDetected) {
+    headers.set("x-llm-router-amp-detected", "true");
+  }
+  const ampMode = toSafeHeaderValue(debugState.ampMode);
+  if (ampMode) headers.set("x-llm-router-amp-mode", ampMode);
+  const ampAgent = toSafeHeaderValue(debugState.ampAgent);
+  if (ampAgent) headers.set("x-llm-router-amp-agent", ampAgent);
+  const ampApplication = toSafeHeaderValue(debugState.ampApplication);
+  if (ampApplication) headers.set("x-llm-router-amp-application", ampApplication);
+  const ampRequestedModel = toSafeHeaderValue(debugState.ampRequestedModel);
+  if (ampRequestedModel) headers.set("x-llm-router-amp-requested-model", ampRequestedModel);
+  const ampMatchedBy = toSafeHeaderValue(debugState.ampMatchedBy);
+  if (ampMatchedBy) headers.set("x-llm-router-amp-matched-by", ampMatchedBy);
+  const ampMatchedRef = toSafeHeaderValue(debugState.ampMatchedRef);
+  if (ampMatchedRef) headers.set("x-llm-router-amp-matched-ref", ampMatchedRef);
+
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers
   });
+}
+
+async function handleAmpInternalRequest(request, env = {}) {
+  const hasContentType = Boolean(request.headers.get("content-type"));
+  if (hasContentType && !isJsonRequest(request)) {
+    return jsonResponse({ error: "Unsupported Media Type. Use application/json." }, 415);
+  }
+
+  const maxRequestBodyBytes = resolveMaxRequestBodyBytes(env);
+  let body = {};
+  try {
+    body = await parseJsonBodyWithLimit(request, maxRequestBodyBytes);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "REQUEST_BODY_TOO_LARGE") {
+      return jsonResponse({ error: "Request body too large" }, 413);
+    }
+    return jsonResponse({ error: "Invalid JSON" }, 400);
+  }
+
+  const rpcId = body?.id ?? null;
+  const wantsJsonRpc = body && typeof body === "object" && !Array.isArray(body)
+    && (Object.prototype.hasOwnProperty.call(body, "id") || Object.prototype.hasOwnProperty.call(body, "jsonrpc"));
+  const method = typeof body?.method === "string" ? body.method.trim() : "";
+  const params = body?.params && typeof body.params === "object" && !Array.isArray(body.params)
+    ? body.params
+    : {};
+
+  const makeRpcResponse = (result) => {
+    const payload = wantsJsonRpc
+      ? {
+          jsonrpc: "2.0",
+          id: rpcId,
+          result
+        }
+      : {
+          ok: true,
+          result
+        };
+    if (isAmpCaptureEnabled(env)) {
+      console.error(`[llm-router][amp-capture] ${JSON.stringify({
+        type: "amp-capture",
+        stage: "amp-internal-response",
+        timestamp: new Date().toISOString(),
+        method: method || "getUserInfo",
+        payloadKeys: Object.keys(payload),
+        resultKeys: Object.keys(result || {}),
+        ok: payload.ok === true
+      })}`);
+    }
+    return jsonResponse(payload);
+  };
+
+  if (!method || method === "getUserInfo") {
+    const result = {
+      id: "llm-router-local",
+      name: "llm-router",
+      email: "local@llm-router",
+      plan: "local",
+      authenticated: true,
+      isAuthenticated: true,
+      apiKeyValid: true,
+      hasApiKey: true,
+      features: [],
+      user: {
+        id: "llm-router-local",
+        email: "local@llm-router",
+        name: "llm-router"
+      },
+      mode: params?.mode || null
+    };
+    return makeRpcResponse(result);
+  }
+
+  if (method === "getUserFreeTierStatus") {
+    return makeRpcResponse({
+      canUseAmpFree: false,
+      isDailyGrantEnabled: false,
+      features: []
+    });
+  }
+
+  if (method === "uploadThread") {
+    const thread = params?.thread && typeof params.thread === "object" && !Array.isArray(params.thread)
+      ? params.thread
+      : null;
+    const parsedVersion = Number(thread?.v);
+    return makeRpcResponse({
+      uploaded: true,
+      threadId: typeof thread?.id === "string" ? thread.id : null,
+      version: Number.isFinite(parsedVersion) ? parsedVersion : null
+    });
+  }
+
+  if (method === "setThreadMeta") {
+    return makeRpcResponse({
+      updated: true,
+      threadId: typeof params?.thread === "string" ? params.thread : null
+    });
+  }
+
+  if (method === "getThreadLinkInfo") {
+    return makeRpcResponse({
+      creatorUserID: "llm-router-local"
+    });
+  }
+
+  return makeRpcResponse({});
 }
 
 async function clearCandidateRoutingState(stateStore, candidateKey) {
@@ -335,12 +735,51 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     return jsonResponse({ error: "Invalid JSON" }, 400);
   }
 
-  const sourceFormat = sourceFormatHint === "auto"
+  const route = options.route || null;
+  if (route?.type === "amp-provider-gemini-route") {
+    const converted = convertAmpGeminiRequestToOpenAI(body, route);
+    if (converted.error) {
+      return jsonResponse({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: converted.error
+        }
+      }, 400);
+    }
+    body = converted.body;
+  }
+
+  let sourceFormat = sourceFormatHint === "auto"
     ? detectUserRequestFormat(request, body, FORMATS.CLAUDE)
     : sourceFormatHint;
-
-  const requestedModel = body?.model || "smart";
+  if (route?.type === "amp-provider-gemini-route") {
+    sourceFormat = FORMATS.OPENAI;
+  }
+  const originalRequestedModel = body?.model || route?.ampModelId || "smart";
+  const requestId = buildRequestCorrelationId(request);
   const stream = isStreamingEnabled(sourceFormat, body);
+
+  const ampContext = buildAmpContext(request, body, route);
+  const ampResolved = resolveAmpRequestedModel(config, originalRequestedModel, ampContext);
+  const requestedModel = ampResolved.requestedModel || originalRequestedModel || "smart";
+
+  if (isAmpCaptureEnabled(env)) {
+    emitAmpCaptureLog(request, body, {
+      requestId,
+      stage: "route",
+      sourceFormatHint,
+      sourceFormat,
+      requestedModel: originalRequestedModel,
+      routeDetected: route?.type || "route",
+      ampMode: ampContext.mode || "",
+      ampAgent: ampContext.agent || "",
+      ampApplication: ampContext.application || "",
+      ampMatchedBy: ampResolved.ampMatchedBy || "",
+      ampMatchedRef: ampResolved.ampMatchedRef || "",
+      ampResolvedRequestedModel: requestedModel
+    });
+  }
 
   const resolved = resolveRequestModel(config, requestedModel, sourceFormat);
   if (!resolved.primary) {
@@ -356,7 +795,15 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
   const fallbackCircuitPolicy = resolveFallbackCircuitPolicy(env);
   const retryPolicy = resolveRetryPolicy(env);
   const stateStore = options.stateStore || null;
-  const routeDebug = buildRouteDebugState(isRoutingDebugEnabled(env), resolved);
+  const routeDebug = buildRouteDebugState(isRoutingDebugEnabled(env), resolved, {
+    ampDetected: ampContext.isAmp,
+    ampMode: ampContext.mode,
+    ampAgent: ampContext.agent,
+    ampApplication: ampContext.application,
+    ampRequestedModel: originalRequestedModel,
+    ampMatchedBy: ampResolved.ampMatchedBy,
+    ampMatchedRef: ampResolved.ampMatchedRef
+  });
   const now = Date.now();
 
   if (stateStore) {
@@ -456,6 +903,7 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
         sourceFormat,
         stream,
         candidate,
+        providerOperation: options?.route?.providerOperation,
         requestHeaders: request.headers,
         env
       });
@@ -559,6 +1007,14 @@ export function createFetchHandler(options) {
     const respond = (response, corsOptions = {}) => withRequestCors(response, request, env, corsOptions);
     let preloadedConfig = null;
     let authValidated = false;
+    const route = resolveApiRoute(url.pathname, request.method);
+
+    if (isAmpCaptureEnabled(env)) {
+      await emitIncomingAmpCaptureLog(request, {
+        requestId: buildRequestCorrelationId(request),
+        routeDetected: route?.type || "none"
+      });
+    }
 
     if (!isRequestFromAllowedIp(request, env)) {
       return respond(jsonResponse({ error: "Forbidden" }, 403));
@@ -628,7 +1084,6 @@ export function createFetchHandler(options) {
       }));
     }
 
-    const route = resolveApiRoute(url.pathname, request.method);
     if (route?.type === "models") {
       const config = preloadedConfig || await loadRuntimeConfig(options.getConfig, env);
       return respond(jsonResponse({
@@ -640,7 +1095,11 @@ export function createFetchHandler(options) {
       }));
     }
 
-    if (route?.type === "route") {
+    if (
+      route?.type === "route" ||
+      route?.type === "amp-provider-route" ||
+      route?.type === "amp-provider-gemini-route"
+    ) {
       let stateStore;
       try {
         stateStore = await ensureStateStore(env);
@@ -656,11 +1115,20 @@ export function createFetchHandler(options) {
 
       const routeResponse = await handleRouteRequest(request, env, options.getConfig, route.sourceFormat, {
         ...options,
+        route,
         preloadedConfig,
         authValidated,
         stateStore
       });
-      return respond(routeResponse);
+      const finalResponse = route?.type === "amp-provider-gemini-route"
+        ? await convertRouteResponseToAmpGemini(routeResponse)
+        : routeResponse;
+      return respond(finalResponse);
+    }
+
+    if (route?.type === "amp-internal") {
+      const internalResponse = await handleAmpInternalRequest(request, env);
+      return respond(internalResponse);
     }
 
     return respond(jsonResponse({ error: "Not found" }, 404));

@@ -91,6 +91,13 @@ const MODEL_ALIAS_STRATEGIES = MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => op
 const DEFAULT_PROBE_REQUESTS_PER_MINUTE = 30;
 const DEFAULT_PROBE_MAX_RATE_LIMIT_RETRIES = 3;
 const DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS = 6000;
+const AMP_ROUTING_MAP_KIND_OPTIONS = [
+  { value: "mode", label: "Mode map", hint: "Map Amp mode names like smart/deep to route refs." },
+  { value: "agent", label: "Agent map", hint: "Map Amp agent names like review to route refs." },
+  { value: "agent-mode", label: "Agent+mode map", hint: "Map a specific agent + mode combination to a route ref." },
+  { value: "application", label: "Application map", hint: "Map x-amp-client-application values to route refs." },
+  { value: "model", label: "Model map", hint: "Map requested model ids or provider/model ids to route refs." }
+];
 const RATE_LIMIT_WINDOW_UNIT_ALIASES = new Map([
   ["s", "second"],
   ["sec", "second"],
@@ -1082,6 +1089,52 @@ function formatRateLimitBucketScopeLabel(bucket) {
   return models.length > 0 ? models.join(", ") : "(none)";
 }
 
+function formatAmpRoutingEntryLabel(entry) {
+  if (!entry) return "(invalid)";
+  if (entry.mapKind === "agent-mode") {
+    return `agent-mode:${entry.agent}/${entry.key} -> ${entry.ref}`;
+  }
+  return `${entry.mapKind}:${entry.key} -> ${entry.ref}`;
+}
+
+function summarizeAmpRouting(ampRouting) {
+  if (!ampRouting || typeof ampRouting !== "object" || Array.isArray(ampRouting)) {
+    return ["Amp routing: (none)"];
+  }
+
+  const lines = [];
+  lines.push(`Amp routing: enabled=${ampRouting.enabled !== false}`);
+  lines.push(`  fallbackRoute=${String(ampRouting.fallbackRoute || "").trim() || "(smart/defaultModel)"}`);
+
+  const pushMap = (label, map) => {
+    const entries = Object.entries(map || {});
+    if (entries.length === 0) {
+      lines.push(`  ${label}=(none)`);
+      return;
+    }
+    lines.push(`  ${label}:`);
+    for (const [key, ref] of entries) {
+      lines.push(`    - ${key} -> ${ref}`);
+    }
+  };
+
+  pushMap("modeMap", ampRouting.modeMap);
+  pushMap("agentMap", ampRouting.agentMap);
+  if (Object.keys(ampRouting.agentModeMap || {}).length === 0) {
+    lines.push("  agentModeMap=(none)");
+  } else {
+    lines.push("  agentModeMap:");
+    for (const [agent, modeMap] of Object.entries(ampRouting.agentModeMap || {})) {
+      for (const [mode, ref] of Object.entries(modeMap || {})) {
+        lines.push(`    - ${agent}/${mode} -> ${ref}`);
+      }
+    }
+  }
+  pushMap("applicationMap", ampRouting.applicationMap);
+  pushMap("modelMap", ampRouting.modelMap);
+  return lines;
+}
+
 export function summarizeConfig(config, configPath, { includeSecrets = false } = {}) {
   const target = includeSecrets ? config : sanitizeConfigForDisplay(config);
   const lines = [];
@@ -1135,6 +1188,8 @@ export function summarizeConfig(config, configPath, { includeSecrets = false } =
       lines.push(`  fallbackTargets=${formatAliasTargetsForSummary(alias.fallbackTargets)}`);
     }
   }
+
+  lines.push(...summarizeAmpRouting(target.ampRouting));
 
   return lines.join("\n");
 }
@@ -2398,6 +2453,231 @@ function serializeStable(value) {
 
 function formatConfigValidationError(errors) {
   return (errors || []).map((line) => String(line || "").trim()).filter(Boolean).join(" ");
+}
+
+function normalizeAmpRoutingMapKind(raw) {
+  const normalized = String(raw || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (["mode", "modes"].includes(normalized)) return "mode";
+  if (["agent", "agents"].includes(normalized)) return "agent";
+  if (["agent-mode", "agentmode", "agent_mode", "agent-modes", "agentmodes"].includes(normalized)) return "agent-mode";
+  if (["application", "app", "applications"].includes(normalized)) return "application";
+  if (["model", "models", "provider-model", "provider_model"].includes(normalized)) return "model";
+  return "";
+}
+
+function normalizeAmpRoutingLookupKey(mapKind, key) {
+  const text = String(key || "").trim();
+  if (!text) return "";
+  if (mapKind === "model") return text;
+  return text.toLowerCase();
+}
+
+function getAmpRoutingMapRef(ampRouting, mapKind, key, agent = "") {
+  if (!ampRouting || typeof ampRouting !== "object" || Array.isArray(ampRouting)) return "";
+  const normalizedKind = normalizeAmpRoutingMapKind(mapKind);
+  const normalizedKey = normalizeAmpRoutingLookupKey(normalizedKind, key);
+  const normalizedAgent = normalizeAmpRoutingLookupKey("agent", agent);
+  if (!normalizedKind) return "";
+  if (normalizedKind === "agent-mode") {
+    const modeMap = ampRouting.agentModeMap?.[normalizedAgent];
+    return typeof modeMap?.[normalizedKey] === "string" ? modeMap[normalizedKey] : "";
+  }
+  if (normalizedKind === "mode") return typeof ampRouting.modeMap?.[normalizedKey] === "string" ? ampRouting.modeMap[normalizedKey] : "";
+  if (normalizedKind === "agent") return typeof ampRouting.agentMap?.[normalizedKey] === "string" ? ampRouting.agentMap[normalizedKey] : "";
+  if (normalizedKind === "application") return typeof ampRouting.applicationMap?.[normalizedKey] === "string" ? ampRouting.applicationMap[normalizedKey] : "";
+  if (normalizedKind === "model") return typeof ampRouting.modelMap?.[normalizedKey] === "string" ? ampRouting.modelMap[normalizedKey] : "";
+  return "";
+}
+
+function collectAmpRoutingEntries(ampRouting) {
+  if (!ampRouting || typeof ampRouting !== "object" || Array.isArray(ampRouting)) return [];
+  const rows = [];
+  for (const [key, ref] of Object.entries(ampRouting.modeMap || {})) {
+    rows.push({ mapKind: "mode", key, ref });
+  }
+  for (const [key, ref] of Object.entries(ampRouting.agentMap || {})) {
+    rows.push({ mapKind: "agent", key, ref });
+  }
+  for (const [agent, modeMap] of Object.entries(ampRouting.agentModeMap || {})) {
+    for (const [key, ref] of Object.entries(modeMap || {})) {
+      rows.push({ mapKind: "agent-mode", agent, key, ref });
+    }
+  }
+  for (const [key, ref] of Object.entries(ampRouting.applicationMap || {})) {
+    rows.push({ mapKind: "application", key, ref });
+  }
+  for (const [key, ref] of Object.entries(ampRouting.modelMap || {})) {
+    rows.push({ mapKind: "model", key, ref });
+  }
+  return rows;
+}
+
+function buildAmpRoutingPromptEntryOptions(ampRouting) {
+  return collectAmpRoutingEntries(ampRouting).map((entry) => ({
+    value: JSON.stringify({
+      mapKind: entry.mapKind,
+      key: entry.key,
+      agent: entry.agent || ""
+    }),
+    label: formatAmpRoutingEntryLabel(entry)
+  }));
+}
+
+export function setAmpRoutingInConfig(config, {
+  enabled,
+  fallbackRoute,
+  clearFallbackRoute = false,
+  mapKind,
+  key,
+  agent,
+  ref,
+  removeMapping = false,
+  clearMap = false,
+  clearAll = false
+} = {}) {
+  const next = structuredClone(config);
+  const normalizedKind = normalizeAmpRoutingMapKind(mapKind);
+  const normalizedKey = normalizeAmpRoutingLookupKey(normalizedKind, key);
+  const normalizedAgent = normalizeAmpRoutingLookupKey("agent", agent);
+  const normalizedRef = String(ref || "").trim();
+  const previousSerialized = serializeStable(next.ampRouting || null);
+
+  if (clearAll) {
+    next.ampRouting = undefined;
+  } else {
+    const currentAmpRouting = next.ampRouting && typeof next.ampRouting === "object" && !Array.isArray(next.ampRouting)
+      ? next.ampRouting
+      : {};
+    const working = {
+      enabled: currentAmpRouting.enabled !== false,
+      ...(typeof currentAmpRouting.fallbackRoute === "string" && currentAmpRouting.fallbackRoute.trim()
+        ? { fallbackRoute: currentAmpRouting.fallbackRoute.trim() }
+        : {}),
+      modeMap: { ...(currentAmpRouting.modeMap || {}) },
+      agentMap: { ...(currentAmpRouting.agentMap || {}) },
+      agentModeMap: Object.fromEntries(
+        Object.entries(currentAmpRouting.agentModeMap || {}).map(([currentAgent, modeMap]) => [
+          currentAgent,
+          { ...(modeMap || {}) }
+        ])
+      ),
+      applicationMap: { ...(currentAmpRouting.applicationMap || {}) },
+      modelMap: { ...(currentAmpRouting.modelMap || {}) },
+      ...(currentAmpRouting.metadata && typeof currentAmpRouting.metadata === "object" && !Array.isArray(currentAmpRouting.metadata)
+        ? { metadata: currentAmpRouting.metadata }
+        : {})
+    };
+
+    if (typeof enabled === "boolean") {
+      working.enabled = enabled;
+    }
+
+    if (clearFallbackRoute) {
+      delete working.fallbackRoute;
+    } else if (fallbackRoute !== undefined) {
+      const normalizedFallback = String(fallbackRoute || "").trim();
+      if (normalizedFallback) {
+        working.fallbackRoute = normalizedFallback;
+      } else {
+        delete working.fallbackRoute;
+      }
+    }
+
+    if (normalizedKind) {
+      if (clearMap) {
+        if (normalizedKind === "agent-mode") {
+          if (normalizedAgent) {
+            delete working.agentModeMap[normalizedAgent];
+          } else {
+            working.agentModeMap = {};
+          }
+        } else if (normalizedKind === "mode") {
+          working.modeMap = {};
+        } else if (normalizedKind === "agent") {
+          working.agentMap = {};
+        } else if (normalizedKind === "application") {
+          working.applicationMap = {};
+        } else if (normalizedKind === "model") {
+          working.modelMap = {};
+        }
+      } else if (removeMapping) {
+        if (!normalizedKey) {
+          return { config: next, changed: false, reason: "amp-key is required when removing an Amp routing mapping." };
+        }
+        if (normalizedKind === "agent-mode") {
+          if (!normalizedAgent) {
+            return { config: next, changed: false, reason: "amp-agent is required for agent-mode mapping changes." };
+          }
+          const modeMap = working.agentModeMap[normalizedAgent];
+          if (modeMap) {
+            delete modeMap[normalizedKey];
+            if (Object.keys(modeMap).length === 0) {
+              delete working.agentModeMap[normalizedAgent];
+            }
+          }
+        } else if (normalizedKind === "mode") {
+          delete working.modeMap[normalizedKey];
+        } else if (normalizedKind === "agent") {
+          delete working.agentMap[normalizedKey];
+        } else if (normalizedKind === "application") {
+          delete working.applicationMap[normalizedKey];
+        } else if (normalizedKind === "model") {
+          delete working.modelMap[normalizedKey];
+        }
+      } else {
+        if (!normalizedKey) {
+          return { config: next, changed: false, reason: "amp-key is required when setting an Amp routing mapping." };
+        }
+        if (!normalizedRef) {
+          return { config: next, changed: false, reason: "amp-ref is required when setting an Amp routing mapping." };
+        }
+
+        if (normalizedKind === "agent-mode") {
+          if (!normalizedAgent) {
+            return { config: next, changed: false, reason: "amp-agent is required for agent-mode mapping changes." };
+          }
+          working.agentModeMap[normalizedAgent] = {
+            ...(working.agentModeMap[normalizedAgent] || {}),
+            [normalizedKey]: normalizedRef
+          };
+        } else if (normalizedKind === "mode") {
+          working.modeMap[normalizedKey] = normalizedRef;
+        } else if (normalizedKind === "agent") {
+          working.agentMap[normalizedKey] = normalizedRef;
+        } else if (normalizedKind === "application") {
+          working.applicationMap[normalizedKey] = normalizedRef;
+        } else if (normalizedKind === "model") {
+          working.modelMap[normalizedKey] = normalizedRef;
+        }
+      }
+    } else if (mapKind !== undefined && mapKind !== null && String(mapKind).trim()) {
+      return {
+        config: next,
+        changed: false,
+        reason: `Invalid amp-map-kind '${mapKind}'. Use one of: ${AMP_ROUTING_MAP_KIND_OPTIONS.map((option) => option.value).join(", ")}.`
+      };
+    }
+
+    next.ampRouting = working;
+  }
+
+  const validationErrors = validateRuntimeConfig(next, { requireProvider: false, requireMasterKey: false });
+  if (validationErrors.length > 0) {
+    return {
+      config,
+      changed: false,
+      reason: formatConfigValidationError(validationErrors)
+    };
+  }
+
+  const nextSerialized = serializeStable(next.ampRouting || null);
+  return {
+    config: next,
+    changed: previousSerialized !== nextSerialized,
+    reason: "",
+    ampRouting: next.ampRouting
+  };
 }
 
 export function upsertModelAliasInConfig(config, {
@@ -4250,6 +4530,317 @@ async function doSetProviderRateLimits(context) {
   };
 }
 
+async function doSetAmpRouting(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const hasEnabledArg =
+    Object.prototype.hasOwnProperty.call(args, "amp-enabled") ||
+    Object.prototype.hasOwnProperty.call(args, "ampEnabled");
+  const enabled = hasEnabledArg ? toBoolean(readArg(args, ["amp-enabled", "ampEnabled"], true), true) : undefined;
+  const fallbackRoute = readArg(args, ["amp-fallback-route", "ampFallbackRoute"], undefined);
+  const clearFallbackRoute = toBoolean(readArg(args, ["clear-amp-fallback-route", "clearAmpFallbackRoute"], false), false);
+  const mapKindArg = readArg(args, ["amp-map-kind", "ampMapKind"], undefined);
+  const keyArg = readArg(args, ["amp-key", "ampKey"], undefined);
+  const agentArg = readArg(args, ["amp-agent", "ampAgent"], undefined);
+  const refArg = readArg(args, ["amp-ref", "ampRef"], undefined);
+  const removeMapping = toBoolean(readArg(args, ["remove-amp-mapping", "removeAmpMapping"], false), false);
+  const clearMap = toBoolean(readArg(args, ["clear-amp-map", "clearAmpMap"], false), false);
+  const clearAll = toBoolean(readArg(args, ["clear-amp-routing", "clearAmpRouting"], false), false);
+  const viewOnly = toBoolean(readArg(args, ["view-amp-routing", "viewAmpRouting"], false), false);
+  let action = String(readArg(args, ["amp-action", "ampAction"], "") || "").trim().toLowerCase();
+
+  const mapKind = normalizeAmpRoutingMapKind(mapKindArg);
+  const mapKey = normalizeAmpRoutingLookupKey(mapKind, keyArg);
+  const mapAgent = normalizeAmpRoutingLookupKey("agent", agentArg);
+  const mapRef = String(refArg || "").trim();
+
+  if (canPrompt() && !action && !hasEnabledArg && fallbackRoute === undefined && !clearFallbackRoute && !mapKindArg && !clearAll && !viewOnly) {
+    action = await context.prompts.select({
+      message: "Amp routing action",
+      options: [
+        { value: "view", label: "View Amp routing config" },
+        { value: "settings", label: "Set Amp routing global options", hint: "enabled + fallbackRoute" },
+        { value: "upsert", label: "Add/Edit mapping rule" },
+        { value: "remove", label: "Remove mapping rule" },
+        { value: "clear-map", label: "Clear one mapping map" },
+        { value: "clear-all", label: "Remove ampRouting section" }
+      ]
+    });
+  }
+
+  if (canPrompt() && action === "view") {
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: summarizeAmpRouting(config.ampRouting).join("\n")
+    };
+  }
+
+  if (canPrompt() && action === "settings") {
+    const nextEnabled = await context.prompts.confirm({
+      message: "Enable Amp routing override module?",
+      initialValue: config?.ampRouting?.enabled !== false
+    });
+    const fallbackInput = await context.prompts.text({
+      message: "fallbackRoute (leave blank to clear and fallback to smart/defaultModel)",
+      required: false,
+      initialValue: String(config?.ampRouting?.fallbackRoute || "")
+    });
+
+    const updated = setAmpRoutingInConfig(config, {
+      enabled: nextEnabled,
+      fallbackRoute: fallbackInput,
+      clearFallbackRoute: !String(fallbackInput || "").trim()
+    });
+    if (!updated.changed && updated.reason) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: updated.reason
+      };
+    }
+
+    await writeConfigFile(updated.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: summarizeAmpRouting(updated.ampRouting).join("\n")
+    };
+  }
+
+  if (canPrompt() && action === "upsert") {
+    const selectedKind = await context.prompts.select({
+      message: "Amp map kind",
+      options: AMP_ROUTING_MAP_KIND_OPTIONS
+    });
+    const selectedAgent = selectedKind === "agent-mode"
+      ? await context.prompts.text({
+          message: "Agent key",
+          required: true,
+          placeholder: "review"
+        })
+      : "";
+    const selectedKey = await context.prompts.text({
+      message: selectedKind === "agent-mode" ? "Mode key" : "Lookup key",
+      required: true,
+      placeholder: selectedKind === "mode"
+        ? "smart"
+        : (selectedKind === "application"
+          ? "cli execute mode"
+          : (selectedKind === "model" ? "claude-haiku-4-5-20251001" : "review"))
+    });
+    const initialRef = getAmpRoutingMapRef(config.ampRouting, selectedKind, selectedKey, selectedAgent);
+    const selectedRef = await context.prompts.text({
+      message: "Route ref (alias or provider/model)",
+      required: true,
+      initialValue: initialRef || "",
+      placeholder: "chat.default"
+    });
+
+    const updated = setAmpRoutingInConfig(config, {
+      mapKind: selectedKind,
+      key: selectedKey,
+      agent: selectedAgent,
+      ref: selectedRef
+    });
+    if (!updated.changed && updated.reason) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: updated.reason
+      };
+    }
+    await writeConfigFile(updated.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: [
+        `Upserted ${selectedKind} mapping.`,
+        summarizeAmpRouting(updated.ampRouting).join("\n")
+      ].join("\n")
+    };
+  }
+
+  if (canPrompt() && action === "remove") {
+    const options = buildAmpRoutingPromptEntryOptions(config.ampRouting);
+    if (options.length === 0) {
+      return {
+        ok: true,
+        mode: context.mode,
+        exitCode: EXIT_SUCCESS,
+        data: "Amp routing has no mapping entries."
+      };
+    }
+    const selected = await context.prompts.select({
+      message: "Remove Amp mapping",
+      options
+    });
+    let parsedSelection;
+    try {
+      parsedSelection = JSON.parse(String(selected || ""));
+    } catch {
+      parsedSelection = null;
+    }
+    if (!parsedSelection || typeof parsedSelection !== "object") {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: "Invalid mapping selection."
+      };
+    }
+
+    const updated = setAmpRoutingInConfig(config, {
+      mapKind: parsedSelection.mapKind,
+      key: parsedSelection.key,
+      agent: parsedSelection.agent,
+      removeMapping: true
+    });
+    if (!updated.changed && updated.reason) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: updated.reason
+      };
+    }
+    await writeConfigFile(updated.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: summarizeAmpRouting(updated.ampRouting).join("\n")
+    };
+  }
+
+  if (canPrompt() && action === "clear-map") {
+    const selectedKind = await context.prompts.select({
+      message: "Amp map kind to clear",
+      options: AMP_ROUTING_MAP_KIND_OPTIONS
+    });
+    let selectedAgent = "";
+    if (selectedKind === "agent-mode") {
+      const knownAgents = Object.keys(config?.ampRouting?.agentModeMap || {});
+      if (knownAgents.length > 0) {
+        const agentSelection = await context.prompts.select({
+          message: "Clear all mappings for which agent?",
+          options: [
+            { value: "__all__", label: "All agents" },
+            ...knownAgents.map((value) => ({ value, label: value }))
+          ]
+        });
+        if (agentSelection !== "__all__") selectedAgent = agentSelection;
+      }
+    }
+
+    const updated = setAmpRoutingInConfig(config, {
+      mapKind: selectedKind,
+      agent: selectedAgent,
+      clearMap: true
+    });
+    if (!updated.changed && updated.reason) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: updated.reason
+      };
+    }
+    await writeConfigFile(updated.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: summarizeAmpRouting(updated.ampRouting).join("\n")
+    };
+  }
+
+  if (canPrompt() && action === "clear-all") {
+    const confirm = await context.prompts.confirm({
+      message: "Remove ampRouting from config?",
+      initialValue: false
+    });
+    if (!confirm) {
+      return { ok: false, mode: context.mode, exitCode: EXIT_FAILURE, errorMessage: "Cancelled." };
+    }
+
+    const updated = setAmpRoutingInConfig(config, {
+      clearAll: true
+    });
+    if (!updated.changed && updated.reason) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: updated.reason
+      };
+    }
+    await writeConfigFile(updated.config, configPath);
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: "Removed ampRouting from config."
+    };
+  }
+
+  const hasChangeIntent = Boolean(
+    clearAll
+    || hasEnabledArg
+    || fallbackRoute !== undefined
+    || clearFallbackRoute
+    || mapKind
+    || removeMapping
+    || clearMap
+  );
+  if (viewOnly || !hasChangeIntent) {
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: summarizeAmpRouting(config.ampRouting).join("\n")
+    };
+  }
+
+  const updated = setAmpRoutingInConfig(config, {
+    enabled,
+    fallbackRoute,
+    clearFallbackRoute,
+    mapKind,
+    key: mapKey,
+    agent: mapAgent,
+    ref: mapRef,
+    removeMapping,
+    clearMap,
+    clearAll
+  });
+  if (!updated.changed && updated.reason) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: updated.reason
+    };
+  }
+
+  await writeConfigFile(updated.config, configPath);
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: [
+      "Updated ampRouting settings.",
+      summarizeAmpRouting(updated.ampRouting).join("\n")
+    ].join("\n")
+  };
+}
+
 async function doSetMasterKey(context) {
   const args = context.args || {};
   const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
@@ -4416,6 +5007,7 @@ async function resolveConfigOperation(context) {
         { value: "remove-model", label: "Remove model from provider" },
         { value: "upsert-model-alias", label: "Add/Edit model alias" },
         { value: "remove-model-alias", label: "Remove model alias" },
+        { value: "set-amp-routing", label: "Manage Amp routing" },
         { value: "set-provider-rate-limits", label: "Manage provider rate-limit buckets" },
         { value: "set-model-fallbacks", label: "Set model silent-fallbacks" },
         { value: "set-master-key", label: "Set worker master key" },
@@ -4449,6 +5041,9 @@ async function runConfigAction(context) {
       return doUpsertModelAlias(context);
     case "remove-model-alias":
       return doRemoveModelAlias(context);
+    case "set-amp-routing":
+    case "set-amp":
+      return doSetAmpRouting(context);
     case "set-provider-rate-limits":
     case "set-rate-limits":
       return doSetProviderRateLimits(context);
@@ -5934,6 +6529,18 @@ const routerModule = {
           "fallback-models",
           "fallbacks",
           "clear-fallbacks",
+          "amp-action",
+          "amp-enabled",
+          "amp-fallback-route",
+          "clear-amp-fallback-route",
+          "amp-map-kind",
+          "amp-key",
+          "amp-agent",
+          "amp-ref",
+          "remove-amp-mapping",
+          "clear-amp-map",
+          "clear-amp-routing",
+          "view-amp-routing",
           "host",
           "port",
           "watch-config",
@@ -5942,7 +6549,7 @@ const routerModule = {
         ]
       },
       help: {
-        summary: "Manage providers, model aliases, rate-limit buckets, master key, and OS startup. TUI by default; commandline via --operation.",
+        summary: "Manage providers, model aliases, Amp routing, rate-limit buckets, master key, and OS startup. TUI by default; commandline via --operation.",
         args: [
           { name: "operation", required: false, description: "Config operation (optional; prompts if omitted).", example: "--operation=upsert-provider" },
           { name: "provider-id", required: false, description: "Provider id (slug/camelCase).", example: "--provider-id=openrouter" },
@@ -5956,6 +6563,18 @@ const routerModule = {
           { name: "model", required: false, description: "Single model id (used by remove-model).", example: "--model=gpt-4o" },
           { name: "fallback-models", required: false, description: "Qualified fallback models for set-model-fallbacks (comma/semicolon/space separated).", example: "--fallback-models=openrouter/gpt-4o,anthropic/claude-3-7-sonnet" },
           { name: "clear-fallbacks", required: false, description: "Clear all fallback models for set-model-fallbacks.", example: "--clear-fallbacks=true" },
+          { name: "amp-action", required: false, description: "For set-amp-routing: view | settings | upsert | remove | clear-map | clear-all.", example: "--amp-action=upsert" },
+          { name: "amp-enabled", required: false, description: "For set-amp-routing: enable/disable Amp routing override module.", example: "--amp-enabled=true" },
+          { name: "amp-fallback-route", required: false, description: "For set-amp-routing: fallback route ref when no Amp mapping matches.", example: "--amp-fallback-route=chat.default" },
+          { name: "clear-amp-fallback-route", required: false, description: "For set-amp-routing: clear fallbackRoute so runtime falls back to smart/defaultModel.", example: "--clear-amp-fallback-route=true" },
+          { name: "amp-map-kind", required: false, description: "For set-amp-routing: mapping family mode | agent | agent-mode | application | model.", example: "--amp-map-kind=mode" },
+          { name: "amp-key", required: false, description: "For set-amp-routing: lookup key in the selected map.", example: "--amp-key=smart" },
+          { name: "amp-agent", required: false, description: "For set-amp-routing agent-mode entries: agent key.", example: "--amp-agent=review" },
+          { name: "amp-ref", required: false, description: "For set-amp-routing: destination route ref (alias or provider/model).", example: "--amp-ref=chat.default" },
+          { name: "remove-amp-mapping", required: false, description: "For set-amp-routing: remove a single mapping entry identified by map kind/key.", example: "--remove-amp-mapping=true" },
+          { name: "clear-amp-map", required: false, description: "For set-amp-routing: clear an entire map family (or one agent subtree for agent-mode when combined with --amp-agent).", example: "--clear-amp-map=true" },
+          { name: "clear-amp-routing", required: false, description: "For set-amp-routing: remove the entire ampRouting section.", example: "--clear-amp-routing=true" },
+          { name: "view-amp-routing", required: false, description: "For set-amp-routing: print current Amp routing summary without changing config.", example: "--view-amp-routing=true" },
           { name: "alias-id", required: false, description: "Model alias id for upsert/remove alias operations.", example: "--alias-id=chat.default" },
           { name: "strategy", required: false, description: "Model alias routing strategy: auto | ordered | round-robin | weighted-rr | quota-aware-weighted-rr.", example: "--strategy=auto" },
           { name: "targets", required: false, description: "Model alias target list syntax: <ref>@<weight> (comma/semicolon/space/newline separated).", example: "--targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2" },
@@ -5988,6 +6607,10 @@ const routerModule = {
           "llm-router config",
           "llm-router config --operation=upsert-provider --provider-id=ramclouds --name=RamClouds --api-key=sk-... --endpoints=https://ramclouds.me,https://ramclouds.me/v1 --models=claude-opus-4-6-thinking,gpt-5.3-codex",
           "llm-router config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2 --fallback-targets=openrouter/gpt-4o",
+          "llm-router config --operation=set-amp-routing --amp-enabled=true --amp-fallback-route=chat.default",
+          "llm-router config --operation=set-amp-routing --amp-map-kind=mode --amp-key=smart --amp-ref=chat.default",
+          "llm-router config --operation=set-amp-routing --amp-map-kind=agent-mode --amp-agent=review --amp-key=deep --amp-ref=chat.review.deep",
+          "llm-router config --operation=set-amp-routing --amp-map-kind=model --amp-key=claude-haiku-4-5-20251001 --amp-ref=rc/claude-opus-4-6",
           "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-id=openrouter-all-month --bucket-models=all --bucket-requests=20000 --bucket-window=month:1",
           "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-name=\"6-hours cap\" --bucket-models=all --bucket-requests=600 --bucket-window=hour:6",
           "llm-router config --operation=migrate-config --target-version=2 --create-backup=true",

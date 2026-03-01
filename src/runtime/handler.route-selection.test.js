@@ -61,6 +61,85 @@ function makeOpenAIRequest(model) {
   });
 }
 
+function makeAmpAnthropicRequest(model, options = {}) {
+  const body = {
+    model,
+    max_tokens: 64,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Hello" }
+        ]
+      }
+    ],
+    stream: false
+  };
+  if (typeof options.mode === "string" && options.mode.trim()) {
+    body.mode = options.mode.trim();
+  }
+  if (typeof options.agent === "string" && options.agent.trim()) {
+    body.agent = options.agent.trim();
+  }
+  return new Request("http://router.local/api/provider/anthropic/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-amp-client-application": options.application || "CLI",
+      ...(options.headers || {})
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+function makeAmpGoogleGenerateContentRequest(model = "gemini-3-pro-preview") {
+  return new Request(`http://router.local/api/provider/google/v1beta1/publishers/google/models/${model}:generateContent`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-amp-client-application": "CLI"
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: "Hello from gemini payload" }]
+        }
+      ],
+      systemInstruction: {
+        parts: [{ text: "Be concise." }]
+      },
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 128
+      }
+    })
+  });
+}
+
+function makeAmpOpenAIResponsesRequest(model, options = {}) {
+  return new Request("http://router.local/api/provider/openai/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-amp-client-application": options.application || "CLI Execute Mode",
+      ...(options.headers || {})
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "Hello" }
+          ]
+        }
+      ],
+      stream: false
+    })
+  });
+}
+
 function jsonPayloadResponse(payload, status = 200, headers = undefined) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -108,6 +187,16 @@ function openAISuccess(model = "gpt-4o-mini") {
   });
 }
 
+async function withMockedNow(now, fn) {
+  const originalNow = Date.now;
+  Date.now = () => now;
+  try {
+    return await fn();
+  } finally {
+    Date.now = originalNow;
+  }
+}
+
 test("alias route executes via live handler and round-robins targets", { concurrency: false }, async () => {
   const config = buildConfig({
     modelAliases: {
@@ -148,6 +237,488 @@ test("alias route executes via live handler and round-robins targets", { concurr
       "gpt-4o-mini",
       "claude-3-5-haiku"
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp anthropic provider path routes through amp model mapping", { concurrency: false }, async () => {
+  const config = buildConfig({
+    ampRouting: {
+      enabled: true,
+      modelMap: {
+        "claude-haiku-4-5-20251001": "openrouter/gpt-4o-mini"
+      }
+    }
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpAnthropicRequest("claude-haiku-4-5-20251001"), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.includes("/chat/completions"));
+    assert.equal(called[0].payload.model, "gpt-4o-mini");
+    assert.equal(response.headers.get("x-llm-router-amp-detected"), "true");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "model");
+    assert.equal(payload.type, "message");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp anthropic provider path falls back to router default route when unmapped", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpAnthropicRequest("claude-haiku-4-5-20251001"), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.includes("/chat/completions"));
+    assert.equal(called[0].payload.model, "gpt-4o-mini");
+    assert.equal(response.headers.get("x-llm-router-amp-detected"), "true");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "fallback");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-ref"), "smart");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp internal getUserInfo returns json-rpc envelope", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/internal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-amp-client-application": "CLI"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getUserInfo",
+        params: {}
+      })
+    }), {});
+
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.jsonrpc, "2.0");
+    assert.equal(payload.id, 1);
+    assert.equal(payload.result?.name, "llm-router");
+    assert.deepEqual(payload.result?.features, []);
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp internal getUserInfo returns result envelope for plain rpc", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/internal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-amp-client-application": "CLI Execute Mode"
+      },
+      body: JSON.stringify({
+        method: "getUserInfo",
+        params: {}
+      })
+    }), {});
+
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload?.ok, true);
+    assert.equal(payload?.result?.name, "llm-router");
+    assert.equal(payload?.result?.authenticated, true);
+    assert.deepEqual(payload?.result?.features, []);
+    assert.equal(payload?.jsonrpc, undefined);
+    assert.equal(payload?.id, undefined);
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp internal getUserFreeTierStatus returns stable boolean shape", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/internal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-amp-client-application": "CLI Execute Mode"
+      },
+      body: JSON.stringify({
+        method: "getUserFreeTierStatus",
+        params: {}
+      })
+    }), {});
+
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload?.ok, true);
+    assert.equal(payload?.result?.canUseAmpFree, false);
+    assert.equal(payload?.result?.isDailyGrantEnabled, false);
+    assert.deepEqual(payload?.result?.features, []);
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp internal uploadThread/setThreadMeta return ack payloads", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  try {
+    const uploadResponse = await fetchHandler(new Request("http://router.local/api/internal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-amp-client-application": "CLI Execute Mode"
+      },
+      body: JSON.stringify({
+        method: "uploadThread",
+        params: {
+          thread: {
+            id: "T-test",
+            v: 7
+          },
+          createdOnServer: false
+        }
+      })
+    }), {});
+    const uploadPayload = await uploadResponse.json();
+    assert.equal(uploadResponse.status, 200);
+    assert.equal(uploadPayload?.ok, true);
+    assert.equal(uploadPayload?.result?.uploaded, true);
+    assert.equal(uploadPayload?.result?.threadId, "T-test");
+    assert.equal(uploadPayload?.result?.version, 7);
+
+    const metaResponse = await fetchHandler(new Request("http://router.local/api/internal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-amp-client-application": "CLI Execute Mode"
+      },
+      body: JSON.stringify({
+        method: "setThreadMeta",
+        params: {
+          thread: "T-test",
+          meta: {
+            visibility: "private"
+          }
+        }
+      })
+    }), {});
+    const metaPayload = await metaResponse.json();
+    assert.equal(metaResponse.status, 200);
+    assert.equal(metaPayload?.ok, true);
+    assert.equal(metaPayload?.result?.updated, true);
+    assert.equal(metaPayload?.result?.threadId, "T-test");
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp google generateContent request is bridged through routing and returned as gemini shape", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpGoogleGenerateContentRequest(), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.includes("/chat/completions"));
+    assert.equal(called[0].payload.model, "gpt-4o-mini");
+    assert.ok(Array.isArray(payload.candidates));
+    assert.equal(payload.candidates[0]?.content?.parts?.[0]?.text, "ok");
+    assert.equal(response.headers.get("x-llm-router-amp-detected"), "true");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "fallback");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp openai responses path preserves responses upstream endpoint", { concurrency: false }, async () => {
+  const config = buildConfig({
+    ampRouting: {
+      enabled: true,
+      modeMap: {
+        deep: "openrouter/gpt-4o-mini"
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpOpenAIResponsesRequest("gpt-5.3-codex", {
+      headers: {
+        "x-amp-mode": "deep"
+      }
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.endsWith("/responses"));
+    assert.equal(called[0].payload.model, "gpt-4o-mini");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "mode");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-ref"), "openrouter/gpt-4o-mini");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp provider path supports mode-based mapping", { concurrency: false }, async () => {
+  const config = buildConfig({
+    ampRouting: {
+      enabled: true,
+      modeMap: {
+        smart: "anthropic/claude-3-5-haiku"
+      }
+    }
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpAnthropicRequest("claude-haiku-4-5-20251001", {
+      mode: "smart"
+    }), { LLM_ROUTER_DEBUG_ROUTING: "true" });
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.includes("/messages"));
+    assert.equal(called[0].payload.model, "claude-3-5-haiku");
+    assert.equal(response.headers.get("x-llm-router-amp-mode"), "smart");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "mode");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-ref"), "anthropic/claude-3-5-haiku");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp provider path supports agent-based mapping", { concurrency: false }, async () => {
+  const config = buildConfig({
+    ampRouting: {
+      enabled: true,
+      agentMap: {
+        review: "anthropic/claude-3-5-haiku"
+      }
+    }
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpAnthropicRequest("claude-haiku-4-5-20251001", {
+      agent: "review"
+    }), { LLM_ROUTER_DEBUG_ROUTING: "true" });
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.includes("/messages"));
+    assert.equal(called[0].payload.model, "claude-3-5-haiku");
+    assert.equal(response.headers.get("x-llm-router-amp-agent"), "review");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "agent");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-ref"), "anthropic/claude-3-5-haiku");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("amp agent-mode map has precedence over mode and agent maps", { concurrency: false }, async () => {
+  const config = buildConfig({
+    ampRouting: {
+      enabled: true,
+      modeMap: {
+        smart: "openrouter/gpt-4o-mini"
+      },
+      agentMap: {
+        review: "openrouter/gpt-4o-mini"
+      },
+      agentModeMap: {
+        review: {
+          smart: "anthropic/claude-3-5-haiku"
+        }
+      }
+    }
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const called = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      called.push({ url: String(url), payload });
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpAnthropicRequest("claude-haiku-4-5-20251001", {
+      mode: "smart",
+      agent: "review"
+    }), { LLM_ROUTER_DEBUG_ROUTING: "true" });
+
+    assert.equal(response.status, 200);
+    assert.equal(called.length, 1);
+    assert.ok(called[0].url.includes("/messages"));
+    assert.equal(called[0].payload.model, "claude-3-5-haiku");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-by"), "agent-mode");
+    assert.equal(response.headers.get("x-llm-router-amp-matched-ref"), "anthropic/claude-3-5-haiku");
   } finally {
     globalThis.fetch = originalFetch;
     if (typeof fetchHandler.close === "function") {
@@ -221,9 +792,9 @@ test("preflight exhausted bucket skips candidate before provider call", { concur
       return openAISuccess(payload.model);
     };
 
-    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+    const response = await withMockedNow(now, () => fetchHandler(makeOpenAIRequest("chat.default"), {
       LLM_ROUTER_DEBUG_ROUTING: "true"
-    });
+    }));
     assert.equal(response.status, 200);
     assert.equal(calledUrls.length, 1);
     assert.ok(calledUrls[0].includes("/messages"));
@@ -325,9 +896,9 @@ test("combined buckets apply with AND logic in live handler routing", { concurre
       return openAISuccess(payload.model);
     };
 
-    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+    const response = await withMockedNow(now, () => fetchHandler(makeOpenAIRequest("chat.default"), {
       LLM_ROUTER_DEBUG_ROUTING: "true"
-    });
+    }));
     assert.equal(response.status, 200);
     assert.equal(calledUrls.length, 1);
     assert.ok(calledUrls[0].includes("/messages"));

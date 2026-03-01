@@ -410,3 +410,71 @@ test("resolveRouteReference looks up direct refs and alias refs", () => {
   assert.equal(alias?.aliasId, "chat.default");
   assert.equal(alias?.alias?.targets?.[0]?.ref, "openrouter/gpt-4o-mini");
 });
+
+test("normalizeRuntimeConfig supports ampRouting maps", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    ampRouting: {
+      enabled: true,
+      fallbackRoute: "openrouter/gpt-4o-mini",
+      modeMap: {
+        SMART: "openrouter/gpt-4o-mini"
+      },
+      agentMap: {
+        Review: "anthropic/claude-3-5-haiku"
+      },
+      agentModeMap: {
+        Review: {
+          Deep: "anthropic/claude-3-5-haiku"
+        }
+      },
+      applicationMap: {
+        "CLI Execute Mode": "openrouter/gpt-4o-mini"
+      },
+      modelMap: {
+        "claude-haiku-4-5-20251001": "openrouter/gpt-4o-mini"
+      }
+    }
+  }));
+
+  assert.equal(normalized.version, CONFIG_VERSION);
+  assert.equal(normalized.ampRouting.enabled, true);
+  assert.equal(normalized.ampRouting.fallbackRoute, "openrouter/gpt-4o-mini");
+  assert.equal(normalized.ampRouting.modeMap.smart, "openrouter/gpt-4o-mini");
+  assert.equal(normalized.ampRouting.agentMap.review, "anthropic/claude-3-5-haiku");
+  assert.equal(normalized.ampRouting.agentModeMap.review.deep, "anthropic/claude-3-5-haiku");
+  assert.equal(normalized.ampRouting.applicationMap["cli execute mode"], "openrouter/gpt-4o-mini");
+  assert.equal(normalized.ampRouting.modelMap["claude-haiku-4-5-20251001"], "openrouter/gpt-4o-mini");
+});
+
+test("validateRuntimeConfig rejects unknown ampRouting refs", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    ampRouting: {
+      modeMap: {
+        smart: "missing.alias"
+      }
+    }
+  }));
+
+  const errors = validateRuntimeConfig(normalized);
+  assert.ok(errors.some((error) => error.includes("ampRouting.modeMap.smart references unknown alias 'missing.alias'")));
+});
+
+test("normalizeRuntimeConfig preserves ampRouting enabled=false state", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    ampRouting: {
+      enabled: false,
+      fallbackRoute: "openrouter/gpt-4o-mini",
+      modeMap: {
+        SMART: "openrouter/gpt-4o-mini"
+      }
+    }
+  }));
+
+  assert.equal(normalized.ampRouting.enabled, false);
+  assert.equal(normalized.ampRouting.fallbackRoute, "openrouter/gpt-4o-mini");
+  assert.equal(normalized.ampRouting.modeMap.smart, "openrouter/gpt-4o-mini");
+  assert.deepEqual(validateRuntimeConfig(normalized), []);
+});

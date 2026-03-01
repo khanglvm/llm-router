@@ -68,6 +68,7 @@ export async function makeProviderCall({
   sourceFormat,
   stream,
   candidate,
+  providerOperation,
   requestHeaders,
   env
 }) {
@@ -112,7 +113,9 @@ export async function makeProviderCall({
     requestHeaders
   });
 
-  const providerUrl = resolveProviderUrl(provider, targetFormat);
+  const providerUrl = resolveProviderUrl(provider, targetFormat, {
+    operation: providerOperation
+  });
   const headers = mergeCachingHeaders(
     buildProviderHeaders(provider, env, targetFormat),
     requestHeaders,

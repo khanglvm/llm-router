@@ -128,6 +128,55 @@ export function resolveApiRoute(pathname, method) {
     return { type: "route", sourceFormat: "auto" };
   }
 
+  if ((isPost || isGet) && (path === "/api/internal" || path.startsWith("/api/internal/"))) {
+    return { type: "amp-internal", sourceFormat: "auto" };
+  }
+
+  const ampProviderMatch = path.match(/^\/api\/provider\/([^/]+)(\/.*)?$/);
+  if (ampProviderMatch) {
+    const ampProvider = String(ampProviderMatch[1] || "").trim().toLowerCase();
+    const ampRest = normalizePath(ampProviderMatch[2] || "/");
+    const googleGenerateMatch = ampRest.match(/^\/v1beta1\/publishers\/google\/models\/([^:/]+):(generateContent|streamGenerateContent)$/);
+
+    if (isGet && ["/models", "/v1/models"].includes(ampRest)) {
+      const sourceFormat = ampProvider === "anthropic"
+        ? FORMATS.CLAUDE
+        : (ampProvider === "openai" ? FORMATS.OPENAI : "auto");
+      return { type: "models", sourceFormat };
+    }
+
+    if (isPost && ["/messages", "/v1/messages"].includes(ampRest)) {
+      return {
+        type: "amp-provider-route",
+        sourceFormat: FORMATS.CLAUDE,
+        ampProvider,
+        providerOperation: "messages"
+      };
+    }
+
+    if (isPost && ["/chat/completions", "/v1/chat/completions", "/completions", "/v1/completions", "/responses", "/v1/responses"].includes(ampRest)) {
+      const providerOperation = ["/responses", "/v1/responses"].includes(ampRest)
+        ? "responses"
+        : ([ "/completions", "/v1/completions" ].includes(ampRest) ? "completions" : "chat.completions");
+      return {
+        type: "amp-provider-route",
+        sourceFormat: FORMATS.OPENAI,
+        ampProvider,
+        providerOperation
+      };
+    }
+
+    if (isPost && ampProvider === "google" && googleGenerateMatch) {
+      return {
+        type: "amp-provider-gemini-route",
+        sourceFormat: FORMATS.OPENAI,
+        ampProvider,
+        ampModelId: String(googleGenerateMatch[1] || "").trim(),
+        ampAction: String(googleGenerateMatch[2] || "").trim()
+      };
+    }
+  }
+
   return null;
 }
 

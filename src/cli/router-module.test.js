@@ -24,6 +24,7 @@ import {
   parseRateLimitWindowInput,
   resolveCloudflareApiTokenFromEnv,
   setProviderRateLimitsInConfig,
+  setAmpRoutingInConfig,
   shouldConfirmLargeWorkerConfigDeploy,
   summarizeConfig,
   suggestZoneNameForHostname,
@@ -574,6 +575,89 @@ test("non-interactive set-provider-rate-limits can auto-generate bucket id from 
   ]);
 });
 
+test("non-interactive set-amp-routing writes expected config", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-routing",
+    config: configPath,
+    "amp-enabled": "true",
+    "amp-fallback-route": "openrouter/gpt-4o-mini",
+    "amp-map-kind": "mode",
+    "amp-key": "smart",
+    "amp-ref": "openrouter/gpt-4o-mini"
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.ampRouting.enabled, true);
+  assert.equal(next.ampRouting.fallbackRoute, "openrouter/gpt-4o-mini");
+  assert.equal(next.ampRouting.modeMap.smart, "openrouter/gpt-4o-mini");
+});
+
+test("non-interactive set-amp-routing can remove mapping entry", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const setResult = await configAction.run(createConfigContext({
+    operation: "set-amp-routing",
+    config: configPath,
+    "amp-map-kind": "agent",
+    "amp-key": "review",
+    "amp-ref": "anthropic/claude-3-5-haiku"
+  }));
+  assert.equal(setResult.ok, true);
+
+  const removeResult = await configAction.run(createConfigContext({
+    operation: "set-amp-routing",
+    config: configPath,
+    "amp-map-kind": "agent",
+    "amp-key": "review",
+    "remove-amp-mapping": "true"
+  }));
+  assert.equal(removeResult.ok, true);
+
+  const next = await readConfigFile(configPath);
+  assert.deepEqual(next.ampRouting.agentMap, {});
+});
+
+test("set-amp-routing rejects unknown refs with validation error", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-routing",
+    config: configPath,
+    "amp-map-kind": "mode",
+    "amp-key": "smart",
+    "amp-ref": "missing.alias"
+  }));
+
+  assert.equal(result.ok, false);
+  assert.match(String(result.errorMessage || ""), /ampRouting\.modeMap\.smart references unknown alias 'missing\.alias'/);
+});
+
+test("setAmpRoutingInConfig canonicalizes case-insensitive keys without duplicates", () => {
+  const existing = baseConfigFixture();
+  const first = setAmpRoutingInConfig(existing, {
+    mapKind: "mode",
+    key: "SMART",
+    ref: "openrouter/gpt-4o-mini"
+  });
+  assert.equal(first.changed, true);
+
+  const second = setAmpRoutingInConfig(first.config, {
+    mapKind: "mode",
+    key: "smart",
+    ref: "anthropic/claude-3-5-haiku"
+  });
+
+  assert.equal(second.changed, true);
+  assert.deepEqual(Object.keys(second.config.ampRouting.modeMap), ["smart"]);
+  assert.equal(second.config.ampRouting.modeMap.smart, "anthropic/claude-3-5-haiku");
+});
+
 test("setProviderRateLimitsInConfig resolves generated bucket id collisions deterministically", () => {
   const existing = baseConfigFixture();
   existing.providers[0].rateLimits = [
@@ -695,6 +779,31 @@ test("list-routing stays stable after mixed edits", async (t) => {
   const normalized = await readConfigFile(configPath);
   assert.equal(normalized.version, 2);
   assert.equal(normalized.modelAliases["chat.default"].targets.length, 2);
+});
+
+test("list-routing includes amp routing summary after amp edits", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const ampResult = await configAction.run(createConfigContext({
+    operation: "set-amp-routing",
+    config: configPath,
+    "amp-enabled": "true",
+    "amp-fallback-route": "openrouter/gpt-4o-mini",
+    "amp-map-kind": "application",
+    "amp-key": "cli execute mode",
+    "amp-ref": "openrouter/gpt-4o-mini"
+  }));
+  assert.equal(ampResult.ok, true);
+
+  const list = await configAction.run(createConfigContext({
+    operation: "list-routing",
+    config: configPath
+  }));
+  assert.equal(list.ok, true);
+  assert.match(String(list.data || ""), /Amp routing: enabled=true/);
+  assert.match(String(list.data || ""), /applicationMap:/);
+  assert.match(String(list.data || ""), /cli execute mode -> openrouter\/gpt-4o-mini/);
 });
 
 test("migrate-config creates backup and upgrades legacy config version", async (t) => {
