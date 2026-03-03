@@ -355,6 +355,13 @@ function normalizeProvider(provider, index = 0) {
 
   const name = provider.name || provider.id || `provider-${index + 1}`;
   const id = slugifyId(provider.id || provider.name || `provider-${index + 1}`);
+  const providerType = provider.type || null;
+  const isSubscription = providerType === "subscription";
+  
+  // Subscription-specific fields
+  const subscriptionType = isSubscription ? (provider.subscriptionType || provider.subscription_type || null) : null;
+  const subscriptionProfile = isSubscription ? (provider.subscriptionProfile || provider.subscription_profile || id) : null;
+  
   const baseUrlByFormat = normalizeBaseUrlByFormat(
     provider.baseUrlByFormat ||
     provider["base-url-by-format"] ||
@@ -362,7 +369,12 @@ function normalizeProvider(provider, index = 0) {
     provider["endpoint-by-format"] ||
     provider.endpoints
   );
-  const explicitBaseUrl = sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "");
+  
+  // Subscription providers have a fixed endpoint, so baseUrl is optional
+  const explicitBaseUrl = !isSubscription 
+    ? sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "")
+    : sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "");
+    
   const rawFormat = provider.format || provider.responseFormat || provider["response-format"];
   const preferredFormat = [FORMATS.OPENAI, FORMATS.CLAUDE].includes(rawFormat) ? rawFormat : undefined;
   const endpointFormats = baseUrlByFormat ? Object.keys(baseUrlByFormat) : [];
@@ -374,6 +386,10 @@ function normalizeProvider(provider, index = 0) {
   const orderedFormats = preferredFormat
     ? dedupeStrings([preferredFormat, ...formats])
     : formats;
+    
+  // For subscription providers, default to OpenAI format
+  const defaultFormat = isSubscription ? FORMATS.OPENAI : (orderedFormats[0] || FORMATS.OPENAI);
+  
   const baseUrl = explicitBaseUrl
     || (preferredFormat && baseUrlByFormat?.[preferredFormat])
     || (baseUrlByFormat?.[orderedFormats[0]])
@@ -401,16 +417,17 @@ function normalizeProvider(provider, index = 0) {
       )
     : undefined;
 
-  return {
+  const baseConfig = {
     id,
     name,
+    type: providerType,
     enabled: provider.enabled !== false,
     baseUrl,
     baseUrlByFormat,
     apiKey: typeof provider.apiKey === "string" ? provider.apiKey : (typeof provider.credential === "string" ? provider.credential : undefined),
     apiKeyEnv: typeof provider.apiKeyEnv === "string" ? provider.apiKeyEnv : undefined,
-    format: preferredFormat || orderedFormats[0],
-    formats: orderedFormats,
+    format: preferredFormat || defaultFormat,
+    formats: orderedFormats.length > 0 ? orderedFormats : [defaultFormat],
     auth,
     authByFormat,
     headers: provider.headers && typeof provider.headers === "object" ? provider.headers : {},
@@ -421,6 +438,14 @@ function normalizeProvider(provider, index = 0) {
     metadata: normalizeMetadataObject(provider.metadata),
     lastProbe: provider.lastProbe && typeof provider.lastProbe === "object" ? provider.lastProbe : undefined
   };
+  
+  // Add subscription-specific fields
+  if (isSubscription) {
+    baseConfig.subscriptionType = subscriptionType;
+    baseConfig.subscriptionProfile = subscriptionProfile;
+  }
+  
+  return baseConfig;
 }
 
 function normalizeModelAliases(rawModelAliases) {

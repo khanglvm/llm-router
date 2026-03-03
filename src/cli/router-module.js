@@ -5230,6 +5230,180 @@ async function runWorkerKeyAction(context) {
   };
 }
 
+// ============================================================================
+// Subscription Provider Actions
+// ============================================================================
+
+/**
+ * Run subscription login action.
+ * Supports browser-based and device code OAuth flows.
+ */
+async function runSubscriptionLoginAction(context) {
+  const args = context.args || {};
+  const profile = String(readArg(args, ["profile", "profileId"], "default") || "default").trim();
+  const deviceCode = toBoolean(readArg(args, ["device-code", "deviceCode"], false), false);
+  
+  // Import subscription auth functions
+  const { loginWithBrowser, loginWithDeviceCode } = await import("../runtime/subscription-auth.js");
+  
+  const lines = [];
+  lines.push(`Logging into subscription profile: ${profile}`);
+  lines.push("");
+  
+  try {
+    if (deviceCode) {
+      lines.push("Using device code flow (for headless environments)...");
+      lines.push("");
+      
+      const success = await loginWithDeviceCode(profile, {
+        onCode: ({ userCode, verificationUri, expiresIn }) => {
+          lines.push(`1. Go to: ${verificationUri}`);
+          lines.push(`2. Enter code: ${userCode}`);
+          lines.push(`   (expires in ${Math.floor(expiresIn / 60)} minutes)`);
+          lines.push("");
+          lines.push("Waiting for authentication...");
+        }
+      });
+      
+      if (success) {
+        lines.push("");
+        lines.push("✓ Successfully authenticated!");
+        lines.push(`Profile '${profile}' is now logged in.`);
+      }
+    } else {
+      lines.push("Opening browser for OAuth login...");
+      lines.push("");
+      
+      const success = await loginWithBrowser(profile, {
+        onUrl: (url) => {
+          lines.push(`If browser doesn't open, visit: ${url}`);
+        }
+      });
+      
+      if (success) {
+        lines.push("");
+        lines.push("✓ Successfully authenticated!");
+        lines.push(`Profile '${profile}' is now logged in.`);
+      }
+    }
+    
+    return {
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: lines.join("\n")
+    };
+  } catch (error) {
+    lines.push("");
+    lines.push(`✗ Login failed: ${error instanceof Error ? error.message : String(error)}`);
+    
+    return {
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      data: lines.join("\n")
+    };
+  }
+}
+
+/**
+ * Run subscription logout action.
+ */
+async function runSubscriptionLogoutAction(context) {
+  const args = context.args || {};
+  const profile = String(readArg(args, ["profile", "profileId"], "default") || "default").trim();
+  
+  // Import subscription auth functions
+  const { logout } = await import("../runtime/subscription-auth.js");
+  
+  const lines = [];
+  lines.push(`Logging out subscription profile: ${profile}`);
+  
+  try {
+    await logout(profile);
+    lines.push("");
+    lines.push(`✓ Successfully logged out profile '${profile}'.`);
+    
+    return {
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: lines.join("\n")
+    };
+  } catch (error) {
+    lines.push("");
+    lines.push(`✗ Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+    
+    return {
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      data: lines.join("\n")
+    };
+  }
+}
+
+/**
+ * Run subscription status action.
+ */
+async function runSubscriptionStatusAction(context) {
+  const args = context.args || {};
+  const profile = String(readArg(args, ["profile", "profileId"], "") || "").trim();
+  
+  // Import subscription auth functions
+  const { getAuthStatus, listTokenProfiles } = await import("../runtime/subscription-auth.js");
+  
+  const lines = [];
+  
+  try {
+    if (profile) {
+      // Show status for specific profile
+      const status = await getAuthStatus(profile);
+      
+      lines.push(`Subscription Profile: ${profile}`);
+      lines.push(`Status: ${status.authenticated ? "✓ Authenticated" : "✗ Not authenticated"}`);
+      
+      if (status.authenticated) {
+        lines.push(`Expires: ${status.expiresAtIso}`);
+        lines.push(`Has refresh token: ${status.hasRefreshToken ? "Yes" : "No"}`);
+      } else if (status.reason) {
+        lines.push(`Reason: ${status.reason}`);
+      }
+    } else {
+      // List all profiles
+      const profiles = await listTokenProfiles();
+      
+      lines.push("Subscription Profiles:");
+      lines.push("");
+      
+      if (profiles.length === 0) {
+        lines.push("  No authenticated profiles found.");
+        lines.push("");
+        lines.push("  To login: llm-router subscription login --profile=<name>");
+      } else {
+        for (const p of profiles) {
+          const status = await getAuthStatus(p);
+          const statusIcon = status.authenticated ? "✓" : "✗";
+          lines.push(`  ${statusIcon} ${p}`);
+          if (status.authenticated && status.expiresAtIso) {
+            lines.push(`      Expires: ${status.expiresAtIso}`);
+          }
+        }
+      }
+    }
+    
+    return {
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: lines.join("\n")
+    };
+  } catch (error) {
+    lines.push(`✗ Status check failed: ${error instanceof Error ? error.message : String(error)}`);
+    
+    return {
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      data: lines.join("\n")
+    };
+  }
+}
+
 const routerModule = {
   moduleId: "router",
   description: "LLM Router local start, config manager, and Cloudflare deploy.",
@@ -5604,6 +5778,66 @@ const routerModule = {
         keybindings: ["Enter confirm", "Esc cancel"]
       },
       run: runWorkerKeyAction
+    },
+    {
+      actionId: "subscription",
+      description: "Manage subscription provider authentication (login, logout, status).",
+      tui: { steps: ["subscription-auth"] },
+      commandline: {
+        requiredArgs: [],
+        optionalArgs: ["profile", "device-code"]
+      },
+      help: {
+        summary: "Manage OAuth authentication for subscription providers (ChatGPT Codex).",
+        args: [
+          { name: "profile", required: false, description: "Subscription profile ID (defaults to 'default').", example: "--profile=personal" },
+          { name: "device-code", required: false, description: "Use device code flow instead of browser (for headless environments).", example: "--device-code=true" }
+        ],
+        examples: [
+          "llm-router subscription login",
+          "llm-router subscription login --profile=personal",
+          "llm-router subscription login --device-code=true",
+          "llm-router subscription logout --profile=personal",
+          "llm-router subscription status",
+          "llm-router subscription status --profile=personal"
+        ],
+        useCases: [
+          {
+            name: "browser login",
+            description: "Login to ChatGPT Codex subscription via browser OAuth.",
+            command: "llm-router subscription login --profile=personal"
+          },
+          {
+            name: "device code login",
+            description: "Login on headless server using device code flow.",
+            command: "llm-router subscription login --device-code=true --profile=server"
+          },
+          {
+            name: "check status",
+            description: "Check authentication status for all profiles.",
+            command: "llm-router subscription status"
+          }
+        ],
+        keybindings: []
+      },
+      subcommands: [
+        {
+          actionId: "login",
+          description: "Login to a subscription provider.",
+          run: runSubscriptionLoginAction
+        },
+        {
+          actionId: "logout",
+          description: "Logout from a subscription provider.",
+          run: runSubscriptionLogoutAction
+        },
+        {
+          actionId: "status",
+          description: "Check subscription authentication status.",
+          run: runSubscriptionStatusAction
+        }
+      ],
+      run: runSubscriptionStatusAction
     }
   ]
 };

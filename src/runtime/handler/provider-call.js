@@ -16,6 +16,7 @@ import { applyReasoningEffortMapping } from "./reasoning-effort.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
 import { buildTimeoutSignal } from "../../shared/timeout-signal.js";
+import { isSubscriptionProvider, makeSubscriptionProviderCall } from "../subscription-provider.js";
 
 async function toProviderError(response) {
   const raw = await response.text();
@@ -74,6 +75,18 @@ export async function makeProviderCall({
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
+  
+  // Handle subscription providers with dedicated handler
+  if (isSubscriptionProvider(provider)) {
+    return makeSubscriptionProviderCall({
+      provider,
+      body,
+      sourceFormat,
+      stream,
+      env
+    });
+  }
+  
   const translate = needsTranslation(sourceFormat, targetFormat);
 
   let providerBody = { ...body };
