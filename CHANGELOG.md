@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.9] - 2026-03-03
+
+### Added
+- Added dedicated modules for Cloudflare API preflight checks and Wrangler TOML target handling.
+- Added runtime policy and route-debug helpers so stateful routing can be safely disabled by default on Cloudflare Worker.
+- Added reusable timeout-signal utility and start-command port reclaim utilities with test coverage.
+
+### Changed
+- Refactored CLI deploy/runtime handler code into focused modules with cleaner boundaries.
+- Updated provider-call timeout handling to support both `AbortSignal.timeout` and `AbortController` fallback.
+- Documented Worker safety defaults and switched README release/security links to canonical GitHub URLs.
+
 ## [1.0.8] - 2026-02-28
 
 ### Changed
