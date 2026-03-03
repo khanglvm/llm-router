@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import { promises as fs } from "node:fs";
 import { FORMATS } from "../translator/index.js";
 import { createFetchHandler } from "./handler.js";
 import { normalizeRuntimeConfig, resolveRequestModel } from "./config.js";
@@ -108,6 +111,11 @@ function openAISuccess(model = "gpt-4o-mini") {
   });
 }
 
+function buildTempPath(name) {
+  const unique = `llm-router-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return path.join(os.tmpdir(), `${name}-${unique}.json`);
+}
+
 test("alias route executes via live handler and round-robins targets", { concurrency: false }, async () => {
   const config = buildConfig({
     modelAliases: {
@@ -210,8 +218,10 @@ test("preflight exhausted bucket skips candidate before provider call", { concur
   });
 
   const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
   const calledUrls = [];
   try {
+    Date.now = () => now;
     globalThis.fetch = async (url, init) => {
       const payload = JSON.parse(String(init?.body || "{}"));
       calledUrls.push(String(url));
@@ -232,6 +242,7 @@ test("preflight exhausted bucket skips candidate before provider call", { concur
         .includes("quota-exhausted")
     );
   } finally {
+    Date.now = originalDateNow;
     globalThis.fetch = originalFetch;
     if (typeof fetchHandler.close === "function") {
       await fetchHandler.close();
@@ -385,4 +396,191 @@ test("direct provider/model requests keep fallbackModels order", { concurrency: 
       await fetchHandler.close();
     }
   }
+});
+
+test("worker safe mode auto-disables stateful round-robin progression", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      "chat.default": {
+        strategy: "round-robin",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    }
+  });
+
+  const fetchHandler = createFetchHandler({
+    runtime: "worker",
+    workerSafeMode: true,
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const first = await fetchHandler(makeOpenAIRequest("chat.default"), {});
+    const second = await fetchHandler(makeOpenAIRequest("chat.default"), {});
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.deepEqual(upstreamModels, [
+      "gpt-4o-mini",
+      "gpt-4o-mini"
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("worker safe mode bypasses local quota blocking and keeps main route flow", { concurrency: false }, async () => {
+  const now = Date.UTC(2026, 1, 28, 16, 0, 0);
+  const config = buildConfig({
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }],
+        rateLimits: [
+          {
+            id: "openrouter-day",
+            models: ["all"],
+            requests: 1,
+            window: { unit: "day", size: 1 }
+          }
+        ]
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    }
+  });
+  const store = createMemoryStateStore();
+  const route = resolveRequestModel(config, "chat.default", FORMATS.OPENAI);
+  const buckets = getApplicableRateLimitBuckets(config, route.primary, now);
+  await store.incrementBucketUsage(
+    buckets[0].bucketKey,
+    buckets[0].windowKey,
+    1,
+    { now, expiresAt: buckets[0].window.endsAt }
+  );
+
+  const fetchHandler = createFetchHandler({
+    runtime: "worker",
+    workerSafeMode: true,
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+  const calledUrls = [];
+  try {
+    Date.now = () => now;
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      calledUrls.push(`${String(url)}:${payload.model}`);
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    assert.equal(response.status, 200);
+    assert.equal(calledUrls.length, 1);
+    assert.ok(calledUrls[0].includes("gpt-4o-mini"));
+    assert.equal(
+      String(response.headers.get("x-llm-router-skipped-candidates") || "").includes("quota-exhausted"),
+      false
+    );
+  } finally {
+    Date.now = originalDateNow;
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("worker runtime coerces file state backend to memory", { concurrency: false }, async () => {
+  const stateFilePath = buildTempPath("worker-state-backend");
+  const config = buildConfig({
+    modelAliases: {
+      "chat.default": {
+        strategy: "round-robin",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    runtime: "worker",
+    workerSafeMode: true,
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+      LLM_ROUTER_WORKER_ALLOW_BEST_EFFORT_STATEFUL_ROUTING: "true",
+      LLM_ROUTER_STATE_BACKEND: "file",
+      LLM_ROUTER_STATE_FILE_PATH: stateFilePath
+    });
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+
+  let fileCreated = true;
+  try {
+    await fs.access(stateFilePath);
+  } catch {
+    fileCreated = false;
+  }
+  assert.equal(fileCreated, false);
+  await fs.unlink(stateFilePath).catch(() => {});
 });

@@ -172,6 +172,11 @@ llm-router deploy
 
 You will be guided in TUI to select account and deploy target.
 
+Worker safety defaults:
+- `LLM_ROUTER_STATE_BACKEND=file` is ignored on Worker (auto-fallback to in-memory state).
+- Stateful timing-dependent routing features (cursor balancing, local quota counters, cooldown persistence) are auto-disabled by default to keep route flow safe across Worker isolates.
+- To opt in to best-effort stateful behavior on Worker, set `LLM_ROUTER_WORKER_ALLOW_BEST_EFFORT_STATEFUL_ROUTING=true`.
+
 ## Config File Location
 
 Local config file:
@@ -180,9 +185,9 @@ Local config file:
 
 ## Security
 
-See [`SECURITY.md`](./SECURITY.md).
+See [`SECURITY.md`](https://github.com/khanglvm/llm-router/blob/master/SECURITY.md).
 
 ## Versioning
 
 - Semver: [Semantic Versioning](https://semver.org/)
-- Release notes: [`CHANGELOG.md`](./CHANGELOG.md)
+- Release notes: [`CHANGELOG.md`](https://github.com/khanglvm/llm-router/blob/master/CHANGELOG.md)

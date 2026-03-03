@@ -1,9 +1,10 @@
 import path from "node:path";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { configFileExists, getDefaultConfigPath, readConfigFile } from "./config-store.js";
 import { clearRuntimeState, writeRuntimeState } from "./instance-state.js";
 import { startLocalRouteServer } from "./local-server.js";
+import { reclaimPort } from "./port-reclaim.js";
 import { configHasProvider, sanitizeConfigForDisplay } from "../runtime/config.js";
 
 function summarizeConfig(config, configPath) {
@@ -130,133 +131,6 @@ function spawnReplacementCli({ cliPath, startArgs }) {
       resolve({ ok: false, error });
     }
   });
-}
-
-function parsePidList(text) {
-  const matches = String(text || "").match(/\d+/g) || [];
-  return [...new Set(matches
-    .map((token) => Number(token))
-    .filter((pid) => Number.isInteger(pid) && pid > 0))];
-}
-
-function listListeningPidsWithLsof(port) {
-  const result = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
-    encoding: "utf8"
-  });
-  if (result.error) {
-    return { ok: false, pids: [], tool: "lsof", error: result.error };
-  }
-
-  return {
-    ok: true,
-    pids: parsePidList(result.stdout),
-    tool: "lsof"
-  };
-}
-
-function listListeningPidsWithFuser(port) {
-  const result = spawnSync("fuser", ["-n", "tcp", String(port)], {
-    encoding: "utf8"
-  });
-  if (result.error) {
-    return { ok: false, pids: [], tool: "fuser", error: result.error };
-  }
-
-  return {
-    ok: true,
-    pids: parsePidList(`${result.stdout || ""}\n${result.stderr || ""}`),
-    tool: "fuser"
-  };
-}
-
-function listListeningPids(port) {
-  const lsof = listListeningPidsWithLsof(port);
-  if (lsof.ok) return lsof;
-
-  const fuser = listListeningPidsWithFuser(port);
-  if (fuser.ok) return fuser;
-
-  return {
-    ok: false,
-    pids: [],
-    tool: "none",
-    error: lsof.error || fuser.error
-  };
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitForPortToRelease(port, timeoutMs = 4000) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const probe = listListeningPids(port);
-    if (!probe.ok || probe.pids.length === 0) {
-      return true;
-    }
-    await sleep(150);
-  }
-
-  const finalProbe = listListeningPids(port);
-  return !finalProbe.ok || finalProbe.pids.length === 0;
-}
-
-async function reclaimPort({ port, line, error }) {
-  const probe = listListeningPids(port);
-  if (!probe.ok) {
-    return {
-      ok: false,
-      errorMessage: `Port ${port} is in use but process lookup failed (${probe.error instanceof Error ? probe.error.message : String(probe.error || "unknown error")}).`
-    };
-  }
-
-  const targets = probe.pids.filter((pid) => pid !== process.pid);
-  if (targets.length === 0) {
-    return {
-      ok: false,
-      errorMessage: `Port ${port} is in use but no external listener PID was detected.`
-    };
-  }
-
-  line(`Port ${port} is already in use. Stopping existing listener(s): ${targets.join(", ")}.`);
-
-  for (const pid of targets) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch (killError) {
-      error(`Failed sending SIGTERM to pid ${pid}: ${killError instanceof Error ? killError.message : String(killError)}`);
-    }
-  }
-
-  let released = await waitForPortToRelease(port, 3000);
-  if (!released) {
-    const remaining = listListeningPids(port);
-    const remainingTargets = (remaining.pids || []).filter((pid) => pid !== process.pid);
-
-    if (remainingTargets.length > 0) {
-      line(`Port ${port} still busy. Force killing listener(s): ${remainingTargets.join(", ")}.`);
-      for (const pid of remainingTargets) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch (killError) {
-          error(`Failed sending SIGKILL to pid ${pid}: ${killError instanceof Error ? killError.message : String(killError)}`);
-        }
-      }
-      released = await waitForPortToRelease(port, 2000);
-    }
-  }
-
-  if (!released) {
-    return {
-      ok: false,
-      errorMessage: `Failed to reclaim port ${port}; listener process is still running.`
-    };
-  }
-
-  return {
-    ok: true
-  };
 }
 
 export async function runStartCommand(options = {}) {

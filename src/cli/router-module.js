@@ -36,6 +36,32 @@ import {
   sanitizeConfigForDisplay,
   validateRuntimeConfig
 } from "../runtime/config.js";
+import {
+  CLOUDFLARE_ACCOUNT_ID_ENV_NAME,
+  CLOUDFLARE_API_TOKEN_ENV_NAME,
+  buildCloudflareApiTokenSetupGuide,
+  buildCloudflareApiTokenTroubleshooting,
+  cloudflareListZones,
+  evaluateCloudflareMembershipsResult,
+  evaluateCloudflareTokenVerifyResult,
+  extractCloudflareMembershipAccounts,
+  preflightCloudflareApiToken,
+  resolveCloudflareApiTokenFromEnv,
+  validateCloudflareApiTokenInput
+} from "./cloudflare-api.js";
+import {
+  applyWranglerDeployTargetToToml,
+  buildCloudflareDnsManualGuide,
+  buildDefaultWranglerTomlForDeploy,
+  extractHostnameFromRoutePattern,
+  hasNoDeployTargets,
+  hasWranglerDeployTargetConfigured,
+  inferZoneNameFromHostname,
+  isHostnameUnderZone,
+  normalizeWranglerRoutePattern,
+  parseTomlStringField,
+  suggestZoneNameForHostname
+} from "./wrangler-toml.js";
 
 const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 1;
@@ -48,17 +74,6 @@ const WEAK_MASTER_KEY_PATTERN = /(password|changeme|default|secret|token|admin|q
 export const CLOUDFLARE_FREE_SECRET_SIZE_LIMIT_BYTES = 5 * 1024;
 const CLOUDFLARE_FREE_TIER_PATTERN = /\bfree\b/i;
 const CLOUDFLARE_PAID_TIER_PATTERN = /\b(pro|business|enterprise|paid|unbound)\b/i;
-const CLOUDFLARE_API_TOKEN_ENV_NAME = "CLOUDFLARE_API_TOKEN";
-const CLOUDFLARE_API_TOKEN_ALT_ENV_NAME = "CF_API_TOKEN";
-const CLOUDFLARE_ACCOUNT_ID_ENV_NAME = "CLOUDFLARE_ACCOUNT_ID";
-const CLOUDFLARE_API_TOKEN_PRESET_NAME = "Edit Cloudflare Workers";
-const CLOUDFLARE_API_TOKEN_DASHBOARD_URL = "https://dash.cloudflare.com/profile/api-tokens";
-const CLOUDFLARE_API_TOKEN_GUIDE_URL = "https://developers.cloudflare.com/fundamentals/api/get-started/create-token/";
-const CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4";
-const CLOUDFLARE_VERIFY_TOKEN_URL = `${CLOUDFLARE_API_BASE_URL}/user/tokens/verify`;
-const CLOUDFLARE_MEMBERSHIPS_URL = `${CLOUDFLARE_API_BASE_URL}/memberships`;
-const CLOUDFLARE_ZONES_URL = `${CLOUDFLARE_API_BASE_URL}/zones`;
-const CLOUDFLARE_API_PREFLIGHT_TIMEOUT_MS = 10_000;
 const MODEL_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const MODEL_ROUTING_STRATEGY_OPTIONS = [
   {
@@ -116,6 +131,25 @@ const RATE_LIMIT_WINDOW_UNIT_ALIASES = new Map([
   ["month", "month"],
   ["months", "month"]
 ]);
+
+export {
+  applyWranglerDeployTargetToToml,
+  buildCloudflareDnsManualGuide,
+  buildCloudflareApiTokenSetupGuide,
+  buildDefaultWranglerTomlForDeploy,
+  evaluateCloudflareMembershipsResult,
+  evaluateCloudflareTokenVerifyResult,
+  extractHostnameFromRoutePattern,
+  extractCloudflareMembershipAccounts,
+  hasNoDeployTargets,
+  hasWranglerDeployTargetConfigured,
+  inferZoneNameFromHostname,
+  isHostnameUnderZone,
+  normalizeWranglerRoutePattern,
+  resolveCloudflareApiTokenFromEnv,
+  suggestZoneNameForHostname,
+  validateCloudflareApiTokenInput
+};
 
 function canPrompt() {
   return Boolean(process.stdout.isTTY && process.stdin.isTTY);
@@ -1232,228 +1266,6 @@ async function runWranglerAsync(args, { cwd, input, envOverrides } = {}) {
   return runCommandAsync(npxCmd, ["wrangler", ...args], { cwd, input, envOverrides });
 }
 
-export function resolveCloudflareApiTokenFromEnv(env = process.env) {
-  const primary = String(env?.[CLOUDFLARE_API_TOKEN_ENV_NAME] || "").trim();
-  if (primary) {
-    return {
-      token: primary,
-      source: CLOUDFLARE_API_TOKEN_ENV_NAME
-    };
-  }
-
-  const fallback = String(env?.[CLOUDFLARE_API_TOKEN_ALT_ENV_NAME] || "").trim();
-  if (fallback) {
-    return {
-      token: fallback,
-      source: CLOUDFLARE_API_TOKEN_ALT_ENV_NAME
-    };
-  }
-
-  return {
-    token: "",
-    source: "none"
-  };
-}
-
-export function buildCloudflareApiTokenSetupGuide() {
-  return [
-    `Cloudflare deploy requires ${CLOUDFLARE_API_TOKEN_ENV_NAME}.`,
-    `Create a User Profile API token in dashboard: ${CLOUDFLARE_API_TOKEN_DASHBOARD_URL}`,
-    "Do not use Account API Tokens for this deploy flow.",
-    `Token docs: ${CLOUDFLARE_API_TOKEN_GUIDE_URL}`,
-    `Recommended preset: ${CLOUDFLARE_API_TOKEN_PRESET_NAME}.`,
-    `Then set ${CLOUDFLARE_API_TOKEN_ENV_NAME} in your shell/CI environment.`
-  ].join("\n");
-}
-
-export function validateCloudflareApiTokenInput(value) {
-  const candidate = String(value || "").trim();
-  if (!candidate) return `${CLOUDFLARE_API_TOKEN_ENV_NAME} is required for deploy.`;
-  return undefined;
-}
-
-function buildCloudflareApiTokenTroubleshooting(preflightMessage = "") {
-  return [
-    preflightMessage,
-    "Required token capabilities for wrangler deploy:",
-    "- User details: Read",
-    "- User memberships: Read",
-    `- Account preset/template: ${CLOUDFLARE_API_TOKEN_PRESET_NAME}`,
-    `Verify token manually: curl \"${CLOUDFLARE_VERIFY_TOKEN_URL}\" -H \"Authorization: Bearer $${CLOUDFLARE_API_TOKEN_ENV_NAME}\"`,
-    buildCloudflareApiTokenSetupGuide()
-  ].filter(Boolean).join("\n");
-}
-
-function normalizeCloudflareMembershipAccount(entry) {
-  if (!entry || typeof entry !== "object") return null;
-  const accountObj = entry.account && typeof entry.account === "object" ? entry.account : {};
-  const accountId = String(
-    accountObj.id
-    || entry.account_id
-    || entry.accountId
-    || entry.id
-    || ""
-  ).trim();
-  if (!accountId) return null;
-
-  const accountName = String(
-    accountObj.name
-    || entry.account_name
-    || entry.accountName
-    || entry.name
-    || `Account ${accountId.slice(0, 8)}`
-  ).trim();
-
-  return {
-    accountId,
-    accountName: accountName || `Account ${accountId.slice(0, 8)}`
-  };
-}
-
-export function extractCloudflareMembershipAccounts(payload) {
-  const list = Array.isArray(payload?.result) ? payload.result : [];
-  const map = new Map();
-  for (const entry of list) {
-    const normalized = normalizeCloudflareMembershipAccount(entry);
-    if (!normalized) continue;
-    if (!map.has(normalized.accountId)) {
-      map.set(normalized.accountId, normalized);
-    }
-  }
-  return Array.from(map.values());
-}
-
-function cloudflareErrorFromPayload(payload, fallback) {
-  const base = String(fallback || "Unknown Cloudflare API error");
-  if (!payload || typeof payload !== "object") return base;
-
-  const errors = Array.isArray(payload.errors) ? payload.errors : [];
-  const first = errors.find((entry) => entry && typeof entry === "object");
-  if (!first) return base;
-
-  const code = Number.isFinite(first.code) ? `code ${first.code}` : "";
-  const message = String(first.message || first.error || "").trim();
-  if (code && message) return `${message} (${code})`;
-  if (message) return message;
-  if (code) return code;
-  return base;
-}
-
-export function evaluateCloudflareTokenVerifyResult(payload) {
-  const status = String(payload?.result?.status || "").toLowerCase();
-  const active = payload?.success === true && status === "active";
-  if (active) {
-    return { ok: true, message: "Token is active." };
-  }
-  return {
-    ok: false,
-    message: cloudflareErrorFromPayload(
-      payload,
-      "Token verification failed. Ensure token is valid and active."
-    )
-  };
-}
-
-export function evaluateCloudflareMembershipsResult(payload) {
-  if (payload?.success !== true || !Array.isArray(payload?.result)) {
-    return {
-      ok: false,
-      message: cloudflareErrorFromPayload(
-        payload,
-        "Could not list Cloudflare memberships for this token."
-      )
-    };
-  }
-
-  if (payload.result.length === 0) {
-    return {
-      ok: false,
-      message: "Token can authenticate but has no accessible memberships."
-    };
-  }
-
-  const accounts = extractCloudflareMembershipAccounts(payload);
-  return {
-    ok: true,
-    message: `Token has access to ${payload.result.length} membership(s).`,
-    count: payload.result.length,
-    accounts
-  };
-}
-
-async function cloudflareApiGetJson(url, token) {
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${token}`
-      },
-      signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-        ? AbortSignal.timeout(CLOUDFLARE_API_PREFLIGHT_TIMEOUT_MS)
-        : undefined
-    });
-    const rawText = await response.text();
-    const payload = parseJsonSafely(rawText) || {};
-    return {
-      ok: response.ok,
-      status: response.status,
-      payload
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: 0,
-      payload: null,
-      error: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-async function preflightCloudflareApiToken(token) {
-  const verified = await cloudflareApiGetJson(CLOUDFLARE_VERIFY_TOKEN_URL, token);
-  if (verified.status === 0) {
-    return {
-      ok: false,
-      stage: "verify",
-      message: `Cloudflare token preflight failed while verifying token: ${verified.error || "network error"}`
-    };
-  }
-
-  const verifyEval = evaluateCloudflareTokenVerifyResult(verified.payload);
-  if (!verified.ok || !verifyEval.ok) {
-    return {
-      ok: false,
-      stage: "verify",
-      message: `Cloudflare token verification failed: ${verifyEval.message}`
-    };
-  }
-
-  const memberships = await cloudflareApiGetJson(CLOUDFLARE_MEMBERSHIPS_URL, token);
-  if (memberships.status === 0) {
-    return {
-      ok: false,
-      stage: "memberships",
-      message: `Cloudflare token preflight failed while checking memberships: ${memberships.error || "network error"}`
-    };
-  }
-
-  const membershipEval = evaluateCloudflareMembershipsResult(memberships.payload);
-  if (!memberships.ok || !membershipEval.ok) {
-    return {
-      ok: false,
-      stage: "memberships",
-      message: `Cloudflare memberships check failed: ${membershipEval.message}`
-    };
-  }
-
-  return {
-    ok: true,
-    stage: "ready",
-    message: membershipEval.message,
-    memberships: membershipEval.accounts || []
-  };
-}
-
 function buildWranglerCloudflareEnv({
   apiToken,
   accountId
@@ -1470,253 +1282,9 @@ function formatCloudflareAccountOptions(accounts = []) {
   return (accounts || []).map((entry) => `\`${entry.accountName}\`: \`${entry.accountId}\``);
 }
 
-export function hasNoDeployTargets(outputText = "") {
-  return /no deploy targets/i.test(String(outputText || ""));
-}
-
 function parseOptionalBoolean(value) {
   if (value === undefined || value === null || value === "") return undefined;
   return toBoolean(value, false);
-}
-
-function parseTomlStringField(text, key) {
-  const pattern = new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']\\s*$`, "m");
-  const match = String(text || "").match(pattern);
-  return match?.[1] ? String(match[1]).trim() : "";
-}
-
-function topLevelTomlLineInfo(text = "") {
-  const lines = String(text || "").split(/\r?\n/g);
-  const info = [];
-  let currentSection = "";
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const trimmed = line.trim();
-    if (/^\s*\[.*\]\s*$/.test(line)) {
-      currentSection = trimmed;
-    }
-    info.push({
-      index,
-      line,
-      trimmed,
-      section: currentSection
-    });
-  }
-
-  return info;
-}
-
-export function hasWranglerDeployTargetConfigured(tomlText = "") {
-  const info = topLevelTomlLineInfo(tomlText);
-
-  const hasTopLevelWorkersDev = info.some((entry) =>
-    entry.section === "" && /^\s*workers_dev\s*=\s*true\s*$/i.test(entry.line)
-  );
-  if (hasTopLevelWorkersDev) return true;
-
-  const hasTopLevelRoute = info.some((entry) =>
-    entry.section === "" && /^\s*route\s*=\s*["'][^"']+["']\s*$/i.test(entry.line)
-  );
-  if (hasTopLevelRoute) return true;
-
-  const hasTopLevelRoutes = info.some((entry) =>
-    entry.section === "" && /^\s*routes\s*=\s*\[/i.test(entry.line)
-  );
-  if (hasTopLevelRoutes) return true;
-
-  return false;
-}
-
-function stripNonTopLevelRouteDeclarations(text = "") {
-  const lines = String(text || "").split(/\r?\n/g);
-  const output = [];
-  let currentSection = "";
-  let skippingRoutesArray = false;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (/^\s*\[.*\]\s*$/.test(line)) {
-      currentSection = trimmed;
-      skippingRoutesArray = false;
-      output.push(line);
-      continue;
-    }
-
-    if (currentSection && /^\s*route\s*=/.test(line)) {
-      continue;
-    }
-
-    if (currentSection && /^\s*routes\s*=\s*\[/.test(line)) {
-      skippingRoutesArray = true;
-      if (line.includes("]")) {
-        skippingRoutesArray = false;
-      }
-      continue;
-    }
-
-    if (skippingRoutesArray) {
-      if (trimmed.includes("]")) {
-        skippingRoutesArray = false;
-      }
-      continue;
-    }
-
-    output.push(line);
-  }
-
-  return output.join("\n");
-}
-
-function insertTopLevelBlockBeforeFirstSection(text = "", block = "") {
-  const source = String(text || "");
-  const blockText = String(block || "").trim();
-  if (!blockText) return source;
-
-  const lines = source.split(/\r?\n/g);
-  const firstSectionIndex = lines.findIndex((line) => /^\s*\[.*\]\s*$/.test(line));
-  if (firstSectionIndex < 0) {
-    const prefix = source.trimEnd();
-    return `${prefix}${prefix ? "\n" : ""}${blockText}\n`;
-  }
-
-  const before = lines.slice(0, firstSectionIndex).join("\n").trimEnd();
-  const after = lines.slice(firstSectionIndex).join("\n").trimStart();
-  return `${before}${before ? "\n" : ""}${blockText}\n\n${after}\n`;
-}
-
-function upsertTomlBooleanField(text, key, value) {
-  const normalized = String(text || "");
-  const replacement = `${key} = ${value ? "true" : "false"}`;
-  if (new RegExp(`^\\s*${key}\\s*=`, "m").test(normalized)) {
-    return normalized.replace(new RegExp(`^\\s*${key}\\s*=.*$`, "m"), replacement);
-  }
-  return `${normalized.trimEnd()}\n${replacement}\n`;
-}
-
-function stripTopLevelRouteDeclarations(text = "") {
-  const lines = String(text || "").split(/\r?\n/g);
-  const output = [];
-  let currentSection = "";
-  let skippingRoutesArray = false;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (/^\s*\[.*\]\s*$/.test(line)) {
-      currentSection = trimmed;
-      skippingRoutesArray = false;
-      output.push(line);
-      continue;
-    }
-
-    if (!currentSection && /^\s*route\s*=/.test(line)) {
-      continue;
-    }
-
-    if (!currentSection && /^\s*routes\s*=\s*\[/.test(line)) {
-      skippingRoutesArray = true;
-      if (line.includes("]")) {
-        skippingRoutesArray = false;
-      }
-      continue;
-    }
-
-    if (skippingRoutesArray) {
-      if (trimmed.includes("]")) {
-        skippingRoutesArray = false;
-      }
-      continue;
-    }
-
-    output.push(line);
-  }
-
-  return output.join("\n");
-}
-
-export function normalizeWranglerRoutePattern(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-
-  let candidate = raw;
-  if (/^https?:\/\//i.test(candidate)) {
-    try {
-      const parsed = new URL(candidate);
-      candidate = `${parsed.hostname}${parsed.pathname || "/"}`;
-    } catch {
-      return "";
-    }
-  }
-
-  if (candidate.startsWith("/")) return "";
-  if (!candidate.includes("*")) {
-    if (candidate.endsWith("/")) candidate = `${candidate}*`;
-    else if (!candidate.includes("/")) candidate = `${candidate}/*`;
-  }
-
-  return candidate;
-}
-
-export function buildDefaultWranglerTomlForDeploy({
-  name = "llm-router-route",
-  main = "src/index.js",
-  compatibilityDate = "2024-01-01",
-  useWorkersDev = false,
-  routePattern = "",
-  zoneName = ""
-} = {}) {
-  const lines = [
-    `name = "${String(name || "llm-router-route")}"`,
-    `main = "${String(main || "src/index.js")}"`,
-    `compatibility_date = "${String(compatibilityDate || "2024-01-01")}"`,
-    `workers_dev = ${useWorkersDev ? "true" : "false"}`
-  ];
-
-  const normalizedPattern = normalizeWranglerRoutePattern(routePattern);
-  const normalizedZone = String(zoneName || "").trim();
-  if (!useWorkersDev && normalizedPattern && normalizedZone) {
-    lines.push("routes = [");
-    lines.push(`  { pattern = "${normalizedPattern}", zone_name = "${normalizedZone}" }`);
-    lines.push("]");
-  }
-
-  lines.push("preview_urls = false");
-  lines.push("");
-  lines.push("[vars]");
-  lines.push('ENVIRONMENT = "production"');
-  lines.push("");
-  return `${lines.join("\n")}`;
-}
-
-export function applyWranglerDeployTargetToToml(existingToml, {
-  useWorkersDev = false,
-  routePattern = "",
-  zoneName = "",
-  replaceExistingTarget = false
-} = {}) {
-  let next = String(existingToml || "");
-  next = stripNonTopLevelRouteDeclarations(next);
-  if (replaceExistingTarget) {
-    next = stripTopLevelRouteDeclarations(next);
-  }
-  next = upsertTomlBooleanField(next, "workers_dev", useWorkersDev);
-
-  if (!useWorkersDev) {
-    const normalizedPattern = normalizeWranglerRoutePattern(routePattern);
-    const normalizedZone = String(zoneName || "").trim();
-    if (normalizedPattern && normalizedZone && (replaceExistingTarget || !hasWranglerDeployTargetConfigured(next))) {
-      const routeBlock = `routes = [\n  { pattern = "${normalizedPattern}", zone_name = "${normalizedZone}" }\n]`;
-      next = insertTopLevelBlockBeforeFirstSection(next, routeBlock);
-    }
-  }
-
-  if (!/^\s*preview_urls\s*=/mi.test(next)) {
-    next = `${next.trimEnd()}\npreview_urls = false\n`;
-  }
-
-  return `${next.trimEnd()}\n`;
 }
 
 async function createTemporaryWranglerConfigFile(projectDir, tomlText) {
@@ -1925,97 +1493,6 @@ async function prepareWranglerDeployConfig(context, {
   };
 }
 
-
-function normalizeHostname(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "")
-    .replace(/:\d+$/, "")
-    .replace(/\.$/, "");
-}
-
-export function extractHostnameFromRoutePattern(value) {
-  const route = String(value || "").trim();
-  if (!route) return "";
-
-  if (/^https?:\/\//i.test(route)) {
-    try {
-      return normalizeHostname(new URL(route).hostname);
-    } catch {
-      return "";
-    }
-  }
-
-  const left = route.split("/")[0] || "";
-  return normalizeHostname(left.replace(/\*+$/g, ""));
-}
-
-export function inferZoneNameFromHostname(hostname) {
-  const host = normalizeHostname(hostname);
-  if (!host || !host.includes(".")) return "";
-  const labels = host.split(".").filter(Boolean);
-  if (labels.length <= 2) return host;
-  return labels.slice(-2).join(".");
-}
-
-export function isHostnameUnderZone(hostname, zoneName) {
-  const host = normalizeHostname(hostname);
-  const zone = normalizeHostname(zoneName);
-  if (!host || !zone) return false;
-  return host === zone || host.endsWith(`.${zone}`);
-}
-
-export function suggestZoneNameForHostname(hostname, zones = []) {
-  const host = normalizeHostname(hostname);
-  if (!host) return "";
-
-  let best = "";
-  for (const zone of zones || []) {
-    const candidate = normalizeHostname(zone?.name || zone);
-    if (!candidate) continue;
-    if (host === candidate || host.endsWith(`.${candidate}`)) {
-      if (!best || candidate.length > best.length) {
-        best = candidate;
-      }
-    }
-  }
-  return best;
-}
-
-export function buildCloudflareDnsManualGuide({
-  hostname = "",
-  zoneName = "",
-  routePattern = ""
-} = {}) {
-  const host = normalizeHostname(hostname || extractHostnameFromRoutePattern(routePattern));
-  const zone = normalizeHostname(zoneName || inferZoneNameFromHostname(host));
-  const subdomain = host && zone && host.endsWith(`.${zone}`)
-    ? host.slice(0, -(`.${zone}`).length)
-    : "";
-  const label = subdomain || "<subdomain>";
-
-  return [
-    "Custom domain checklist:",
-    `- Route target: ${routePattern || `${host || "<host>"}/*`} (zone: ${zone || "<zone>"})`,
-    `- DNS: create/update CNAME \`${label}\` -> \`@\` in zone \`${zone || "<zone>"}\``,
-    "- Proxy status must be ON (orange cloud / proxied)",
-    host ? `- Verify DNS: dig +short ${host} @1.1.1.1` : "- Verify DNS: dig +short <host> @1.1.1.1",
-    host ? `- Verify HTTP: curl -I https://${host}/anthropic` : "- Verify HTTP: curl -I https://<host>/anthropic",
-    "- Claude base URL must NOT include :8787 for Cloudflare Worker deployments"
-  ].join("\n");
-}
-
-async function cloudflareListZones(token, accountId = "") {
-  const params = new URLSearchParams({ per_page: "50" });
-  if (accountId) params.set("account.id", accountId);
-  const result = await cloudflareApiGetJson(`${CLOUDFLARE_ZONES_URL}?${params.toString()}`, token);
-  if (!result.ok || !Array.isArray(result.payload?.result)) return [];
-  return result.payload.result
-    .map((zone) => ({ id: String(zone?.id || "").trim(), name: normalizeHostname(zone?.name || "") }))
-    .filter((zone) => zone.id && zone.name);
-}
 function parseJsonSafely(value) {
   const text = String(value || "").trim();
   if (!text) return null;

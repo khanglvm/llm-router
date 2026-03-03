@@ -15,6 +15,7 @@ import { applyCachingMapping, mergeCachingHeaders } from "./cache-mapping.js";
 import { applyReasoningEffortMapping } from "./reasoning-effort.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
+import { buildTimeoutSignal } from "../../shared/timeout-signal.js";
 
 async function toProviderError(response) {
   const raw = await response.text();
@@ -136,15 +137,18 @@ export async function makeProviderCall({
   }
 
   let response;
+  let cleanupTimeout = () => {};
   try {
     const timeoutMs = resolveUpstreamTimeoutMs(env);
+    const timeoutControl = buildTimeoutSignal(timeoutMs);
+    cleanupTimeout = timeoutControl.cleanup;
     const init = {
       method: "POST",
       headers,
       body: JSON.stringify(providerBody)
     };
-    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-      init.signal = AbortSignal.timeout(timeoutMs);
+    if (timeoutControl.signal) {
+      init.signal = timeoutControl.signal;
     }
 
     response = await fetch(providerUrl, {
@@ -164,6 +168,8 @@ export async function makeProviderCall({
         }
       }, 503)
     };
+  } finally {
+    cleanupTimeout();
   }
 
   if (!response.ok) {

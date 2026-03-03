@@ -8,7 +8,9 @@ import { runtimeConfigFromEnv } from "./runtime/config.js";
 
 const workerFetch = createFetchHandler({
   getConfig: async (env) => runtimeConfigFromEnv(env),
-  defaultStateStoreBackend: "memory"
+  defaultStateStoreBackend: "memory",
+  runtime: "worker",
+  workerSafeMode: true
 });
 
 export default {

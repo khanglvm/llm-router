@@ -11,8 +11,7 @@ import {
 import { consumeCandidateRateLimits } from "./rate-limits.js";
 import {
   buildRouteKey,
-  createStateStore,
-  normalizeStateStoreBackend
+  createStateStore
 } from "./state-store.js";
 import { FORMATS } from "../translator/index.js";
 import { shouldEnforceWorkerAuth, validateAuth } from "./handler/auth.js";
@@ -43,50 +42,25 @@ import {
   resolveFallbackCircuitPolicy,
   resolveRetryPolicy
 } from "./handler/fallback.js";
-import { sleep, toBoolean, toNonNegativeInteger } from "./handler/utils.js";
-
-const ROUTE_DEBUG_MAX_LIST_ITEMS = 8;
-const ROUTE_DEBUG_MAX_HEADER_VALUE_LENGTH = 512;
-
-function normalizeTimestamp(value, fallback = 0) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-  return Math.floor(parsed);
-}
-
-function normalizeCount(value, fallback = 0) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-  return Math.floor(parsed);
-}
-
-function isFallbackCircuitTrackingEnabled(policy) {
-  return Number.isFinite(policy?.failureThreshold) &&
-    Number.isFinite(policy?.cooldownMs) &&
-    policy.failureThreshold > 0 &&
-    policy.cooldownMs > 0;
-}
-
-function shouldTrackCandidateFailure(classification) {
-  if (!classification) return false;
-  if (classification.category === "invalid_request" || classification.category === "client_error") {
-    return false;
-  }
-  if (classification.category === "not_supported_error") {
-    return false;
-  }
-  return Boolean(classification.retryable || normalizeTimestamp(classification.originCooldownMs) > 0);
-}
+import { sleep } from "./handler/utils.js";
+import {
+  applyCandidateFailureState,
+  applyRuntimeRetryPolicyGuards,
+  clearCandidateRoutingState,
+  resolveRuntimeFlags,
+  resolveStateStoreOptions
+} from "./handler/runtime-policy.js";
+import {
+  buildRouteDebugState,
+  isRoutingDebugEnabled,
+  recordRouteAttempt,
+  recordRouteSkip,
+  setRouteSelectedCandidate,
+  withRouteDebugHeaders
+} from "./handler/route-debug.js";
 
 function shouldConsumeQuotaFromResult(result) {
   return Boolean(result?.ok || result?.upstreamResponse instanceof Response);
-}
-
-function candidateRef(candidate) {
-  return candidate?.requestModelId ||
-    (candidate?.providerId && candidate?.modelId
-      ? `${candidate.providerId}/${candidate.modelId}`
-      : candidate?.backend || "unknown/unknown");
 }
 
 function filterCandidatesByFormat(candidates) {
@@ -113,182 +87,6 @@ function hasNextEligibleCandidate(entries, startIndex) {
     if (entries[index]?.eligible) return true;
   }
   return false;
-}
-
-function isRoutingDebugEnabled(env = {}) {
-  return toBoolean(
-    env?.LLM_ROUTER_DEBUG_ROUTING,
-    toBoolean(env?.LLM_ROUTER_DEBUG, false)
-  );
-}
-
-function pushBounded(list, value, maxItems = ROUTE_DEBUG_MAX_LIST_ITEMS) {
-  if (!Array.isArray(list) || !value) return;
-  if (list.length >= maxItems) return;
-  list.push(value);
-}
-
-function buildRouteDebugState(enabled, resolved) {
-  return {
-    enabled,
-    requestedModel: resolved?.requestedModel || "smart",
-    routeType: resolved?.routeType || "direct",
-    routeRef: resolved?.routeRef || resolved?.resolvedModel || resolved?.requestedModel || "smart",
-    strategy: resolved?.routeStrategy || "ordered",
-    selectedCandidate: "",
-    skippedCandidates: [],
-    attempts: []
-  };
-}
-
-function recordRouteSkip(debugState, candidate, reasons) {
-  if (!debugState?.enabled) return;
-  const reasonText = Array.isArray(reasons)
-    ? reasons.filter(Boolean).join("+")
-    : String(reasons || "").trim();
-  pushBounded(
-    debugState.skippedCandidates,
-    `${candidateRef(candidate)}:${reasonText || "skipped"}`
-  );
-}
-
-function recordRouteAttempt(debugState, candidate, status, classification, attempt) {
-  if (!debugState?.enabled) return;
-  const category = classification?.category || (status && status < 400 ? "ok" : "unknown");
-  pushBounded(
-    debugState.attempts,
-    `${candidateRef(candidate)}:${Number.isFinite(status) ? status : "error"}/${category}#${attempt}`
-  );
-}
-
-function setRouteSelectedCandidate(debugState, candidate, { overwrite = false } = {}) {
-  if (!debugState?.enabled || !candidate) return;
-  if (debugState.selectedCandidate && !overwrite) return;
-  debugState.selectedCandidate = candidateRef(candidate);
-}
-
-function toSafeHeaderValue(value) {
-  const text = String(value || "").replace(/[\r\n]+/g, " ").trim();
-  if (!text) return "";
-  return text.length > ROUTE_DEBUG_MAX_HEADER_VALUE_LENGTH
-    ? text.slice(0, ROUTE_DEBUG_MAX_HEADER_VALUE_LENGTH)
-    : text;
-}
-
-function withRouteDebugHeaders(response, debugState) {
-  if (!debugState?.enabled || !(response instanceof Response)) {
-    return response;
-  }
-
-  const headers = new Headers(response.headers);
-  headers.set("x-llm-router-requested-model", toSafeHeaderValue(debugState.requestedModel));
-  headers.set("x-llm-router-route-type", toSafeHeaderValue(debugState.routeType));
-  headers.set("x-llm-router-route-ref", toSafeHeaderValue(debugState.routeRef));
-  headers.set("x-llm-router-route-strategy", toSafeHeaderValue(debugState.strategy));
-
-  const selectedCandidate = toSafeHeaderValue(debugState.selectedCandidate);
-  if (selectedCandidate) {
-    headers.set("x-llm-router-selected-candidate", selectedCandidate);
-  }
-
-  const skippedCandidates = toSafeHeaderValue(debugState.skippedCandidates.join(","));
-  if (skippedCandidates) {
-    headers.set("x-llm-router-skipped-candidates", skippedCandidates);
-  }
-
-  const attempts = toSafeHeaderValue(debugState.attempts.join(","));
-  if (attempts) {
-    headers.set("x-llm-router-attempts", attempts);
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
-
-async function clearCandidateRoutingState(stateStore, candidateKey) {
-  if (!stateStore || !candidateKey) return;
-  await stateStore.setCandidateState(candidateKey, null);
-}
-
-async function applyCandidateFailureState(
-  stateStore,
-  candidateKey,
-  classification,
-  fallbackCircuitPolicy,
-  status,
-  now = Date.now()
-) {
-  if (!stateStore || !candidateKey || !shouldTrackCandidateFailure(classification)) {
-    return;
-  }
-
-  const prior = await stateStore.getCandidateState(candidateKey) || {};
-  const priorCooldownUntil = normalizeTimestamp(prior.cooldownUntil);
-  const priorOpenUntil = normalizeTimestamp(prior.openUntil);
-  const priorFailures = normalizeCount(
-    prior.consecutiveRetryableFailures ?? prior.consecutiveFailures
-  );
-
-  const consecutiveRetryableFailures = classification.retryable
-    ? priorFailures + 1
-    : 0;
-
-  let openUntil = priorOpenUntil > now ? priorOpenUntil : 0;
-  if (
-    classification.retryable &&
-    isFallbackCircuitTrackingEnabled(fallbackCircuitPolicy) &&
-    consecutiveRetryableFailures >= fallbackCircuitPolicy.failureThreshold
-  ) {
-    openUntil = Math.max(openUntil, now + fallbackCircuitPolicy.cooldownMs);
-  }
-
-  const cooldownMs = normalizeTimestamp(classification.originCooldownMs);
-  const cooldownUntil = cooldownMs > 0
-    ? Math.max(priorCooldownUntil, now + cooldownMs)
-    : (priorCooldownUntil > now ? priorCooldownUntil : 0);
-
-  await stateStore.setCandidateState(candidateKey, {
-    ...prior,
-    cooldownUntil,
-    openUntil,
-    consecutiveRetryableFailures,
-    lastFailureAt: now,
-    lastFailureStatus: Number.isFinite(status) ? Number(status) : 0,
-    lastFailureCategory: classification.category,
-    updatedAt: now
-  });
-}
-
-function resolveStateStoreOptions(options = {}, env = {}) {
-  const baseOptions = options.stateStoreOptions && typeof options.stateStoreOptions === "object"
-    ? { ...options.stateStoreOptions }
-    : {};
-  const defaultBackend = normalizeStateStoreBackend(
-    options.defaultStateStoreBackend || baseOptions.backend,
-    "memory"
-  );
-  const backend = normalizeStateStoreBackend(
-    options.stateStoreBackend || env?.LLM_ROUTER_STATE_BACKEND || baseOptions.backend,
-    defaultBackend
-  );
-  const candidateStateTtlMs = toNonNegativeInteger(
-    env?.LLM_ROUTER_CANDIDATE_STATE_TTL_MS,
-    toNonNegativeInteger(options.stateStoreCandidateStateTtlMs, baseOptions.candidateStateTtlMs)
-  );
-  const rawFilePath = options.stateStoreFilePath || env?.LLM_ROUTER_STATE_FILE_PATH || baseOptions.filePath;
-  const filePath = typeof rawFilePath === "string" && rawFilePath.trim()
-    ? rawFilePath.trim()
-    : undefined;
-
-  return {
-    ...baseOptions,
-    backend,
-    ...(candidateStateTtlMs !== undefined ? { candidateStateTtlMs } : {}),
-    ...(backend === "file" && filePath ? { filePath } : {})
-  };
 }
 
 async function handleRouteRequest(request, env, getConfig, sourceFormatHint, options = {}) {
@@ -353,9 +151,12 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     }, 400);
   }
 
+  const runtimeFlags = options.runtimeFlags || resolveRuntimeFlags(options, env);
   const fallbackCircuitPolicy = resolveFallbackCircuitPolicy(env);
-  const retryPolicy = resolveRetryPolicy(env);
-  const stateStore = options.stateStore || null;
+  const retryPolicy = applyRuntimeRetryPolicyGuards(resolveRetryPolicy(env), runtimeFlags);
+  const stateStore = runtimeFlags.statefulRoutingEnabled
+    ? (options.stateStore || null)
+    : null;
   const routeDebug = buildRouteDebugState(isRoutingDebugEnabled(env), resolved);
   const now = Date.now();
 
@@ -392,7 +193,9 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     ranking = await rankRouteCandidates({
       route: routePlan,
       routeKey: buildRouteKey(routePlan, { sourceFormat }),
-      strategy: resolved.routeType === "alias" ? resolved.routeStrategy : "ordered",
+      strategy: runtimeFlags.statefulRoutingEnabled && resolved.routeType === "alias"
+        ? resolved.routeStrategy
+        : "ordered",
       candidates: formatFiltered.eligible,
       stateStore,
       config,
@@ -531,10 +334,10 @@ export function createFetchHandler(options) {
   let stateStoreRef = options.stateStore || null;
   let stateStorePromise = null;
 
-  async function ensureStateStore(env = {}) {
+  async function ensureStateStore(env = {}, runtimeFlags = {}) {
     if (stateStoreRef) return stateStoreRef;
     if (!stateStorePromise) {
-      stateStorePromise = createStateStore(resolveStateStoreOptions(options, env))
+      stateStorePromise = createStateStore(resolveStateStoreOptions(options, env, runtimeFlags))
         .then((store) => {
           stateStoreRef = store;
           return store;
@@ -557,6 +360,7 @@ export function createFetchHandler(options) {
   const fetchHandler = async function fetchHandler(request, env = {}, ctx) {
     const url = new URL(request.url);
     const respond = (response, corsOptions = {}) => withRequestCors(response, request, env, corsOptions);
+    const runtimeFlags = resolveRuntimeFlags(options, env);
     let preloadedConfig = null;
     let authValidated = false;
 
@@ -641,24 +445,27 @@ export function createFetchHandler(options) {
     }
 
     if (route?.type === "route") {
-      let stateStore;
-      try {
-        stateStore = await ensureStateStore(env);
-      } catch (error) {
-        return respond(jsonResponse({
-          type: "error",
-          error: {
-            type: "configuration_error",
-            message: `Failed initializing routing state: ${error instanceof Error ? error.message : String(error)}`
-          }
-        }, 500));
+      let stateStore = null;
+      if (runtimeFlags.statefulRoutingEnabled) {
+        try {
+          stateStore = await ensureStateStore(env, runtimeFlags);
+        } catch (error) {
+          return respond(jsonResponse({
+            type: "error",
+            error: {
+              type: "configuration_error",
+              message: `Failed initializing routing state: ${error instanceof Error ? error.message : String(error)}`
+            }
+          }, 500));
+        }
       }
 
       const routeResponse = await handleRouteRequest(request, env, options.getConfig, route.sourceFormat, {
         ...options,
         preloadedConfig,
         authValidated,
-        stateStore
+        stateStore,
+        runtimeFlags
       });
       return respond(routeResponse);
     }
