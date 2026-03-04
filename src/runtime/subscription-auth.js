@@ -4,12 +4,9 @@
  */
 
 import http from 'node:http';
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 import crypto from 'node:crypto';
-import { CODEX_OAUTH_CONFIG, TOKEN_STORAGE_DIR } from './subscription-constants.js';
-import { saveTokens, loadTokens, isTokenExpired, deleteTokens } from './subscription-tokens.js';
+import { CODEX_OAUTH_CONFIG } from './subscription-constants.js';
+import { saveTokens, loadTokens, isTokenExpired, deleteTokens, listTokenProfiles as listTokenProfilesFromStore } from './subscription-tokens.js';
 
 /**
  * Generate PKCE code verifier and challenge.
@@ -341,4 +338,12 @@ export async function getAuthStatus(profileId) {
     expired,
     hasRefreshToken: !!tokens.refreshToken
   };
+}
+
+/**
+ * List all token profiles with stored subscription credentials.
+ * @returns {Promise<string[]>} Profile IDs
+ */
+export async function listTokenProfiles() {
+  return listTokenProfilesFromStore();
 }

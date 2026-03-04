@@ -3,7 +3,9 @@
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
 import { getDefaultConfigPath } from "./node/config-store.js";
+import { resolveListenPort } from "./node/listen-port.js";
 import { runStartCommand } from "./node/start-command.js";
 
 function parseSimpleArgs(argv) {
@@ -51,20 +53,46 @@ function parseBoolean(value, fallback = true) {
   return fallback;
 }
 
-function parseNumber(value, fallback = 8787) {
-  if (value === undefined || value === null || value === "") return fallback;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+async function promptStartupConflictResolution({ port }) {
+  if (!(process.stdout.isTTY && process.stdin.isTTY)) return "";
+
+  const ui = createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  const lines = [
+    "",
+    `A startup-managed llm-router instance is already running on port ${port}.`,
+    "Choose how to continue:",
+    "1. Restart startup-managed llm-router instance (use latest installed version)",
+    "2. Stop running instance and start it here",
+    "3. Exit"
+  ];
+  console.log(lines.join("\n"));
+
+  try {
+    while (true) {
+      const input = String(await ui.question("Select [1/2/3]: ")).trim();
+      if (input === "1") return "restart-startup";
+      if (input === "2") return "stop-and-start-here";
+      if (input === "3") return "exit";
+      console.log("Invalid choice. Enter 1, 2, or 3.");
+    }
+  } finally {
+    ui.close();
+  }
 }
 
 async function runStartFastPath(args) {
   const result = await runStartCommand({
     configPath: args.config || args.configPath || getDefaultConfigPath(),
     host: args.host || "127.0.0.1",
-    port: parseNumber(args.port, 8787),
+    port: resolveListenPort({ explicitPort: args.port }),
     watchConfig: parseBoolean(args["watch-config"] ?? args.watchConfig, true),
     watchBinary: parseBoolean(args["watch-binary"] ?? args.watchBinary, true),
     requireAuth: parseBoolean(args["require-auth"] ?? args.requireAuth, false),
+    onStartupConflict: (payload) => promptStartupConflictResolution(payload),
     cliPathForWatch: process.argv[1],
     onLine: (line) => console.log(line),
     onError: (line) => console.error(line)

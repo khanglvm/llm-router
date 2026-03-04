@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-03-04
+
+### Added
+- Added full `config --operation=upsert-provider` UX support for subscription providers:
+  - `--type=subscription`
+  - `--subscription-type=chatgpt-codex`
+  - `--subscription-profile=<name>`
+- Added subscription provider coverage tests for config workflows and runtime provider-call behavior.
+- Added `.gitignore` rules for local IDE and deploy temp artifacts (`.idea/`, `.llm-router.deploy.*.wrangler.toml`).
+
+### Changed
+- Updated config summaries and AI-help guidance to include subscription provider details and setup commands.
+- Updated README setup guide with explicit ChatGPT Codex subscription onboarding flow.
+
+### Fixed
+- Fixed subscription status command import path so `llm-router subscription status` works reliably.
+- Fixed subscription provider request path to run standard request translation/mapping before OAuth-backed provider call.
+- Fixed subscription provider config validation and normalization:
+  - subscription providers no longer require `baseUrl`
+  - predefined ChatGPT Codex model list is enforced during normalization.
+
 ## [1.0.9] - 2026-03-03
 
 ### Added
@@ -16,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refactored CLI deploy/runtime handler code into focused modules with cleaner boundaries.
 - Updated provider-call timeout handling to support both `AbortSignal.timeout` and `AbortController` fallback.
 - Documented Worker safety defaults and switched README release/security links to canonical GitHub URLs.
+- Added local start port resolution via `--port`, `LLM_ROUTER_PORT`, or generic `PORT` env variables.
 
 ## [1.0.8] - 2026-02-28
 

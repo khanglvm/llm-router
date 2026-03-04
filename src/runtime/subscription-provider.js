@@ -4,12 +4,10 @@
  */
 
 import { getValidAccessToken, loginWithBrowser, loginWithDeviceCode, logout, getAuthStatus } from './subscription-auth.js';
-import { CODEX_SUBSCRIPTION_MODELS, CODEX_OAUTH_CONFIG } from './subscription-constants.js';
 import {
   transformRequestForCodex,
   buildCodexHeaders,
   CODEX_ENDPOINT,
-  isCodexModel,
   mapCodexVariant
 } from './codex-request-transformer.js';
 import { FORMATS } from '../translator/index.js';
@@ -76,13 +74,11 @@ export function validateSubscriptionProvider(provider) {
  * 
  * @param {Object} options - Call options
  * @param {Object} options.provider - Provider config
- * @param {Object} options.body - Request body
- * @param {string} options.sourceFormat - Source format (openai/claude)
+ * @param {Object} options.body - OpenAI-format provider request body
  * @param {boolean} options.stream - Whether streaming is enabled
- * @param {Object} [options.env] - Environment variables
  * @returns {Promise<Object>} Call result with ok, status, response
  */
-export async function makeSubscriptionProviderCall({ provider, body, sourceFormat, stream, env }) {
+export async function makeSubscriptionProviderCall({ provider, body, stream }) {
   const validation = validateSubscriptionProvider(provider);
   if (!validation.valid) {
     return {
@@ -150,7 +146,7 @@ export async function makeSubscriptionProviderCall({ provider, body, sourceForma
   
   // Route to appropriate handler based on subscription type
   if (subType === SUBSCRIPTION_TYPES.CHATGPT_CODEX) {
-    return makeCodexProviderCall({ provider, body, sourceFormat, stream, accessToken, env });
+    return makeCodexProviderCall({ provider, body, stream, accessToken });
   }
   
   return {
@@ -177,7 +173,7 @@ export async function makeSubscriptionProviderCall({ provider, body, sourceForma
  * @param {Object} options - Call options
  * @returns {Promise<Object>} Call result
  */
-async function makeCodexProviderCall({ provider, body, sourceFormat, stream, accessToken, env }) {
+async function makeCodexProviderCall({ provider, body, stream, accessToken }) {
   // Transform request for Codex backend
   const codexBody = transformRequestForCodex(body);
   

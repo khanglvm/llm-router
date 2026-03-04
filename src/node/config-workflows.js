@@ -4,8 +4,23 @@
 
 import { normalizeRuntimeConfig, validateRuntimeConfig } from "../runtime/config.js";
 
+const PROVIDER_TYPE_SUBSCRIPTION = "subscription";
+const SUBSCRIPTION_TYPE_CHATGPT_CODEX = "chatgpt-codex";
+
 function dedupe(values) {
   return [...new Set((values || []).filter(Boolean).map((value) => String(value).trim()).filter(Boolean))];
+}
+
+function normalizeProviderType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === PROVIDER_TYPE_SUBSCRIPTION ? PROVIDER_TYPE_SUBSCRIPTION : undefined;
+}
+
+function normalizeSubscriptionType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === SUBSCRIPTION_TYPE_CHATGPT_CODEX) return SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  return normalized;
 }
 
 function normalizeBaseUrlByFormatInput(input) {
@@ -49,9 +64,11 @@ function normalizeModelArray(models) {
       const id = String(entry.id || entry.name || "").trim();
       if (!id) return null;
       const formats = dedupe(entry.formats || entry.format || []).filter((value) => value === "openai" || value === "claude");
+      const variant = typeof entry.variant === "string" ? entry.variant.trim() : "";
       return {
         id,
-        ...(formats.length > 0 ? { formats } : {})
+        ...(formats.length > 0 ? { formats } : {}),
+        ...(variant ? { variant } : {})
       };
     })
     .filter(Boolean);
@@ -80,6 +97,12 @@ function summarizeEndpointMatrix(endpointMatrix) {
 
 export function buildProviderFromConfigInput(input) {
   const providerId = input.providerId || input.id || input.name;
+  const providerType = normalizeProviderType(input.type || input.providerType || input["provider-type"]);
+  const isSubscriptionProvider = providerType === PROVIDER_TYPE_SUBSCRIPTION;
+  const subscriptionType = normalizeSubscriptionType(input.subscriptionType || input["subscription-type"]);
+  const subscriptionProfile = String(
+    input.subscriptionProfile || input["subscription-profile"] || providerId || "default"
+  ).trim() || "default";
   const baseUrlByFormat = normalizeBaseUrlByFormatInput(input);
   const explicitModelIds = parseModelListInput(input.models);
   const probeModelSupport = input.probe?.modelSupport && typeof input.probe.modelSupport === "object"
@@ -97,7 +120,9 @@ export function buildProviderFromConfigInput(input) {
   const mergedModels = explicitModels.length > 0 ? explicitModels : probeModels;
   const endpointFormats = baseUrlByFormat ? Object.keys(baseUrlByFormat) : [];
 
-  const preferredFormat = input.probe?.preferredFormat || input.format;
+  const preferredFormat = isSubscriptionProvider
+    ? "openai"
+    : (input.probe?.preferredFormat || input.format);
   const supportedFormats = dedupe([
     ...(input.probe?.formats || []),
     ...endpointFormats,
@@ -114,6 +139,9 @@ export function buildProviderFromConfigInput(input) {
     providers: [{
       id: providerId,
       name: input.name || providerId,
+      type: providerType,
+      subscriptionType: isSubscriptionProvider ? subscriptionType : undefined,
+      subscriptionProfile: isSubscriptionProvider ? subscriptionProfile : undefined,
       baseUrl,
       baseUrlByFormat,
       apiKey: input.apiKey,

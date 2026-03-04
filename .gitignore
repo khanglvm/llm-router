@@ -1,10 +1,12 @@
 node_modules/
 .wrangler/
+.idea/
 .DS_Store
 .npm-cache/
 *.tgz
 .llm-router.worker.json
 .llm-router.runtime.json
+.llm-router.deploy.*.wrangler.toml
 
 # Local secrets / test inputs
 .env

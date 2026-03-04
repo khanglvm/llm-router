@@ -176,6 +176,13 @@ export async function reclaimPort({ port, line, error }, deps = {}) {
 
   const targets = probe.pids.filter((pid) => pid !== selfPid);
   if (targets.length === 0) {
+    if (startupStop.attempted) {
+      line(`Startup-managed listener stop requested. Waiting for port ${port} to release...`);
+      const releasedAfterStartupStop = await waitForPortToReleaseFn(port, 4000);
+      if (releasedAfterStartupStop) {
+        return { ok: true };
+      }
+    }
     return {
       ok: false,
       errorMessage: `Port ${port} is in use but no external listener PID was detected.`
@@ -221,4 +228,3 @@ export async function reclaimPort({ port, line, error }, deps = {}) {
     ok: true
   };
 }
-

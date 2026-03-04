@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   applyConfigChanges,
+  buildProviderFromConfigInput,
   buildWorkerConfigPayload
 } from "./config-workflows.js";
+import { CODEX_SUBSCRIPTION_MODELS } from "../runtime/subscription-constants.js";
 
 function baseConfig() {
   return {
@@ -117,4 +119,20 @@ test("buildWorkerConfigPayload accepts v2 config with aliases and rate limits", 
   assert.equal(payload.masterKey, "gw_override_master_key");
   assert.equal(payload.modelAliases["chat.default"].strategy, "quota-aware-weighted-rr");
   assert.equal(payload.providers[0].rateLimits[0].id, "openrouter-all-month");
+});
+
+test("buildProviderFromConfigInput keeps subscription provider fields and predefined models", () => {
+  const provider = buildProviderFromConfigInput({
+    providerId: "chatgpt",
+    name: "ChatGPT Subscription",
+    type: "subscription",
+    subscriptionType: "chatgpt-codex",
+    subscriptionProfile: "personal"
+  });
+
+  assert.equal(provider.type, "subscription");
+  assert.equal(provider.subscriptionType, "chatgpt-codex");
+  assert.equal(provider.subscriptionProfile, "personal");
+  assert.equal(provider.format, "openai");
+  assert.deepEqual(provider.models.map((model) => model.id), CODEX_SUBSCRIPTION_MODELS);
 });

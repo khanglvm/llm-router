@@ -100,3 +100,27 @@ test("reclaimPort escalates from SIGTERM to SIGKILL when listener remains", asyn
   assert.match(lines[0], /Stopping existing listener/);
   assert.match(lines[1], /Force killing listener/);
 });
+
+test("reclaimPort waits for startup-managed port release when no external pid is detected", async () => {
+  const lines = [];
+  const waitCalls = [];
+
+  const result = await reclaimPort({
+    port: 8787,
+    line: (message) => lines.push(message),
+    error: () => {}
+  }, {
+    selfPid: 4242,
+    stopStartupManagedListener: async () => ({ ok: true, attempted: true }),
+    listListeningPids: () => ({ ok: true, pids: [4242] }),
+    waitForPortToRelease: async (_port, timeoutMs) => {
+      waitCalls.push(timeoutMs);
+      return true;
+    }
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(waitCalls, [4000]);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Waiting for port 8787 to release/);
+});

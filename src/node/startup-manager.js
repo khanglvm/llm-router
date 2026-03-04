@@ -41,12 +41,15 @@ function runCommand(command, args, { cwd } = {}) {
 }
 
 function resolveCliEntryPath() {
-  if (process.env.LLM_ROUTER_CLI_PATH) return process.env.LLM_ROUTER_CLI_PATH;
   const nodeBinDir = path.dirname(process.execPath);
   for (const binName of ["llm-router", "llm-router-route"]) {
     const candidate = path.join(nodeBinDir, binName);
     if (existsSync(candidate)) return candidate;
   }
+  if (process.env.LLM_ROUTER_CLI_PATH && existsSync(process.env.LLM_ROUTER_CLI_PATH)) {
+    return process.env.LLM_ROUTER_CLI_PATH;
+  }
+  if (process.env.LLM_ROUTER_CLI_PATH) return process.env.LLM_ROUTER_CLI_PATH;
   if (process.argv[1]) return path.resolve(process.argv[1]);
   throw new Error("Unable to resolve llm-router CLI entry path.");
 }

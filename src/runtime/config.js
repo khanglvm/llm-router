@@ -4,6 +4,7 @@
  */
 
 import { FORMATS } from "../translator/index.js";
+import { CODEX_SUBSCRIPTION_MODELS } from "./subscription-constants.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
@@ -32,6 +33,9 @@ const ALLOWED_RATE_LIMIT_WINDOW_UNITS = new Set([
   "month"
 ]);
 const ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const SUBSCRIPTION_PROVIDER_TYPES = Object.freeze({
+  CHATGPT_CODEX: "chatgpt-codex"
+});
 let runtimeEnvCache = null;
 
 function readNodeRuntimeInfo() {
@@ -300,11 +304,29 @@ function normalizeModelEntry(model) {
     formats: dedupeStrings(model.formats || model.format || [])
       .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE),
     enabled: model.enabled !== false,
+    variant: typeof model.variant === "string" ? model.variant.trim() : undefined,
     contextWindow: Number.isFinite(model.contextWindow) ? Number(model.contextWindow) : undefined,
     cost: model.cost,
     metadata: model.metadata && typeof model.metadata === "object" ? model.metadata : undefined,
     ...(rawFallbacks !== undefined ? { fallbackModels } : {})
   };
+}
+
+function normalizeSubscriptionModels(models, subscriptionType) {
+  const normalizedModels = toArray(models)
+    .map(normalizeModelEntry)
+    .filter(Boolean)
+    .filter((item) => item.enabled !== false);
+
+  if (subscriptionType !== SUBSCRIPTION_PROVIDER_TYPES.CHATGPT_CODEX) {
+    return normalizedModels;
+  }
+
+  const configuredById = new Map(normalizedModels.map((model) => [model.id, model]));
+  return CODEX_SUBSCRIPTION_MODELS.map((modelId) => ({
+    ...(configuredById.get(modelId) || {}),
+    id: modelId
+  }));
 }
 
 function sanitizeModelFallbackReferences(providers) {
@@ -397,10 +419,12 @@ function normalizeProvider(provider, index = 0) {
     || baseUrlByFormat?.[FORMATS.CLAUDE]
     || "";
 
-  const normalizedModels = toArray(provider.models)
-    .map(normalizeModelEntry)
-    .filter(Boolean)
-    .filter((item) => item.enabled !== false);
+  const normalizedModels = isSubscription
+    ? normalizeSubscriptionModels(provider.models, subscriptionType)
+    : toArray(provider.models)
+      .map(normalizeModelEntry)
+      .filter(Boolean)
+      .filter((item) => item.enabled !== false);
   const reservedRateLimitBucketIds = new Set();
   const normalizedRateLimits = toArray(provider.rateLimits ?? provider["rate-limits"])
     .map((entry, bucketIndex) => normalizeRateLimitBucketEntry(entry, bucketIndex, {
@@ -897,11 +921,15 @@ export function validateRuntimeConfig(config, { requireMasterKey = false, requir
   }
 
   for (const provider of (config.providers || [])) {
+    const isSubscriptionProvider = provider?.type === "subscription";
     if (!provider.id) errors.push("Provider missing id.");
     if (provider.id && !PROVIDER_ID_PATTERN.test(provider.id)) {
       errors.push(`Provider id '${provider.id}' is invalid. Use slug/camelCase (e.g. openrouter or myProvider).`);
     }
-    if (!provider.baseUrl) errors.push(`Provider ${provider.id || "(unknown)"} missing baseUrl.`);
+    if (!isSubscriptionProvider && !provider.baseUrl) errors.push(`Provider ${provider.id || "(unknown)"} missing baseUrl.`);
+    if (isSubscriptionProvider && !provider.subscriptionType) {
+      errors.push(`Subscription provider ${provider.id || "(unknown)"} missing subscriptionType.`);
+    }
     if (!provider.format && (!provider.formats || provider.formats.length === 0)) {
       errors.push(`Provider ${provider.id || "(unknown)"} missing detected format.`);
     }

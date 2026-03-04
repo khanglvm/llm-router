@@ -31,6 +31,7 @@ import {
 } from "./router-module.js";
 import routerModule from "./router-module.js";
 import { readConfigFile } from "../node/config-store.js";
+import { CODEX_SUBSCRIPTION_MODELS } from "../runtime/subscription-constants.js";
 
 // Test configuration from environment
 const TEST_HOSTNAME = process.env.LLM_ROUTER_TEST_HOSTNAME || "router.example.com";
@@ -42,6 +43,10 @@ function getConfigAction() {
 
 function getAiHelpAction() {
   return routerModule.actions.find((entry) => entry.actionId === "ai-help");
+}
+
+function getSubscriptionAction() {
+  return routerModule.actions.find((entry) => entry.actionId === "subscription");
 }
 
 function createConfigContext(args) {
@@ -209,6 +214,16 @@ test("resolveCloudflareApiTokenFromEnv returns missing when no token in env", ()
 
   assert.equal(result.token, "");
   assert.equal(result.source, "none");
+});
+
+test("subscription status subcommand runs without import errors", async () => {
+  const subscriptionAction = getSubscriptionAction();
+  const statusAction = subscriptionAction?.subcommands?.find((entry) => entry.actionId === "status");
+  assert.ok(statusAction);
+
+  const result = await statusAction.run(createConfigContext({}));
+  assert.equal(result.exitCode, 0);
+  assert.ok(String(result.data || "").includes("Subscription"));
 });
 
 test("buildCloudflareApiTokenSetupGuide includes preset and token env instructions", () => {
@@ -498,6 +513,48 @@ test("non-interactive upsert-model-alias writes expected config", async (t) => {
   assert.deepEqual(next.modelAliases["chat.default"].fallbackTargets, [
     { ref: "openrouter/gpt-4o", weight: undefined, metadata: undefined }
   ]);
+});
+
+test("non-interactive upsert-provider supports subscription provider UX", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "upsert-provider",
+    config: configPath,
+    "provider-id": "chatgpt",
+    name: "ChatGPT Subscription",
+    type: "subscription",
+    "subscription-type": "chatgpt-codex",
+    "subscription-profile": "personal"
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /type=subscription/);
+
+  const next = await readConfigFile(configPath);
+  const provider = next.providers.find((entry) => entry.id === "chatgpt");
+  assert.ok(provider);
+  assert.equal(provider.type, "subscription");
+  assert.equal(provider.subscriptionType, "chatgpt-codex");
+  assert.equal(provider.subscriptionProfile, "personal");
+  assert.deepEqual(provider.models.map((model) => model.id), CODEX_SUBSCRIPTION_MODELS);
+});
+
+test("non-interactive upsert-provider validates missing subscription-type", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "upsert-provider",
+    config: configPath,
+    "provider-id": "chatgpt",
+    name: "ChatGPT Subscription",
+    type: "subscription"
+  }));
+
+  assert.equal(result.ok, false);
+  assert.match(String(result.errorMessage || ""), /subscription-type is required/);
 });
 
 test("non-interactive upsert-model-alias accepts auto model routing strategy", async (t) => {

@@ -11,6 +11,7 @@ import {
   resolveRouteReference,
   validateRuntimeConfig
 } from "./config.js";
+import { CODEX_SUBSCRIPTION_MODELS } from "./subscription-constants.js";
 
 function createBaseRawConfig(overrides = {}) {
   const base = {
@@ -343,6 +344,51 @@ test("validateRuntimeConfig rejects alias cycles", () => {
 
   const errors = validateRuntimeConfig(normalized);
   assert.ok(errors.some((error) => error.includes("Alias cycle detected")));
+});
+
+test("normalizeRuntimeConfig injects predefined Codex models for subscription providers", () => {
+  const normalized = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "chatgpt/gpt-5.3-codex",
+    providers: [
+      {
+        id: "chatgpt",
+        name: "ChatGPT Subscription",
+        type: "subscription",
+        subscriptionType: "chatgpt-codex",
+        subscriptionProfile: "personal",
+        models: [
+          { id: "gpt-5.3-codex", variant: "high" },
+          { id: "not-allowed", variant: "low" }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(normalized.providers[0].format, FORMATS.OPENAI);
+  assert.deepEqual(
+    normalized.providers[0].models.map((model) => model.id),
+    CODEX_SUBSCRIPTION_MODELS
+  );
+  assert.equal(normalized.providers[0].models[0].variant, "high");
+  assert.equal(validateRuntimeConfig(normalized).length, 0);
+});
+
+test("validateRuntimeConfig requires subscriptionType for subscription providers", () => {
+  const normalized = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    providers: [
+      {
+        id: "chatgpt",
+        name: "ChatGPT Subscription",
+        type: "subscription",
+        models: [{ id: "gpt-5.3-codex" }]
+      }
+    ]
+  });
+
+  const errors = validateRuntimeConfig(normalized);
+  assert.ok(errors.some((error) => error.includes("missing subscriptionType")));
 });
 
 test("resolveRequestModel preserves direct routing and fallback behavior", () => {

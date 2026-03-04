@@ -2,9 +2,11 @@ import path from "node:path";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { configFileExists, getDefaultConfigPath, readConfigFile } from "./config-store.js";
-import { clearRuntimeState, writeRuntimeState } from "./instance-state.js";
+import { buildStartArgsFromState, clearRuntimeState, getActiveRuntimeState, writeRuntimeState } from "./instance-state.js";
+import { resolveListenPort } from "./listen-port.js";
 import { startLocalRouteServer } from "./local-server.js";
-import { reclaimPort } from "./port-reclaim.js";
+import { reclaimPort, stopStartupManagedListener } from "./port-reclaim.js";
+import { installStartup, startupStatus } from "./startup-manager.js";
 import { configHasProvider, sanitizeConfigForDisplay } from "../runtime/config.js";
 
 function summarizeConfig(config, configPath) {
@@ -133,10 +135,126 @@ function spawnReplacementCli({ cliPath, startArgs }) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeStartupConflictChoice(value) {
+  const raw = typeof value === "object" && value !== null
+    ? (value.action ?? value.choice ?? "")
+    : value;
+  const normalized = String(raw || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (["1", "restart", "restart-startup", "restart_startup", "restart-startup-managed"].includes(normalized)) {
+    return "restart-startup";
+  }
+  if (["2", "stop-start", "stop-and-start-here", "takeover", "manual-takeover"].includes(normalized)) {
+    return "stop-and-start-here";
+  }
+  if (["3", "exit", "quit", "cancel"].includes(normalized)) {
+    return "exit";
+  }
+  return "";
+}
+
+async function detectStartupManagedConflictOnPort(port) {
+  let runtime = null;
+  try {
+    runtime = await getActiveRuntimeState();
+  } catch {
+    runtime = null;
+  }
+
+  if (runtime?.managedByStartup && Number(runtime.port) === Number(port)) {
+    return {
+      running: true,
+      runtime,
+      source: "runtime-state"
+    };
+  }
+
+  let status = null;
+  try {
+    status = await startupStatus();
+  } catch {
+    status = null;
+  }
+
+  if (status?.running) {
+    return {
+      running: true,
+      runtime,
+      status,
+      source: "startup-status"
+    };
+  }
+
+  return {
+    running: false,
+    runtime,
+    status,
+    source: "none"
+  };
+}
+
+async function restartStartupManagedWithLatest({
+  runtimeState,
+  fallbackStartArgs,
+  error
+}) {
+  const startArgs = runtimeState?.managedByStartup
+    ? buildStartArgsFromState(runtimeState)
+    : fallbackStartArgs;
+  try {
+    const restarted = await installStartup({
+      configPath: startArgs.configPath,
+      host: startArgs.host,
+      port: startArgs.port,
+      watchConfig: startArgs.watchConfig,
+      watchBinary: startArgs.watchBinary,
+      requireAuth: startArgs.requireAuth
+    });
+    await clearRuntimeState();
+    return {
+      ok: true,
+      detail: restarted
+    };
+  } catch (startupRestartError) {
+    const message = startupRestartError instanceof Error ? startupRestartError.message : String(startupRestartError);
+    error(`Failed restarting startup-managed service: ${message}`);
+    return {
+      ok: false,
+      errorMessage: `Failed to restart startup-managed llm-router with latest installed version: ${message}`
+    };
+  }
+}
+
+async function attemptServerStartAfterStartupStop(buildLocalServerOptions, {
+  attempts = 24,
+  delayMs = 250
+} = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const server = await startLocalRouteServer(buildLocalServerOptions());
+      return { ok: true, server };
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== "EADDRINUSE") {
+        return { ok: false, error };
+      }
+      if (attempt < attempts - 1) {
+        await sleep(delayMs);
+      }
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
 export async function runStartCommand(options = {}) {
   const configPath = options.configPath || getDefaultConfigPath();
   const host = options.host || "127.0.0.1";
-  const port = toNumber(options.port, 8787);
+  const port = resolveListenPort({ explicitPort: options.port });
   const watchConfig = toBoolean(options.watchConfig, true);
   const watchBinary = toBoolean(options.watchBinary, true);
   const binaryWatchIntervalMs = Math.max(
@@ -144,6 +262,7 @@ export async function runStartCommand(options = {}) {
     toNumber(options.binaryWatchIntervalMs ?? process.env.LLM_ROUTER_BINARY_WATCH_INTERVAL_MS, 15000)
   );
   const requireAuth = toBoolean(options.requireAuth, false);
+  const onStartupConflict = typeof options.onStartupConflict === "function" ? options.onStartupConflict : null;
   const managedByStartup = options.managedByStartup === true || process.env.LLM_ROUTER_MANAGED_BY_STARTUP === "1";
   const cliPathForWatch = String(options.cliPathForWatch || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "");
   const line = typeof options.onLine === "function" ? options.onLine : console.log;
@@ -222,24 +341,108 @@ export async function runStartCommand(options = {}) {
       };
     }
 
-    const reclaimed = await reclaimPort({ port, line, error });
-    if (!reclaimed.ok) {
-      return {
-        ok: false,
-        exitCode: 1,
-        errorMessage: reclaimed.errorMessage
-      };
+    if (!managedByStartup && onStartupConflict) {
+      const conflict = await detectStartupManagedConflictOnPort(port);
+      if (conflict.running) {
+        let choice = "";
+        try {
+          choice = normalizeStartupConflictChoice(await onStartupConflict({
+            port,
+            host,
+            configPath,
+            startup: conflict
+          }));
+        } catch (promptError) {
+          error(`Failed reading startup conflict prompt: ${promptError instanceof Error ? promptError.message : String(promptError)}`);
+        }
+
+        if (choice === "restart-startup") {
+          const restarted = await restartStartupManagedWithLatest({
+            runtimeState: conflict.runtime,
+            fallbackStartArgs: {
+              configPath,
+              host,
+              port,
+              watchConfig,
+              watchBinary,
+              requireAuth
+            },
+            error
+          });
+          if (!restarted.ok) {
+            return {
+              ok: false,
+              exitCode: 1,
+              errorMessage: restarted.errorMessage
+            };
+          }
+          return {
+            ok: true,
+            exitCode: 0,
+            data: [
+              "Restarted startup-managed llm-router instance with latest installed version.",
+              `manager=${restarted.detail?.manager || "unknown"}`,
+              `service=${restarted.detail?.serviceId || "unknown"}`
+            ].join("\n")
+          };
+        }
+
+        if (choice === "exit") {
+          return {
+            ok: true,
+            exitCode: 0,
+            data: `Startup-managed llm-router is still running on port ${port}. Exiting without changes.`
+          };
+        }
+
+        if (choice === "stop-and-start-here") {
+          const stopped = await stopStartupManagedListener({ port, line, error });
+          if (!stopped.ok) {
+            return {
+              ok: false,
+              exitCode: 1,
+              errorMessage: stopped.errorMessage
+            };
+          }
+
+          line("Startup-managed instance stopped. Starting llm-router in this terminal...");
+          const takeoverStart = await attemptServerStartAfterStartupStop(buildLocalServerOptions);
+          if (takeoverStart.ok) {
+            server = takeoverStart.server;
+            line(`Port ${port} reclaimed successfully.`);
+          } else if (takeoverStart.error?.code !== "EADDRINUSE") {
+            return {
+              ok: false,
+              exitCode: 1,
+              errorMessage: `Failed to start llm-router on http://${host}:${port}: ${takeoverStart.error instanceof Error ? takeoverStart.error.message : String(takeoverStart.error)}`
+            };
+          }
+        }
+      }
     }
 
-    try {
-      server = await startLocalRouteServer(buildLocalServerOptions());
-      line(`Port ${port} reclaimed successfully.`);
-    } catch (retryError) {
-      return {
-        ok: false,
-        exitCode: 1,
-        errorMessage: `Failed to start llm-router after reclaiming port ${port}: ${retryError instanceof Error ? retryError.message : String(retryError)}`
-      };
+    if (server) {
+      // Startup conflict handling already resolved the bind conflict.
+    } else {
+      const reclaimed = await reclaimPort({ port, line, error });
+      if (!reclaimed.ok) {
+        return {
+          ok: false,
+          exitCode: 1,
+          errorMessage: reclaimed.errorMessage
+        };
+      }
+
+      try {
+        server = await startLocalRouteServer(buildLocalServerOptions());
+        line(`Port ${port} reclaimed successfully.`);
+      } catch (retryError) {
+        return {
+          ok: false,
+          exitCode: 1,
+          errorMessage: `Failed to start llm-router after reclaiming port ${port}: ${retryError instanceof Error ? retryError.message : String(retryError)}`
+        };
+      }
     }
   }
   line(`LLM Router started on http://${host}:${port}`);

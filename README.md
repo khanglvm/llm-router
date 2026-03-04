@@ -24,7 +24,7 @@ Run `llm-router ai-help` first, then set up and operate llm-router for me using 
 
 ## Main Workflow
 
-1. Add Providers + models into llm-router
+1. Add providers + models into llm-router (standard API-key providers or OAuth subscription providers)
 2. Optionally, group models as alias with load balancing and auto fallback support
 3. Start llm-router server, point your coding tool API and model to llm-router
 
@@ -77,9 +77,31 @@ Then follow this order.
 Flow:
 1. `Config manager`
 2. `Add/Edit provider`
-3. Enter provider name, endpoint, API key
-4. Enter model list
+3. Select provider type:
+   - `standard` -> endpoint + API key + model list
+   - `subscription` -> OAuth profile for predefined ChatGPT Codex models
+4. Enter provider details
 5. Save
+
+### 1b) Add Subscription Provider (ChatGPT Codex)
+Commandline example:
+
+```bash
+llm-router config \
+  --operation=upsert-provider \
+  --provider-id=chatgpt \
+  --name="ChatGPT Subscription" \
+  --type=subscription \
+  --subscription-type=chatgpt-codex \
+  --subscription-profile=default
+
+llm-router subscription login --profile=default
+llm-router subscription status --profile=default
+```
+
+Notes:
+- `chatgpt-codex` subscription providers use predefined model IDs managed by llm-router releases.
+- No provider API key or endpoint probing is required for this provider type.
 
 ### 2) Configure Model Fallback (Optional)
 Flow:
@@ -127,10 +149,18 @@ Flow:
 llm-router start
 ```
 
+Custom port (optional):
+
+```bash
+llm-router start --port=3001
+# or
+LLM_ROUTER_PORT=3001 llm-router start
+```
+
 Local endpoints:
-- Unified: `http://127.0.0.1:8787/route`
-- Anthropic-style: `http://127.0.0.1:8787/anthropic`
-- OpenAI-style: `http://127.0.0.1:8787/openai`
+- Unified: `http://127.0.0.1:<port>/route`
+- Anthropic-style: `http://127.0.0.1:<port>/anthropic`
+- OpenAI-style: `http://127.0.0.1:<port>/openai`
 
 ## Connect your coding tool
 

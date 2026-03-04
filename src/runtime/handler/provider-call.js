@@ -75,18 +75,6 @@ export async function makeProviderCall({
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
-  
-  // Handle subscription providers with dedicated handler
-  if (isSubscriptionProvider(provider)) {
-    return makeSubscriptionProviderCall({
-      provider,
-      body,
-      sourceFormat,
-      stream,
-      env
-    });
-  }
-  
   const translate = needsTranslation(sourceFormat, targetFormat);
 
   let providerBody = { ...body };
@@ -125,6 +113,15 @@ export async function makeProviderCall({
     targetModel: candidate.backend,
     requestHeaders
   });
+
+  if (isSubscriptionProvider(provider)) {
+    return makeSubscriptionProviderCall({
+      provider,
+      body: providerBody,
+      stream,
+      env
+    });
+  }
 
   const providerUrl = resolveProviderUrl(provider, targetFormat);
   const headers = mergeCachingHeaders(
