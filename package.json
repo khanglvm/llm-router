@@ -1,6 +1,6 @@
 {
   "name": "@khanglvm/llm-router",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
   "keywords": [
     "llm-router",
@@ -30,7 +30,7 @@
     "test:provider-smoke": "node ./scripts/provider-smoke-suite.mjs"
   },
   "dependencies": {
-    "@levu/snap": "^0.3.11"
+    "@levu/snap": "^0.3.12"
   },
   "devDependencies": {
     "wrangler": "^4.68.1"
