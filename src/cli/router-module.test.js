@@ -49,7 +49,7 @@ function getSubscriptionAction() {
   return routerModule.actions.find((entry) => entry.actionId === "subscription");
 }
 
-function createConfigContext(args) {
+function createConfigContext(args, overrides = {}) {
   return {
     args,
     mode: "commandline",
@@ -59,7 +59,8 @@ function createConfigContext(args) {
       warn() {},
       error() {}
     },
-    prompts: {}
+    prompts: {},
+    ...overrides
   };
 }
 
@@ -483,11 +484,14 @@ test("summarizeConfig includes aliases and provider rate-limit buckets", () => {
     }
   }, "/tmp/config.json");
 
-  assert.match(summary, /Model aliases:/);
-  assert.match(summary, /chat\.default strategy=round-robin/);
-  assert.match(summary, /targets=openrouter\/gpt-4o-mini@2/);
-  assert.match(summary, /rateLimits:/);
-  assert.match(summary, /Monthly cap \(or-month\): models=all models cap=20000 req \/ 1 month window=1\/month/);
+  assert.match(summary, /Current Router Configuration/);
+  assert.match(summary, /Model Aliases/);
+  assert.match(summary, /chat\.default/);
+  assert.match(summary, /Round-robin/);
+  assert.match(summary, /openrouter\/gpt-4o-mini@2/);
+  assert.match(summary, /Rate-Limit Buckets/);
+  assert.match(summary, /Monthly cap/);
+  assert.match(summary, /20,000 requests/);
 });
 
 test("non-interactive upsert-model-alias writes expected config", async (t) => {
@@ -515,7 +519,115 @@ test("non-interactive upsert-model-alias writes expected config", async (t) => {
   ]);
 });
 
-test("non-interactive upsert-provider supports subscription provider UX", async (t) => {
+test("non-interactive upsert-provider subscription runs oauth login and probes selected models", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const loginProfiles = [];
+  const probedRequests = [];
+
+  const result = await configAction.run(createConfigContext({
+    operation: "upsert-provider",
+    config: configPath,
+    "provider-id": "chatgpt",
+    name: "ChatGPT Subscription",
+    type: "subscription"
+  }, {
+    subscriptionAuth: {
+      getAuthStatus: async () => ({ authenticated: true }),
+      loginWithBrowser: async (profile, options = {}) => {
+        loginProfiles.push(profile);
+        options.onUrl?.("https://auth.example.com", { openedBrowser: true });
+        return true;
+      },
+      loginWithDeviceCode: async () => true
+    },
+    subscriptionProvider: {
+      makeSubscriptionProviderCall: async ({ body }) => {
+        probedRequests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          response: new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          })
+        };
+      }
+    }
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Provider Saved/);
+  assert.match(String(result.data || ""), /Subscription \(OAuth\)/);
+  assert.deepEqual(loginProfiles, ["chatgpt"]);
+  assert.deepEqual(probedRequests.map((body) => body.model), CODEX_SUBSCRIPTION_MODELS);
+  assert.ok(probedRequests.every((body) => typeof body.instructions === "string" && body.instructions.length > 0));
+  assert.ok(probedRequests.every((body) => body.stream === true));
+  assert.ok(probedRequests.every((body) => body.max_tokens === undefined));
+  assert.ok(probedRequests.every((body) => body.tool_choice === "auto"));
+  assert.ok(probedRequests.every((body) => body.parallel_tool_calls === false));
+  assert.ok(probedRequests.every((body) => body.messages === undefined));
+  assert.ok(probedRequests.every((body) => Array.isArray(body.input) && body.input[0]?.role === "user"));
+
+  const next = await readConfigFile(configPath);
+  const provider = next.providers.find((entry) => entry.id === "chatgpt");
+  assert.ok(provider);
+  assert.equal(provider.type, "subscription");
+  assert.equal(provider.subscriptionType, "chatgpt-codex");
+  assert.equal(provider.subscriptionProfile, "chatgpt");
+  assert.deepEqual(provider.models.map((model) => model.id), CODEX_SUBSCRIPTION_MODELS);
+});
+
+test("non-interactive upsert-provider subscription keeps custom model list and probes all entries", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const probedRequests = [];
+
+  const result = await configAction.run(createConfigContext({
+    operation: "upsert-provider",
+    config: configPath,
+    "provider-id": "chatgpt-custom",
+    name: "ChatGPT Custom",
+    type: "subscription",
+    models: "gpt-5.3-codex\ngpt-5-codex-custom"
+  }, {
+    subscriptionAuth: {
+      getAuthStatus: async () => ({ authenticated: true }),
+      loginWithBrowser: async () => true,
+      loginWithDeviceCode: async () => true
+    },
+    subscriptionProvider: {
+      makeSubscriptionProviderCall: async ({ body }) => {
+        probedRequests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          response: new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          })
+        };
+      }
+    }
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(probedRequests.map((body) => body.model), ["gpt-5.3-codex", "gpt-5-codex-custom"]);
+  assert.ok(probedRequests.every((body) => typeof body.instructions === "string" && body.instructions.length > 0));
+  assert.ok(probedRequests.every((body) => body.stream === true));
+  assert.ok(probedRequests.every((body) => body.max_tokens === undefined));
+  assert.ok(probedRequests.every((body) => body.tool_choice === "auto"));
+  assert.ok(probedRequests.every((body) => body.parallel_tool_calls === false));
+  assert.ok(probedRequests.every((body) => body.messages === undefined));
+  assert.ok(probedRequests.every((body) => Array.isArray(body.input) && body.input[0]?.role === "user"));
+
+  const next = await readConfigFile(configPath);
+  const provider = next.providers.find((entry) => entry.id === "chatgpt-custom");
+  assert.ok(provider);
+  assert.deepEqual(provider.models.map((model) => model.id), ["gpt-5.3-codex", "gpt-5-codex-custom"]);
+});
+
+test("non-interactive upsert-provider validates unsupported subscription-type", async (t) => {
   const configAction = getConfigAction();
   const configPath = await createTempConfigFile(t, baseConfigFixture());
 
@@ -525,36 +637,66 @@ test("non-interactive upsert-provider supports subscription provider UX", async 
     "provider-id": "chatgpt",
     name: "ChatGPT Subscription",
     type: "subscription",
-    "subscription-type": "chatgpt-codex",
-    "subscription-profile": "personal"
+    "subscription-type": "unknown-subscription-type"
+  }, {
+    subscriptionAuth: {
+      getAuthStatus: async () => ({ authenticated: true }),
+      loginWithBrowser: async () => true,
+      loginWithDeviceCode: async () => true
+    }
   }));
 
-  assert.equal(result.ok, true);
-  assert.match(String(result.data || ""), /type=subscription/);
-
-  const next = await readConfigFile(configPath);
-  const provider = next.providers.find((entry) => entry.id === "chatgpt");
-  assert.ok(provider);
-  assert.equal(provider.type, "subscription");
-  assert.equal(provider.subscriptionType, "chatgpt-codex");
-  assert.equal(provider.subscriptionProfile, "personal");
-  assert.deepEqual(provider.models.map((model) => model.id), CODEX_SUBSCRIPTION_MODELS);
+  assert.equal(result.ok, false);
+  assert.match(String(result.errorMessage || ""), /Unsupported subscription-type/);
 });
 
-test("non-interactive upsert-provider validates missing subscription-type", async (t) => {
+test("non-interactive upsert-provider subscription auto-generates unique gpt-sub id with suffix", async (t) => {
   const configAction = getConfigAction();
-  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const fixture = baseConfigFixture();
+  fixture.providers.push({
+    id: "gpt-sub",
+    name: "Existing Sub Provider",
+    baseUrl: "https://example.com/v1",
+    format: "openai",
+    formats: ["openai"],
+    apiKey: "sk-existing",
+    models: [{ id: "gpt-4o-mini" }]
+  });
+  const configPath = await createTempConfigFile(t, fixture);
+  const probedRequests = [];
 
   const result = await configAction.run(createConfigContext({
     operation: "upsert-provider",
     config: configPath,
-    "provider-id": "chatgpt",
-    name: "ChatGPT Subscription",
     type: "subscription"
+  }, {
+    subscriptionAuth: {
+      getAuthStatus: async () => ({ authenticated: true }),
+      loginWithBrowser: async () => true,
+      loginWithDeviceCode: async () => true
+    },
+    subscriptionProvider: {
+      makeSubscriptionProviderCall: async ({ body }) => {
+        probedRequests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          response: new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          })
+        };
+      }
+    }
   }));
 
-  assert.equal(result.ok, false);
-  assert.match(String(result.errorMessage || ""), /subscription-type is required/);
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  const provider = next.providers.find((entry) => entry.id === "gpt-sub-2");
+  assert.ok(provider);
+  assert.equal(provider.name, "GPT Sub");
+  assert.equal(provider.subscriptionProfile, "gpt-sub-2");
+  assert.deepEqual(probedRequests.map((body) => body.model), CODEX_SUBSCRIPTION_MODELS);
 });
 
 test("non-interactive upsert-model-alias accepts auto model routing strategy", async (t) => {
@@ -570,6 +712,8 @@ test("non-interactive upsert-model-alias accepts auto model routing strategy", a
   }));
 
   assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Model Alias Saved/);
+  assert.match(String(result.data || ""), /Routing Strategy/);
   const next = await readConfigFile(configPath);
   assert.equal(next.modelAliases.coding.strategy, "auto");
 });
@@ -589,6 +733,8 @@ test("non-interactive set-provider-rate-limits writes expected config", async (t
   }));
 
   assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Rate-Limit Buckets Updated/);
+  assert.match(String(result.data || ""), /Provider ID/);
   const next = await readConfigFile(configPath);
   const provider = next.providers.find((entry) => entry.id === "openrouter");
   assert.deepEqual(provider.rateLimits, [
@@ -746,8 +892,8 @@ test("list-routing stays stable after mixed edits", async (t) => {
     config: configPath
   }));
   assert.equal(list.ok, true);
-  assert.match(String(list.data || ""), /Model aliases:/);
-  assert.match(String(list.data || ""), /rateLimits:/);
+  assert.match(String(list.data || ""), /Model Aliases/);
+  assert.match(String(list.data || ""), /Rate-Limit Buckets/);
 
   const normalized = await readConfigFile(configPath);
   assert.equal(normalized.version, 2);
@@ -768,7 +914,8 @@ test("migrate-config creates backup and upgrades legacy config version", async (
   }));
 
   assert.equal(result.ok, true);
-  assert.match(String(result.data || ""), /Migrated config 1 -> 2|already at target schema/);
+  assert.match(String(result.data || ""), /Config Migration Completed|Config Already Up To Date/);
+  assert.match(String(result.data || ""), /Current Version\s+\|\s+2/);
 
   const next = await readConfigFile(configPath);
   assert.equal(next.version, 2);

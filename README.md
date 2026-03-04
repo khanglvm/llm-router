@@ -77,10 +77,15 @@ Then follow this order.
 Flow:
 1. `Config manager`
 2. `Add/Edit provider`
-3. Select provider type:
-   - `standard` -> endpoint + API key + model list
-   - `subscription` -> OAuth profile for predefined ChatGPT Codex models
-4. Enter provider details
+3. Select provider auth mode:
+   - `API Key` -> endpoint + API key + model list
+   - `OAuth` -> browser OAuth + editable model list
+4. For `OAuth`:
+   - Choose subscription provider (`ChatGPT` for now)
+   - Enter Friendly Name and Provider ID
+   - Complete browser OAuth login inside this same flow
+   - Edit model list (pre-filled defaults; you can add/remove)
+   - llm-router live-tests every selected model before save
 5. Save
 
 ### 1b) Add Subscription Provider (ChatGPT Codex)
@@ -90,18 +95,14 @@ Commandline example:
 llm-router config \
   --operation=upsert-provider \
   --provider-id=chatgpt \
-  --name="ChatGPT Subscription" \
-  --type=subscription \
-  --subscription-type=chatgpt-codex \
-  --subscription-profile=default
-
-llm-router subscription login --profile=default
-llm-router subscription status --profile=default
+  --name="GPT Sub" \
+  --type=subscription
 ```
 
 Notes:
-- `chatgpt-codex` subscription providers use predefined model IDs managed by llm-router releases.
-- No provider API key or endpoint probing is required for this provider type.
+- OAuth login is run during provider upsert (browser flow by default).
+- `chatgpt-codex` is the current subscription type and its default model list is prefilled, but editable.
+- No provider API key or endpoint probe input is required for subscription mode.
 
 ### 2) Configure Model Fallback (Optional)
 Flow:
@@ -161,6 +162,7 @@ Local endpoints:
 - Unified: `http://127.0.0.1:<port>/route`
 - Anthropic-style: `http://127.0.0.1:<port>/anthropic`
 - OpenAI-style: `http://127.0.0.1:<port>/openai`
+- OpenAI Responses-style: `http://127.0.0.1:<port>/openai/v1/responses` (Codex CLI-compatible)
 
 ## Connect your coding tool
 
@@ -189,6 +191,8 @@ When local server is running:
 - the running proxy updates instantly
 
 No stop/start cycle needed.
+
+Config/status outputs are shown in structured table layouts for easier operator review.
 
 ## Cloudflare Worker (Hosted)
 

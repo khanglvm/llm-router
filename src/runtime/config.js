@@ -8,7 +8,7 @@ import { CODEX_SUBSCRIPTION_MODELS } from "./subscription-constants.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
-export const PROVIDER_ID_PATTERN = /^[a-z][a-zA-Z0-9-]*$/;
+export const PROVIDER_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const DEFAULT_PROVIDER_USER_AGENT_NAME = "AICodeClient";
 const DEFAULT_PROVIDER_USER_AGENT_VERSION = "1.0.0";
 export const DEFAULT_PROVIDER_USER_AGENT = buildDefaultProviderUserAgent();
@@ -322,11 +322,13 @@ function normalizeSubscriptionModels(models, subscriptionType) {
     return normalizedModels;
   }
 
-  const configuredById = new Map(normalizedModels.map((model) => [model.id, model]));
-  return CODEX_SUBSCRIPTION_MODELS.map((modelId) => ({
-    ...(configuredById.get(modelId) || {}),
-    id: modelId
-  }));
+  // ChatGPT Codex subscription models are prefilled defaults. Users can still
+  // customize (add/remove) the model list explicitly.
+  if (normalizedModels.length > 0) {
+    return normalizedModels;
+  }
+
+  return CODEX_SUBSCRIPTION_MODELS.map((modelId) => ({ id: modelId }));
 }
 
 function sanitizeModelFallbackReferences(providers) {
@@ -924,7 +926,7 @@ export function validateRuntimeConfig(config, { requireMasterKey = false, requir
     const isSubscriptionProvider = provider?.type === "subscription";
     if (!provider.id) errors.push("Provider missing id.");
     if (provider.id && !PROVIDER_ID_PATTERN.test(provider.id)) {
-      errors.push(`Provider id '${provider.id}' is invalid. Use slug/camelCase (e.g. openrouter or myProvider).`);
+      errors.push(`Provider id '${provider.id}' is invalid. Use lowercase slug format (e.g. openrouter-primary).`);
     }
     if (!isSubscriptionProvider && !provider.baseUrl) errors.push(`Provider ${provider.id || "(unknown)"} missing baseUrl.`);
     if (isSubscriptionProvider && !provider.subscriptionType) {

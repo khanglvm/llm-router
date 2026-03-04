@@ -346,7 +346,7 @@ test("validateRuntimeConfig rejects alias cycles", () => {
   assert.ok(errors.some((error) => error.includes("Alias cycle detected")));
 });
 
-test("normalizeRuntimeConfig injects predefined Codex models for subscription providers", () => {
+test("normalizeRuntimeConfig preserves explicit model list for subscription providers", () => {
   const normalized = normalizeRuntimeConfig({
     version: CONFIG_VERSION,
     defaultModel: "chatgpt/gpt-5.3-codex",
@@ -368,9 +368,31 @@ test("normalizeRuntimeConfig injects predefined Codex models for subscription pr
   assert.equal(normalized.providers[0].format, FORMATS.OPENAI);
   assert.deepEqual(
     normalized.providers[0].models.map((model) => model.id),
-    CODEX_SUBSCRIPTION_MODELS
+    ["gpt-5.3-codex", "not-allowed"]
   );
   assert.equal(normalized.providers[0].models[0].variant, "high");
+  assert.equal(validateRuntimeConfig(normalized).length, 0);
+});
+
+test("normalizeRuntimeConfig injects predefined Codex models when subscription models are omitted", () => {
+  const normalized = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "chatgpt/gpt-5.3-codex",
+    providers: [
+      {
+        id: "chatgpt",
+        name: "ChatGPT Subscription",
+        type: "subscription",
+        subscriptionType: "chatgpt-codex",
+        subscriptionProfile: "personal"
+      }
+    ]
+  });
+
+  assert.deepEqual(
+    normalized.providers[0].models.map((model) => model.id),
+    CODEX_SUBSCRIPTION_MODELS
+  );
   assert.equal(validateRuntimeConfig(normalized).length, 0);
 });
 

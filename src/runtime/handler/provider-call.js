@@ -17,6 +17,11 @@ import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
 import { buildTimeoutSignal } from "../../shared/timeout-signal.js";
 import { isSubscriptionProvider, makeSubscriptionProviderCall } from "../subscription-provider.js";
+import {
+  convertCodexResponseToOpenAIChatCompletion,
+  extractCodexFinalResponse,
+  handleCodexStreamToOpenAI
+} from "../codex-response-transformer.js";
 
 async function toProviderError(response) {
   const raw = await response.text();
@@ -115,12 +120,88 @@ export async function makeProviderCall({
   });
 
   if (isSubscriptionProvider(provider)) {
-    return makeSubscriptionProviderCall({
+    const subscriptionResult = await makeSubscriptionProviderCall({
       provider,
       body: providerBody,
-      stream,
+      // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
+      stream: true,
       env
     });
+
+    if (!subscriptionResult?.ok) {
+      return subscriptionResult;
+    }
+
+    if (!(subscriptionResult.response instanceof Response)) {
+      return {
+        ok: false,
+        status: 502,
+        retryable: true,
+        response: jsonResponse({
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "Subscription provider returned an invalid response."
+          }
+        }, 502)
+      };
+    }
+
+    const fallbackModel = candidate?.backend || providerBody?.model || "unknown";
+    if (stream) {
+      const openAIStreamResponse = handleCodexStreamToOpenAI(subscriptionResult.response, {
+        fallbackModel
+      });
+      if (sourceFormat === FORMATS.CLAUDE) {
+        return {
+          ok: true,
+          status: 200,
+          retryable: false,
+          response: handleOpenAIStreamToClaude(openAIStreamResponse)
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        response: openAIStreamResponse
+      };
+    }
+
+    const parsedSubscriptionResponse = await extractCodexFinalResponse(subscriptionResult.response);
+    if (!parsedSubscriptionResponse) {
+      return {
+        ok: false,
+        status: 502,
+        retryable: true,
+        response: jsonResponse({
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "Subscription provider stream did not contain a completed response payload."
+          }
+        }, 502)
+      };
+    }
+
+    const openAINonStreamResponse = convertCodexResponseToOpenAIChatCompletion(parsedSubscriptionResponse, {
+      fallbackModel
+    });
+    if (sourceFormat === FORMATS.CLAUDE) {
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        response: jsonResponse(convertOpenAINonStreamToClaude(openAINonStreamResponse, fallbackModel))
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      retryable: false,
+      response: jsonResponse(openAINonStreamResponse)
+    };
   }
 
   const providerUrl = resolveProviderUrl(provider, targetFormat);

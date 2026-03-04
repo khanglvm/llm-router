@@ -5,6 +5,7 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { CODEX_OAUTH_CONFIG } from './subscription-constants.js';
 import { saveTokens, loadTokens, isTokenExpired, deleteTokens, listTokenProfiles as listTokenProfilesFromStore } from './subscription-tokens.js';
 
@@ -25,6 +26,26 @@ function generatePKCE() {
  */
 function generateState() {
   return crypto.randomBytes(16).toString('hex');
+}
+
+function tryOpenBrowser(url) {
+  const target = String(url || '').trim();
+  if (!target) return false;
+
+  try {
+    let child;
+    if (process.platform === 'darwin') {
+      child = spawn('open', [target], { stdio: 'ignore', detached: true });
+    } else if (process.platform === 'win32') {
+      child = spawn('cmd', ['/c', 'start', '', target], { stdio: 'ignore', detached: true });
+    } else {
+      child = spawn('xdg-open', [target], { stdio: 'ignore', detached: true });
+    }
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -148,10 +169,16 @@ export async function loginWithBrowser(profileId, options = {}) {
   authUrl.searchParams.set('client_id', CODEX_OAUTH_CONFIG.clientId);
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('scope', CODEX_OAUTH_CONFIG.scopes);
-  authUrl.searchParams.set('audience', CODEX_OAUTH_CONFIG.audience);
   authUrl.searchParams.set('state', state);
   authUrl.searchParams.set('code_challenge', pkce.challenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
+  if (CODEX_OAUTH_CONFIG.authorizeParams && typeof CODEX_OAUTH_CONFIG.authorizeParams === 'object') {
+    for (const [key, value] of Object.entries(CODEX_OAUTH_CONFIG.authorizeParams)) {
+      if (value !== undefined && value !== null && String(value).trim() !== '') {
+        authUrl.searchParams.set(key, String(value));
+      }
+    }
+  }
 
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -203,8 +230,9 @@ export async function loginWithBrowser(profileId, options = {}) {
 
     server.listen(port, () => {
       const authUrlStr = authUrl.toString();
+      const openedBrowser = options.autoOpen !== false ? tryOpenBrowser(authUrlStr) : false;
       if (options.onUrl) {
-        options.onUrl(authUrlStr);
+        options.onUrl(authUrlStr, { openedBrowser });
       }
     });
 
@@ -231,8 +259,7 @@ export async function loginWithDeviceCode(profileId, options = {}) {
     },
     body: new URLSearchParams({
       client_id: CODEX_OAUTH_CONFIG.clientId,
-      scope: CODEX_OAUTH_CONFIG.scopes,
-      audience: CODEX_OAUTH_CONFIG.audience
+      scope: CODEX_OAUTH_CONFIG.scopes
     }).toString()
   });
 

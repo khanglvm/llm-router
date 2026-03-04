@@ -12,6 +12,9 @@ import {
 } from './codex-request-transformer.js';
 import { FORMATS } from '../translator/index.js';
 
+const UNSUPPORTED_PARAMETER_PATTERN = /Unsupported parameter:\s*([A-Za-z0-9_.-]+)/gi;
+const MAX_UNSUPPORTED_PARAMETER_RETRIES = 6;
+
 /**
  * Subscription provider types.
  */
@@ -176,6 +179,7 @@ export async function makeSubscriptionProviderCall({ provider, body, stream }) {
 async function makeCodexProviderCall({ provider, body, stream, accessToken }) {
   // Transform request for Codex backend
   const codexBody = transformRequestForCodex(body);
+  stripCodexTokenLimitFields(codexBody);
   
   // Apply variant settings if specified in model config
   const modelConfig = (provider.models || []).find(m => m.id === body.model);
@@ -188,15 +192,60 @@ async function makeCodexProviderCall({ provider, body, stream, accessToken }) {
   
   // Make the request
   try {
-    const response = await fetch(CODEX_ENDPOINT, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(codexBody),
-      signal: stream ? null : AbortSignal.timeout(120000) // 2 min timeout for non-streaming
-    });
-    
-    if (!response.ok) {
+    const removedUnsupportedParameters = new Set();
+    for (let attempt = 0; attempt <= MAX_UNSUPPORTED_PARAMETER_RETRIES; attempt += 1) {
+      const response = await fetch(CODEX_ENDPOINT, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(codexBody),
+        signal: stream ? undefined : AbortSignal.timeout(120000) // 2 min timeout for non-streaming
+      });
+
+      if (response.ok) {
+        // For streaming, pass through the response
+        if (stream) {
+          return {
+            ok: true,
+            status: 200,
+            retryable: false,
+            response: new Response(response.body, {
+              status: 200,
+              headers: {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+              }
+            })
+          };
+        }
+
+        // For non-streaming, pass through
+        const responseText = await response.text();
+        return {
+          ok: true,
+          status: 200,
+          retryable: false,
+          response: new Response(responseText, {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          })
+        };
+      }
+
       const errorText = await response.text();
+      const unsupportedParameters = extractUnsupportedParameters(errorText);
+      let removedAnyUnsupportedParameter = false;
+      for (const parameter of unsupportedParameters) {
+        const normalized = parameter.toLowerCase();
+        if (removedUnsupportedParameters.has(normalized)) continue;
+        if (!removeUnsupportedParameter(codexBody, parameter)) continue;
+        removedUnsupportedParameters.add(normalized);
+        removedAnyUnsupportedParameter = true;
+      }
+      if (removedAnyUnsupportedParameter) {
+        continue;
+      }
+
       return {
         ok: false,
         status: response.status,
@@ -208,32 +257,16 @@ async function makeCodexProviderCall({ provider, body, stream, accessToken }) {
         })
       };
     }
-    
-    // For streaming, pass through the response
-    if (stream) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: new Response(response.body, {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-          }
-        })
-      };
-    }
-    
-    // For non-streaming, pass through
-    const responseText = await response.text();
+
     return {
-      ok: true,
-      status: 200,
+      ok: false,
+      status: 400,
       retryable: false,
-      response: new Response(responseText, {
-        status: 200,
+      errorKind: 'provider_error',
+      response: new Response(JSON.stringify({
+        detail: 'Codex request failed after removing unsupported parameters.'
+      }), {
+        status: 400,
         headers: { 'Content-Type': 'application/json' }
       })
     };
@@ -285,6 +318,100 @@ async function makeCodexProviderCall({ provider, body, stream, accessToken }) {
  */
 function isRetryableStatus(status) {
   return status === 429 || (status >= 500 && status < 600);
+}
+
+function stripCodexTokenLimitFields(body) {
+  if (!body || typeof body !== 'object') return;
+  delete body.max_tokens;
+  delete body.max_output_tokens;
+  delete body.max_completion_tokens;
+}
+
+function extractUnsupportedParameters(errorText) {
+  const detail = extractErrorDetail(errorText);
+  if (!detail) return [];
+  const matches = [];
+  let match = UNSUPPORTED_PARAMETER_PATTERN.exec(detail);
+  while (match) {
+    const name = String(match[1] || '').trim();
+    if (name) matches.push(name);
+    match = UNSUPPORTED_PARAMETER_PATTERN.exec(detail);
+  }
+  UNSUPPORTED_PARAMETER_PATTERN.lastIndex = 0;
+  return [...new Set(matches)];
+}
+
+function extractErrorDetail(errorText) {
+  const raw = String(errorText || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.detail === 'string' && parsed.detail.trim()) return parsed.detail.trim();
+    if (typeof parsed?.error?.message === 'string' && parsed.error.message.trim()) return parsed.error.message.trim();
+    if (typeof parsed?.message === 'string' && parsed.message.trim()) return parsed.message.trim();
+  } catch {
+    // keep raw payload if not JSON
+  }
+  return raw;
+}
+
+function removeUnsupportedParameter(body, parameterPath) {
+  const normalizedPath = String(parameterPath || '').trim();
+  if (!normalizedPath || !body || typeof body !== 'object') return false;
+
+  if (Object.prototype.hasOwnProperty.call(body, normalizedPath)) {
+    delete body[normalizedPath];
+    return true;
+  }
+
+  const parts = normalizedPath
+    .replace(/\[(\d+)\]/g, '.$1')
+    .split('.')
+    .filter(Boolean);
+  if (parts.length < 2) {
+    return removeKeysRecursively(body, normalizedPath);
+  }
+
+  let node = body;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const segment = parts[index];
+    if (!node || typeof node !== 'object' || !Object.prototype.hasOwnProperty.call(node, segment)) {
+      return false;
+    }
+    node = node[segment];
+  }
+
+  const leaf = parts[parts.length - 1];
+  if (!node || typeof node !== 'object' || !Object.prototype.hasOwnProperty.call(node, leaf)) {
+    return removeKeysRecursively(body, leaf);
+  }
+  delete node[leaf];
+  return true;
+}
+
+function removeKeysRecursively(node, targetKey) {
+  if (!node || typeof node !== 'object') return false;
+  let removed = false;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      if (removeKeysRecursively(item, targetKey)) {
+        removed = true;
+      }
+    }
+    return removed;
+  }
+
+  for (const key of Object.keys(node)) {
+    if (key === targetKey) {
+      delete node[key];
+      removed = true;
+      continue;
+    }
+    if (removeKeysRecursively(node[key], targetKey)) {
+      removed = true;
+    }
+  }
+  return removed;
 }
 
 /**

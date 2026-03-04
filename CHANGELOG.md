@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-03-04
+
+### Added
+- Added Codex Responses API compatibility layer:
+  - request transformation into Codex Responses payload shape
+  - response transformation from Codex responses/SSE events to OpenAI Chat Completions-compatible output
+  - dedicated runtime tests for request + response transformation coverage
+- Added explicit project-level ignore for local `AGENTS.md`.
+
+### Changed
+- Improved TUI/CLI operation reports to user-friendly structured layouts and tables across provider/model-alias/rate-limit/config flows and operational actions.
+- Improved startup/deploy/worker-key/status outputs to avoid raw config variable style and show friendly fields.
+- Updated subscription auth/provider flow behavior and tests for more robust OAuth/Codex subscription handling.
+
+### Fixed
+- Fixed migration/reporting test expectations and summary rendering stability after report format refactor.
+
 ## [1.1.1] - 2026-03-04
 
 ### Fixed
