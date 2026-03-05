@@ -30,7 +30,7 @@
     "test:provider-smoke": "node ./scripts/provider-smoke-suite.mjs"
   },
   "dependencies": {
-    "@levu/snap": "^0.3.12"
+    "@levu/snap": "^0.3.13"
   },
   "devDependencies": {
     "wrangler": "^4.68.1"

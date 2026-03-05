@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-03-05
+
+### Changed
+- Upgraded `@levu/snap` dependency to `^0.3.13`:
+  - TUI `Esc` now defaults to stepping back to previous workflow step.
+  - On root step, `Esc` still exits.
+- Added compliance warning in interactive provider setup: using provider resources through `llm-router` may violate provider terms; users are solely responsible for compliance.
+
 ## [1.3.0] - 2026-03-05
 
 ### Added

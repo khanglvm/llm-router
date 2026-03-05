@@ -425,7 +425,13 @@ function findProviderByFriendlyName(providers, name, { excludeId = "" } = {}) {
 }
 
 function printProviderInputGuidance(context) {
-  void context;
+  const warn = typeof context?.terminal?.warn === "function" ? context.terminal.warn.bind(context.terminal) : null;
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  const output = warn || line;
+  output?.(
+    "Compliance notice: Using provider resources through llm-router may violate provider terms. " +
+    "You are solely responsible for compliance; llm-router maintainers take no responsibility for misuse."
+  );
 }
 
 function trimOuterPunctuation(value) {

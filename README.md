@@ -114,6 +114,7 @@ Notes:
 - Default model lists are prefilled by subscription type, then editable.
 - Device-code login is available for `chatgpt-codex` only.
 - No provider API key or endpoint probe input is required for subscription mode.
+- Compliance notice: provider account/resource usage via `llm-router` may violate a provider's terms. You are solely responsible for compliance; `llm-router` maintainers take no responsibility for misuse.
 
 ### 2) Configure Model Fallback (Optional)
 Flow:
