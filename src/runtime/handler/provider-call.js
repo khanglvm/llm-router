@@ -70,6 +70,120 @@ export async function buildFailureResponse(result) {
   }, fallbackStatus);
 }
 
+async function adaptProviderResponse({
+  response,
+  stream,
+  translate,
+  sourceFormat,
+  targetFormat,
+  fallbackModel
+}) {
+  if (stream) {
+    if (!translate) {
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        response: passthroughResponseWithCors(response, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive"
+        })
+      };
+    }
+
+    if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        response: handleOpenAIStreamToClaude(response)
+      };
+    }
+
+    if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        response: handleClaudeStreamToOpenAI(response)
+      };
+    }
+
+    return {
+      ok: false,
+      status: 501,
+      retryable: false,
+      errorKind: "not_supported_error",
+      response: jsonResponse({
+        type: "error",
+        error: {
+          type: "not_supported_error",
+          message: `Streaming translation from ${targetFormat} to ${sourceFormat} is not implemented.`
+        }
+      }, 501)
+    };
+  }
+
+  if (!translate) {
+    return {
+      ok: true,
+      status: 200,
+      retryable: false,
+      response: passthroughResponseWithCors(response)
+    };
+  }
+
+  const raw = await response.text();
+  const parsed = parseJsonSafely(raw);
+  if (!parsed) {
+    return {
+      ok: false,
+      status: 502,
+      retryable: true,
+      response: jsonResponse({
+        type: "error",
+        error: {
+          type: "api_error",
+          message: "Provider returned invalid JSON."
+        }
+      }, 502)
+    };
+  }
+
+  if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
+    return {
+      ok: true,
+      status: 200,
+      retryable: false,
+      response: jsonResponse(convertOpenAINonStreamToClaude(parsed, fallbackModel))
+    };
+  }
+
+  if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
+    return {
+      ok: true,
+      status: 200,
+      retryable: false,
+      response: jsonResponse(claudeToOpenAINonStreamResponse(parsed))
+    };
+  }
+
+  return {
+    ok: false,
+    status: 501,
+    retryable: false,
+    errorKind: "not_supported_error",
+    response: jsonResponse({
+      type: "error",
+      error: {
+        type: "not_supported_error",
+        message: `Non-stream translation from ${targetFormat} to ${sourceFormat} is not implemented.`
+      }
+    }, 501)
+  };
+}
+
 export async function makeProviderCall({
   body,
   sourceFormat,
@@ -120,11 +234,12 @@ export async function makeProviderCall({
   });
 
   if (isSubscriptionProvider(provider)) {
+    const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
     const subscriptionResult = await makeSubscriptionProviderCall({
       provider,
       body: providerBody,
       // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
-      stream: true,
+      stream: subscriptionType === "chatgpt-codex" ? true : Boolean(stream),
       env
     });
 
@@ -148,6 +263,17 @@ export async function makeProviderCall({
     }
 
     const fallbackModel = candidate?.backend || providerBody?.model || "unknown";
+    if (subscriptionType !== "chatgpt-codex") {
+      return adaptProviderResponse({
+        response: subscriptionResult.response,
+        stream,
+        translate,
+        sourceFormat,
+        targetFormat,
+        fallbackModel
+      });
+    }
+
     if (stream) {
       const openAIStreamResponse = handleCodexStreamToOpenAI(subscriptionResult.response, {
         fallbackModel
@@ -273,108 +399,12 @@ export async function makeProviderCall({
     };
   }
 
-  if (stream) {
-    if (!translate) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: passthroughResponseWithCors(response, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive"
-        })
-      };
-    }
-
-    if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: handleOpenAIStreamToClaude(response)
-      };
-    }
-
-    if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: handleClaudeStreamToOpenAI(response)
-      };
-    }
-
-    return {
-      ok: false,
-      status: 501,
-      retryable: false,
-      errorKind: "not_supported_error",
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "not_supported_error",
-          message: `Streaming translation from ${targetFormat} to ${sourceFormat} is not implemented.`
-        }
-      }, 501)
-    };
-  }
-
-  if (!translate) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: passthroughResponseWithCors(response)
-    };
-  }
-
-  const raw = await response.text();
-  const parsed = parseJsonSafely(raw);
-  if (!parsed) {
-    return {
-      ok: false,
-      status: 502,
-      retryable: true,
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: "Provider returned invalid JSON."
-        }
-      }, 502)
-    };
-  }
-
-  if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: jsonResponse(convertOpenAINonStreamToClaude(parsed, candidate.backend))
-    };
-  }
-
-  if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: jsonResponse(claudeToOpenAINonStreamResponse(parsed))
-    };
-  }
-
-  return {
-    ok: false,
-    status: 501,
-    retryable: false,
-    errorKind: "not_supported_error",
-    response: jsonResponse({
-      type: "error",
-      error: {
-        type: "not_supported_error",
-        message: `Non-stream translation from ${targetFormat} to ${sourceFormat} is not implemented.`
-      }
-    }, 501)
-  };
+  return adaptProviderResponse({
+    response,
+    stream,
+    translate,
+    sourceFormat,
+    targetFormat,
+    fallbackModel: candidate.backend
+  });
 }

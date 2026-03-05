@@ -5,7 +5,10 @@ import {
   buildProviderFromConfigInput,
   buildWorkerConfigPayload
 } from "./config-workflows.js";
-import { CODEX_SUBSCRIPTION_MODELS } from "../runtime/subscription-constants.js";
+import {
+  CODEX_SUBSCRIPTION_MODELS,
+  CLAUDE_CODE_SUBSCRIPTION_MODELS
+} from "../runtime/subscription-constants.js";
 
 function baseConfig() {
   return {
@@ -135,4 +138,20 @@ test("buildProviderFromConfigInput keeps subscription provider fields and predef
   assert.equal(provider.subscriptionProfile, "personal");
   assert.equal(provider.format, "openai");
   assert.deepEqual(provider.models.map((model) => model.id), CODEX_SUBSCRIPTION_MODELS);
+});
+
+test("buildProviderFromConfigInput applies Claude subscription defaults", () => {
+  const provider = buildProviderFromConfigInput({
+    providerId: "claude-sub",
+    name: "Claude Subscription",
+    type: "subscription",
+    subscriptionType: "claude-code",
+    subscriptionProfile: "work"
+  });
+
+  assert.equal(provider.type, "subscription");
+  assert.equal(provider.subscriptionType, "claude-code");
+  assert.equal(provider.subscriptionProfile, "work");
+  assert.equal(provider.format, "claude");
+  assert.deepEqual(provider.models.map((model) => model.id), CLAUDE_CODE_SUBSCRIPTION_MODELS);
 });

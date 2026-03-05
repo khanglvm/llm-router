@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-03-05
+
+### Added
+- Added Claude Code OAuth subscription provider support end-to-end:
+  - new subscription type: `claude-code`
+  - Claude OAuth constants and runtime request config (`anthropic-beta`, OAuth token endpoint, Claude messages endpoint)
+  - default Claude subscription model seed list for new subscription providers
+- Added CLI support for Claude subscription auth operations:
+  - `llm-router subscription login --subscription-type=claude-code`
+  - `llm-router subscription logout --subscription-type=claude-code`
+  - `llm-router subscription status --subscription-type=claude-code`
+- Added runtime and CLI test coverage for Claude subscription request translation/headers and setup flows.
+
+### Changed
+- Updated subscription probe and provider upsert flow to build type-specific probe payloads:
+  - ChatGPT Codex keeps Responses/Codex probe shape
+  - Claude Code uses Claude messages probe shape
+- Updated subscription config normalization/workflows so default format and model seed list are selected by `subscriptionType`.
+- Updated README and CLI help text/examples to document both supported OAuth subscription types (`chatgpt-codex`, `claude-code`).
+
+### Fixed
+- Fixed new Claude subscription provider creation default model seeding to correctly use Claude defaults instead of ChatGPT defaults.
+
 ## [1.2.0] - 2026-03-04
 
 ### Added

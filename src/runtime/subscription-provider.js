@@ -10,6 +10,9 @@ import {
   CODEX_ENDPOINT,
   mapCodexVariant
 } from './codex-request-transformer.js';
+import {
+  CLAUDE_CODE_OAUTH_CONFIG
+} from './subscription-constants.js';
 import { FORMATS } from '../translator/index.js';
 
 const UNSUPPORTED_PARAMETER_PATTERN = /Unsupported parameter:\s*([A-Za-z0-9_.-]+)/gi;
@@ -19,7 +22,8 @@ const MAX_UNSUPPORTED_PARAMETER_RETRIES = 6;
  * Subscription provider types.
  */
 export const SUBSCRIPTION_TYPES = {
-  CHATGPT_CODEX: 'chatgpt-codex'
+  CHATGPT_CODEX: 'chatgpt-codex',
+  CLAUDE_CODE: 'claude-code'
 };
 
 /**
@@ -108,7 +112,7 @@ export async function makeSubscriptionProviderCall({ provider, body, stream }) {
   // Get valid access token (auto-refreshes if expired)
   let accessToken;
   try {
-    accessToken = await getValidAccessToken(profileId);
+    accessToken = await getValidAccessToken(profileId, { subscriptionType: subType });
   } catch (error) {
     return {
       ok: false,
@@ -150,6 +154,9 @@ export async function makeSubscriptionProviderCall({ provider, body, stream }) {
   // Route to appropriate handler based on subscription type
   if (subType === SUBSCRIPTION_TYPES.CHATGPT_CODEX) {
     return makeCodexProviderCall({ provider, body, stream, accessToken });
+  }
+  if (subType === SUBSCRIPTION_TYPES.CLAUDE_CODE) {
+    return makeClaudeCodeProviderCall({ provider, body, stream, accessToken });
   }
   
   return {
@@ -311,6 +318,120 @@ async function makeCodexProviderCall({ provider, body, stream, accessToken }) {
 }
 
 /**
+ * Make a Claude Code OAuth API call.
+ *
+ * @param {Object} options - Call options
+ * @returns {Promise<Object>} Call result
+ */
+async function makeClaudeCodeProviderCall({ provider, body, stream, accessToken }) {
+  const apiBaseUrl = String(CLAUDE_CODE_OAUTH_CONFIG.apiBaseUrl || '').replace(/\/+$/, '');
+  const messagesPath = String(CLAUDE_CODE_OAUTH_CONFIG.messagesPath || '/v1/messages?beta=true');
+  const endpoint = `${apiBaseUrl}${messagesPath.startsWith('/') ? messagesPath : `/${messagesPath}`}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${accessToken}`,
+    'anthropic-beta': CLAUDE_CODE_OAUTH_CONFIG.oauthBeta,
+    'anthropic-version': provider?.anthropicVersion || '2023-06-01',
+    ...(provider.headers || {})
+  };
+  const claudeBody = {
+    ...(body || {}),
+    stream: Boolean(stream)
+  };
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(claudeBody),
+      signal: stream ? undefined : AbortSignal.timeout(120000)
+    });
+
+    if (response.ok) {
+      if (stream) {
+        return {
+          ok: true,
+          status: 200,
+          retryable: false,
+          subscriptionType: SUBSCRIPTION_TYPES.CLAUDE_CODE,
+          response: new Response(response.body, {
+            status: 200,
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive'
+            }
+          })
+        };
+      }
+
+      const responseText = await response.text();
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        subscriptionType: SUBSCRIPTION_TYPES.CLAUDE_CODE,
+        response: new Response(responseText, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      };
+    }
+
+    const errorText = await response.text();
+    return {
+      ok: false,
+      status: response.status,
+      retryable: isRetryableStatus(response.status),
+      errorKind: 'provider_error',
+      subscriptionType: SUBSCRIPTION_TYPES.CLAUDE_CODE,
+      response: new Response(errorText, {
+        status: response.status,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    };
+  } catch (error) {
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+      return {
+        ok: false,
+        status: 504,
+        retryable: true,
+        errorKind: 'timeout_error',
+        subscriptionType: SUBSCRIPTION_TYPES.CLAUDE_CODE,
+        response: new Response(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'timeout_error',
+            message: 'Claude Code OAuth API request timed out'
+          }
+        }), {
+          status: 504,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      };
+    }
+
+    return {
+      ok: false,
+      status: 503,
+      retryable: true,
+      errorKind: 'network_error',
+      subscriptionType: SUBSCRIPTION_TYPES.CLAUDE_CODE,
+      response: new Response(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: `Claude Code OAuth API network error: ${error instanceof Error ? error.message : String(error)}`
+        }
+      }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    };
+  }
+}
+
+/**
  * Check if an HTTP status is retryable.
  * 
  * @param {number} status - HTTP status code
@@ -427,11 +548,13 @@ function removeKeysRecursively(node, targetKey) {
 export async function loginSubscription(profileId, options = {}) {
   if (options.deviceCode) {
     return loginWithDeviceCode(profileId, {
+      subscriptionType: options.subscriptionType,
       onCode: options.onCode
     });
   }
   
   return loginWithBrowser(profileId, {
+    subscriptionType: options.subscriptionType,
     onUrl: options.onUrl
   });
 }
@@ -440,19 +563,27 @@ export async function loginSubscription(profileId, options = {}) {
  * Logout from a subscription provider.
  * 
  * @param {string} profileId - Profile ID
+ * @param {Object} [options] - Options
+ * @param {string} [options.subscriptionType] - Subscription type
  */
-export async function logoutSubscription(profileId) {
-  await logout(profileId);
+export async function logoutSubscription(profileId, options = {}) {
+  await logout(profileId, {
+    subscriptionType: options.subscriptionType || SUBSCRIPTION_TYPES.CHATGPT_CODEX
+  });
 }
 
 /**
  * Get authentication status for a subscription profile.
  * 
  * @param {string} profileId - Profile ID
+ * @param {Object} [options] - Options
+ * @param {string} [options.subscriptionType] - Subscription type
  * @returns {Promise<Object>} Status object
  */
-export async function getSubscriptionStatus(profileId) {
-  return getAuthStatus(profileId);
+export async function getSubscriptionStatus(profileId, options = {}) {
+  return getAuthStatus(profileId, {
+    subscriptionType: options.subscriptionType || SUBSCRIPTION_TYPES.CHATGPT_CODEX
+  });
 }
 
 /**
@@ -464,25 +595,40 @@ export async function getSubscriptionStatus(profileId) {
  * @returns {Object} Headers object
  */
 export function buildSubscriptionProviderHeaders(provider, accessToken) {
-  return {
+  const subType = provider?.subscriptionType || provider?.subscription_type;
+  const headers = {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${accessToken}`,
     ...(provider.headers || {})
   };
+  if (subType === SUBSCRIPTION_TYPES.CLAUDE_CODE) {
+    headers['anthropic-beta'] = CLAUDE_CODE_OAUTH_CONFIG.oauthBeta;
+    headers['anthropic-version'] = provider?.anthropicVersion || '2023-06-01';
+  }
+  return headers;
 }
 
 /**
  * Get the target format for a subscription provider.
- * Subscription providers always use OpenAI format.
+ * Target format depends on subscription provider type.
  * 
  * @param {Object} provider - Provider config
  * @param {string} sourceFormat - Source format
  * @returns {string} Target format
  */
 export function resolveSubscriptionProviderFormat(provider, sourceFormat) {
-  // Subscription providers use OpenAI format internally
+  void sourceFormat;
+  const subType = provider?.subscriptionType || provider?.subscription_type;
+  if (subType === SUBSCRIPTION_TYPES.CLAUDE_CODE) {
+    return FORMATS.CLAUDE;
+  }
   return FORMATS.OPENAI;
 }
 
 // Re-export for convenience
-export { CODEX_SUBSCRIPTION_MODELS, CODEX_OAUTH_CONFIG } from './subscription-constants.js';
+export {
+  CODEX_SUBSCRIPTION_MODELS,
+  CODEX_OAUTH_CONFIG,
+  CLAUDE_CODE_SUBSCRIPTION_MODELS,
+  CLAUDE_CODE_OAUTH_CONFIG
+} from './subscription-constants.js';

@@ -11,7 +11,10 @@ import {
   resolveRouteReference,
   validateRuntimeConfig
 } from "./config.js";
-import { CODEX_SUBSCRIPTION_MODELS } from "./subscription-constants.js";
+import {
+  CODEX_SUBSCRIPTION_MODELS,
+  CLAUDE_CODE_SUBSCRIPTION_MODELS
+} from "./subscription-constants.js";
 
 function createBaseRawConfig(overrides = {}) {
   const base = {
@@ -392,6 +395,29 @@ test("normalizeRuntimeConfig injects predefined Codex models when subscription m
   assert.deepEqual(
     normalized.providers[0].models.map((model) => model.id),
     CODEX_SUBSCRIPTION_MODELS
+  );
+  assert.equal(validateRuntimeConfig(normalized).length, 0);
+});
+
+test("normalizeRuntimeConfig injects predefined Claude models when subscription models are omitted", () => {
+  const normalized = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "claude-sub/claude-sonnet-4-6",
+    providers: [
+      {
+        id: "claude-sub",
+        name: "Claude Subscription",
+        type: "subscription",
+        subscriptionType: "claude-code",
+        subscriptionProfile: "work"
+      }
+    ]
+  });
+
+  assert.equal(normalized.providers[0].format, FORMATS.CLAUDE);
+  assert.deepEqual(
+    normalized.providers[0].models.map((model) => model.id),
+    CLAUDE_CODE_SUBSCRIPTION_MODELS
   );
   assert.equal(validateRuntimeConfig(normalized).length, 0);
 });

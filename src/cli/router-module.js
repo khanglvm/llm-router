@@ -37,7 +37,10 @@ import {
   sanitizeConfigForDisplay,
   validateRuntimeConfig
 } from "../runtime/config.js";
-import { CODEX_SUBSCRIPTION_MODELS } from "../runtime/subscription-constants.js";
+import {
+  CODEX_SUBSCRIPTION_MODELS,
+  CLAUDE_CODE_SUBSCRIPTION_MODELS
+} from "../runtime/subscription-constants.js";
 import { FORMATS } from "../translator/index.js";
 import {
   CLOUDFLARE_ACCOUNT_ID_ENV_NAME,
@@ -107,12 +110,21 @@ const DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS = 6000;
 const PROVIDER_TYPE_STANDARD = "standard";
 const PROVIDER_TYPE_SUBSCRIPTION = "subscription";
 const SUBSCRIPTION_TYPE_CHATGPT_CODEX = "chatgpt-codex";
+const SUBSCRIPTION_TYPE_CLAUDE_CODE = "claude-code";
 const SUBSCRIPTION_PROVIDER_PRESETS = Object.freeze([
   Object.freeze({
     subscriptionType: SUBSCRIPTION_TYPE_CHATGPT_CODEX,
     label: "ChatGPT",
     defaultName: "GPT Sub",
-    defaultModels: CODEX_SUBSCRIPTION_MODELS
+    defaultModels: CODEX_SUBSCRIPTION_MODELS,
+    targetFormat: FORMATS.OPENAI
+  }),
+  Object.freeze({
+    subscriptionType: SUBSCRIPTION_TYPE_CLAUDE_CODE,
+    label: "Claude Code",
+    defaultName: "Claude Sub",
+    defaultModels: CLAUDE_CODE_SUBSCRIPTION_MODELS,
+    targetFormat: FORMATS.CLAUDE
   })
 ]);
 const RATE_LIMIT_WINDOW_UNIT_ALIASES = new Map([
@@ -359,6 +371,7 @@ function normalizeSubscriptionTypeInput(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return "";
   if (normalized === SUBSCRIPTION_TYPE_CHATGPT_CODEX) return SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  if (normalized === SUBSCRIPTION_TYPE_CLAUDE_CODE) return SUBSCRIPTION_TYPE_CLAUDE_CODE;
   return "";
 }
 
@@ -366,11 +379,31 @@ function getSubscriptionProviderPreset(subscriptionType) {
   return SUBSCRIPTION_PROVIDER_PRESETS.find((preset) => preset.subscriptionType === subscriptionType) || null;
 }
 
-function getDefaultSubscriptionModelListInput(existingProvider) {
+function getSupportedSubscriptionTypes() {
+  return SUBSCRIPTION_PROVIDER_PRESETS.map((preset) => preset.subscriptionType);
+}
+
+function formatSupportedSubscriptionTypes() {
+  return getSupportedSubscriptionTypes().join(", ");
+}
+
+function getSubscriptionTargetFormat(subscriptionType) {
+  const preset = getSubscriptionProviderPreset(subscriptionType);
+  return preset?.targetFormat || FORMATS.OPENAI;
+}
+
+function getDefaultSubscriptionModelListInput(
+  existingProvider,
+  fallbackSubscriptionType = SUBSCRIPTION_TYPE_CHATGPT_CODEX
+) {
+  const existingSubType = normalizeSubscriptionTypeInput(
+    existingProvider?.subscriptionType || existingProvider?.subscription_type || ""
+  ) || normalizeSubscriptionTypeInput(fallbackSubscriptionType) || SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  const preset = getSubscriptionProviderPreset(existingSubType);
   const existingModels = dedupeList((existingProvider?.models || []).map((model) => model?.id).filter(Boolean));
   const defaults = existingModels.length > 0
     ? existingModels
-    : CODEX_SUBSCRIPTION_MODELS;
+    : (preset?.defaultModels || CODEX_SUBSCRIPTION_MODELS);
   return defaults.join(",");
 }
 
@@ -2695,7 +2728,9 @@ async function resolveUpsertInput(context, existingConfig) {
         message: "Provider Friendly Name (unique, shown in management screen)",
         required: true,
         initialValue: defaultName,
-        placeholder: providerType === PROVIDER_TYPE_SUBSCRIPTION ? "GPT Sub" : "OpenRouter Primary",
+        placeholder: providerType === PROVIDER_TYPE_SUBSCRIPTION
+          ? (subscriptionPreset?.defaultName || "Subscription Sub")
+          : "OpenRouter Primary",
         validate: (value) => {
           const candidate = String(value || "").trim();
           if (!candidate) return "Provider Friendly Name is required.";
@@ -2717,7 +2752,9 @@ async function resolveUpsertInput(context, existingConfig) {
         message: "Provider ID (auto-slug from Friendly Name; editable)",
         required: true,
         initialValue: generatedProviderId,
-        placeholder: providerType === PROVIDER_TYPE_SUBSCRIPTION ? "gpt-sub" : "openrouter-primary",
+        placeholder: providerType === PROVIDER_TYPE_SUBSCRIPTION
+          ? slugifyId(subscriptionPreset?.defaultName || "subscription-sub")
+          : "openrouter-primary",
         validate: (value) => {
           const candidate = String(value || "").trim();
           if (!candidate) return "Provider ID is required.";
@@ -2754,7 +2791,7 @@ async function resolveUpsertInput(context, existingConfig) {
     ? String(
         hasModelsArg
           ? readArg(args, ["models"], "")
-          : getDefaultSubscriptionModelListInput(selectedExisting)
+          : getDefaultSubscriptionModelListInput(selectedExisting, subscriptionType)
       )
     : "";
   const baseIsSubscription = providerType === PROVIDER_TYPE_SUBSCRIPTION;
@@ -2779,7 +2816,7 @@ async function resolveUpsertInput(context, existingConfig) {
       models: baseIsSubscription
         ? parseProviderModelListInput(subscriptionModelsInput)
         : parseProviderModelListInput(baseModels),
-      format: baseIsSubscription ? "openai" : baseFormat,
+      format: baseIsSubscription ? (subscriptionPreset?.targetFormat || FORMATS.OPENAI) : baseFormat,
       formats: baseFormats,
       headers: parsedHeaders,
       probeRequestsPerMinute: baseProbeRequestsPerMinute,
@@ -2797,11 +2834,13 @@ async function resolveUpsertInput(context, existingConfig) {
   let interactiveHeaders = parsedHeaders;
   let probe = false;
   let probeRequestsPerMinute = baseProbeRequestsPerMinute;
-  let manualFormat = providerType === PROVIDER_TYPE_SUBSCRIPTION ? "openai" : baseFormat;
+  let manualFormat = providerType === PROVIDER_TYPE_SUBSCRIPTION
+    ? (subscriptionPreset?.targetFormat || FORMATS.OPENAI)
+    : baseFormat;
 
   if (providerType === PROVIDER_TYPE_SUBSCRIPTION) {
     const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
-    info?.(`${subscriptionPreset?.label || "ChatGPT"} uses browser OAuth login. Model validation will run after authentication.`);
+    info?.(`${subscriptionPreset?.label || "Subscription provider"} uses browser OAuth login. Model validation will run after authentication.`);
   } else {
     const askReplaceKey = selectedExisting?.apiKey ? await context.prompts.confirm({
       message: "Replace saved API key?",
@@ -2930,6 +2969,7 @@ async function resolveSubscriptionProviderFns(context) {
 
 async function ensureSubscriptionAuthenticated(context, {
   profile,
+  subscriptionType = SUBSCRIPTION_TYPE_CHATGPT_CODEX,
   forceLogin = false,
   deviceCode = false
 }) {
@@ -2944,7 +2984,7 @@ async function ensureSubscriptionAuthenticated(context, {
   }
 
   if (!forceLogin) {
-    const status = await getAuthStatus(profile);
+    const status = await getAuthStatus(profile, { subscriptionType });
     if (status?.authenticated) {
       line?.(`Subscription profile '${profile}' already authenticated.`);
       return { authenticated: true, loginAttempted: false };
@@ -2954,12 +2994,14 @@ async function ensureSubscriptionAuthenticated(context, {
   line?.(`Starting OAuth login for subscription profile '${profile}'...`);
   if (deviceCode) {
     await loginWithDeviceCode(profile, {
+      subscriptionType,
       onCode: ({ userCode, verificationUri, expiresIn }) => {
         line?.(`Open ${verificationUri} and enter code ${userCode} (expires in ${Math.floor(Number(expiresIn || 0) / 60)} minutes).`);
       }
     });
   } else {
     await loginWithBrowser(profile, {
+      subscriptionType,
       onUrl: (url, meta = {}) => {
         if (meta?.openedBrowser === true) {
           line?.("Opened browser for OAuth login. Complete authentication to continue.");
@@ -2970,26 +3012,27 @@ async function ensureSubscriptionAuthenticated(context, {
     });
   }
 
-  const refreshedStatus = await getAuthStatus(profile);
+  const refreshedStatus = await getAuthStatus(profile, { subscriptionType });
   if (!refreshedStatus?.authenticated) {
     throw new Error(`OAuth login did not complete for subscription profile '${profile}'.`);
   }
   return { authenticated: true, loginAttempted: true };
 }
 
-function buildSubscriptionProbeSeed(models) {
+function buildSubscriptionProbeSeed(models, targetFormat = FORMATS.OPENAI) {
+  const format = targetFormat === FORMATS.CLAUDE ? FORMATS.CLAUDE : FORMATS.OPENAI;
   const modelSupport = {};
   const modelPreferredFormat = {};
   for (const model of (models || [])) {
-    modelSupport[model] = [FORMATS.OPENAI];
-    modelPreferredFormat[model] = FORMATS.OPENAI;
+    modelSupport[model] = [format];
+    modelPreferredFormat[model] = format;
   }
 
   return {
     ok: true,
-    preferredFormat: FORMATS.OPENAI,
-    formats: [FORMATS.OPENAI],
-    workingFormats: [FORMATS.OPENAI],
+    preferredFormat: format,
+    formats: [format],
+    workingFormats: [format],
     models: [...(models || [])],
     modelSupport,
     modelPreferredFormat
@@ -3021,6 +3064,49 @@ async function closeSubscriptionProbeResponse(result) {
   }
 }
 
+function buildSubscriptionProbeBody(modelId, subscriptionType) {
+  if (subscriptionType === SUBSCRIPTION_TYPE_CLAUDE_CODE) {
+    return {
+      model: modelId,
+      max_tokens: 16,
+      stream: true,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Reply with exactly: pong"
+            }
+          ]
+        }
+      ]
+    };
+  }
+
+  return {
+    model: modelId,
+    stream: true,
+    store: false,
+    instructions: "You are a helpful assistant. Reply concisely.",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "Reply with exactly: pong"
+          }
+        ]
+      }
+    ],
+    tools: [],
+    tool_choice: "auto",
+    parallel_tool_calls: false
+  };
+}
+
 async function probeSubscriptionModels(context, {
   providerId,
   providerName,
@@ -3048,31 +3134,12 @@ async function probeSubscriptionModels(context, {
     headers: headers || {},
     models: uniqueModels.map((id) => ({ id }))
   };
+  const targetFormat = getSubscriptionTargetFormat(subscriptionType);
 
   const failures = [];
   for (const modelId of uniqueModels) {
     line?.(`[subscription probe] Testing model ${modelId}...`);
-    const probeBody = {
-      model: modelId,
-      stream: true,
-      store: false,
-      instructions: "You are a helpful assistant. Reply concisely.",
-      input: [
-        {
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Reply with exactly: pong"
-            }
-          ]
-        }
-      ],
-      tools: [],
-      tool_choice: "auto",
-      parallel_tool_calls: false
-    };
+    const probeBody = buildSubscriptionProbeBody(modelId, subscriptionType);
     const result = await makeSubscriptionProviderCall({
       provider,
       body: probeBody,
@@ -3100,7 +3167,7 @@ async function probeSubscriptionModels(context, {
   return {
     ok: failures.length === 0,
     failures,
-    probe: buildSubscriptionProbeSeed(uniqueModels)
+    probe: buildSubscriptionProbeSeed(uniqueModels, targetFormat)
   };
 }
 
@@ -3115,6 +3182,9 @@ async function doUpsertProvider(context) {
   const subscriptionType = isSubscriptionProvider
     ? (normalizedSubscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX)
     : "";
+  const subscriptionPreset = isSubscriptionProvider
+    ? getSubscriptionProviderPreset(subscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX)
+    : null;
   const subscriptionProfile = String(input.subscriptionProfile || input.providerId || "default").trim() || input.providerId || "default";
 
   const endpointCandidates = parseEndpointListInput([
@@ -3138,7 +3208,7 @@ async function doUpsertProvider(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_VALIDATION,
-      errorMessage: `Unsupported subscription-type '${rawSubscriptionType}'. Supported: ${SUBSCRIPTION_TYPE_CHATGPT_CODEX}.`
+      errorMessage: `Unsupported subscription-type '${rawSubscriptionType}'. Supported: ${formatSupportedSubscriptionTypes()}.`
     };
   }
   if (!isSubscriptionProvider && (!hasAnyEndpoint || !input.apiKey)) {
@@ -3199,6 +3269,7 @@ async function doUpsertProvider(context) {
     try {
       await ensureSubscriptionAuthenticated(context, {
         profile: subscriptionProfile,
+        subscriptionType,
         forceLogin: Boolean(input.requireSubscriptionLogin),
         deviceCode: Boolean(input.subscriptionDeviceCode)
       });
@@ -3305,7 +3376,7 @@ async function doUpsertProvider(context) {
       }
     }
 
-    selectedFormat = FORMATS.OPENAI;
+    selectedFormat = subscriptionPreset?.targetFormat || getSubscriptionTargetFormat(subscriptionType);
     effectiveBaseUrl = "";
     effectiveOpenAIBaseUrl = "";
     effectiveClaudeBaseUrl = "";
@@ -5454,7 +5525,7 @@ async function runAiHelpAction(context) {
   const suggestions = [];
   if (providerCount === 0) {
     suggestions.push("Add first provider with at least one model. Run: llm-router config --operation=upsert-provider --provider-id=<id> --name=\"<name>\" --base-url=<url> --api-key=<key> --models=<model1,model2>");
-    suggestions.push("Or add OAuth-backed subscription provider. Run: llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default");
+    suggestions.push("Or add OAuth-backed subscription provider. Run: llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default (or use --subscription-type=claude-code).");
   } else {
     const providersWithoutModels = providers
       .filter((provider) => (provider.models || []).filter((model) => model && model.enabled !== false).length === 0)
@@ -5581,9 +5652,11 @@ async function runAiHelpAction(context) {
     "## LLM-ROUTER CONFIG WORKFLOWS (CLI)",
     "1. Upsert provider + models:",
     "   llm-router config --operation=upsert-provider --provider-id=<id> --name=\"<name>\" --endpoints=<url1,url2> --api-key=<key> --models=<model1,model2>",
-    "1b. Upsert subscription provider (OAuth-backed ChatGPT Codex):",
+    "1b. Upsert subscription provider (OAuth-backed ChatGPT Codex / Claude Code):",
     "   llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default",
-    "   llm-router subscription login --profile=default",
+    "   llm-router config --operation=upsert-provider --provider-id=claude-sub --name=\"Claude Sub\" --type=subscription --subscription-type=claude-code --subscription-profile=default",
+    "   llm-router subscription login --subscription-type=chatgpt-codex --profile=default",
+    "   llm-router subscription login --subscription-type=claude-code --profile=default",
     "2. Upsert model alias/group:",
     "   llm-router config --operation=upsert-model-alias --alias-id=<alias> --strategy=auto --targets=<provider/model,...>",
     "3. Set provider rate limit bucket:",
@@ -6341,12 +6414,32 @@ async function runSubscriptionLoginAction(context) {
   const args = context.args || {};
   const profile = String(readArg(args, ["profile", "profileId"], "default") || "default").trim();
   const deviceCode = toBoolean(readArg(args, ["device-code", "deviceCode"], false), false);
+  const rawSubscriptionType = String(readArg(args, ["subscription-type", "subscriptionType"], "") || "").trim();
+  const normalizedSubscriptionType = normalizeSubscriptionTypeInput(rawSubscriptionType);
+  if (rawSubscriptionType && !normalizedSubscriptionType) {
+    return {
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      data: `Unsupported subscription-type '${rawSubscriptionType}'. Supported: ${formatSupportedSubscriptionTypes()}.`
+    };
+  }
+  const subscriptionType = normalizedSubscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  const subscriptionPreset = getSubscriptionProviderPreset(subscriptionType);
+  const subscriptionLabel = subscriptionPreset?.label || subscriptionType;
+  if (deviceCode && subscriptionType === SUBSCRIPTION_TYPE_CLAUDE_CODE) {
+    return {
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      data: "Device code flow is not supported for subscription-type=claude-code. Use browser OAuth login."
+    };
+  }
   
   // Import subscription auth functions
   const { loginWithBrowser, loginWithDeviceCode } = await import("../runtime/subscription-auth.js");
   
   const lines = [];
   lines.push(`Logging into subscription profile: ${profile}`);
+  lines.push(`Subscription provider: ${subscriptionLabel} (${subscriptionType})`);
   lines.push("");
   
   try {
@@ -6355,6 +6448,7 @@ async function runSubscriptionLoginAction(context) {
       lines.push("");
       
       const success = await loginWithDeviceCode(profile, {
+        subscriptionType,
         onCode: ({ userCode, verificationUri, expiresIn }) => {
           lines.push(`1. Go to: ${verificationUri}`);
           lines.push(`2. Enter code: ${userCode}`);
@@ -6374,6 +6468,7 @@ async function runSubscriptionLoginAction(context) {
       lines.push("");
       
       const success = await loginWithBrowser(profile, {
+        subscriptionType,
         onUrl: (url, meta = {}) => {
           if (meta?.openedBrowser === true) {
             lines.push("Opened browser for OAuth login.");
@@ -6414,15 +6509,28 @@ async function runSubscriptionLoginAction(context) {
 async function runSubscriptionLogoutAction(context) {
   const args = context.args || {};
   const profile = String(readArg(args, ["profile", "profileId"], "default") || "default").trim();
+  const rawSubscriptionType = String(readArg(args, ["subscription-type", "subscriptionType"], "") || "").trim();
+  const normalizedSubscriptionType = normalizeSubscriptionTypeInput(rawSubscriptionType);
+  if (rawSubscriptionType && !normalizedSubscriptionType) {
+    return {
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      data: `Unsupported subscription-type '${rawSubscriptionType}'. Supported: ${formatSupportedSubscriptionTypes()}.`
+    };
+  }
+  const subscriptionType = normalizedSubscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  const subscriptionPreset = getSubscriptionProviderPreset(subscriptionType);
+  const subscriptionLabel = subscriptionPreset?.label || subscriptionType;
   
   // Import subscription auth functions
   const { logout } = await import("../runtime/subscription-auth.js");
   
   const lines = [];
   lines.push(`Logging out subscription profile: ${profile}`);
+  lines.push(`Subscription provider: ${subscriptionLabel} (${subscriptionType})`);
   
   try {
-    await logout(profile);
+    await logout(profile, { subscriptionType });
     lines.push("");
     lines.push(`✓ Successfully logged out profile '${profile}'.`);
     
@@ -6449,16 +6557,30 @@ async function runSubscriptionLogoutAction(context) {
 async function runSubscriptionStatusAction(context) {
   const args = context.args || {};
   const profile = String(readArg(args, ["profile", "profileId"], "") || "").trim();
+  const rawSubscriptionType = String(readArg(args, ["subscription-type", "subscriptionType"], "") || "").trim();
+  const normalizedSubscriptionType = normalizeSubscriptionTypeInput(rawSubscriptionType);
+  if (rawSubscriptionType && !normalizedSubscriptionType) {
+    return {
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      data: `Unsupported subscription-type '${rawSubscriptionType}'. Supported: ${formatSupportedSubscriptionTypes()}.`
+    };
+  }
+  const subscriptionType = normalizedSubscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  const subscriptionPreset = getSubscriptionProviderPreset(subscriptionType);
+  const subscriptionLabel = subscriptionPreset?.label || subscriptionType;
   
   // Import subscription auth functions
   const { getAuthStatus, listTokenProfiles } = await import("../runtime/subscription-auth.js");
   
   const lines = [];
+  lines.push(`Subscription provider: ${subscriptionLabel} (${subscriptionType})`);
+  lines.push("");
   
   try {
     if (profile) {
       // Show status for specific profile
-      const status = await getAuthStatus(profile);
+      const status = await getAuthStatus(profile, { subscriptionType });
       
       lines.push(`Subscription Profile: ${profile}`);
       lines.push(`Status: ${status.authenticated ? "✓ Authenticated" : "✗ Not authenticated"}`);
@@ -6471,7 +6593,7 @@ async function runSubscriptionStatusAction(context) {
       }
     } else {
       // List all profiles
-      const profiles = await listTokenProfiles();
+      const profiles = await listTokenProfiles({ subscriptionType });
       
       lines.push("Subscription Profiles:");
       lines.push("");
@@ -6479,10 +6601,10 @@ async function runSubscriptionStatusAction(context) {
       if (profiles.length === 0) {
         lines.push("  No authenticated profiles found.");
         lines.push("");
-        lines.push("  To login: llm-router subscription login --profile=<name>");
+        lines.push(`  To login: llm-router subscription login --subscription-type=${subscriptionType} --profile=<name>`);
       } else {
         for (const p of profiles) {
-          const status = await getAuthStatus(p);
+          const status = await getAuthStatus(p, { subscriptionType });
           const statusIcon = status.authenticated ? "✓" : "✗";
           lines.push(`  ${statusIcon} ${p}`);
           if (status.authenticated && status.expiresAtIso) {
@@ -6712,15 +6834,15 @@ const routerModule = {
           { name: "provider-id", required: false, description: "Provider id (lowercase letters/numbers/dashes).", example: "--provider-id=openrouter-primary" },
           { name: "name", required: false, description: "Provider Friendly Name (must be unique; shown in management screen).", example: "--name=OpenRouter Primary" },
           { name: "type", required: false, description: "Provider type: standard (API key) | subscription (OAuth).", example: "--type=subscription" },
-          { name: "subscription-type", required: false, description: "For --type=subscription. Defaults to chatgpt-codex.", example: "--subscription-type=chatgpt-codex" },
+          { name: "subscription-type", required: false, description: "For --type=subscription. Supported: chatgpt-codex | claude-code. Defaults to chatgpt-codex.", example: "--subscription-type=claude-code" },
           { name: "subscription-profile", required: false, description: "OAuth token profile for subscription provider (defaults to provider-id).", example: "--subscription-profile=personal" },
-          { name: "device-code", required: false, description: "For subscription OAuth login during upsert: use device-code flow instead of browser.", example: "--device-code=true" },
+          { name: "device-code", required: false, description: "For subscription OAuth login during upsert: use device-code flow instead of browser (chatgpt-codex only).", example: "--device-code=true" },
           { name: "endpoints", required: false, description: "For standard provider: endpoint candidates for auto-probe (comma-separated URLs).", example: "--endpoints=https://ramclouds.me,https://ramclouds.me/v1" },
           { name: "base-url", required: false, description: "For standard provider: provider base URL.", example: "--base-url=https://openrouter.ai/api/v1" },
           { name: "openai-base-url", required: false, description: "For standard provider: OpenAI endpoint base URL (format-specific override).", example: "--openai-base-url=https://ramclouds.me/v1" },
           { name: "claude-base-url", required: false, description: "For standard provider: Anthropic endpoint base URL (format-specific override).", example: "--claude-base-url=https://ramclouds.me" },
           { name: "api-key", required: false, description: "For standard provider: API key.", example: "--api-key=sk-or-v1-..." },
-          { name: "models", required: false, description: "Model list (comma-separated IDs; strips common log/error noise). For chatgpt-codex subscription type, defaults are prefilled and you can add/remove models; all selected models are live-validated before save.", example: "--models=gpt-5.3-codex,gpt-5-codex" },
+          { name: "models", required: false, description: "Model list (comma-separated IDs; strips common log/error noise). Subscription defaults are prefilled by subscription-type and all selected models are live-validated before save.", example: "--models=claude-sonnet-4-6,claude-opus-4-6" },
           { name: "model", required: false, description: "Single model id (used by remove-model).", example: "--model=gpt-4o" },
           { name: "fallback-models", required: false, description: "Qualified fallback models for set-model-fallbacks (comma-separated).", example: "--fallback-models=openrouter/gpt-4o,anthropic/claude-3-7-sonnet" },
           { name: "clear-fallbacks", required: false, description: "Clear all fallback models for set-model-fallbacks.", example: "--clear-fallbacks=true" },
@@ -6759,7 +6881,9 @@ const routerModule = {
           "llm-router config",
           "llm-router config --operation=upsert-provider --provider-id=ramclouds --name=RamClouds --api-key=sk-... --endpoints=https://ramclouds.me,https://ramclouds.me/v1 --models=claude-opus-4-6-thinking,gpt-5.3-codex",
           "llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default",
-          "llm-router subscription login --profile=default",
+          "llm-router config --operation=upsert-provider --provider-id=claude-sub --name=\"Claude Sub\" --type=subscription --subscription-type=claude-code --subscription-profile=default",
+          "llm-router subscription login --subscription-type=chatgpt-codex --profile=default",
+          "llm-router subscription login --subscription-type=claude-code --profile=default",
           "llm-router config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2 --fallback-targets=openrouter/gpt-4o",
           "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-id=openrouter-all-month --bucket-models=all --bucket-requests=20000 --bucket-window=month:1",
           "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-name=\"6-hours cap\" --bucket-models=all --bucket-requests=600 --bucket-window=hour:6",
@@ -6907,32 +7031,34 @@ const routerModule = {
       tui: { steps: ["subscription-auth"] },
       commandline: {
         requiredArgs: [],
-        optionalArgs: ["profile", "device-code"]
+        optionalArgs: ["profile", "device-code", "subscription-type"]
       },
       help: {
-        summary: "Manage OAuth authentication for subscription providers (ChatGPT Codex).",
+        summary: "Manage OAuth authentication for subscription providers (ChatGPT Codex and Claude Code).",
         args: [
           { name: "profile", required: false, description: "Subscription profile ID (defaults to 'default').", example: "--profile=personal" },
-          { name: "device-code", required: false, description: "Use device code flow instead of browser (for headless environments).", example: "--device-code=true" }
+          { name: "subscription-type", required: false, description: "Subscription provider type: chatgpt-codex | claude-code (defaults to chatgpt-codex).", example: "--subscription-type=claude-code" },
+          { name: "device-code", required: false, description: "Use device code flow instead of browser (headless environments; chatgpt-codex only).", example: "--device-code=true" }
         ],
         examples: [
           "llm-router subscription login",
-          "llm-router subscription login --profile=personal",
-          "llm-router subscription login --device-code=true",
+          "llm-router subscription login --subscription-type=chatgpt-codex --profile=personal",
+          "llm-router subscription login --subscription-type=claude-code --profile=work",
+          "llm-router subscription login --subscription-type=chatgpt-codex --device-code=true",
           "llm-router subscription logout --profile=personal",
           "llm-router subscription status",
-          "llm-router subscription status --profile=personal"
+          "llm-router subscription status --subscription-type=claude-code --profile=personal"
         ],
         useCases: [
           {
             name: "browser login",
-            description: "Login to ChatGPT Codex subscription via browser OAuth.",
-            command: "llm-router subscription login --profile=personal"
+            description: "Login to subscription provider via browser OAuth.",
+            command: "llm-router subscription login --subscription-type=claude-code --profile=personal"
           },
           {
             name: "device code login",
-            description: "Login on headless server using device code flow.",
-            command: "llm-router subscription login --device-code=true --profile=server"
+            description: "Login on headless server using device code flow (chatgpt-codex only).",
+            command: "llm-router subscription login --subscription-type=chatgpt-codex --device-code=true --profile=server"
           },
           {
             name: "check status",

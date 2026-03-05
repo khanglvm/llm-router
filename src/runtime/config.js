@@ -4,7 +4,10 @@
  */
 
 import { FORMATS } from "../translator/index.js";
-import { CODEX_SUBSCRIPTION_MODELS } from "./subscription-constants.js";
+import {
+  CODEX_SUBSCRIPTION_MODELS,
+  CLAUDE_CODE_SUBSCRIPTION_MODELS
+} from "./subscription-constants.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
@@ -34,7 +37,8 @@ const ALLOWED_RATE_LIMIT_WINDOW_UNITS = new Set([
 ]);
 const ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const SUBSCRIPTION_PROVIDER_TYPES = Object.freeze({
-  CHATGPT_CODEX: "chatgpt-codex"
+  CHATGPT_CODEX: "chatgpt-codex",
+  CLAUDE_CODE: "claude-code"
 });
 let runtimeEnvCache = null;
 
@@ -318,17 +322,14 @@ function normalizeSubscriptionModels(models, subscriptionType) {
     .filter(Boolean)
     .filter((item) => item.enabled !== false);
 
-  if (subscriptionType !== SUBSCRIPTION_PROVIDER_TYPES.CHATGPT_CODEX) {
-    return normalizedModels;
-  }
-
-  // ChatGPT Codex subscription models are prefilled defaults. Users can still
-  // customize (add/remove) the model list explicitly.
-  if (normalizedModels.length > 0) {
-    return normalizedModels;
-  }
-
-  return CODEX_SUBSCRIPTION_MODELS.map((modelId) => ({ id: modelId }));
+  const defaultModelsByType = {
+    [SUBSCRIPTION_PROVIDER_TYPES.CHATGPT_CODEX]: CODEX_SUBSCRIPTION_MODELS,
+    [SUBSCRIPTION_PROVIDER_TYPES.CLAUDE_CODE]: CLAUDE_CODE_SUBSCRIPTION_MODELS
+  };
+  const defaultModels = defaultModelsByType[subscriptionType];
+  if (!defaultModels) return normalizedModels;
+  if (normalizedModels.length > 0) return normalizedModels;
+  return defaultModels.map((modelId) => ({ id: modelId }));
 }
 
 function sanitizeModelFallbackReferences(providers) {
@@ -411,8 +412,11 @@ function normalizeProvider(provider, index = 0) {
     ? dedupeStrings([preferredFormat, ...formats])
     : formats;
     
-  // For subscription providers, default to OpenAI format
-  const defaultFormat = isSubscription ? FORMATS.OPENAI : (orderedFormats[0] || FORMATS.OPENAI);
+  // Subscription providers have type-specific target formats.
+  const defaultSubscriptionFormat = subscriptionType === SUBSCRIPTION_PROVIDER_TYPES.CLAUDE_CODE
+    ? FORMATS.CLAUDE
+    : FORMATS.OPENAI;
+  const defaultFormat = isSubscription ? defaultSubscriptionFormat : (orderedFormats[0] || FORMATS.OPENAI);
   
   const baseUrl = explicitBaseUrl
     || (preferredFormat && baseUrlByFormat?.[preferredFormat])

@@ -10,6 +10,17 @@ export const CODEX_SUBSCRIPTION_MODELS = Object.freeze([
 ]);
 
 /**
+ * Hardcoded Claude Code subscription models.
+ * These defaults mirror current Claude Code model naming.
+ * Users can still customize the final saved model list.
+ */
+export const CLAUDE_CODE_SUBSCRIPTION_MODELS = Object.freeze([
+  'claude-sonnet-4-6',
+  'claude-opus-4-6',
+  'claude-haiku-4-5'
+]);
+
+/**
  * OAuth configuration for ChatGPT Codex subscription.
  */
 export const CODEX_OAUTH_CONFIG = Object.freeze({
@@ -26,6 +37,27 @@ export const CODEX_OAUTH_CONFIG = Object.freeze({
     originator: 'codex_cli_rs'
   }),
   tokenRefreshBufferMs: 5 * 60 * 1000 // 5 minutes before expiration
+});
+
+/**
+ * OAuth configuration for Claude Code subscription.
+ * Values align with the current Claude Code CLI runtime.
+ */
+export const CLAUDE_CODE_OAUTH_CONFIG = Object.freeze({
+  authorizeUrl: 'https://claude.ai/oauth/authorize',
+  tokenUrl: 'https://platform.claude.com/v1/oauth/token',
+  callbackPort: 1456,
+  callbackPath: '/callback',
+  manualRedirectUrl: 'https://platform.claude.com/oauth/code/callback',
+  scopes: 'user:profile user:inference user:sessions:claude_code user:mcp_servers',
+  clientId: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+  authorizeParams: Object.freeze({
+    code: 'true'
+  }),
+  oauthBeta: 'oauth-2025-04-20',
+  apiBaseUrl: 'https://api.anthropic.com',
+  messagesPath: '/v1/messages?beta=true',
+  tokenRefreshBufferMs: 5 * 60 * 1000
 });
 
 /**

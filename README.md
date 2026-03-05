@@ -81,27 +81,38 @@ Flow:
    - `API Key` -> endpoint + API key + model list
    - `OAuth` -> browser OAuth + editable model list
 4. For `OAuth`:
-   - Choose subscription provider (`ChatGPT` for now)
+   - Choose subscription provider (`ChatGPT` or `Claude Code`)
    - Enter Friendly Name and Provider ID
    - Complete browser OAuth login inside this same flow
    - Edit model list (pre-filled defaults; you can add/remove)
    - llm-router live-tests every selected model before save
 5. Save
 
-### 1b) Add Subscription Provider (ChatGPT Codex)
-Commandline example:
+### 1b) Add Subscription Provider (OAuth)
+Commandline examples:
 
 ```bash
+# ChatGPT Codex subscription
 llm-router config \
   --operation=upsert-provider \
   --provider-id=chatgpt \
   --name="GPT Sub" \
   --type=subscription
+
+# Claude Code subscription
+llm-router config \
+  --operation=upsert-provider \
+  --provider-id=claude-sub \
+  --name="Claude Sub" \
+  --type=subscription \
+  --subscription-type=claude-code
 ```
 
 Notes:
 - OAuth login is run during provider upsert (browser flow by default).
-- `chatgpt-codex` is the current subscription type and its default model list is prefilled, but editable.
+- Supported `subscription-type`: `chatgpt-codex` and `claude-code` (defaults to `chatgpt-codex`).
+- Default model lists are prefilled by subscription type, then editable.
+- Device-code login is available for `chatgpt-codex` only.
 - No provider API key or endpoint probe input is required for subscription mode.
 
 ### 2) Configure Model Fallback (Optional)

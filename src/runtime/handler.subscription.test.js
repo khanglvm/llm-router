@@ -7,6 +7,7 @@ import { FORMATS } from "../translator/index.js";
 import { makeProviderCall } from "./handler/provider-call.js";
 import { CODEX_ENDPOINT } from "./codex-request-transformer.js";
 import { saveTokens } from "./subscription-tokens.js";
+import { CLAUDE_CODE_OAUTH_CONFIG } from "./subscription-constants.js";
 
 function restoreHomeValue(originalHomeValue) {
   if (originalHomeValue === undefined) {
@@ -28,6 +29,21 @@ function buildSubscriptionCandidate() {
     },
     targetFormat: FORMATS.OPENAI,
     backend: "gpt-5.3-codex"
+  };
+}
+
+function buildClaudeSubscriptionCandidate() {
+  return {
+    provider: {
+      id: "claude-sub",
+      name: "Claude Subscription",
+      type: "subscription",
+      subscriptionType: "claude-code",
+      subscriptionProfile: "work",
+      models: [{ id: "claude-sonnet-4-6" }]
+    },
+    targetFormat: FORMATS.CLAUDE,
+    backend: "claude-sonnet-4-6"
   };
 }
 
@@ -365,4 +381,143 @@ test("makeProviderCall converts streaming subscription response to Claude SSE ev
   assert.match(streamPayload, /event: content_block_delta/);
   assert.match(streamPayload, /pong/);
   assert.match(streamPayload, /event: message_stop/);
+});
+
+test("makeProviderCall sends Claude OAuth subscription requests with Anthropic headers", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("claude-code__work", {
+    accessToken: "claude-token-xyz",
+    refreshToken: "claude-refresh-xyz",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "user:inference"
+  });
+
+  const originalFetch = globalThis.fetch;
+  let capturedRequest = null;
+  globalThis.fetch = async (url, init = {}) => {
+    capturedRequest = {
+      url: String(url),
+      headers: init.headers || {},
+      body: JSON.parse(String(init.body || "{}"))
+    };
+    return new Response(JSON.stringify({
+      id: "msg_claude_sub",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{ type: "text", text: "claude-sub-ok" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 1 }
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "claude-sub/claude-sonnet-4-6",
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 64
+    },
+    sourceFormat: FORMATS.OPENAI,
+    stream: false,
+    candidate: buildClaudeSubscriptionCandidate(),
+    requestHeaders: new Headers(),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    capturedRequest?.url,
+    `${CLAUDE_CODE_OAUTH_CONFIG.apiBaseUrl}${CLAUDE_CODE_OAUTH_CONFIG.messagesPath}`
+  );
+  assert.equal(capturedRequest?.headers?.Authorization, "Bearer claude-token-xyz");
+  assert.equal(capturedRequest?.headers?.["anthropic-beta"], CLAUDE_CODE_OAUTH_CONFIG.oauthBeta);
+  assert.equal(capturedRequest?.headers?.["anthropic-version"], "2023-06-01");
+  assert.equal(capturedRequest?.body?.model, "claude-sonnet-4-6");
+  assert.equal(capturedRequest?.body?.stream, false);
+  assert.ok(Array.isArray(capturedRequest?.body?.messages));
+
+  const openaiJson = await result.response.json();
+  assert.equal(openaiJson.object, "chat.completion");
+  assert.equal(openaiJson.choices?.[0]?.message?.content, "claude-sub-ok");
+});
+
+test("makeProviderCall converts Claude OAuth streaming response to OpenAI SSE", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("claude-code__work", {
+    accessToken: "claude-token-xyz",
+    refreshToken: "claude-refresh-xyz",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "user:inference"
+  });
+
+  const claudeSse = [
+    "event: message_start",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}",
+    "",
+    "event: content_block_start",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+    "",
+    "event: content_block_delta",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}",
+    "",
+    "event: content_block_stop",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}",
+    "",
+    "event: message_delta",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}",
+    "",
+    "event: message_stop",
+    "data: {\"type\":\"message_stop\"}",
+    "",
+    ""
+  ].join("\n");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(claudeSse, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "claude-sub/claude-sonnet-4-6",
+      messages: [{ role: "user", content: "ping" }]
+    },
+    sourceFormat: FORMATS.OPENAI,
+    stream: true,
+    candidate: buildClaudeSubscriptionCandidate(),
+    requestHeaders: new Headers(),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  const streamPayload = await result.response.text();
+  assert.match(streamPayload, /chat\.completion\.chunk/);
+  assert.match(streamPayload, /pong/);
+  assert.match(streamPayload, /\[DONE\]/);
 });

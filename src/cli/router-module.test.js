@@ -31,7 +31,10 @@ import {
 } from "./router-module.js";
 import routerModule from "./router-module.js";
 import { readConfigFile } from "../node/config-store.js";
-import { CODEX_SUBSCRIPTION_MODELS } from "../runtime/subscription-constants.js";
+import {
+  CODEX_SUBSCRIPTION_MODELS,
+  CLAUDE_CODE_SUBSCRIPTION_MODELS
+} from "../runtime/subscription-constants.js";
 
 // Test configuration from environment
 const TEST_HOSTNAME = process.env.LLM_ROUTER_TEST_HOSTNAME || "router.example.com";
@@ -627,6 +630,62 @@ test("non-interactive upsert-provider subscription keeps custom model list and p
   assert.deepEqual(provider.models.map((model) => model.id), ["gpt-5.3-codex", "gpt-5-codex-custom"]);
 });
 
+test("non-interactive upsert-provider Claude subscription probes Claude-formatted payload", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const probedRequests = [];
+  const authStatusCalls = [];
+
+  const result = await configAction.run(createConfigContext({
+    operation: "upsert-provider",
+    config: configPath,
+    "provider-id": "claude-sub",
+    name: "Claude Subscription",
+    type: "subscription",
+    "subscription-type": "claude-code"
+  }, {
+    subscriptionAuth: {
+      getAuthStatus: async (_profile, options = {}) => {
+        authStatusCalls.push(options.subscriptionType);
+        return { authenticated: true };
+      },
+      loginWithBrowser: async () => true,
+      loginWithDeviceCode: async () => true
+    },
+    subscriptionProvider: {
+      makeSubscriptionProviderCall: async ({ body }) => {
+        probedRequests.push(body);
+        return {
+          ok: true,
+          status: 200,
+          response: new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          })
+        };
+      }
+    }
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(authStatusCalls, ["claude-code"]);
+  assert.deepEqual(probedRequests.map((body) => body.model), CLAUDE_CODE_SUBSCRIPTION_MODELS);
+  assert.ok(probedRequests.every((body) => body.stream === true));
+  assert.ok(probedRequests.every((body) => Array.isArray(body.messages) && body.messages[0]?.role === "user"));
+  assert.ok(probedRequests.every((body) => body.messages?.[0]?.content?.[0]?.type === "text"));
+  assert.ok(probedRequests.every((body) => body.input === undefined));
+  assert.ok(probedRequests.every((body) => body.instructions === undefined));
+
+  const next = await readConfigFile(configPath);
+  const provider = next.providers.find((entry) => entry.id === "claude-sub");
+  assert.ok(provider);
+  assert.equal(provider.type, "subscription");
+  assert.equal(provider.subscriptionType, "claude-code");
+  assert.equal(provider.subscriptionProfile, "claude-sub");
+  assert.equal(provider.format, "claude");
+  assert.deepEqual(provider.models.map((model) => model.id), CLAUDE_CODE_SUBSCRIPTION_MODELS);
+});
+
 test("non-interactive upsert-provider validates unsupported subscription-type", async (t) => {
   const configAction = getConfigAction();
   const configPath = await createTempConfigFile(t, baseConfigFixture());
@@ -648,6 +707,20 @@ test("non-interactive upsert-provider validates unsupported subscription-type", 
 
   assert.equal(result.ok, false);
   assert.match(String(result.errorMessage || ""), /Unsupported subscription-type/);
+});
+
+test("subscription login rejects device-code for claude subscription type", async () => {
+  const subscriptionAction = getSubscriptionAction();
+  const loginAction = subscriptionAction?.subcommands?.find((entry) => entry.actionId === "login");
+  assert.ok(loginAction);
+
+  const result = await loginAction.run(createConfigContext({
+    "subscription-type": "claude-code",
+    "device-code": true
+  }));
+
+  assert.equal(result.exitCode, 2);
+  assert.match(String(result.data || ""), /Device code flow is not supported/);
 });
 
 test("non-interactive upsert-provider subscription auto-generates unique gpt-sub id with suffix", async (t) => {

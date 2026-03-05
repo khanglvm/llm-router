@@ -6,6 +6,7 @@ import { normalizeRuntimeConfig, validateRuntimeConfig } from "../runtime/config
 
 const PROVIDER_TYPE_SUBSCRIPTION = "subscription";
 const SUBSCRIPTION_TYPE_CHATGPT_CODEX = "chatgpt-codex";
+const SUBSCRIPTION_TYPE_CLAUDE_CODE = "claude-code";
 
 function dedupe(values) {
   return [...new Set((values || []).filter(Boolean).map((value) => String(value).trim()).filter(Boolean))];
@@ -20,6 +21,7 @@ function normalizeSubscriptionType(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return undefined;
   if (normalized === SUBSCRIPTION_TYPE_CHATGPT_CODEX) return SUBSCRIPTION_TYPE_CHATGPT_CODEX;
+  if (normalized === SUBSCRIPTION_TYPE_CLAUDE_CODE) return SUBSCRIPTION_TYPE_CLAUDE_CODE;
   return normalized;
 }
 
@@ -121,7 +123,7 @@ export function buildProviderFromConfigInput(input) {
   const endpointFormats = baseUrlByFormat ? Object.keys(baseUrlByFormat) : [];
 
   const preferredFormat = isSubscriptionProvider
-    ? "openai"
+    ? (subscriptionType === SUBSCRIPTION_TYPE_CLAUDE_CODE ? "claude" : "openai")
     : (input.probe?.preferredFormat || input.format);
   const supportedFormats = dedupe([
     ...(input.probe?.formats || []),
