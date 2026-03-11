@@ -8,7 +8,7 @@
 
 ## Beta Notice
 
-`2.0.0-beta.0` is the next public prerelease. It includes major AMP routing, web console, and local operator workflow changes, so treat it as beta and expect rough edges while validating it before a stable `2.0.0` release.
+`2.0.0-beta.1` is the current public prerelease. It includes major AMP routing, web console, and local operator workflow changes, so treat it as beta and expect rough edges while validating it before a stable `2.0.0` release.
 
 Short highlights in this beta:
 - New localhost web console for config editing, provider testing, and router lifecycle control
@@ -27,7 +27,7 @@ npm i -g @khanglvm/llm-router@latest
 Beta preview:
 
 ```bash
-npm i -g @khanglvm/llm-router@2.0.0-beta.0
+npm i -g @khanglvm/llm-router@2.0.0-beta.1
 ```
 
 ## Usage
@@ -532,4 +532,4 @@ See [`SECURITY.md`](https://github.com/khanglvm/llm-router/blob/master/SECURITY.
 
 - Semver: [Semantic Versioning](https://semver.org/)
 - Release notes: [`CHANGELOG.md`](https://github.com/khanglvm/llm-router/blob/master/CHANGELOG.md)
-- Prereleases are published with explicit beta versions such as `2.0.0-beta.0`; pin them intentionally instead of treating them as stable upgrades.
+- Prereleases are published with explicit beta versions such as `2.0.0-beta.1`; pin them intentionally instead of treating them as stable upgrades.

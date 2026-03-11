@@ -416,6 +416,28 @@ test("web console serves the React shell assets", async () => {
   }
 });
 
+test("web console does not load dev asset tooling when dev mode is disabled", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+  }, {
+    loadWebConsoleDevAssets: async () => {
+      throw new Error("dev assets should not load in production mode");
+    }
+  });
+
+  try {
+    const appResponse = await fetch(`${server.url}/app.js`);
+    assert.equal(appResponse.status, 200);
+    assert.match(appResponse.headers.get("content-type") || "", /application\/javascript/);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
 test("web console toggles AMP global routing and reports the global route state", async () => {
   const ampClient = await makeAmpClientEnv();
   const fixture = await makeTempConfig({

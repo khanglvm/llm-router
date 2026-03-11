@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0-beta.1] - 2026-03-11
+
+### Fixed
+- Fixed global npm installs of the `2.0.0-beta` web console entrypoint. Bare `llm-router` / `llm-router config` no longer import the dev-only `esbuild` asset builder on normal runtime startup, so published installs work without devDependencies.
+
 ## [2.0.0-beta.0] - 2026-03-11
 
 ### Beta

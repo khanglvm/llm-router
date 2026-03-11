@@ -19,7 +19,6 @@ import { listListeningPids, reclaimPort } from "./port-reclaim.js";
 import { probeProvider, probeProviderEndpointMatrix } from "./provider-probe.js";
 import { installStartup, startupStatus, stopStartup, uninstallStartup } from "./startup-manager.js";
 import { WEB_CONSOLE_CSS, renderWebConsoleHtml } from "./web-console-assets.js";
-import { startWebConsoleDevAssets } from "./web-console-dev-assets.js";
 import {
   buildAmpClientPatchPlan,
   maybeBootstrapAmpConfig,
@@ -55,6 +54,11 @@ import {
 const JSON_BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_ENTRIES = 150;
 const WEB_CONSOLE_APP_JS = readFileSync(fileURLToPath(new URL("./web-console-client.js", import.meta.url)), "utf8");
+
+async function loadWebConsoleDevAssets() {
+  const module = await import("./web-console-dev-assets.js");
+  return module.startWebConsoleDevAssets;
+}
 
 function buildDefaultConfigObject() {
   return normalizeRuntimeConfig({}, { migrateToVersion: CONFIG_VERSION });
@@ -805,6 +809,9 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   const ampClientCwd = typeof deps.ampClientCwd === "string" && deps.ampClientCwd.trim() ? deps.ampClientCwd : process.cwd();
   const codexCliEnv = deps.codexCliEnv && typeof deps.codexCliEnv === "object" ? deps.codexCliEnv : process.env;
   const claudeCodeEnv = deps.claudeCodeEnv && typeof deps.claudeCodeEnv === "object" ? deps.claudeCodeEnv : process.env;
+  const loadWebConsoleDevAssetsFn = typeof deps.loadWebConsoleDevAssets === "function"
+    ? deps.loadWebConsoleDevAssets
+    : loadWebConsoleDevAssets;
   const resolvedRouterCliPath = String(cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim();
 
   async function resolvePreferredAmpSettingsTarget() {
@@ -1476,12 +1483,14 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     })();
   </script>` : "";
 
-  const devAssets = devMode
-    ? await startWebConsoleDevAssets({
+  let devAssets = null;
+  if (devMode) {
+    const startWebConsoleDevAssets = await loadWebConsoleDevAssetsFn();
+    devAssets = await startWebConsoleDevAssets({
       onChange: (payload) => pushDevReload(payload),
       onError: (message) => addLog("warn", "Web console dev asset issue.", message)
-    })
-    : null;
+    });
+  }
 
   if (devMode) {
     addLog("info", "Web console dev asset watcher enabled.");
