@@ -133,6 +133,49 @@ function ensureAssistantRoleChunk(state, chunks) {
   chunks.push(makeOpenAIChunk(state, { role: 'assistant' }, null));
 }
 
+function commonPrefixLength(left, right) {
+  const leftText = typeof left === 'string' ? left : '';
+  const rightText = typeof right === 'string' ? right : '';
+  const limit = Math.min(leftText.length, rightText.length);
+  let index = 0;
+
+  while (index < limit && leftText[index] === rightText[index]) {
+    index += 1;
+  }
+
+  return index;
+}
+
+function getMissingSuffix(emittedText, finalText) {
+  const emitted = typeof emittedText === 'string' ? emittedText : '';
+  const finalValue = typeof finalText === 'string' ? finalText : '';
+
+  if (!finalValue) return '';
+  if (!emitted) return finalValue;
+  if (finalValue.startsWith(emitted)) {
+    return finalValue.slice(emitted.length);
+  }
+  if (emitted.startsWith(finalValue)) {
+    return '';
+  }
+
+  const prefixLength = commonPrefixLength(emitted, finalValue);
+  if (prefixLength <= 0) return '';
+  return finalValue.slice(prefixLength);
+}
+
+function parseStreamBlock(block) {
+  const normalized = String(block || '').trim();
+  if (!normalized) return null;
+  if (!normalized.includes('data:') && !normalized.includes('event:')) {
+    return {
+      eventType: '',
+      data: normalized
+    };
+  }
+  return parseSseBlock(normalized);
+}
+
 function parseSseBlock(block) {
   let eventType = '';
   const dataLines = [];
@@ -185,7 +228,7 @@ export function extractCodexFinalResponseFromText(rawText) {
 
   for (const block of blocks) {
     if (!block || !block.trim()) continue;
-    const parsedBlock = parseSseBlock(block);
+    const parsedBlock = parseStreamBlock(block);
     if (!parsedBlock.data || parsedBlock.data === '[DONE]') continue;
 
     let payload;
@@ -241,12 +284,114 @@ function updateStateFromResponse(state, response, fallbackModel) {
   }
 }
 
+function extractAssistantOutputText(item) {
+  if (!item || item.type !== 'message' || item.role !== 'assistant' || !Array.isArray(item.content)) {
+    return '';
+  }
+
+  const textParts = [];
+  for (const contentPart of item.content) {
+    if (!contentPart || typeof contentPart !== 'object') continue;
+    if (contentPart.type === 'output_text' && typeof contentPart.text === 'string') {
+      textParts.push(contentPart.text);
+      continue;
+    }
+    if (contentPart.type === 'refusal' && typeof contentPart.refusal === 'string') {
+      textParts.push(contentPart.refusal);
+    }
+  }
+
+  return textParts.join('');
+}
+
+function emitFallbackTextChunk(state, item, chunks) {
+  const text = extractAssistantOutputText(item);
+  if (!text) return;
+
+  const itemId = typeof item?.id === 'string' ? item.id.trim() : '';
+  const missingText = itemId
+    ? getMissingSuffix(state.textOutputByItemId.get(itemId) || '', text)
+    : (state.hasTextOutput ? '' : text);
+  if (!missingText) return;
+
+  ensureAssistantRoleChunk(state, chunks);
+  chunks.push(makeOpenAIChunk(state, { content: missingText }, null));
+  if (itemId) {
+    state.textOutputItemIds.add(itemId);
+    state.textOutputByItemId.set(itemId, `${state.textOutputByItemId.get(itemId) || ''}${missingText}`);
+  }
+  state.hasTextOutput = true;
+}
+
+function emitFallbackToolCallChunks(state, item, outputIndex, chunks) {
+  if (!item || item.type !== 'function_call') return;
+
+  ensureAssistantRoleChunk(state, chunks);
+  state.hasToolCalls = true;
+
+  const toolIndex = resolveToolIndex(state, {
+    output_index: outputIndex,
+    item_id: typeof item.id === 'string' && item.id.trim() ? item.id.trim() : undefined
+  });
+
+  if (!state.toolCallStartSentByIndex.has(toolIndex)) {
+    chunks.push(makeOpenAIChunk(state, {
+      tool_calls: [
+        {
+          index: toolIndex,
+          id: String(item.call_id || item.id || `call_${toolIndex}`),
+          type: 'function',
+          function: {
+            name: String(item.name || 'tool'),
+            arguments: ''
+          }
+        }
+      ]
+    }, null));
+    state.toolCallStartSentByIndex.add(toolIndex);
+  }
+
+  const argumentsText = typeof item.arguments === 'string' ? item.arguments : '';
+  const missingArguments = getMissingSuffix(state.toolCallArgumentsByIndex.get(toolIndex) || '', argumentsText);
+  if (missingArguments) {
+    chunks.push(makeOpenAIChunk(state, {
+      tool_calls: [
+        {
+          index: toolIndex,
+          function: {
+            arguments: missingArguments
+          }
+        }
+      ]
+    }, null));
+    state.toolCallArgumentsSeenByIndex.add(toolIndex);
+    state.toolCallArgumentsByIndex.set(toolIndex, `${state.toolCallArgumentsByIndex.get(toolIndex) || ''}${missingArguments}`);
+  }
+}
+
+function emitResponseOutputFallbacks(state, response, chunks) {
+  const outputItems = Array.isArray(response?.output) ? response.output : [];
+  for (let index = 0; index < outputItems.length; index += 1) {
+    const item = outputItems[index];
+    if (!item || typeof item !== 'object') continue;
+
+    if (item.type === 'message' && item.role === 'assistant') {
+      emitFallbackTextChunk(state, item, chunks);
+      continue;
+    }
+
+    if (item.type === 'function_call') {
+      emitFallbackToolCallChunks(state, item, index, chunks);
+    }
+  }
+}
+
 function eventToOpenAIChunks(event, state, { fallbackModel = 'unknown' } = {}) {
   if (!event || typeof event !== 'object') return [];
   const type = String(event.type || '').trim();
   const chunks = [];
 
-  if (type === 'response.created' || type === 'response.in_progress' || type === 'response.output_item.done') {
+  if (type === 'response.created' || type === 'response.in_progress') {
     updateStateFromResponse(state, event.response, fallbackModel);
     return chunks;
   }
@@ -259,6 +404,7 @@ function eventToOpenAIChunks(event, state, { fallbackModel = 'unknown' } = {}) {
       ensureAssistantRoleChunk(state, chunks);
       const toolIndex = resolveToolIndex(state, event);
       state.hasToolCalls = true;
+      state.toolCallStartSentByIndex.add(toolIndex);
       chunks.push(makeOpenAIChunk(state, {
         tool_calls: [
           {
@@ -280,34 +426,85 @@ function eventToOpenAIChunks(event, state, { fallbackModel = 'unknown' } = {}) {
     return chunks;
   }
 
+  if (type === 'response.reasoning_summary_text.delta') {
+    ensureAssistantRoleChunk(state, chunks);
+    chunks.push(makeOpenAIChunk(state, { reasoning_content: String(event.delta || '') }, null));
+    return chunks;
+  }
+
+  if (type === 'response.reasoning_summary_text.done') {
+    if (typeof event.text === 'string' && event.text) {
+      ensureAssistantRoleChunk(state, chunks);
+      chunks.push(makeOpenAIChunk(state, { reasoning_content: event.text }, null));
+    }
+    return chunks;
+  }
+
   if (type === 'response.output_text.delta') {
+    const deltaText = String(event.delta || '');
+    if (!deltaText) return chunks;
     ensureAssistantRoleChunk(state, chunks);
     if (typeof event.item_id === 'string' && event.item_id.trim()) {
-      state.textDeltaItemIds.add(event.item_id.trim());
+      const itemId = event.item_id.trim();
+      state.textOutputItemIds.add(itemId);
+      state.textOutputByItemId.set(itemId, `${state.textOutputByItemId.get(itemId) || ''}${deltaText}`);
     }
-    chunks.push(makeOpenAIChunk(state, { content: String(event.delta || '') }, null));
+    state.hasTextOutput = true;
+    chunks.push(makeOpenAIChunk(state, { content: deltaText }, null));
     return chunks;
   }
 
   if (type === 'response.output_text.done') {
     const itemId = typeof event.item_id === 'string' ? event.item_id.trim() : '';
-    if (itemId && !state.textDeltaItemIds.has(itemId) && typeof event.text === 'string' && event.text) {
+    const finalText = typeof event.text === 'string' ? event.text : '';
+    const missingText = itemId
+      ? getMissingSuffix(state.textOutputByItemId.get(itemId) || '', finalText)
+      : (state.hasTextOutput ? '' : finalText);
+    if (missingText) {
       ensureAssistantRoleChunk(state, chunks);
-      chunks.push(makeOpenAIChunk(state, { content: event.text }, null));
+      chunks.push(makeOpenAIChunk(state, { content: missingText }, null));
+      if (itemId) {
+        state.textOutputItemIds.add(itemId);
+        state.textOutputByItemId.set(itemId, `${state.textOutputByItemId.get(itemId) || ''}${missingText}`);
+      }
+      state.hasTextOutput = true;
     }
     return chunks;
   }
 
+  if (type === 'response.content_part.done') {
+    const itemId = typeof event.item_id === 'string' ? event.item_id.trim() : '';
+    const finalText = event.part?.type === 'output_text' && typeof event.part?.text === 'string'
+      ? event.part.text
+      : '';
+    const missingText = itemId
+      ? getMissingSuffix(state.textOutputByItemId.get(itemId) || '', finalText)
+      : (state.hasTextOutput ? '' : finalText);
+    if (!missingText) return chunks;
+    ensureAssistantRoleChunk(state, chunks);
+    chunks.push(makeOpenAIChunk(state, { content: missingText }, null));
+    if (itemId) {
+      state.textOutputItemIds.add(itemId);
+      state.textOutputByItemId.set(itemId, `${state.textOutputByItemId.get(itemId) || ''}${missingText}`);
+    }
+    state.hasTextOutput = true;
+    return chunks;
+  }
+
   if (type === 'response.function_call_arguments.delta') {
+    const deltaArguments = String(event.delta || '');
+    if (!deltaArguments) return chunks;
     ensureAssistantRoleChunk(state, chunks);
     const toolIndex = resolveToolIndex(state, event);
     state.hasToolCalls = true;
+    state.toolCallArgumentsSeenByIndex.add(toolIndex);
+    state.toolCallArgumentsByIndex.set(toolIndex, `${state.toolCallArgumentsByIndex.get(toolIndex) || ''}${deltaArguments}`);
     chunks.push(makeOpenAIChunk(state, {
       tool_calls: [
         {
           index: toolIndex,
           function: {
-            arguments: String(event.delta || '')
+            arguments: deltaArguments
           }
         }
       ]
@@ -316,15 +513,20 @@ function eventToOpenAIChunks(event, state, { fallbackModel = 'unknown' } = {}) {
   }
 
   if (type === 'response.function_call_arguments.done') {
-    ensureAssistantRoleChunk(state, chunks);
     const toolIndex = resolveToolIndex(state, event);
+    const finalArguments = String(event.arguments || '');
+    const missingArguments = getMissingSuffix(state.toolCallArgumentsByIndex.get(toolIndex) || '', finalArguments);
+    if (!missingArguments) return chunks;
+    ensureAssistantRoleChunk(state, chunks);
     state.hasToolCalls = true;
+    state.toolCallArgumentsSeenByIndex.add(toolIndex);
+    state.toolCallArgumentsByIndex.set(toolIndex, `${state.toolCallArgumentsByIndex.get(toolIndex) || ''}${missingArguments}`);
     chunks.push(makeOpenAIChunk(state, {
       tool_calls: [
         {
           index: toolIndex,
           function: {
-            arguments: String(event.arguments || '')
+            arguments: missingArguments
           }
         }
       ]
@@ -332,8 +534,26 @@ function eventToOpenAIChunks(event, state, { fallbackModel = 'unknown' } = {}) {
     return chunks;
   }
 
-  if (type === 'response.completed' || type === 'response.failed') {
+  if (type === 'response.output_item.done') {
     updateStateFromResponse(state, event.response, fallbackModel);
+    const item = event.item;
+    if (!item || typeof item !== 'object') return chunks;
+
+    if (item.type === 'message' && item.role === 'assistant') {
+      emitFallbackTextChunk(state, item, chunks);
+      return chunks;
+    }
+
+    if (item.type === 'function_call') {
+      emitFallbackToolCallChunks(state, item, Number.isFinite(event.output_index) ? Number(event.output_index) : 0, chunks);
+    }
+
+    return chunks;
+  }
+
+  if (type === 'response.completed' || type === 'response.failed' || type === 'response.incomplete') {
+    updateStateFromResponse(state, event.response, fallbackModel);
+    emitResponseOutputFallbacks(state, event.response, chunks);
     ensureAssistantRoleChunk(state, chunks);
     const responseUsage = toOpenAIUsage(event.response?.usage);
     const hasResponseToolCalls = Array.isArray(event.response?.output)
@@ -370,10 +590,42 @@ export function handleCodexStreamToOpenAI(response, { fallbackModel = 'unknown' 
     toolCallByOutputIndex: new Map(),
     toolCallByItemId: new Map(),
     nextToolCallIndex: 0,
-    textDeltaItemIds: new Set()
+    toolCallStartSentByIndex: new Set(),
+    toolCallArgumentsSeenByIndex: new Set(),
+    toolCallArgumentsByIndex: new Map(),
+    textOutputItemIds: new Set(),
+    textOutputByItemId: new Map(),
+    hasTextOutput: false
   };
 
   let buffer = '';
+
+  function processBlock(block, controller) {
+    if (!block || !block.trim()) return;
+
+    const parsedBlock = parseStreamBlock(block);
+    if (!parsedBlock.data) return;
+
+    if (parsedBlock.data === '[DONE]') {
+      if (!state.doneSent) {
+        state.doneSent = true;
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      }
+      return;
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(parsedBlock.data);
+    } catch {
+      return;
+    }
+
+    const chunks = eventToOpenAIChunks(payload, state, { fallbackModel });
+    for (const translated of chunks) {
+      controller.enqueue(encoder.encode(serializeOpenAIChunk(translated)));
+    }
+  }
 
   const transformStream = new TransformStream({
     transform(chunk, controller) {
@@ -383,34 +635,15 @@ export function handleCodexStreamToOpenAI(response, { fallbackModel = 'unknown' 
       while ((boundaryIndex = buffer.indexOf('\n\n')) >= 0) {
         const block = buffer.slice(0, boundaryIndex);
         buffer = buffer.slice(boundaryIndex + 2);
-        if (!block.trim()) continue;
-
-        const parsedBlock = parseSseBlock(block);
-        if (!parsedBlock.data) continue;
-
-        if (parsedBlock.data === '[DONE]') {
-          if (!state.doneSent) {
-            state.doneSent = true;
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          }
-          continue;
-        }
-
-        let payload;
-        try {
-          payload = JSON.parse(parsedBlock.data);
-        } catch {
-          continue;
-        }
-
-        const chunks = eventToOpenAIChunks(payload, state, { fallbackModel });
-        for (const translated of chunks) {
-          controller.enqueue(encoder.encode(serializeOpenAIChunk(translated)));
-        }
+        processBlock(block, controller);
       }
     },
 
     flush(controller) {
+      const remainder = buffer.trim();
+      if (remainder) {
+        processBlock(remainder, controller);
+      }
       if (state.doneSent) return;
       if (!state.roleSent) {
         controller.enqueue(encoder.encode(serializeOpenAIChunk(makeOpenAIChunk(state, { role: 'assistant' }, null))));

@@ -319,6 +319,6 @@ export function buildCloudflareDnsManualGuide({
     "- Proxy status must be ON (orange cloud / proxied)",
     host ? `- Verify DNS: dig +short ${host} @1.1.1.1` : "- Verify DNS: dig +short <host> @1.1.1.1",
     host ? `- Verify HTTP: curl -I https://${host}/anthropic` : "- Verify HTTP: curl -I https://<host>/anthropic",
-    "- Claude base URL must NOT include :8787 for Cloudflare Worker deployments"
+    "- Claude base URL must NOT include a local router port for Cloudflare Worker deployments"
   ].join("\n");
 }

@@ -23,6 +23,7 @@ import {
 import { corsResponse, jsonResponse } from "./handler/http.js";
 import {
   detectUserRequestFormat,
+  isAmpManagementPath,
   isJsonRequest,
   isStreamingEnabled,
   normalizePath,
@@ -30,6 +31,18 @@ import {
   resolveApiRoute,
   resolveMaxRequestBodyBytes
 } from "./handler/request.js";
+import {
+  isAmpManagementAllowed,
+  isAmpProxyEnabled,
+  proxyAmpUpstreamRequest
+} from "./handler/amp.js";
+import {
+  adaptOpenAIResponseToAmpGeminiResponse,
+  buildAmpGeminiModelPayload,
+  buildAmpGeminiModelsPayload,
+  convertAmpGeminiRequestToOpenAI,
+  hasGeminiWebSearchTool
+} from "./handler/amp-gemini.js";
 import {
   isRequestFromAllowedIp,
   resolveAllowedOrigin,
@@ -56,6 +69,7 @@ import {
   recordRouteAttempt,
   recordRouteSkip,
   setRouteSelectedCandidate,
+  setRouteToolDebug,
   withRouteDebugHeaders
 } from "./handler/route-debug.js";
 
@@ -89,6 +103,207 @@ function hasNextEligibleCandidate(entries, startIndex) {
   return false;
 }
 
+function extractBuiltInToolTypes(body) {
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  const seen = new Set();
+  const types = [];
+
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const type = String(tool.type || "").trim();
+    if (!type) continue;
+    if (type === "function") continue;
+    if (seen.has(type)) continue;
+    seen.add(type);
+    types.push(type);
+  }
+
+  return types;
+}
+
+function isWebSearchToolType(type) {
+  const normalized = String(type || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.startsWith("web_search");
+}
+
+function hasWebSearchTool(toolTypes) {
+  return Array.isArray(toolTypes) && toolTypes.some((type) => isWebSearchToolType(type));
+}
+
+function hasAmpUpstreamApiKey(config) {
+  return Boolean(String(config?.amp?.upstreamApiKey || "").trim());
+}
+
+function shouldProxyAmpWebSearchRequest(clientType, toolTypes, config) {
+  return clientType === "amp"
+    && hasWebSearchTool(toolTypes)
+    && config?.amp?.proxyWebSearchToUpstream === true
+    && isAmpProxyEnabled(config)
+    && hasAmpUpstreamApiKey(config);
+}
+
+function buildAmpWebSearchProxyDebugState(env, requestedModel, toolTypes) {
+  const routeDebug = buildRouteDebugState(isRoutingDebugEnabled(env), {
+    requestedModel,
+    routeType: "amp-proxy",
+    routeRef: "amp.upstream",
+    routeStrategy: "ordered"
+  });
+  setRouteToolDebug(routeDebug, toolTypes, "amp-web-search:proxy-upstream");
+  return routeDebug;
+}
+
+function isChatGPTCodexCandidate(candidate) {
+  const provider = candidate?.provider;
+  if (!provider || provider.type !== "subscription") return false;
+  const subscriptionType = String(provider.subscriptionType || provider.subscription_type || "").trim().toLowerCase();
+  return subscriptionType === "chatgpt-codex";
+}
+
+const WEB_SEARCH_UNAVAILABLE_HINTS = [
+  "web search credits are unavailable in this session",
+  "web access unavailable (out of credits)",
+  "web access unavailable"
+];
+
+function extractAssistantTextFragments(payload) {
+  const fragments = [];
+  if (!payload || typeof payload !== "object") return fragments;
+
+  if (typeof payload.output_text === "string" && payload.output_text.trim()) {
+    fragments.push(payload.output_text.trim());
+  }
+
+  if (Array.isArray(payload.choices)) {
+    for (const choice of payload.choices) {
+      const content = choice?.message?.content;
+      if (typeof content === "string" && content.trim()) {
+        fragments.push(content.trim());
+      }
+    }
+  }
+
+  if (payload.type === "message" && Array.isArray(payload.content)) {
+    for (const block of payload.content) {
+      if (typeof block?.text === "string" && block.text.trim()) {
+        fragments.push(block.text.trim());
+      }
+    }
+  }
+
+  if (Array.isArray(payload.output)) {
+    for (const item of payload.output) {
+      if (item?.type !== "message" || item.role !== "assistant" || !Array.isArray(item.content)) continue;
+      for (const block of item.content) {
+        if (typeof block?.text === "string" && block.text.trim()) {
+          fragments.push(block.text.trim());
+          continue;
+        }
+        if (typeof block?.refusal === "string" && block.refusal.trim()) {
+          fragments.push(block.refusal.trim());
+        }
+      }
+    }
+  }
+
+  return fragments;
+}
+
+async function detectSemanticWebSearchFailure(response, toolTypes, stream = false) {
+  if (stream) return "";
+  if (!(response instanceof Response)) return "";
+  if (!Array.isArray(toolTypes) || !toolTypes.some((type) => isWebSearchToolType(type))) return "";
+
+  let fragments = [];
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+
+  if (contentType.includes("json")) {
+    try {
+      const payload = await response.clone().json();
+      fragments = extractAssistantTextFragments(payload);
+    } catch {
+      fragments = [];
+    }
+  }
+
+  if (fragments.length === 0) {
+    try {
+      const raw = await response.clone().text();
+      if (raw.trim()) fragments = [raw.trim()];
+    } catch {
+      fragments = [];
+    }
+  }
+
+  const normalized = fragments.join("\n").toLowerCase();
+  if (!normalized) return "";
+
+  for (const hint of WEB_SEARCH_UNAVAILABLE_HINTS) {
+    if (normalized.includes(hint)) return hint;
+  }
+  return "";
+}
+
+function createSemanticWebSearchFailureResult(response) {
+  return {
+    ok: false,
+    status: response instanceof Response ? response.status : 200,
+    retryable: false,
+    errorKind: "search_unavailable",
+    response
+  };
+}
+
+function createSemanticWebSearchFailureClassification() {
+  return {
+    category: "search_unavailable",
+    retryable: false,
+    retryOrigin: false,
+    allowFallback: true,
+    originCooldownMs: 0
+  };
+}
+
+function prioritizeAmpToolAwareCandidates(candidates, toolTypes, options = {}) {
+  const toolTypeList = Array.isArray(toolTypes) ? toolTypes : [];
+  if (options?.clientType !== "amp") {
+    return {
+      candidates,
+      routingHint: ""
+    };
+  }
+  if (!toolTypeList.some((type) => isWebSearchToolType(type))) {
+    return {
+      candidates,
+      routingHint: ""
+    };
+  }
+  if (!Array.isArray(candidates) || candidates.length <= 1) {
+    return {
+      candidates,
+      routingHint: "amp-web-search-request"
+    };
+  }
+
+  const prioritized = candidates
+    .map((candidate, index) => ({
+      candidate,
+      index,
+      penalty: isChatGPTCodexCandidate(candidate) ? 1 : 0
+    }))
+    .sort((left, right) => left.penalty - right.penalty || left.index - right.index)
+    .map((entry) => entry.candidate);
+
+  const changed = prioritized.some((candidate, index) => candidate !== candidates[index]);
+  return {
+    candidates: prioritized,
+    routingHint: changed
+      ? "amp-web-search:prefer-non-codex"
+      : "amp-web-search-request"
+  };
+}
+
 async function handleRouteRequest(request, env, getConfig, sourceFormatHint, options = {}) {
   let config;
   try {
@@ -104,6 +319,9 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
   }
 
   if (!configHasProvider(config)) {
+    if (options.clientType === "amp" && isAmpProxyEnabled(config)) {
+      return proxyAmpUpstreamRequest({ request, config });
+    }
     return jsonResponse({
       type: "error",
       error: {
@@ -136,19 +354,44 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
   const sourceFormat = sourceFormatHint === "auto"
     ? detectUserRequestFormat(request, body, FORMATS.CLAUDE)
     : sourceFormatHint;
+  const builtInToolTypes = extractBuiltInToolTypes(body);
 
   const requestedModel = body?.model || "smart";
   const stream = isStreamingEnabled(sourceFormat, body);
 
-  const resolved = resolveRequestModel(config, requestedModel, sourceFormat);
+  if (shouldProxyAmpWebSearchRequest(options.clientType, builtInToolTypes, config)) {
+    const routeDebug = buildAmpWebSearchProxyDebugState(env, requestedModel, builtInToolTypes);
+    if (routeDebug.enabled) {
+      console.warn(
+        `[llm-router] tool routing request=${requestedModel} tools=${builtInToolTypes.join(",")} hint=${routeDebug.toolRouting || "none"}`
+      );
+    }
+    return withRouteDebugHeaders(await proxyAmpUpstreamRequest({
+      request,
+      config,
+      bodyOverride: JSON.stringify(body || {})
+    }), routeDebug);
+  }
+
+  const resolved = resolveRequestModel(config, requestedModel, sourceFormat, {
+    clientType: options.clientType,
+    providerHint: options.providerHint
+  });
   if (!resolved.primary) {
+    if (options.clientType === "amp" && resolved.allowAmpProxy !== false && isAmpProxyEnabled(config)) {
+      return proxyAmpUpstreamRequest({
+        request,
+        config,
+        bodyOverride: JSON.stringify(body || {})
+      });
+    }
     return jsonResponse({
       type: "error",
       error: {
         type: "configuration_error",
         message: resolved.error || `No matching model found for "${requestedModel}" and no default provider/model configured.`
       }
-    }, 400);
+    }, Number.isInteger(resolved?.statusCode) ? resolved.statusCode : 400);
   }
 
   const runtimeFlags = options.runtimeFlags || resolveRuntimeFlags(options, env);
@@ -177,6 +420,13 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
   for (const skipped of formatFiltered.skipped) {
     recordRouteSkip(routeDebug, skipped.candidate, skipped.reason);
   }
+  const prioritizedCandidates = prioritizeAmpToolAwareCandidates(formatFiltered.eligible, builtInToolTypes, options);
+  setRouteToolDebug(routeDebug, builtInToolTypes, prioritizedCandidates.routingHint);
+  if (routeDebug.enabled && builtInToolTypes.length > 0) {
+    console.warn(
+      `[llm-router] tool routing request=${requestedModel} tools=${builtInToolTypes.join(",")} hint=${prioritizedCandidates.routingHint || "none"}`
+    );
+  }
 
   if (formatFiltered.eligible.length === 0) {
     return withRouteDebugHeaders(jsonResponse({
@@ -196,7 +446,7 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
       strategy: runtimeFlags.statefulRoutingEnabled && resolved.routeType === "alias"
         ? resolved.routeStrategy
         : "ordered",
-      candidates: formatFiltered.eligible,
+      candidates: prioritizedCandidates.candidates,
       stateStore,
       config,
       now
@@ -255,12 +505,14 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     while (attempt < maxAttempts) {
       attempt += 1;
       result = await makeProviderCall({
-        body,
-        sourceFormat,
-        stream,
-        candidate,
-        requestHeaders: request.headers,
-        env
+      body,
+      sourceFormat,
+      stream,
+      requestKind: options.requestKind,
+      candidate,
+      requestHeaders: request.headers,
+      env,
+      clientType: options.clientType
       });
 
       if (!quotaConsumed && shouldConsumeQuotaFromResult(result)) {
@@ -272,6 +524,18 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
       }
 
       if (result.ok) {
+        const semanticSearchFailure = await detectSemanticWebSearchFailure(result.response, builtInToolTypes, stream);
+        if (semanticSearchFailure) {
+          classification = createSemanticWebSearchFailureClassification();
+          result = createSemanticWebSearchFailureResult(result.response);
+          recordRouteAttempt(routeDebug, candidate, result.status, classification, attempt);
+          if (routeDebug.enabled) {
+            console.warn(
+              `[llm-router] semantic web-search failure request=${requestedModel} candidate=${candidate.requestModelId} hint=${semanticSearchFailure}`
+            );
+          }
+          break;
+        }
         await clearCandidateRoutingState(stateStore, entry.candidateKey);
         setRouteSelectedCandidate(routeDebug, candidate, { overwrite: true });
         recordRouteAttempt(routeDebug, candidate, result.status, null, attempt);
@@ -432,6 +696,31 @@ export function createFetchHandler(options) {
       }));
     }
 
+    if (isAmpManagementPath(url.pathname)) {
+      let config;
+      try {
+        config = preloadedConfig || await loadRuntimeConfig(options.getConfig, env);
+      } catch (error) {
+        return respond(jsonResponse({
+          type: "error",
+          error: {
+            type: "configuration_error",
+            message: `Failed reading runtime config: ${error instanceof Error ? error.message : String(error)}`
+          }
+        }, 500));
+      }
+
+      if (authValidated !== true && !validateAuth(request, config, options)) {
+        return respond(jsonResponse({ error: "Unauthorized" }, 401));
+      }
+
+      if (!isAmpManagementAllowed(request, config)) {
+        return respond(jsonResponse({ error: "Forbidden" }, 403));
+      }
+
+      return respond(await proxyAmpUpstreamRequest({ request, config }));
+    }
+
     const route = resolveApiRoute(url.pathname, request.method);
     if (route?.type === "models") {
       const config = preloadedConfig || await loadRuntimeConfig(options.getConfig, env);
@@ -442,6 +731,154 @@ export function createFetchHandler(options) {
           route.sourceFormat === "auto" ? undefined : route.sourceFormat
         )
       }));
+    }
+
+    if (["amp-gemini-models", "amp-gemini-model", "amp-gemini"].includes(route?.type)) {
+      let config;
+      try {
+        config = preloadedConfig || await loadRuntimeConfig(options.getConfig, env);
+      } catch (error) {
+        return respond(jsonResponse({
+          type: "error",
+          error: {
+            type: "configuration_error",
+            message: `Failed reading runtime config: ${error instanceof Error ? error.message : String(error)}`
+          }
+        }, 500));
+      }
+
+      if (authValidated !== true && !validateAuth(request, config, options)) {
+        return respond(jsonResponse({ error: "Unauthorized" }, 401));
+      }
+
+      if (route.type === "amp-gemini-models") {
+        return respond(jsonResponse(buildAmpGeminiModelsPayload(config)));
+      }
+
+      if (route.type === "amp-gemini-model") {
+        const modelPayload = buildAmpGeminiModelPayload(config, route.modelHint);
+        if (modelPayload) {
+          return respond(jsonResponse(modelPayload));
+        }
+        if (isAmpProxyEnabled(config)) {
+          return respond(await proxyAmpUpstreamRequest({ request, config }));
+        }
+        return respond(jsonResponse({
+          error: {
+            code: 404,
+            message: `AMP Gemini model '${route.modelHint}' not found.`,
+            status: "NOT_FOUND"
+          }
+        }, 404));
+      }
+
+      const hasContentType = Boolean(request.headers.get("content-type"));
+      if (hasContentType && !isJsonRequest(request)) {
+        return respond(jsonResponse({ error: "Unsupported Media Type. Use application/json." }, 415));
+      }
+
+      let body;
+      try {
+        body = await parseJsonBodyWithLimit(request, resolveMaxRequestBodyBytes(env));
+      } catch (error) {
+        if (error && typeof error === "object" && error.code === "REQUEST_BODY_TOO_LARGE") {
+          return respond(jsonResponse({ error: "Request body too large" }, 413));
+        }
+        return respond(jsonResponse({ error: "Invalid JSON" }, 400));
+      }
+
+      const geminiToolTypes = hasGeminiWebSearchTool(body?.tools) ? ["web_search"] : [];
+      const requestedModel = route.modelHint || body?.model || "smart";
+      if (shouldProxyAmpWebSearchRequest("amp", geminiToolTypes, config)) {
+        const routeDebug = buildAmpWebSearchProxyDebugState(env, requestedModel, geminiToolTypes);
+        if (routeDebug.enabled) {
+          console.warn(
+            `[llm-router] tool routing request=${requestedModel} tools=${geminiToolTypes.join(",")} hint=${routeDebug.toolRouting || "none"}`
+          );
+        }
+        return respond(withRouteDebugHeaders(await proxyAmpUpstreamRequest({
+          request,
+          config,
+          bodyOverride: JSON.stringify(body || {})
+        }), routeDebug));
+      }
+
+      const translatedBody = convertAmpGeminiRequestToOpenAI(body, {
+        model: route.modelHint || body?.model,
+        method: route.methodHint,
+        stream: route.streamHint
+      });
+
+      const resolved = resolveRequestModel(config, translatedBody.model, FORMATS.OPENAI, {
+        clientType: "amp",
+        providerHint: "google"
+      });
+      if (!resolved.primary) {
+        if (isAmpProxyEnabled(config)) {
+          return respond(await proxyAmpUpstreamRequest({
+            request,
+            config,
+            bodyOverride: JSON.stringify(body || {})
+          }));
+        }
+        return respond(jsonResponse({
+          error: {
+            code: Number.isInteger(resolved?.statusCode) ? resolved.statusCode : 400,
+            message: resolved.error || `No matching model found for AMP Gemini request '${translatedBody.model}'.`,
+            status: "INVALID_ARGUMENT"
+          }
+        }, Number.isInteger(resolved?.statusCode) ? resolved.statusCode : 400));
+      }
+
+      let stateStore = null;
+      if (runtimeFlags.statefulRoutingEnabled) {
+        try {
+          stateStore = await ensureStateStore(env, runtimeFlags);
+        } catch (error) {
+          return respond(jsonResponse({
+            type: "error",
+            error: {
+              type: "configuration_error",
+              message: `Failed initializing routing state: ${error instanceof Error ? error.message : String(error)}`
+            }
+          }, 500));
+        }
+      }
+
+      const translatedHeaders = new Headers(request.headers);
+      translatedHeaders.set("content-type", "application/json");
+      const translatedRequest = new Request(request.url, {
+        method: "POST",
+        headers: translatedHeaders,
+        body: JSON.stringify(translatedBody)
+      });
+
+      const routeResponse = await handleRouteRequest(translatedRequest, env, options.getConfig, FORMATS.OPENAI, {
+        ...options,
+        preloadedConfig: config,
+        authValidated: true,
+        clientType: "amp",
+        providerHint: "google",
+        requestKind: "chat-completions",
+        stateStore,
+        runtimeFlags
+      });
+
+      if (routeResponse.status >= 400) {
+        return respond(routeResponse);
+      }
+
+      return respond(await adaptOpenAIResponseToAmpGeminiResponse(routeResponse, {
+        stream: route.streamHint === true
+      }));
+    }
+
+    if (route?.type === "amp-proxy") {
+      const config = preloadedConfig || await loadRuntimeConfig(options.getConfig, env);
+      if (authValidated !== true && !validateAuth(request, config, options)) {
+        return respond(jsonResponse({ error: "Unauthorized" }, 401));
+      }
+      return respond(await proxyAmpUpstreamRequest({ request, config }));
     }
 
     if (route?.type === "route") {
@@ -464,6 +901,9 @@ export function createFetchHandler(options) {
         ...options,
         preloadedConfig,
         authValidated,
+        clientType: route.clientType,
+        providerHint: route.providerHint,
+        requestKind: route.requestKind,
         stateStore,
         runtimeFlags
       });

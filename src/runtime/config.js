@@ -8,10 +8,12 @@ import {
   CODEX_SUBSCRIPTION_MODELS,
   CLAUDE_CODE_SUBSCRIPTION_MODELS
 } from "./subscription-constants.js";
+import { sanitizeRuntimeMetadata } from "../shared/local-router-defaults.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
 export const PROVIDER_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
+export const DEFAULT_MODEL_ALIAS_ID = "default";
 const DEFAULT_PROVIDER_USER_AGENT_NAME = "AICodeClient";
 const DEFAULT_PROVIDER_USER_AGENT_VERSION = "1.0.0";
 export const DEFAULT_PROVIDER_USER_AGENT = buildDefaultProviderUserAgent();
@@ -63,6 +65,10 @@ function toArray(value) {
   if (Array.isArray(value)) return value;
   if (value === undefined || value === null) return [];
   return [value];
+}
+
+function hasOwn(object, key) {
+  return Boolean(object) && Object.prototype.hasOwnProperty.call(object, key);
 }
 
 function dedupeStrings(values) {
@@ -147,6 +153,586 @@ function sanitizeEndpointUrl(value) {
   parsed.password = "";
   parsed.hash = "";
   return parsed.toString();
+}
+
+function normalizeBooleanValue(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizeAmpModelMappingEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const from = String(
+    entry.from ??
+    entry.match ??
+    entry.pattern ??
+    entry.model ??
+    ""
+  ).trim();
+  const to = String(
+    entry.to ??
+    entry.target ??
+    entry.route ??
+    entry.ref ??
+    ""
+  ).trim();
+
+  if (!from || !to) return null;
+
+  return {
+    from,
+    to
+  };
+}
+
+function normalizeAmpIdentifierText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[–—]+/g, "-")
+    .replace(/[\s_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function normalizeAmpVersionToken(value) {
+  const text = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, ".")
+    .replace(/\s+/g, "");
+  if (!text) return "";
+  if (/^\d+-\d+$/.test(text)) return text.replace(/-/g, ".");
+  return text;
+}
+
+function normalizeAmpSignatureKey(value) {
+  const text = normalizeAmpIdentifierText(String(value || "").replace(/^@+/, ""));
+  if (!text) return "";
+  return `@${text}`;
+}
+
+function normalizeAmpRouteKey(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.trim().startsWith("@")) return normalizeAmpSignatureKey(text);
+  return normalizeAmpSubagentKey(text);
+}
+
+function normalizeAmpRouteMappings(rawMappings) {
+  if (rawMappings === undefined || rawMappings === null || rawMappings === "") return undefined;
+  const out = {};
+  const source = Array.isArray(rawMappings)
+    ? rawMappings
+    : (typeof rawMappings === "object" && rawMappings !== null
+      ? Object.entries(rawMappings).map(([name, to]) => ({ name, to }))
+      : []);
+
+  for (const entry of source) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = normalizeAmpRouteKey(
+      entry.id ?? entry.key ?? entry.name ?? entry.agent ?? entry.subagent ?? entry.signature
+    );
+    const target = String(entry.to ?? entry.target ?? entry.route ?? entry.ref ?? "").trim();
+    if (!key || !target) continue;
+    out[key] = target;
+  }
+
+  return out;
+}
+
+function normalizeAmpMatchEntry(entry) {
+  if (typeof entry === "string") {
+    const text = String(entry || "").trim();
+    return text ? text : null;
+  }
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const vendor = normalizeAmpIdentifierText(entry.vendor);
+  const family = normalizeAmpIdentifierText(entry.family);
+  const version = normalizeAmpVersionToken(entry.version ?? entry.modelVersion);
+  const versionPrefix = normalizeAmpVersionToken(entry.versionPrefix ?? entry.versionStartsWith);
+  const variant = normalizeAmpIdentifierText(entry.variant ?? entry.modelVariant);
+  const variantPrefix = normalizeAmpIdentifierText(entry.variantPrefix ?? entry.variantStartsWith);
+  const modifiers = dedupeStrings(
+    toArray(entry.modifiers ?? entry.flags ?? entry.tags)
+      .map((value) => normalizeAmpIdentifierText(value))
+      .filter(Boolean)
+  );
+  const normalized = {
+    ...(vendor ? { vendor } : {}),
+    ...(family ? { family } : {}),
+    ...(version ? { version } : {}),
+    ...(versionPrefix ? { versionPrefix } : {}),
+    ...(variant ? { variant } : {}),
+    ...(variantPrefix ? { variantPrefix } : {}),
+    ...(modifiers.length > 0 ? { modifiers } : {}),
+    ...(normalizeBooleanValue(entry.variantAbsent, false) ? { variantAbsent: true } : {})
+  };
+
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function normalizeAmpMatchList(value) {
+  return toArray(value)
+    .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+    .map((entry) => normalizeAmpMatchEntry(entry))
+    .filter(Boolean);
+}
+
+function normalizeAmpEntityDefinitionEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const id = normalizeAmpSubagentKey(entry.id ?? entry.agent ?? entry.subagent ?? entry.name ?? entry.key);
+  const type = normalizeAmpIdentifierText(entry.type ?? entry.kind ?? entry.category);
+  const aliases = dedupeStrings(
+    toArray(entry.aliases ?? entry.alias)
+      .map((value) => normalizeAmpSubagentKey(value))
+      .filter(Boolean)
+  );
+  const match = normalizeAmpMatchList(
+    entry.match ?? entry.matches ?? entry.patterns ?? entry.models ?? entry.model ?? entry.pattern
+  );
+  const signatures = dedupeStrings(
+    toArray(entry.signatures ?? entry.signatureIds ?? entry.signature)
+      .map((value) => normalizeAmpSignatureKey(value))
+      .filter(Boolean)
+  );
+  const route = String(entry.route ?? entry.to ?? entry.target ?? entry.ref ?? "").trim();
+  if (!id) return null;
+
+  return {
+    id,
+    ...(type ? { type } : {}),
+    ...(typeof entry.description === "string" && entry.description.trim()
+      ? { description: entry.description.trim() }
+      : {}),
+    ...(aliases.length > 0 ? { aliases } : {}),
+    ...(match.length > 0 ? { match } : {}),
+    ...(signatures.length > 0 ? { signatures } : {}),
+    ...(route ? { route } : {}),
+    ...(entry.enabled === false ? { enabled: false } : {})
+  };
+}
+
+function normalizeAmpSignatureDefinitionEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const id = normalizeAmpSignatureKey(entry.id ?? entry.signature ?? entry.name ?? entry.key);
+  const aliases = dedupeStrings(
+    toArray(entry.aliases ?? entry.alias)
+      .map((value) => normalizeAmpSignatureKey(value))
+      .filter(Boolean)
+  );
+  const match = normalizeAmpMatchList(
+    entry.match ?? entry.matches ?? entry.patterns ?? entry.models ?? entry.model ?? entry.pattern
+  );
+  const route = String(entry.route ?? entry.to ?? entry.target ?? entry.ref ?? "").trim();
+  if (!id) return null;
+
+  return {
+    id,
+    ...(typeof entry.description === "string" && entry.description.trim()
+      ? { description: entry.description.trim() }
+      : {}),
+    ...(aliases.length > 0 ? { aliases } : {}),
+    ...(match.length > 0 ? { match } : {}),
+    ...(route ? { route } : {}),
+    ...(entry.enabled === false ? { enabled: false } : {})
+  };
+}
+
+function normalizeAmpDefinitionList(value, entryNormalizer) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const entries = Array.isArray(value)
+    ? value
+    : (typeof value === "object" && value !== null
+      ? Object.entries(value).map(([id, entry]) => ({
+          ...(entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {}),
+          id: entry?.id ?? id
+        }))
+      : []);
+
+  const seen = new Set();
+  const out = [];
+  for (const entry of entries.map((candidate) => entryNormalizer(candidate)).filter(Boolean)) {
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
+  }
+  return out;
+}
+
+function normalizeAmpOverrides(rawOverrides) {
+  if (rawOverrides === undefined || rawOverrides === null || rawOverrides === "") return undefined;
+  const source = rawOverrides && typeof rawOverrides === "object" && !Array.isArray(rawOverrides)
+    ? rawOverrides
+    : {};
+  const entities = normalizeAmpDefinitionList(source.entities, normalizeAmpEntityDefinitionEntry);
+  const signatures = normalizeAmpDefinitionList(source.signatures, normalizeAmpSignatureDefinitionEntry);
+  if (entities === undefined && signatures === undefined) return undefined;
+  return {
+    ...(entities !== undefined ? { entities } : {}),
+    ...(signatures !== undefined ? { signatures } : {})
+  };
+}
+
+function normalizeAmpFallbackAction(value) {
+  const text = normalizeAmpIdentifierText(value);
+  if (!text) return undefined;
+  if (["default", "default-route", "defaultroute"].includes(text)) return "default-route";
+  if (["default-model", "defaultmodel"].includes(text)) return "default-model";
+  if (["upstream", "proxy", "proxy-upstream"].includes(text)) return "upstream";
+  if (["none", "disabled", "off"].includes(text)) return "none";
+  return undefined;
+}
+
+function normalizeAmpFallback(rawFallback) {
+  if (rawFallback === undefined || rawFallback === null || rawFallback === "") return undefined;
+  const source = rawFallback && typeof rawFallback === "object" && !Array.isArray(rawFallback)
+    ? rawFallback
+    : {};
+  const onUnknown = normalizeAmpFallbackAction(source.onUnknown ?? source["on-unknown"]);
+  const onAmbiguous = normalizeAmpFallbackAction(source.onAmbiguous ?? source["on-ambiguous"]);
+  const hasProxyFlag = hasOwn(source, "proxyUpstream") || hasOwn(source, "proxy-upstream");
+  const proxyUpstream = hasProxyFlag
+    ? normalizeBooleanValue(source.proxyUpstream ?? source["proxy-upstream"], true)
+    : undefined;
+  if (onUnknown === undefined && onAmbiguous === undefined && proxyUpstream === undefined) return undefined;
+  return {
+    ...(onUnknown ? { onUnknown } : {}),
+    ...(onAmbiguous ? { onAmbiguous } : {}),
+    ...(proxyUpstream !== undefined ? { proxyUpstream } : {})
+  };
+}
+
+function normalizeAmpPreset(value) {
+  if (value === undefined || value === null) return undefined;
+  const text = normalizeAmpIdentifierText(value);
+  if (!text) return "builtin";
+  if (["default", "builtin", "builtins"].includes(text)) return "builtin";
+  if (["none", "disabled", "off"].includes(text)) return "none";
+  return text;
+}
+
+function normalizeAmpSubagentKey(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return "";
+  if (["lookat", "look-at", "look_at", "look at"].includes(text)) return "look-at";
+  if (["title", "titling"].includes(text)) return "title";
+  return text;
+}
+
+function normalizeAmpSubagentMappings(rawMappings) {
+  if (rawMappings === undefined || rawMappings === null || rawMappings === "") return {};
+  const out = {};
+  const source = Array.isArray(rawMappings)
+    ? rawMappings
+    : (typeof rawMappings === "object" && rawMappings !== null
+      ? Object.entries(rawMappings).map(([agent, to]) => ({ agent, to }))
+      : []);
+  for (const entry of source) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = normalizeAmpSubagentKey(entry.agent ?? entry.subagent ?? entry.name ?? entry.id);
+    const target = String(entry.to ?? entry.target ?? entry.route ?? entry.ref ?? "").trim();
+    if (!key || !target) continue;
+    out[key] = target;
+  }
+  return out;
+}
+
+function normalizeAmpSubagentDefinitionEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const id = normalizeAmpSubagentKey(entry.id ?? entry.agent ?? entry.subagent ?? entry.name ?? entry.key);
+  const patterns = dedupeStrings(toArray(entry.patterns ?? entry.matches ?? entry.models ?? entry.model ?? entry.pattern));
+  if (!id || patterns.length === 0) return null;
+
+  return {
+    id,
+    patterns
+  };
+}
+
+function normalizeAmpSubagentDefinitions(rawDefinitions) {
+  if (rawDefinitions === undefined || rawDefinitions === null || rawDefinitions === "") return undefined;
+  if (!Array.isArray(rawDefinitions)) return undefined;
+
+  const seen = new Set();
+  const out = [];
+  for (const entry of rawDefinitions.map(normalizeAmpSubagentDefinitionEntry).filter(Boolean)) {
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
+  }
+  return out;
+}
+
+function normalizeAmpConfig(rawAmp) {
+  const source = rawAmp && typeof rawAmp === "object" && !Array.isArray(rawAmp)
+    ? rawAmp
+    : {};
+  const hasProxyWebSearchToUpstream = hasOwn(source, "proxyWebSearchToUpstream") || hasOwn(source, "proxy-web-search-to-upstream");
+  const hasPreset = hasOwn(source, "preset");
+  const hasDefaultRoute = hasOwn(source, "defaultRoute") || hasOwn(source, "default-route");
+  const hasRoutes = hasOwn(source, "routes");
+  const hasRawModelRoutes = hasOwn(source, "rawModelRoutes") || hasOwn(source, "raw-model-routes");
+  const hasOverrides = hasOwn(source, "overrides");
+  const hasFallback = hasOwn(source, "fallback");
+  const normalizedSubagentDefinitions = normalizeAmpSubagentDefinitions(
+    source.subagentDefinitions ?? source["subagent-definitions"]
+  );
+  const normalizedPreset = normalizeAmpPreset(source.preset);
+  const normalizedDefaultRoute = String(source.defaultRoute ?? source["default-route"] ?? "").trim();
+  const normalizedRoutes = normalizeAmpRouteMappings(source.routes);
+  const normalizedRawModelRoutes = toArray(
+    source.rawModelRoutes ?? source["raw-model-routes"]
+  )
+    .map(normalizeAmpModelMappingEntry)
+    .filter(Boolean);
+  const normalizedOverrides = normalizeAmpOverrides(source.overrides);
+  const normalizedFallback = normalizeAmpFallback(source.fallback);
+
+  return {
+    upstreamUrl: sanitizeEndpointUrl(
+      source.upstreamUrl ??
+      source["upstream-url"] ??
+      source.baseUrl ??
+      source["base-url"] ??
+      ""
+    ),
+    upstreamApiKey: String(
+      source.upstreamApiKey ??
+      source["upstream-api-key"] ??
+      ""
+    ).trim() || undefined,
+    restrictManagementToLocalhost: normalizeBooleanValue(
+      source.restrictManagementToLocalhost ?? source["restrict-management-to-localhost"],
+      false
+    ),
+    forceModelMappings: normalizeBooleanValue(
+      source.forceModelMappings ?? source["force-model-mappings"],
+      false
+    ),
+    ...(hasProxyWebSearchToUpstream
+      ? {
+          proxyWebSearchToUpstream: normalizeBooleanValue(
+            source.proxyWebSearchToUpstream ?? source["proxy-web-search-to-upstream"],
+            false
+          )
+        }
+      : {}),
+    modelMappings: toArray(
+      source.modelMappings ?? source["model-mappings"]
+    )
+      .map(normalizeAmpModelMappingEntry)
+      .filter(Boolean),
+    subagentMappings: normalizeAmpSubagentMappings(
+      source.subagentMappings ?? source["subagent-mappings"]
+    ),
+    ...(hasPreset
+      ? {
+          preset: normalizedPreset
+        }
+      : {}),
+    ...(hasDefaultRoute
+      ? {
+          defaultRoute: normalizedDefaultRoute
+        }
+      : {}),
+    ...(hasRoutes
+      ? {
+          routes: normalizedRoutes || {}
+        }
+      : {}),
+    ...(hasRawModelRoutes
+      ? {
+          rawModelRoutes: normalizedRawModelRoutes
+        }
+      : {}),
+    ...(hasOverrides && normalizedOverrides !== undefined
+      ? {
+          overrides: normalizedOverrides
+        }
+      : {}),
+    ...(hasFallback && normalizedFallback !== undefined
+      ? {
+          fallback: normalizedFallback
+        }
+      : {}),
+    ...(normalizedSubagentDefinitions !== undefined
+      ? {
+          subagentDefinitions: normalizedSubagentDefinitions
+        }
+      : {})
+  };
+}
+
+function escapeRegex(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseAmpModelPattern(pattern) {
+  const text = String(pattern || "").trim();
+  if (!text) return null;
+
+  if (text.startsWith("/") && text.lastIndexOf("/") > 0) {
+    const endIndex = text.lastIndexOf("/");
+    const source = text.slice(1, endIndex);
+    const flags = text.slice(endIndex + 1);
+    try {
+      return new RegExp(source, flags);
+    } catch {
+      return null;
+    }
+  }
+
+  if (text.includes("*")) {
+    return new RegExp(`^${escapeRegex(text).replace(/\\\*/g, ".*")}$`);
+  }
+
+  return null;
+}
+
+function canonicalizeAmpModelText(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.startsWith("/") && text.lastIndexOf("/") > 0) return text;
+
+  return text
+    .toLowerCase()
+    .replace(/[–—]+/g, "-")
+    .replace(/[\s_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/\bclaude-(opus|sonnet|haiku)-(\d+)-(\d+)\b/g, "claude-$1-$2.$3")
+    .replace(/\b(opus|sonnet|haiku)-(\d+)-(\d+)\b/g, "$1-$2.$3")
+    .replace(/\bgpt-(\d+)-(\d+)(?=$|[-])\b/g, "gpt-$1.$2")
+    .replace(/\bgemini-(\d+)-(\d+)(?=-)\b/g, "gemini-$1.$2")
+    .replace(/^-+|-+$/g, "");
+}
+
+function isAmpVersionToken(value) {
+  const text = normalizeAmpVersionToken(value);
+  return /^\d+(?:\.\d+)?$/.test(text);
+}
+
+function parseAmpModelDescriptor(value) {
+  const raw = String(value || "").trim();
+  const canonical = canonicalizeAmpModelText(raw);
+  const tokens = canonical
+    .split(/[\/-]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  const descriptor = {
+    raw,
+    canonical,
+    vendor: "",
+    family: "",
+    version: "",
+    variant: "",
+    variantChain: "",
+    modifiers: []
+  };
+
+  if (tokens.length === 0) return descriptor;
+
+  if (tokens[0] === "claude" || ["opus", "sonnet", "haiku"].includes(tokens[0])) {
+    descriptor.vendor = "anthropic";
+    let cursor = tokens[0] === "claude" ? 1 : 0;
+    descriptor.family = tokens[cursor] || "";
+    cursor += 1;
+    if (isAmpVersionToken(tokens[cursor])) {
+      descriptor.version = normalizeAmpVersionToken(tokens[cursor]);
+      cursor += 1;
+    } else if (/^\d+$/.test(tokens[cursor] || "") && /^\d+$/.test(tokens[cursor + 1] || "")) {
+      descriptor.version = `${tokens[cursor]}.${tokens[cursor + 1]}`;
+      cursor += 2;
+    }
+    const rest = tokens.slice(cursor);
+    descriptor.variant = rest[0] || "";
+    descriptor.variantChain = rest.join("-");
+    descriptor.modifiers = rest.slice(1);
+    return descriptor;
+  }
+
+  if (tokens[0] === "gpt") {
+    descriptor.vendor = "openai";
+    descriptor.family = "gpt";
+    let cursor = 1;
+    if (isAmpVersionToken(tokens[cursor])) {
+      descriptor.version = normalizeAmpVersionToken(tokens[cursor]);
+      cursor += 1;
+    }
+    const rest = tokens.slice(cursor);
+    descriptor.variant = rest[0] || "";
+    descriptor.variantChain = rest.join("-");
+    descriptor.modifiers = rest.slice(1);
+    return descriptor;
+  }
+
+  if (tokens[0] === "gemini") {
+    descriptor.vendor = "google";
+    descriptor.family = "gemini";
+    let cursor = 1;
+    if (isAmpVersionToken(tokens[cursor])) {
+      descriptor.version = normalizeAmpVersionToken(tokens[cursor]);
+      cursor += 1;
+    }
+    const rest = tokens.slice(cursor);
+    descriptor.variant = rest[0] || "";
+    descriptor.variantChain = rest.join("-");
+    descriptor.modifiers = rest.slice(1);
+    return descriptor;
+  }
+
+  return descriptor;
+}
+
+function matchAmpModelSelector(selector, value, descriptor = parseAmpModelDescriptor(value)) {
+  if (typeof selector === "string") return matchAmpModelPattern(selector, value);
+  if (!selector || typeof selector !== "object" || Array.isArray(selector)) return false;
+
+  if (selector.vendor && selector.vendor !== descriptor.vendor) return false;
+  if (selector.family && selector.family !== descriptor.family) return false;
+  if (selector.version && selector.version !== descriptor.version) return false;
+  if (selector.versionPrefix && !String(descriptor.version || "").startsWith(selector.versionPrefix)) return false;
+  if (selector.variant && selector.variant !== descriptor.variant) return false;
+  if (selector.variantPrefix && !String(descriptor.variantChain || "").startsWith(selector.variantPrefix)) return false;
+  if (selector.variantAbsent === true && descriptor.variantChain) return false;
+  if (Array.isArray(selector.modifiers) && selector.modifiers.some((modifier) => !descriptor.modifiers.includes(modifier))) return false;
+
+  return true;
+}
+
+function matchAmpModelPattern(pattern, value) {
+  const normalizedValue = String(value || "").trim();
+  const normalizedPattern = String(pattern || "").trim();
+  if (!normalizedPattern || !normalizedValue) return false;
+
+  const valueCandidates = dedupeStrings([
+    normalizedValue,
+    canonicalizeAmpModelText(normalizedValue)
+  ]);
+  const patternCandidates = normalizedPattern.startsWith("/") && normalizedPattern.lastIndexOf("/") > 0
+    ? [normalizedPattern]
+    : dedupeStrings([
+        normalizedPattern,
+        canonicalizeAmpModelText(normalizedPattern)
+      ]);
+
+  for (const candidatePattern of patternCandidates) {
+    if (valueCandidates.includes(candidatePattern)) return true;
+    const regex = parseAmpModelPattern(candidatePattern);
+    if (regex && valueCandidates.some((candidateValue) => regex.test(candidateValue))) return true;
+  }
+
+  return false;
 }
 
 function parseRouteReference(value) {
@@ -243,12 +829,20 @@ function normalizeRateLimitBucketEntry(entry, index = 0, { reservedIds } = {}) {
 
   const unitRaw =
     entry.window?.unit ??
+    entry["window.unit"] ??
     entry.windowUnit ??
     entry["window-unit"];
   const sizeRaw =
     entry.window?.size ??
+    entry.window?.value ??
+    entry["window.size"] ??
+    entry["window.value"] ??
     entry.windowSize ??
     entry["window-size"];
+  const requestsRaw =
+    entry.requests ??
+    entry.limit ??
+    entry["requests-per-window"];
   const models = dedupeStrings(toArray(entry.models ?? entry.model));
   const explicitId = String(entry.id || "").trim();
   const name = sanitizeRateLimitBucketName(entry.name);
@@ -262,7 +856,7 @@ function normalizeRateLimitBucketEntry(entry, index = 0, { reservedIds } = {}) {
     id,
     ...(name ? { name } : {}),
     models,
-    requests: parsePositiveInteger(entry.requests),
+    requests: parsePositiveInteger(requestsRaw),
     window: {
       unit: typeof unitRaw === "string" ? unitRaw.trim().toLowerCase() : "",
       size: parsePositiveInteger(sizeRaw)
@@ -504,6 +1098,56 @@ function normalizeModelAliases(rawModelAliases) {
   };
 }
 
+function buildDefaultModelAlias(defaultModel, aliases = {}) {
+  const existingDefault = aliases?.[DEFAULT_MODEL_ALIAS_ID];
+  if (existingDefault && typeof existingDefault === "object" && !Array.isArray(existingDefault)) {
+    return {
+      ...existingDefault,
+      id: DEFAULT_MODEL_ALIAS_ID,
+      strategy: String(existingDefault.strategy || "ordered").trim().toLowerCase() || "ordered",
+      targets: dedupeAliasTargets(existingDefault.targets || []),
+      fallbackTargets: dedupeAliasTargets(existingDefault.fallbackTargets || [])
+    };
+  }
+
+  const configuredDefault = String(defaultModel || "").trim();
+  if (!configuredDefault || configuredDefault === "smart") {
+    return {
+      id: DEFAULT_MODEL_ALIAS_ID,
+      strategy: "ordered",
+      targets: [],
+      fallbackTargets: []
+    };
+  }
+
+  const parsed = parseRouteReference(configuredDefault);
+  if (parsed.type === "alias" && aliases?.[parsed.aliasId]) {
+    const aliasedDefault = aliases[parsed.aliasId];
+    return {
+      ...aliasedDefault,
+      id: DEFAULT_MODEL_ALIAS_ID,
+      strategy: String(aliasedDefault.strategy || "ordered").trim().toLowerCase() || "ordered",
+      targets: dedupeAliasTargets(aliasedDefault.targets || []),
+      fallbackTargets: dedupeAliasTargets(aliasedDefault.fallbackTargets || [])
+    };
+  }
+
+  return {
+    id: DEFAULT_MODEL_ALIAS_ID,
+    strategy: "ordered",
+    targets: dedupeAliasTargets([{ ref: configuredDefault }]),
+    fallbackTargets: []
+  };
+}
+
+function ensureDefaultModelAlias(defaultModel, aliases = {}) {
+  const nextAliases = {
+    ...(aliases && typeof aliases === "object" && !Array.isArray(aliases) ? aliases : {})
+  };
+  nextAliases[DEFAULT_MODEL_ALIAS_ID] = buildDefaultModelAlias(defaultModel, nextAliases);
+  return nextAliases;
+}
+
 function hasV2ConfigFields(raw, providers, modelAliases) {
   if (Object.keys(modelAliases || {}).length > 0) return true;
   if ((providers || []).some((provider) => Array.isArray(provider.rateLimits) && provider.rateLimits.length > 0)) {
@@ -698,15 +1342,17 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     .filter((provider) => provider.enabled !== false)
   );
   const modelAliasResult = normalizeModelAliases(raw.modelAliases || raw["model-aliases"]);
-  const modelAliases = modelAliasResult.aliases;
+  const rawDefaultModel = typeof raw.defaultModel === "string"
+    ? raw.defaultModel
+    : (typeof raw["default-model"] === "string" ? raw["default-model"] : undefined);
+  const modelAliases = ensureDefaultModelAlias(rawDefaultModel, modelAliasResult.aliases);
 
   const masterKey = typeof raw.masterKey === "string"
     ? raw.masterKey
     : (typeof raw["master-key"] === "string" ? raw["master-key"] : undefined);
 
-  const defaultModel = typeof raw.defaultModel === "string"
-    ? raw.defaultModel
-    : (typeof raw["default-model"] === "string" ? raw["default-model"] : undefined);
+  const defaultModel = rawDefaultModel;
+  const amp = normalizeAmpConfig(raw.amp ?? raw.ampcode ?? raw["amp-code"]);
 
   const normalized = {
     version: inferNormalizedConfigVersion(raw, providers, modelAliases),
@@ -714,7 +1360,8 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     defaultModel,
     providers,
     modelAliases,
-    metadata: raw.metadata && typeof raw.metadata === "object" ? raw.metadata : {}
+    amp,
+    metadata: sanitizeRuntimeMetadata(raw.metadata)
   };
   Object.defineProperty(normalized, NORMALIZATION_ISSUES_SYMBOL, {
     value: {
@@ -725,6 +1372,20 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     configurable: true
   });
   return attachRoutingIndex(normalized, buildRoutingIndex(normalized));
+}
+
+function getDefaultRouteReference(config, routingIndex = getRoutingIndex(config)) {
+  if (routingIndex?.aliasById?.has(DEFAULT_MODEL_ALIAS_ID)) {
+    return DEFAULT_MODEL_ALIAS_ID;
+  }
+  return String(config?.defaultModel || "").trim();
+}
+
+function getSmartRouteReference(config, routingIndex = getRoutingIndex(config)) {
+  if (routingIndex?.aliasById?.has("smart")) {
+    return "smart";
+  }
+  return getDefaultRouteReference(config, routingIndex);
 }
 
 export function parseRuntimeConfigJson(json, options = undefined) {
@@ -869,9 +1530,6 @@ function validateModelAliases(config, routingIndex, errors) {
     if (!ALLOWED_ALIAS_STRATEGIES.has(alias?.strategy || "ordered")) {
       errors.push(`Alias '${aliasId}' has unsupported strategy '${alias?.strategy}'.`);
     }
-    if (!Array.isArray(alias?.targets) || alias.targets.length === 0) {
-      errors.push(`Alias '${aliasId}' must define at least one target.`);
-    }
 
     for (const entry of collectAliasReferenceEntries(alias, aliasId)) {
       const ref = String(entry.target?.ref || "").trim();
@@ -898,6 +1556,51 @@ function validateModelAliases(config, routingIndex, errors) {
   }
 
   detectAliasCycles(config, errors);
+}
+
+function validateAmpRouteReference(ref, routingIndex, errors, context) {
+  const parsed = parseRouteReference(ref);
+  if (parsed.type === "invalid") {
+    errors.push(`${context} has invalid ref '${ref}'.`);
+    return;
+  }
+  if (parsed.type === "direct") {
+    const resolved = routingIndex.modelByRef.get(parsed.ref) || routingIndex.modelByAliasRef.get(parsed.ref);
+    if (!resolved) errors.push(`${context} references unknown model '${parsed.ref}'.`);
+    return;
+  }
+  if (!routingIndex.aliasById.has(parsed.aliasId)) {
+    errors.push(`${context} references unknown alias '${parsed.aliasId}'.`);
+  }
+}
+
+function validateAmpConfig(config, routingIndex, errors) {
+  const amp = config?.amp;
+  if (!amp || typeof amp !== "object") return;
+
+  if (amp.defaultRoute) {
+    validateAmpRouteReference(String(amp.defaultRoute), routingIndex, errors, "AMP defaultRoute");
+  }
+
+  for (const [key, ref] of Object.entries(amp.routes && typeof amp.routes === "object" ? amp.routes : {})) {
+    if (!ref) continue;
+    validateAmpRouteReference(String(ref), routingIndex, errors, `AMP route '${key}'`);
+  }
+
+  for (const mapping of (Array.isArray(amp.rawModelRoutes) ? amp.rawModelRoutes : [])) {
+    if (!mapping?.to) continue;
+    validateAmpRouteReference(String(mapping.to), routingIndex, errors, `AMP rawModelRoute '${mapping.from || "(match)"}'`);
+  }
+
+  for (const entry of (amp?.overrides?.entities || [])) {
+    if (!entry?.route) continue;
+    validateAmpRouteReference(String(entry.route), routingIndex, errors, `AMP override entity '${entry.id || "(unknown)"}'`);
+  }
+
+  for (const entry of (amp?.overrides?.signatures || [])) {
+    if (!entry?.route) continue;
+    validateAmpRouteReference(String(entry.route), routingIndex, errors, `AMP override signature '${entry.id || "(unknown)"}'`);
+  }
 }
 
 export function validateRuntimeConfig(config, { requireMasterKey = false, requireProvider = false } = {}) {
@@ -947,6 +1650,7 @@ export function validateRuntimeConfig(config, { requireMasterKey = false, requir
   const routingIndex = getRoutingIndex(config);
   validateProviderRateLimits(config, routingIndex, errors);
   validateModelAliases(config, routingIndex, errors);
+  validateAmpConfig(config, routingIndex, errors);
 
   if (requireMasterKey && !config.masterKey) {
     errors.push("masterKey is required for worker deployment/export.");
@@ -972,12 +1676,22 @@ export function resolveProviderFormat(provider, sourceFormat = undefined) {
   return FORMATS.OPENAI;
 }
 
-export function resolveProviderUrl(provider, targetFormat) {
+export function resolveProviderUrl(provider, targetFormat, requestKind = undefined) {
   const baseUrl = sanitizeEndpointUrl(provider?.baseUrlByFormat?.[targetFormat] || provider?.baseUrl || "").replace(/\/+$/, "");
   if (!baseUrl) return "";
   const isVersionedApiRoot = /\/v\d+(?:\.\d+)?$/i.test(baseUrl);
 
   if (targetFormat === FORMATS.OPENAI) {
+    if (requestKind === "responses") {
+      if (baseUrl.endsWith("/responses")) return baseUrl;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/responses`;
+      return `${baseUrl}/v1/responses`;
+    }
+    if (requestKind === "completions") {
+      if (baseUrl.endsWith("/completions")) return baseUrl;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/completions`;
+      return `${baseUrl}/v1/completions`;
+    }
     if (baseUrl.endsWith("/chat/completions")) return baseUrl;
     if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/chat/completions`;
     return `${baseUrl}/v1/chat/completions`;
@@ -1099,6 +1813,12 @@ export function sanitizeConfigForDisplay(config) {
   return {
     ...config,
     masterKey: config.masterKey ? maskSecret(config.masterKey) : undefined,
+    amp: config.amp
+      ? {
+          ...config.amp,
+          upstreamApiKey: config.amp.upstreamApiKey ? maskSecret(config.amp.upstreamApiKey) : undefined
+        }
+      : undefined,
     providers: (config.providers || []).map((provider) => ({
       ...provider,
       apiKey: provider.apiKey ? maskSecret(provider.apiKey) : undefined
@@ -1106,11 +1826,34 @@ export function sanitizeConfigForDisplay(config) {
   };
 }
 
+function getConfiguredModelFormats(model) {
+  return dedupeStrings([...(model?.formats || []), model?.format])
+    .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE);
+}
+
+function getProbedModelFormats(provider, model) {
+  const modelId = typeof model?.id === "string" ? model.id.trim() : "";
+  if (!modelId) return [];
+
+  const preferredFormat = provider?.lastProbe?.modelPreferredFormat?.[modelId];
+  if (preferredFormat === FORMATS.OPENAI || preferredFormat === FORMATS.CLAUDE) {
+    return [preferredFormat];
+  }
+
+  return dedupeStrings(provider?.lastProbe?.modelSupport?.[modelId] || [])
+    .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE);
+}
+
+function getRuntimeModelFormats(provider, model) {
+  const probedFormats = getProbedModelFormats(provider, model);
+  if (probedFormats.length > 0) return probedFormats;
+  return getConfiguredModelFormats(model);
+}
+
 function buildTargetCandidate(provider, model, sourceFormat, target = undefined) {
   const providerFormats = dedupeStrings([...(provider?.formats || []), provider?.format])
     .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE);
-  const modelFormats = dedupeStrings([...(model?.formats || []), model?.format])
-    .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE);
+  const modelFormats = getRuntimeModelFormats(provider, model);
   const supportedFormats = modelFormats.length > 0
     ? providerFormats.filter((fmt) => modelFormats.includes(fmt))
     : providerFormats;
@@ -1179,8 +1922,7 @@ function applyAliasTargetOptions(candidate, target, routeTier) {
 function modelSupportsProviderFormat(provider, model) {
   const providerFormats = dedupeStrings([...(provider.formats || []), provider.format])
     .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE);
-  const modelFormats = dedupeStrings([...(model.formats || []), model.format])
-    .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE);
+  const modelFormats = getRuntimeModelFormats(provider, model);
   if (modelFormats.length === 0) return true;
   return providerFormats.some((fmt) => modelFormats.includes(fmt));
 }
@@ -1193,6 +1935,110 @@ function resolveQualifiedModel(config, qualifiedModel, routingIndex = getRouting
   const parsed = parseRouteReference(qualifiedModel);
   if (parsed.type !== "direct") return null;
   return routingIndex.modelByRef.get(parsed.ref) || routingIndex.modelByAliasRef.get(parsed.ref) || null;
+}
+
+function sortAmpCandidates(candidates, providerHint) {
+  if (!providerHint) return candidates;
+  const hint = String(providerHint || "").trim().toLowerCase();
+  return [...candidates].sort((left, right) => {
+    const leftScore = left?.providerId === hint ? 0 : 1;
+    const rightScore = right?.providerId === hint ? 0 : 1;
+    return leftScore - rightScore;
+  });
+}
+
+function attachAmpCandidateMetadata(candidate, details) {
+  if (!candidate) return candidate;
+  return {
+    ...candidate,
+    amp: {
+      requestedModel: details.requestedModel,
+      resolvedInputModel: details.resolvedInputModel,
+      providerHint: details.providerHint || undefined,
+      mappedFrom: details.mappedFrom || undefined,
+      subagents: Array.isArray(details.ampSubagents) && details.ampSubagents.length > 0 ? details.ampSubagents : undefined,
+      entities: Array.isArray(details.ampEntities) && details.ampEntities.length > 0 ? details.ampEntities : undefined,
+      signatures: Array.isArray(details.ampSignatures) && details.ampSignatures.length > 0 ? details.ampSignatures : undefined
+    }
+  };
+}
+
+function decorateAmpResolvedRoute(route, details) {
+  if (!route || !route.primary) return route;
+  return {
+    ...route,
+    routeType: `amp-${details.routeType || route.routeType || "direct"}`,
+    routeMetadata: {
+      ...(route.routeMetadata && typeof route.routeMetadata === "object" ? route.routeMetadata : {}),
+      amp: {
+        requestedModel: details.requestedModel,
+        resolvedInputModel: details.resolvedInputModel,
+        providerHint: details.providerHint || undefined,
+        mappedFrom: details.mappedFrom || undefined,
+        subagents: Array.isArray(details.ampSubagents) && details.ampSubagents.length > 0 ? details.ampSubagents : undefined,
+        entities: Array.isArray(details.ampEntities) && details.ampEntities.length > 0 ? details.ampEntities : undefined,
+        signatures: Array.isArray(details.ampSignatures) && details.ampSignatures.length > 0 ? details.ampSignatures : undefined
+      }
+    },
+    primary: attachAmpCandidateMetadata(route.primary, details),
+    fallbacks: (route.fallbacks || []).map((candidate) => attachAmpCandidateMetadata(candidate, details))
+  };
+}
+
+function resolveBareModelRoutePlan(config, bareModelId, normalizedRequested, sourceFormat, routingIndex, options = {}) {
+  const exactCandidates = [];
+  const aliasCandidates = [];
+  const seen = new Set();
+
+  for (const provider of (config?.providers || [])) {
+    if (!provider || provider.enabled === false) continue;
+
+    for (const model of (provider.models || [])) {
+      if (!model || model.enabled === false) continue;
+      const isExactMatch = model.id === bareModelId;
+      const isAliasMatch = !isExactMatch && (model.aliases || []).includes(bareModelId);
+      if (!isExactMatch && !isAliasMatch) continue;
+      if (!modelSupportsProviderFormat(provider, model)) continue;
+
+      const candidate = buildTargetCandidate(provider, model, sourceFormat);
+      if (seen.has(candidate.requestModelId)) continue;
+      seen.add(candidate.requestModelId);
+
+      if (isExactMatch) {
+        exactCandidates.push(candidate);
+      } else {
+        aliasCandidates.push(candidate);
+      }
+    }
+  }
+
+  const candidates = [
+    ...sortAmpCandidates(exactCandidates, options.providerHint),
+    ...sortAmpCandidates(aliasCandidates, options.providerHint)
+  ];
+  const primary = candidates[0] || null;
+
+  if (!primary) {
+    return {
+      requestedModel: normalizedRequested,
+      resolvedModel: null,
+      routeType: "bare-model",
+      routeRef: bareModelId,
+      primary: null,
+      fallbacks: [],
+      error: `Model '${bareModelId}' is not configured under any enabled provider.`
+    };
+  }
+
+  return {
+    requestedModel: normalizedRequested,
+    resolvedModel: bareModelId,
+    routeType: "bare-model",
+    routeRef: bareModelId,
+    routeStrategy: "ordered",
+    primary,
+    fallbacks: candidates.slice(1)
+  };
 }
 
 function resolveDirectRoutePlan(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex) {
@@ -1427,6 +2273,7 @@ function resolveAliasRoutePlan(config, aliasId, normalizedRequested, sourceForma
 
   const primary = primaryCandidates[0] || null;
   if (!primary) {
+    const hasConfiguredTargets = (alias.targets || []).length > 0 || (alias.fallbackTargets || []).length > 0;
     return {
       requestedModel: normalizedRequested,
       resolvedModel: null,
@@ -1434,7 +2281,9 @@ function resolveAliasRoutePlan(config, aliasId, normalizedRequested, sourceForma
       routeRef: aliasId,
       primary: null,
       fallbacks: [],
-      error: `Alias '${aliasId}' has no resolvable target candidates.`
+      error: hasConfiguredTargets
+        ? `Alias '${aliasId}' has no resolvable target candidates.`
+        : `Alias '${aliasId}' has no target candidates configured.`
     };
   }
 
@@ -1450,28 +2299,7 @@ function resolveAliasRoutePlan(config, aliasId, normalizedRequested, sourceForma
   };
 }
 
-export function resolveRequestedRoute(config, requestedModel, sourceFormat = FORMATS.CLAUDE) {
-  const normalizedRequested = typeof requestedModel === "string" && requestedModel.trim()
-    ? requestedModel.trim()
-    : "smart";
-  const defaultModel = config?.defaultModel || "smart";
-  const effectiveRequested = normalizedRequested === "smart"
-    ? defaultModel
-    : normalizedRequested;
-
-  if (effectiveRequested === "smart") {
-    return {
-      requestedModel: normalizedRequested,
-      resolvedModel: null,
-      routeType: "unknown",
-      routeRef: null,
-      primary: null,
-      fallbacks: [],
-      error: "No default model is configured."
-    };
-  }
-
-  const routingIndex = getRoutingIndex(config);
+function resolveRequestedRouteCore(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex) {
   const parsed = parseRouteReference(effectiveRequested);
   if (parsed.type === "alias") {
     return resolveAliasRoutePlan(config, parsed.aliasId, normalizedRequested, sourceFormat, routingIndex);
@@ -1486,8 +2314,538 @@ export function resolveRequestedRoute(config, requestedModel, sourceFormat = FOR
   );
 }
 
-export function resolveRequestModel(config, requestedModel, sourceFormat = FORMATS.CLAUDE) {
-  return resolveRequestedRoute(config, requestedModel, sourceFormat);
+function resolveAmpMappedModel(config, requestedModel) {
+  const mappings = Array.isArray(config?.amp?.modelMappings)
+    ? config.amp.modelMappings
+    : [];
+
+  for (const mapping of mappings) {
+    if (!mapping || typeof mapping !== "object") continue;
+    if (!matchAmpModelPattern(mapping.from, requestedModel)) continue;
+    const target = String(mapping.to || "").trim();
+    if (target) return target;
+  }
+
+  return "";
+}
+
+export const DEFAULT_AMP_SIGNATURE_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    id: "@anthropic-opus",
+    description: "Anthropic Opus family used by AMP smart-like flows.",
+    match: [{ vendor: "anthropic", family: "opus", variantAbsent: true }],
+    defaultMatch: "claude-opus-{number}"
+  }),
+  Object.freeze({
+    id: "@anthropic-sonnet",
+    description: "Anthropic Sonnet family used by AMP librarian-like flows.",
+    match: [{ vendor: "anthropic", family: "sonnet", variantAbsent: true }],
+    defaultMatch: "claude-sonnet-{number}"
+  }),
+  Object.freeze({
+    id: "@anthropic-haiku-shared",
+    description: "Anthropic Haiku family shared by AMP rush/title-like flows.",
+    match: [{ vendor: "anthropic", family: "haiku", variantAbsent: true }],
+    defaultMatch: "claude-haiku-{number}"
+  }),
+  Object.freeze({
+    id: "@openai-gpt-base",
+    description: "Base GPT family currently observed for AMP Oracle-like flows.",
+    match: [{ vendor: "openai", family: "gpt", variantAbsent: true }],
+    defaultMatch: "gpt-{number}"
+  }),
+  Object.freeze({
+    id: "@openai-gpt-codex",
+    description: "OpenAI GPT Codex family used by AMP deep-like flows.",
+    match: [{ vendor: "openai", family: "gpt", variantPrefix: "codex" }, "gpt-*-codex*"],
+    defaultMatch: "gpt-*-codex*"
+  }),
+  Object.freeze({
+    id: "@google-gemini-pro",
+    description: "Google Gemini Pro family used by AMP review-like flows.",
+    match: [{ vendor: "google", family: "gemini", variant: "pro" }, "gemini-*-pro*"],
+    defaultMatch: "gemini-*-pro*"
+  }),
+  Object.freeze({
+    id: "@google-gemini-pro-image",
+    description: "Google Gemini image family used by AMP painter-like flows.",
+    match: ["gemini-3-pro-image", "gemini-3-pro-image*", "gemini-*-image*"],
+    defaultMatch: "gemini-*-image*"
+  }),
+  Object.freeze({
+    id: "@google-gemini-flash-shared",
+    description: "Google Gemini Flash family shared by AMP search/look-at/handoff-like flows.",
+    match: [{ vendor: "google", family: "gemini", variantPrefix: "flash" }, "gemini-*-flash*"],
+    defaultMatch: "gemini-*-flash*"
+  })
+]);
+
+export const DEFAULT_AMP_ENTITY_DEFINITIONS = Object.freeze([
+  Object.freeze({ id: "smart", type: "mode", description: "Unconstrained state-of-the-art model use", signatures: ["@anthropic-opus"] }),
+  Object.freeze({ id: "rush", type: "mode", description: "Faster and cheaper, for small well-defined tasks", signatures: ["@anthropic-haiku-shared"] }),
+  Object.freeze({ id: "deep", type: "mode", description: "Deep reasoning with extended thinking", signatures: ["@openai-gpt-codex"] }),
+  Object.freeze({ id: "review", type: "feature", description: "Bug identification and code review assistance", signatures: ["@google-gemini-pro"] }),
+  Object.freeze({ id: "search", type: "agent", description: "Fast, accurate codebase retrieval", signatures: ["@google-gemini-flash-shared"] }),
+  Object.freeze({ id: "oracle", type: "agent", description: "Complex reasoning and planning on code", signatures: ["@openai-gpt-base"] }),
+  Object.freeze({ id: "librarian", type: "agent", description: "Large-scale retrieval and research on external code", signatures: ["@anthropic-sonnet"] }),
+  Object.freeze({ id: "look-at", type: "system", description: "Image, PDF, and media file analysis", aliases: ["look at", "lookat"], signatures: ["@google-gemini-flash-shared"] }),
+  Object.freeze({ id: "painter", type: "system", description: "Image generation and editing", signatures: ["@google-gemini-pro-image"] }),
+  Object.freeze({ id: "handoff", type: "system", description: "Fallback context analysis for task continuation", signatures: ["@google-gemini-flash-shared"] }),
+  Object.freeze({ id: "title", type: "system", description: "Fast title generation for threads", aliases: ["titling"], signatures: ["@anthropic-haiku-shared"] })
+]);
+
+export const DEFAULT_AMP_SUBAGENT_DEFINITIONS = Object.freeze([
+  Object.freeze({ id: "oracle", patterns: ["/^gpt-\\d+(?:\\.\\d+)?$/"] }),
+  Object.freeze({ id: "librarian", patterns: ["/^(?:claude-)?sonnet-\\d+(?:\\.\\d+)?$/"] }),
+  Object.freeze({ id: "title", patterns: ["/^(?:claude-)?haiku-\\d+(?:\\.\\d+)?$/"] }),
+  Object.freeze({ id: "painter", patterns: ["gemini-3-pro-image", "gemini-3-pro-image*"] }),
+  Object.freeze({ id: "search", patterns: ["gemini-2.5-flash", "gemini-2.5-flash*", "gemini-3-flash", "gemini-3-flash*"] }),
+  Object.freeze({ id: "look-at", patterns: ["gemini-2.5-flash", "gemini-2.5-flash*", "gemini-3-flash", "gemini-3-flash*"] }),
+  Object.freeze({ id: "handoff", patterns: ["gemini-3-flash", "gemini-3-flash*"] })
+]);
+
+function getAmpSubagentDefinitions(config) {
+  const configuredDefinitions = Array.isArray(config?.amp?.subagentDefinitions)
+    ? config.amp.subagentDefinitions
+    : undefined;
+  if (configuredDefinitions !== undefined) return configuredDefinitions;
+  return DEFAULT_AMP_SUBAGENT_DEFINITIONS;
+}
+
+function ampHasNewRoutingSchema(config) {
+  const amp = config?.amp;
+  return Boolean(
+    amp
+    && (
+      hasOwn(amp, "preset")
+      || hasOwn(amp, "defaultRoute")
+      || hasOwn(amp, "routes")
+      || hasOwn(amp, "rawModelRoutes")
+      || hasOwn(amp, "overrides")
+      || hasOwn(amp, "fallback")
+    )
+  );
+}
+
+function mergeAmpDefinitionEntries(baseEntries, overrideEntries = []) {
+  const merged = new Map();
+  for (const entry of baseEntries || []) {
+    if (!entry?.id) continue;
+    merged.set(entry.id, { ...entry });
+  }
+
+  for (const entry of overrideEntries || []) {
+    if (!entry?.id) continue;
+    if (entry.enabled === false) {
+      merged.delete(entry.id);
+      continue;
+    }
+    const current = merged.get(entry.id) || {};
+    merged.set(entry.id, {
+      ...current,
+      ...entry,
+      ...(current.aliases || entry.aliases
+        ? { aliases: dedupeStrings([...(current.aliases || []), ...(entry.aliases || [])]) }
+        : {}),
+      ...(current.signatures || entry.signatures
+        ? { signatures: dedupeStrings([...(current.signatures || []), ...(entry.signatures || [])]) }
+        : {}),
+      ...(entry.match !== undefined
+        ? { match: entry.match }
+        : (current.match !== undefined ? { match: current.match } : {}))
+    });
+  }
+
+  return [...merged.values()];
+}
+
+function getAmpPresetEntityDefinitions(config) {
+  const preset = normalizeAmpPreset(config?.amp?.preset) || "builtin";
+  if (preset === "none") return [];
+  return DEFAULT_AMP_ENTITY_DEFINITIONS;
+}
+
+function getAmpPresetSignatureDefinitions(config) {
+  const preset = normalizeAmpPreset(config?.amp?.preset) || "builtin";
+  if (preset === "none") return [];
+  return DEFAULT_AMP_SIGNATURE_DEFINITIONS;
+}
+
+function getAmpEntityDefinitions(config) {
+  return mergeAmpDefinitionEntries(
+    getAmpPresetEntityDefinitions(config),
+    config?.amp?.overrides?.entities
+  );
+}
+
+function getAmpSignatureDefinitions(config) {
+  return mergeAmpDefinitionEntries(
+    getAmpPresetSignatureDefinitions(config),
+    config?.amp?.overrides?.signatures
+  );
+}
+
+function findAmpMatchingSignatures(config, requestedModel) {
+  const descriptor = parseAmpModelDescriptor(requestedModel);
+  return getAmpSignatureDefinitions(config)
+    .filter((entry) => Array.isArray(entry?.match) && entry.match.some((selector) => matchAmpModelSelector(selector, requestedModel, descriptor)));
+}
+
+function findAmpMatchingEntities(config, requestedModel, matchingSignatures) {
+  const descriptor = parseAmpModelDescriptor(requestedModel);
+  const matchedSignatureIds = new Set((matchingSignatures || []).map((entry) => entry.id));
+  return getAmpEntityDefinitions(config)
+    .filter((entry) => {
+      const directMatch = Array.isArray(entry?.match) && entry.match.some((selector) => matchAmpModelSelector(selector, requestedModel, descriptor));
+      const signatureMatch = Array.isArray(entry?.signatures) && entry.signatures.some((id) => matchedSignatureIds.has(id));
+      return directMatch || signatureMatch;
+    });
+}
+
+function resolveAmpConfiguredDefinitionTarget(definitions, routes, propertyName = "route") {
+  const activeDefinitions = Array.isArray(definitions) ? definitions : [];
+  if (activeDefinitions.length === 0) return { target: "", ambiguous: false };
+
+  const configuredMatches = activeDefinitions
+    .map((entry) => ({ id: entry.id, target: String(entry?.[propertyName] || routes?.[entry.id] || "").trim() }))
+    .filter((entry) => entry.target);
+
+  if (configuredMatches.length === 0) {
+    return { target: "", ambiguous: false };
+  }
+
+  const uniqueTargets = [...new Set(configuredMatches.map((entry) => entry.target))];
+  if (activeDefinitions.length > 1 && configuredMatches.length !== activeDefinitions.length) {
+    return { target: "", ambiguous: true };
+  }
+  if (uniqueTargets.length !== 1) {
+    return { target: "", ambiguous: true };
+  }
+
+  return {
+    target: uniqueTargets[0],
+    ambiguous: false
+  };
+}
+
+function resolveAmpRawModelMappedTarget(config, requestedModel) {
+  const mappings = Array.isArray(config?.amp?.rawModelRoutes)
+    ? config.amp.rawModelRoutes
+    : [];
+
+  for (const mapping of mappings) {
+    if (!mapping || typeof mapping !== "object") continue;
+    if (!matchAmpModelPattern(mapping.from, requestedModel)) continue;
+    const target = String(mapping.to || "").trim();
+    if (target) return target;
+  }
+
+  return "";
+}
+
+function getAmpFallbackAction(config, { ambiguous = false } = {}) {
+  const fallback = config?.amp?.fallback && typeof config.amp.fallback === "object"
+    ? config.amp.fallback
+    : {};
+  return ambiguous
+    ? (fallback.onAmbiguous || undefined)
+    : (fallback.onUnknown || undefined);
+}
+
+function shouldAllowAmpUpstreamProxy(config, fallbackAction) {
+  const proxyUpstream = config?.amp?.fallback?.proxyUpstream;
+  if (fallbackAction === "none") return false;
+  if (proxyUpstream === false) return false;
+  return true;
+}
+
+function buildAmpUnresolvedRoute(normalizedRequested, error, { allowAmpProxy = true } = {}) {
+  return {
+    requestedModel: normalizedRequested,
+    resolvedModel: null,
+    routeType: "unknown",
+    routeRef: null,
+    primary: null,
+    fallbacks: [],
+    error,
+    allowAmpProxy
+  };
+}
+
+function resolveAmpSubagentMappedModel(config, requestedModel) {
+  const mappings = config?.amp?.subagentMappings && typeof config.amp.subagentMappings === "object"
+    ? config.amp.subagentMappings
+    : {};
+  const matchingProfiles = getAmpSubagentDefinitions(config)
+    .filter((profile) => Array.isArray(profile?.patterns) && profile.patterns.some((pattern) => matchAmpModelPattern(pattern, requestedModel)));
+  if (matchingProfiles.length === 0) return { target: "", subagents: [], ambiguous: false };
+
+  const configuredMatches = matchingProfiles
+    .map((profile) => ({ subagent: profile.id, target: String(mappings[profile.id] || "").trim() }))
+    .filter((entry) => entry.target);
+
+  if (configuredMatches.length === 0) {
+    return { target: "", subagents: matchingProfiles.map((profile) => profile.id), ambiguous: false };
+  }
+
+  const uniqueTargets = [...new Set(configuredMatches.map((entry) => entry.target))];
+  if (matchingProfiles.length > 1 && configuredMatches.length !== matchingProfiles.length) {
+    return { target: "", subagents: matchingProfiles.map((profile) => profile.id), ambiguous: true };
+  }
+  if (uniqueTargets.length !== 1) {
+    return { target: "", subagents: matchingProfiles.map((profile) => profile.id), ambiguous: true };
+  }
+
+  return {
+    target: uniqueTargets[0],
+    subagents: matchingProfiles.map((profile) => profile.id),
+    ambiguous: false
+  };
+}
+
+function resolveAmpRequestedRoute(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex, options = {}) {
+  const providerHint = String(options.providerHint || "").trim().toLowerCase();
+  const forceModelMappings = config?.amp?.forceModelMappings === true;
+
+  const resolveLocalRoute = (targetModel, details = {}) => {
+    const mappedFrom = String(details.mappedFrom || "").trim();
+    const routeTypeOverride = String(details.routeTypeOverride || "").trim();
+    const ampSubagents = Array.isArray(details.ampSubagents) ? details.ampSubagents.filter(Boolean) : [];
+    const ampEntities = Array.isArray(details.ampEntities) ? details.ampEntities.filter(Boolean) : [];
+    const ampSignatures = Array.isArray(details.ampSignatures) ? details.ampSignatures.filter(Boolean) : [];
+    const coreRoute = resolveRequestedRouteCore(config, targetModel, normalizedRequested, sourceFormat, routingIndex);
+    if (coreRoute?.primary) {
+      return decorateAmpResolvedRoute(coreRoute, {
+        requestedModel: normalizedRequested,
+        resolvedInputModel: targetModel,
+        providerHint,
+        mappedFrom,
+        ampSubagents,
+        ampEntities,
+        ampSignatures,
+        routeType: routeTypeOverride || coreRoute.routeType
+      });
+    }
+
+    if (!String(targetModel || "").includes("/")) {
+      const bareRoute = resolveBareModelRoutePlan(config, targetModel, normalizedRequested, sourceFormat, routingIndex, {
+        providerHint
+      });
+      if (bareRoute?.primary) {
+        return decorateAmpResolvedRoute(bareRoute, {
+          requestedModel: normalizedRequested,
+          resolvedInputModel: targetModel,
+          providerHint,
+          mappedFrom,
+          ampSubagents,
+          ampEntities,
+          ampSignatures,
+          routeType: routeTypeOverride || bareRoute.routeType
+        });
+      }
+    }
+
+    return coreRoute;
+  };
+
+  const localRoute = resolveLocalRoute(effectiveRequested);
+
+  if (ampHasNewRoutingSchema(config)) {
+    const matchingSignatures = findAmpMatchingSignatures(config, effectiveRequested);
+    const matchingEntities = findAmpMatchingEntities(config, effectiveRequested, matchingSignatures);
+    const signatureIds = matchingSignatures.map((entry) => entry.id);
+    const entityIds = matchingEntities.map((entry) => entry.id);
+    const routes = config?.amp?.routes && typeof config.amp.routes === "object"
+      ? config.amp.routes
+      : {};
+    const entityTarget = resolveAmpConfiguredDefinitionTarget(matchingEntities, routes);
+    const signatureTarget = resolveAmpConfiguredDefinitionTarget(matchingSignatures, routes);
+    const rawMappedTarget = resolveAmpRawModelMappedTarget(config, effectiveRequested);
+
+    const entityRoute = entityTarget.target
+      ? resolveLocalRoute(entityTarget.target, {
+          mappedFrom: effectiveRequested,
+          ampSubagents: entityIds,
+          ampEntities: entityIds,
+          ampSignatures: signatureIds,
+          routeTypeOverride: "entity"
+        })
+      : null;
+    const signatureRoute = signatureTarget.target
+      ? resolveLocalRoute(signatureTarget.target, {
+          mappedFrom: effectiveRequested,
+          ampSubagents: entityIds,
+          ampEntities: entityIds,
+          ampSignatures: signatureIds,
+          routeTypeOverride: "signature"
+        })
+      : null;
+    const rawMappedRoute = rawMappedTarget && rawMappedTarget !== effectiveRequested
+      ? resolveLocalRoute(rawMappedTarget, {
+          mappedFrom: effectiveRequested,
+          ampSubagents: entityIds,
+          ampEntities: entityIds,
+          ampSignatures: signatureIds,
+          routeTypeOverride: "raw-model-route"
+        })
+      : null;
+
+    const ambiguous = entityTarget.ambiguous || signatureTarget.ambiguous;
+    const fallbackAction = getAmpFallbackAction(config, { ambiguous });
+    const ampDefaultTarget = String(config?.amp?.defaultRoute || "").trim();
+    const globalDefaultTarget = getDefaultRouteReference(config, routingIndex);
+    const selectedDefaultTarget = fallbackAction === "none" || fallbackAction === "upstream"
+      ? ""
+      : (fallbackAction === "default-model"
+        ? globalDefaultTarget
+        : (ampDefaultTarget || globalDefaultTarget));
+    const selectedDefaultRouteType = fallbackAction === "default-model"
+      ? "default-model"
+      : (ampDefaultTarget ? "default-route" : "default-model");
+    const shouldFallbackToDefault = Boolean(
+      selectedDefaultTarget
+      && selectedDefaultTarget !== effectiveRequested
+      && selectedDefaultTarget !== entityTarget.target
+      && selectedDefaultTarget !== signatureTarget.target
+      && selectedDefaultTarget !== rawMappedTarget
+      && !entityRoute?.primary
+      && !signatureRoute?.primary
+      && !rawMappedRoute?.primary
+      && !localRoute?.primary
+    );
+    const defaultRoute = shouldFallbackToDefault
+      ? resolveLocalRoute(selectedDefaultTarget, {
+          mappedFrom: effectiveRequested,
+          ampSubagents: entityIds,
+          ampEntities: entityIds,
+          ampSignatures: signatureIds,
+          routeTypeOverride: selectedDefaultRouteType
+        })
+      : null;
+
+    if (entityRoute?.primary) return entityRoute;
+    if (signatureRoute?.primary) return signatureRoute;
+
+    if (forceModelMappings) {
+      if (rawMappedRoute?.primary) return rawMappedRoute;
+      if (localRoute?.primary) return localRoute;
+    } else {
+      if (localRoute?.primary) return localRoute;
+      if (rawMappedRoute?.primary) return rawMappedRoute;
+    }
+
+    if (defaultRoute?.primary) return defaultRoute;
+
+    const allowAmpProxy = shouldAllowAmpUpstreamProxy(config, fallbackAction);
+    const matchedLabel = ambiguous
+      ? `Matched AMP entities/signatures ambiguously (${entityIds.join(", ") || "none"}; ${signatureIds.join(", ") || "none"}).`
+      : `No AMP route matched '${effectiveRequested}'.`;
+
+    const unresolvedCandidate = defaultRoute || rawMappedRoute || signatureRoute || entityRoute || localRoute;
+    if (unresolvedCandidate) {
+      return {
+        ...unresolvedCandidate,
+        error: unresolvedCandidate.error || matchedLabel,
+        allowAmpProxy
+      };
+    }
+
+    return buildAmpUnresolvedRoute(normalizedRequested, matchedLabel, { allowAmpProxy });
+  }
+
+  const defaultAmpTarget = getDefaultRouteReference(config, routingIndex);
+  const subagentMapped = resolveAmpSubagentMappedModel(config, effectiveRequested);
+  const subagentRoute = subagentMapped.target
+    ? resolveLocalRoute(subagentMapped.target, {
+        mappedFrom: effectiveRequested,
+        ampSubagents: subagentMapped.subagents,
+        routeTypeOverride: "subagent"
+      })
+    : null;
+  const mappedModel = resolveAmpMappedModel(config, effectiveRequested);
+  const mappedRoute = mappedModel && mappedModel !== effectiveRequested
+    ? resolveLocalRoute(mappedModel, { mappedFrom: effectiveRequested, routeTypeOverride: "mapped" })
+    : null;
+  const shouldFallbackToDefault = Boolean(
+    defaultAmpTarget
+    && defaultAmpTarget !== effectiveRequested
+    && defaultAmpTarget !== mappedModel
+    && defaultAmpTarget !== subagentMapped.target
+    && !localRoute?.primary
+    && !subagentRoute?.primary
+    && !mappedRoute?.primary
+  );
+  const defaultRoute = shouldFallbackToDefault
+    ? resolveLocalRoute(defaultAmpTarget, { mappedFrom: effectiveRequested, routeTypeOverride: "default-model" })
+    : null;
+
+  if (forceModelMappings) {
+    if (subagentRoute?.primary) return subagentRoute;
+    if (mappedRoute?.primary) return mappedRoute;
+    if (localRoute?.primary) return localRoute;
+    return defaultRoute || localRoute;
+  }
+
+  if (subagentRoute?.primary) return subagentRoute;
+  if (localRoute?.primary) return localRoute;
+  if (mappedRoute?.primary) return mappedRoute;
+  return defaultRoute || mappedRoute || subagentRoute || localRoute;
+}
+
+export function resolveRequestedRoute(config, requestedModel, sourceFormat = FORMATS.CLAUDE, options = {}) {
+  const routingIndex = getRoutingIndex(config);
+  const normalizedRequested = typeof requestedModel === "string" && requestedModel.trim()
+    ? requestedModel.trim()
+    : "smart";
+  const smartRouteReference = normalizedRequested === "smart"
+    ? getSmartRouteReference(config, routingIndex)
+    : "";
+  const effectiveRequested = normalizedRequested === "smart"
+    ? (smartRouteReference || "smart")
+    : normalizedRequested;
+
+  if (normalizedRequested === "smart" && !smartRouteReference) {
+    return {
+      requestedModel: normalizedRequested,
+      resolvedModel: null,
+      routeType: "unknown",
+      routeRef: null,
+      primary: null,
+      fallbacks: [],
+      error: "No default model is configured."
+    };
+  }
+
+  if (options?.clientType === "amp") {
+    const resolvedAmpRoute = resolveAmpRequestedRoute(
+      config,
+      effectiveRequested,
+      normalizedRequested,
+      sourceFormat,
+      routingIndex,
+      options
+    );
+    if (!resolvedAmpRoute?.primary && effectiveRequested === DEFAULT_MODEL_ALIAS_ID) {
+      return {
+        ...resolvedAmpRoute,
+        statusCode: 500
+      };
+    }
+    return resolvedAmpRoute;
+  }
+
+  const resolvedRoute = resolveRequestedRouteCore(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex);
+  if (!resolvedRoute?.primary && effectiveRequested === DEFAULT_MODEL_ALIAS_ID) {
+    return {
+      ...resolvedRoute,
+      statusCode: 500
+    };
+  }
+  return resolvedRoute;
+}
+
+export function resolveRequestModel(config, requestedModel, sourceFormat = FORMATS.CLAUDE, options = {}) {
+  return resolveRequestedRoute(config, requestedModel, sourceFormat, options);
 }
 
 export function listConfiguredModels(config, { endpointFormat } = {}) {
@@ -1499,6 +2857,7 @@ export function listConfiguredModels(config, { endpointFormat } = {}) {
 
     for (const model of (provider.models || [])) {
       if (model.enabled === false) continue;
+      const modelFormats = getRuntimeModelFormats(provider, model);
 
       rows.push({
         id: `${provider.id}/${model.id}`,
@@ -1507,13 +2866,13 @@ export function listConfiguredModels(config, { endpointFormat } = {}) {
         owned_by: provider.id,
         provider_id: provider.id,
         provider_name: provider.name,
-        formats: (model.formats && model.formats.length > 0) ? model.formats : (provider.formats || []),
+        formats: modelFormats.length > 0 ? modelFormats : (provider.formats || []),
         endpoint_format_supported: endpointFormat
-          ? ((model.formats && model.formats.length > 0) ? model.formats.includes(endpointFormat) : (provider.formats || []).includes(endpointFormat))
+          ? (modelFormats.length > 0 ? modelFormats.includes(endpointFormat) : (provider.formats || []).includes(endpointFormat))
           : undefined,
         context_window: model.contextWindow,
         cost: model.cost,
-        model_formats: model.formats || [],
+        model_formats: modelFormats,
         fallback_models: model.fallbackModels || []
       });
     }

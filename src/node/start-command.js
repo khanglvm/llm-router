@@ -1,8 +1,14 @@
 import path from "node:path";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { configFileExists, getDefaultConfigPath, readConfigFile } from "./config-store.js";
-import { buildStartArgsFromState, clearRuntimeState, getActiveRuntimeState, writeRuntimeState } from "./instance-state.js";
+import { configFileExists, getDefaultConfigPath, readConfigFile, readConfigFileState, writeConfigFile } from "./config-store.js";
+import { buildStartArgsFromState, clearRuntimeState, getActiveRuntimeState, stopProcessByPid, waitForRuntimeMatch, writeRuntimeState } from "./instance-state.js";
+import {
+  FIXED_LOCAL_ROUTER_HOST,
+  applyLocalServerSettings,
+  areLocalServerSettingsEqual,
+  readLocalServerSettings
+} from "./local-server-settings.js";
 import { resolveListenPort } from "./listen-port.js";
 import { startLocalRouteServer } from "./local-server.js";
 import { reclaimPort, stopStartupManagedListener } from "./port-reclaim.js";
@@ -15,6 +21,14 @@ function summarizeConfig(config, configPath) {
   lines.push(`Config: ${configPath}`);
   lines.push(`Default model: ${target.defaultModel || "(not set)"}`);
   lines.push(`Master key: ${target.masterKey || "(not set)"}`);
+  lines.push(`AMP upstream URL: ${target.amp?.upstreamUrl || "(disabled)"}`);
+  lines.push(`AMP upstream API key: ${target.amp?.upstreamApiKey || "(not set)"}`);
+  lines.push(`AMP restrict management to localhost: ${target.amp?.restrictManagementToLocalhost === true ? "yes" : "no"}`);
+  lines.push(`AMP force model mappings: ${target.amp?.forceModelMappings === true ? "yes" : "no"}`);
+  lines.push(`AMP model mappings: ${(target.amp?.modelMappings || []).map((mapping) => `${mapping.from}->${mapping.to}`).join(", ") || "(none)"}`);
+  const ampDefinitions = Array.isArray(target.amp?.subagentDefinitions) ? target.amp.subagentDefinitions : null;
+  lines.push(`AMP subagent definitions: ${ampDefinitions ? ampDefinitions.map((entry) => `${entry.id}=>${(entry.patterns || []).join("|")}`).join(", ") || "(none)" : "(default built-ins)"}`);
+  lines.push(`AMP subagent mappings: ${Object.entries(target.amp?.subagentMappings || {}).map(([agent, route]) => `${agent}->${route}`).join(", ") || "(none)"}`);
 
   if (!target.providers || target.providers.length === 0) {
     lines.push("Providers: (none)");
@@ -57,6 +71,30 @@ function toNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function formatStartupConfigMigrationMessage(configState, configPath) {
+  if (!configState?.changed) return "";
+
+  const beforeVersion = Number(configState.beforeVersion);
+  const afterVersion = Number(configState.afterVersion);
+  const versionChanged = Number.isInteger(beforeVersion) && Number.isInteger(afterVersion) && beforeVersion !== afterVersion;
+  const baseMessage = versionChanged
+    ? `Config auto-migrated from v${beforeVersion} to v${afterVersion}`
+    : "Config auto-normalized for startup compatibility";
+
+  if (configState.persisted) {
+    return `${baseMessage} and saved to ${configPath}.`;
+  }
+
+  if (configState.persistError) {
+    const detail = configState.persistError instanceof Error
+      ? configState.persistError.message
+      : String(configState.persistError);
+    return `${baseMessage} for this run, but could not be saved to ${configPath}: ${detail}`;
+  }
+
+  return "";
+}
+
 function safeRealpath(filePath) {
   if (!filePath) return "";
   try {
@@ -96,16 +134,18 @@ function snapshotCliVersionState(cliPath) {
   return { cliPath, realpath, packageJsonPath, version };
 }
 
-function buildStartArgs({ configPath, host, port, watchConfig, watchBinary, requireAuth }) {
-  return [
+function buildStartArgs({ configPath, watchConfig, watchBinary, requireAuth, useConfigDefaults = false }) {
+  const args = [
     "start",
-    `--config=${configPath}`,
-    `--host=${host}`,
-    `--port=${port}`,
+    `--config=${configPath}`
+  ];
+  if (useConfigDefaults) return args;
+  args.push(
     `--watch-config=${watchConfig ? "true" : "false"}`,
     `--watch-binary=${watchBinary ? "true" : "false"}`,
     `--require-auth=${requireAuth ? "true" : "false"}`
-  ];
+  );
+  return args;
 }
 
 function spawnReplacementCli({ cliPath, startArgs }) {
@@ -157,10 +197,17 @@ function normalizeStartupConflictChoice(value) {
   return "";
 }
 
-async function detectStartupManagedConflictOnPort(port) {
+async function detectStartupManagedConflictOnPort(port, deps = {}) {
+  const getActiveRuntimeStateFn = typeof deps.getActiveRuntimeState === "function"
+    ? deps.getActiveRuntimeState
+    : getActiveRuntimeState;
+  const startupStatusFn = typeof deps.startupStatus === "function"
+    ? deps.startupStatus
+    : startupStatus;
+
   let runtime = null;
   try {
-    runtime = await getActiveRuntimeState();
+    runtime = await getActiveRuntimeStateFn();
   } catch {
     runtime = null;
   }
@@ -175,7 +222,7 @@ async function detectStartupManagedConflictOnPort(port) {
 
   let status = null;
   try {
-    status = await startupStatus();
+    status = await startupStatusFn();
   } catch {
     status = null;
   }
@@ -197,27 +244,89 @@ async function detectStartupManagedConflictOnPort(port) {
   };
 }
 
-async function restartStartupManagedWithLatest({
+async function handoffToStartupManagedWithLatest({
   runtimeState,
   fallbackStartArgs,
+  cliPath,
+  line,
   error
-}) {
+}, deps = {}) {
+  const getActiveRuntimeStateFn = typeof deps.getActiveRuntimeState === "function"
+    ? deps.getActiveRuntimeState
+    : getActiveRuntimeState;
+  const stopProcessByPidFn = typeof deps.stopProcessByPid === "function"
+    ? deps.stopProcessByPid
+    : stopProcessByPid;
+  const clearRuntimeStateFn = typeof deps.clearRuntimeState === "function"
+    ? deps.clearRuntimeState
+    : clearRuntimeState;
+  const reclaimPortFn = typeof deps.reclaimPort === "function"
+    ? deps.reclaimPort
+    : (args) => reclaimPort(args, deps);
+  const installStartupFn = typeof deps.installStartup === "function"
+    ? deps.installStartup
+    : installStartup;
+  const waitForRuntimeMatchFn = typeof deps.waitForRuntimeMatch === "function"
+    ? deps.waitForRuntimeMatch
+    : (options, waitOptions = {}) => waitForRuntimeMatch(options, waitOptions);
+
   const startArgs = runtimeState?.managedByStartup
     ? buildStartArgsFromState(runtimeState)
     : fallbackStartArgs;
+
+  let activeRuntime = null;
   try {
-    const restarted = await installStartup({
+    activeRuntime = await getActiveRuntimeStateFn();
+  } catch {
+    activeRuntime = null;
+  }
+
+  if (activeRuntime && Number(activeRuntime.pid) !== Number(process.pid) && !activeRuntime.managedByStartup) {
+    const stopped = await stopProcessByPidFn(activeRuntime.pid);
+    if (!stopped?.ok) {
+      return {
+        ok: false,
+        errorMessage: stopped?.reason || `Failed to stop existing llm-router pid ${activeRuntime.pid}.`
+      };
+    }
+    await clearRuntimeStateFn({ pid: activeRuntime.pid });
+    line(`Stopped manual llm-router on http://${activeRuntime.host}:${activeRuntime.port} so the startup service can own the router.`);
+  }
+
+  const reclaimed = await reclaimPortFn({ port: startArgs.port, line, error });
+  if (!reclaimed.ok) {
+    return {
+      ok: false,
+      errorMessage: reclaimed.errorMessage
+    };
+  }
+
+  try {
+    await clearRuntimeStateFn();
+    const detail = await installStartupFn({
       configPath: startArgs.configPath,
       host: startArgs.host,
       port: startArgs.port,
       watchConfig: startArgs.watchConfig,
       watchBinary: startArgs.watchBinary,
-      requireAuth: startArgs.requireAuth
+      requireAuth: startArgs.requireAuth,
+      cliPath
     });
-    await clearRuntimeState();
+    const runtime = await waitForRuntimeMatchFn(startArgs, {
+      getActiveRuntimeState: getActiveRuntimeStateFn,
+      requireManagedByStartup: true
+    });
+    if (!runtime) {
+      return {
+        ok: false,
+        errorMessage: `Startup-managed llm-router did not become ready on http://${startArgs.host}:${startArgs.port}.`
+      };
+    }
     return {
       ok: true,
-      detail: restarted
+      detail,
+      runtime,
+      startArgs
     };
   } catch (startupRestartError) {
     const message = startupRestartError instanceof Error ? startupRestartError.message : String(startupRestartError);
@@ -229,14 +338,15 @@ async function restartStartupManagedWithLatest({
   }
 }
 
-async function attemptServerStartAfterStartupStop(buildLocalServerOptions, {
+async function attemptServerStartAfterStartupStop(buildLocalServerOptions, deps = {}, {
   attempts = 24,
   delayMs = 250
 } = {}) {
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const server = await startLocalRouteServer(buildLocalServerOptions());
+      const startLocalRouteServerFn = typeof deps.startLocalRouteServer === "function" ? deps.startLocalRouteServer : startLocalRouteServer;
+      const server = await startLocalRouteServerFn(buildLocalServerOptions());
       return { ok: true, server };
     } catch (error) {
       lastError = error;
@@ -253,20 +363,30 @@ async function attemptServerStartAfterStartupStop(buildLocalServerOptions, {
 
 export async function runStartCommand(options = {}) {
   const configPath = options.configPath || getDefaultConfigPath();
-  const host = options.host || "127.0.0.1";
-  const port = resolveListenPort({ explicitPort: options.port });
-  const watchConfig = toBoolean(options.watchConfig, true);
-  const watchBinary = toBoolean(options.watchBinary, true);
+  const requestedWatchConfig = options.watchConfig;
+  const requestedWatchBinary = options.watchBinary;
   const binaryWatchIntervalMs = Math.max(
     1000,
     toNumber(options.binaryWatchIntervalMs ?? process.env.LLM_ROUTER_BINARY_WATCH_INTERVAL_MS, 15000)
   );
-  const requireAuth = toBoolean(options.requireAuth, false);
+  const requestedRequireAuth = options.requireAuth;
   const onStartupConflict = typeof options.onStartupConflict === "function" ? options.onStartupConflict : null;
   const managedByStartup = options.managedByStartup === true || process.env.LLM_ROUTER_MANAGED_BY_STARTUP === "1";
   const cliPathForWatch = String(options.cliPathForWatch || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "");
   const line = typeof options.onLine === "function" ? options.onLine : console.log;
   const error = typeof options.onError === "function" ? options.onError : console.error;
+  const startLocalRouteServerFn = typeof options.startLocalRouteServer === "function" ? options.startLocalRouteServer : startLocalRouteServer;
+  const getActiveRuntimeStateFn = typeof options.getActiveRuntimeState === "function" ? options.getActiveRuntimeState : getActiveRuntimeState;
+  const stopProcessByPidFn = typeof options.stopProcessByPid === "function" ? options.stopProcessByPid : stopProcessByPid;
+  const clearRuntimeStateFn = typeof options.clearRuntimeState === "function" ? options.clearRuntimeState : clearRuntimeState;
+  const installStartupFn = typeof options.installStartup === "function" ? options.installStartup : installStartup;
+  const startupStatusFn = typeof options.startupStatus === "function" ? options.startupStatus : startupStatus;
+  const reclaimPortFn = typeof options.reclaimPort === "function"
+    ? options.reclaimPort
+    : (args) => reclaimPort(args, options);
+  const waitForRuntimeMatchFn = typeof options.waitForRuntimeMatch === "function"
+    ? options.waitForRuntimeMatch
+    : (startOptions, waitOptions = {}) => waitForRuntimeMatch(startOptions, waitOptions);
 
   if (!(await configFileExists(configPath))) {
     return {
@@ -279,7 +399,40 @@ export async function runStartCommand(options = {}) {
     };
   }
 
-  const config = await readConfigFile(configPath);
+  let configState;
+  try {
+    configState = await readConfigFileState(configPath);
+  } catch (readConfigError) {
+    return {
+      ok: false,
+      exitCode: 2,
+      errorMessage: `Failed to load config from ${configPath}: ${readConfigError instanceof Error ? readConfigError.message : String(readConfigError)}`
+    };
+  }
+
+  const configMigrationMessage = formatStartupConfigMigrationMessage(configState, configPath);
+  if (configMigrationMessage) {
+    if (configState.persistError) {
+      error(configMigrationMessage);
+    } else {
+      line(configMigrationMessage);
+    }
+  }
+
+  let config = configState.config;
+  const persistedLocalServer = readLocalServerSettings(config);
+  const host = FIXED_LOCAL_ROUTER_HOST;
+  const port = resolveListenPort({ explicitPort: persistedLocalServer.port });
+  const watchConfig = requestedWatchConfig === undefined ? persistedLocalServer.watchConfig : toBoolean(requestedWatchConfig, persistedLocalServer.watchConfig);
+  const watchBinary = requestedWatchBinary === undefined ? persistedLocalServer.watchBinary : toBoolean(requestedWatchBinary, persistedLocalServer.watchBinary);
+  const requireAuth = requestedRequireAuth === undefined ? persistedLocalServer.requireAuth : toBoolean(requestedRequireAuth, persistedLocalServer.requireAuth);
+  const resolvedLocalServer = { host, port, watchConfig, watchBinary, requireAuth };
+
+  if (!areLocalServerSettingsEqual(persistedLocalServer, resolvedLocalServer)) {
+    config = await readConfigFile(configPath, { persistMigrated: false });
+    config = applyLocalServerSettings(config, resolvedLocalServer);
+    config = await writeConfigFile(config, configPath);
+  }
   if (!configHasProvider(config)) {
     return {
       ok: false,
@@ -302,6 +455,54 @@ export async function runStartCommand(options = {}) {
     };
   }
 
+  const requestedStartArgs = {
+    configPath,
+    host,
+    port,
+    watchConfig,
+    watchBinary,
+    requireAuth
+  };
+
+  const startup = await startupStatusFn().catch(() => null);
+  if (!managedByStartup && startup?.installed) {
+    const handoff = await handoffToStartupManagedWithLatest({
+      runtimeState: null,
+      fallbackStartArgs: requestedStartArgs,
+      cliPath: cliPathForWatch,
+      line,
+      error
+    }, {
+      getActiveRuntimeState: getActiveRuntimeStateFn,
+      stopProcessByPid: stopProcessByPidFn,
+      clearRuntimeState: clearRuntimeStateFn,
+      reclaimPort: reclaimPortFn,
+      installStartup: installStartupFn,
+      waitForRuntimeMatch: waitForRuntimeMatchFn,
+      startupStatus: startupStatusFn,
+      onLine: line,
+      onError: error
+    });
+    if (!handoff.ok) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: handoff.errorMessage
+      };
+    }
+    return {
+      ok: true,
+      exitCode: 0,
+      data: [
+        `Startup-managed llm-router is active on http://${handoff.runtime.host}:${handoff.runtime.port}.`,
+        `manager=${handoff.detail?.manager || startup.manager || "unknown"}`,
+        `service=${handoff.detail?.serviceId || startup.serviceId || "unknown"}`
+      ].join("\n")
+    };
+  }
+
+  let restartRequestedByConfig = false;
+
   const buildLocalServerOptions = () => ({
     port,
     host,
@@ -319,6 +520,33 @@ export async function runStartCommand(options = {}) {
     },
     onConfigReload: (nextConfig, reason) => {
       if (reason === "startup") return;
+      const nextLocalServer = readLocalServerSettings(nextConfig, resolvedLocalServer);
+      if (!areLocalServerSettingsEqual(nextLocalServer, resolvedLocalServer)) {
+        if (restartRequestedByConfig) return;
+        restartRequestedByConfig = true;
+        line(`Local server settings changed in config (${reason}). Restarting to apply local router settings...`);
+        void (async () => {
+          if (managedByStartup) {
+            await shutdown();
+            process.exit(0);
+            return;
+          }
+
+          await shutdown();
+          const launch = await spawnReplacementCli({
+            cliPath: cliPathForWatch || process.argv[1],
+            startArgs: buildStartArgs({ configPath, ...nextLocalServer })
+          });
+          if (!launch.ok) {
+            error(`Failed to relaunch llm-router after config runtime change: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
+            process.exit(1);
+            return;
+          }
+          process.exit(0);
+        })();
+        return;
+      }
+
       line(`Config hot-reloaded in memory (${reason}).`);
       if (!configHasProvider(nextConfig)) {
         error("Reloaded config has no enabled providers.");
@@ -329,9 +557,18 @@ export async function runStartCommand(options = {}) {
     }
   });
 
+  const activeRuntime = await getActiveRuntimeStateFn().catch(() => null);
+  if (activeRuntime && Number(activeRuntime.pid) !== Number(process.pid)) {
+    return {
+      ok: false,
+      exitCode: 1,
+      errorMessage: `Another llm-router instance is already running at http://${activeRuntime.host}:${activeRuntime.port}. Stop it before starting a new one.`
+    };
+  }
+
   let server;
   try {
-    server = await startLocalRouteServer(buildLocalServerOptions());
+    server = await startLocalRouteServerFn(buildLocalServerOptions());
   } catch (startError) {
     if (startError?.code !== "EADDRINUSE") {
       return {
@@ -342,7 +579,7 @@ export async function runStartCommand(options = {}) {
     }
 
     if (!managedByStartup && onStartupConflict) {
-      const conflict = await detectStartupManagedConflictOnPort(port);
+      const conflict = await detectStartupManagedConflictOnPort(port, { getActiveRuntimeState: getActiveRuntimeStateFn, startupStatus: startupStatusFn });
       if (conflict.running) {
         let choice = "";
         try {
@@ -357,17 +594,22 @@ export async function runStartCommand(options = {}) {
         }
 
         if (choice === "restart-startup") {
-          const restarted = await restartStartupManagedWithLatest({
+          const restarted = await handoffToStartupManagedWithLatest({
             runtimeState: conflict.runtime,
-            fallbackStartArgs: {
-              configPath,
-              host,
-              port,
-              watchConfig,
-              watchBinary,
-              requireAuth
-            },
+            fallbackStartArgs: requestedStartArgs,
+            cliPath: cliPathForWatch,
+            line,
             error
+          }, {
+            getActiveRuntimeState: getActiveRuntimeStateFn,
+            stopProcessByPid: stopProcessByPidFn,
+            clearRuntimeState: clearRuntimeStateFn,
+            reclaimPort: reclaimPortFn,
+            installStartup: installStartupFn,
+            waitForRuntimeMatch: waitForRuntimeMatchFn,
+            startupStatus: startupStatusFn,
+            onLine: line,
+            onError: error
           });
           if (!restarted.ok) {
             return {
@@ -406,7 +648,7 @@ export async function runStartCommand(options = {}) {
           }
 
           line("Startup-managed instance stopped. Starting llm-router in this terminal...");
-          const takeoverStart = await attemptServerStartAfterStartupStop(buildLocalServerOptions);
+          const takeoverStart = await attemptServerStartAfterStartupStop(buildLocalServerOptions, { startLocalRouteServer: startLocalRouteServerFn });
           if (takeoverStart.ok) {
             server = takeoverStart.server;
             line(`Port ${port} reclaimed successfully.`);
@@ -424,7 +666,7 @@ export async function runStartCommand(options = {}) {
     if (server) {
       // Startup conflict handling already resolved the bind conflict.
     } else {
-      const reclaimed = await reclaimPort({ port, line, error });
+      const reclaimed = await reclaimPortFn({ port, line, error });
       if (!reclaimed.ok) {
         return {
           ok: false,
@@ -434,7 +676,7 @@ export async function runStartCommand(options = {}) {
       }
 
       try {
-        server = await startLocalRouteServer(buildLocalServerOptions());
+        server = await startLocalRouteServerFn(buildLocalServerOptions());
         line(`Port ${port} reclaimed successfully.`);
       } catch (retryError) {
         return {
@@ -502,7 +744,7 @@ export async function runStartCommand(options = {}) {
         // ignore
       }
       await closeServer();
-      await clearRuntimeState({ pid: process.pid });
+      await clearRuntimeStateFn({ pid: process.pid });
       resolveDone();
     };
 

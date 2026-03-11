@@ -51,3 +51,76 @@ test("transformRequestForCodex keeps existing responses-style input untouched", 
   assert.equal(Array.isArray(transformed.input), true);
   assert.equal(transformed.input?.[0]?.content?.[0]?.text, "ping");
 });
+
+test("transformRequestForCodex promotes leading system messages into instructions", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [
+      { role: "system", content: "You are Claude Code." },
+      { role: "developer", content: "Be decisive with repo maintenance tasks." },
+      { role: "user", content: "Fix the merge conflict." }
+    ]
+  });
+
+  assert.equal(
+    transformed.instructions,
+    "You are Claude Code.\n\nBe decisive with repo maintenance tasks."
+  );
+  assert.equal(transformed.input?.length, 1);
+  assert.equal(transformed.input?.[0]?.role, "user");
+  assert.equal(transformed.input?.[0]?.content?.[0]?.text, "Fix the merge conflict.");
+});
+
+test("transformRequestForCodex preserves tool call history after lifting system instructions", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [
+      { role: "system", content: "You are Claude Code." },
+      { role: "user", content: "Fix the merge conflict." },
+      {
+        role: "assistant",
+        content: "I'll check git status first.",
+        tool_calls: [
+          {
+            id: "toolu_1",
+            type: "function",
+            function: {
+              name: "Bash",
+              arguments: "{\"command\":\"git status\"}"
+            }
+          }
+        ]
+      },
+      {
+        role: "tool",
+        tool_call_id: "toolu_1",
+        content: "interactive rebase in progress"
+      }
+    ]
+  });
+
+  assert.equal(transformed.instructions, "You are Claude Code.");
+  assert.deepEqual(transformed.input, [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Fix the merge conflict." }]
+    },
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "input_text", text: "I'll check git status first." }]
+    },
+    {
+      type: "function_call",
+      call_id: "toolu_1",
+      name: "Bash",
+      arguments: "{\"command\":\"git status\"}"
+    },
+    {
+      type: "function_call_output",
+      call_id: "toolu_1",
+      output: "interactive rebase in progress"
+    }
+  ]);
+});

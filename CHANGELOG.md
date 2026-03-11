@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.0.0-beta.0] - 2026-03-11
+
+### Beta
+- Published this release as `2.0.0-beta.0` because it introduces large routing and operator-surface changes. Expect regressions while it is validated before the stable `2.0.0` release.
+
+### Added
+- Added AMP CLI / AMP Code compatibility routes:
+  - `/api/provider/openai/v1/chat/completions`
+  - `/api/provider/openai/v1/completions`
+  - `/api/provider/openai/v1/responses`
+  - `/api/provider/anthropic/v1/messages`
+- Added a local-only real-provider test suite for CLI, TUI, and web-console flows:
+  - isolated temp HOME/config/runtime-state handling so live tests do not mutate the developer's normal `~/.llm-router*` files
+  - real provider discovery/probe coverage through the web-console APIs
+  - browser-bundle render coverage for the web console via jsdom
+  - `npm run test:provider-live` (with `test:provider-smoke` kept as an alias)
+- Added AMP-aware runtime config block with local bare-model matching and explicit model rewrites:
+  - `amp.upstreamUrl`
+  - `amp.upstreamApiKey`
+  - `amp.restrictManagementToLocalhost`
+  - `amp.forceModelMappings`
+  - `amp.modelMappings`
+- Added AMP upstream proxy handling for management/auth routes and unresolved AMP provider requests.
+- Added AMP Gemini/Google compatibility bridging for local `models`, `generateContent`, and `streamGenerateContent` routes.
+- Added `llm-router config --operation=set-amp-config` AMP wizard for upstream/proxy settings, mode/model mappings, editable subagent definitions/mappings, and AMP client file patching.
+- Added AMP subagent mapping support with local default-model fallback for unmapped specialized/system agents.
+- Added editable `amp.subagentDefinitions` support so AMP agent ids/model-pattern bindings can be renamed, added, removed, cleared, or reset to built-in defaults without breaking local fallback routing.
+- Added focused runtime tests covering AMP route parsing, local resolution, upstream fallback, Gemini translation, and `/openai/v1/responses` provider dispatch.
+- Added reusable `npm run test:amp-smoke` local AMP E2E smoke suite that clones local config, starts a local handler server, runs headless AMP modes, and records router/CLI logs.
+
+### Changed
+- Extended provider URL resolution so OpenAI-compatible providers can receive `/v1/completions` and `/v1/responses` requests instead of always forcing `/v1/chat/completions`.
+- Updated README with AMP wizard flow, AMP client patching behavior/file locations, upstream key guidance via `https://ampcode.com/settings`, editable subagent definition flow, reset behavior, and local Gemini bridge behavior.
+
+### Fixed
+- Fixed Codex CLI global-route patching to generate `model_catalog_json` metadata for direct managed route refs like `provider/model`, and to keep that catalog synced when managed route refs are renamed. This avoids Codex fallback metadata warnings for direct route bindings such as `rc/gpt-5.4`.
+
 ## [1.3.1] - 2026-03-05
 
 ### Changed

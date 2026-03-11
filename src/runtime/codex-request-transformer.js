@@ -27,12 +27,14 @@ export function transformRequestForCodex(body) {
     ? { ...body }
     : {};
 
-  const instructions = typeof transformed.instructions === 'string'
-    ? transformed.instructions.trim()
-    : '';
   const reasoning = normalizeReasoningConfig(transformed.reasoning, transformed.reasoning_effort);
   const include = normalizeIncludeList(transformed.include, reasoning);
-  const input = resolveResponseInput(transformed);
+  const resolvedInput = resolveResponseInput(transformed);
+  const extractedGuidance = extractLeadingInstructionMessages(resolvedInput);
+  const instructions = joinInstructionText(
+    typeof transformed.instructions === 'string' ? transformed.instructions.trim() : '',
+    extractedGuidance.instructions
+  );
   const tools = Array.isArray(transformed.tools)
     ? transformed.tools.map(normalizeToolDefinitionForResponses).filter(Boolean)
     : [];
@@ -40,7 +42,7 @@ export function transformRequestForCodex(body) {
   const output = {
     model: transformed.model,
     instructions: instructions || DEFAULT_CODEX_INSTRUCTIONS,
-    input,
+    input: extractedGuidance.input,
     tools,
     tool_choice: normalizeToolChoiceForResponses(transformed.tool_choice),
     parallel_tool_calls: Boolean(transformed.parallel_tool_calls),
@@ -68,6 +70,13 @@ function hasUsableInput(input) {
   return Array.isArray(input) && input.length > 0;
 }
 
+function joinInstructionText(...parts) {
+  return parts
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
 function resolveResponseInput(transformed) {
   if (hasUsableInput(transformed.input)) return transformed.input;
   if (typeof transformed.input === 'string' && transformed.input.trim()) {
@@ -81,6 +90,38 @@ function resolveResponseInput(transformed) {
     return convertMessagesToResponseInput(transformed.messages);
   }
   return [];
+}
+
+function isInstructionMessageItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (item.type !== 'message') return false;
+  const role = normalizeMessageRole(item.role);
+  return role === 'system' || role === 'developer';
+}
+
+function extractLeadingInstructionMessages(input) {
+  if (!Array.isArray(input) || input.length === 0) {
+    return {
+      instructions: '',
+      input: []
+    };
+  }
+
+  const instructions = [];
+  let index = 0;
+
+  while (index < input.length) {
+    const item = input[index];
+    if (!isInstructionMessageItem(item)) break;
+    const text = normalizeMessageContentToText(item.content);
+    if (text) instructions.push(text);
+    index += 1;
+  }
+
+  return {
+    instructions: joinInstructionText(...instructions),
+    input: index > 0 ? input.slice(index) : input
+  };
 }
 
 function normalizeIncludeList(rawInclude, reasoning) {

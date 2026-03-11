@@ -398,6 +398,86 @@ test("direct provider/model requests keep fallbackModels order", { concurrency: 
   }
 });
 
+test("smart and default requests return 500 when the fixed default alias is empty", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "default",
+    modelAliases: {
+      default: {
+        id: "default",
+        strategy: "ordered",
+        targets: [],
+        fallbackTargets: []
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  try {
+    const defaultResponse = await fetchHandler(makeOpenAIRequest("default"), {});
+    assert.equal(defaultResponse.status, 500);
+    const defaultPayload = await defaultResponse.json();
+    assert.match(defaultPayload?.error?.message || "", /no target candidates configured/i);
+
+    const smartResponse = await fetchHandler(makeOpenAIRequest("smart"), {});
+    assert.equal(smartResponse.status, 500);
+    const smartPayload = await smartResponse.json();
+    assert.match(smartPayload?.error?.message || "", /no target candidates configured/i);
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("smart requests honor the explicit smart alias before the fixed default alias", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "default",
+    modelAliases: {
+      default: {
+        id: "default",
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }],
+        fallbackTargets: []
+      },
+      smart: {
+        id: "smart",
+        strategy: "ordered",
+        targets: [{ ref: "anthropic/claude-3-5-haiku" }],
+        fallbackTargets: []
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: init?.body ? JSON.parse(String(init.body)) : null
+    });
+    return claudeSuccess("claude-3-5-haiku");
+  };
+
+  try {
+    const smartResponse = await fetchHandler(makeOpenAIRequest("smart"), {});
+    assert.equal(smartResponse.status, 200);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /api\.anthropic\.com/);
+    assert.equal(calls[0].body?.model, "claude-3-5-haiku");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
 test("worker safe mode auto-disables stateful round-robin progression", { concurrency: false }, async () => {
   const config = buildConfig({
     modelAliases: {
@@ -583,4 +663,38 @@ test("worker runtime coerces file state backend to memory", { concurrency: false
   }
   assert.equal(fileCreated, false);
   await fs.unlink(stateFilePath).catch(() => {});
+});
+
+
+test("live handler returns 500 when the fixed default alias is empty", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "default",
+    modelAliases: {
+      default: {
+        strategy: "ordered",
+        targets: [],
+        fallbackTargets: []
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  try {
+    const smartResponse = await fetchHandler(makeOpenAIRequest("smart"), {});
+    assert.equal(smartResponse.status, 500);
+    const smartPayload = await smartResponse.json();
+    assert.match(smartPayload?.error?.message || "", /no target candidates configured/i);
+
+    const defaultResponse = await fetchHandler(makeOpenAIRequest("default"), {});
+    assert.equal(defaultResponse.status, 500);
+    const defaultPayload = await defaultResponse.json();
+    assert.match(defaultPayload?.error?.message || "", /no target candidates configured/i);
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
 });

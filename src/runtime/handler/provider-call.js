@@ -10,7 +10,15 @@ import {
 import { claudeToOpenAINonStreamResponse } from "../../translator/response/claude-to-openai.js";
 import { shouldRetryStatus } from "./fallback.js";
 import { jsonResponse, passthroughResponseWithCors } from "./http.js";
-import { convertOpenAINonStreamToClaude, handleClaudeStreamToOpenAI, handleOpenAIStreamToClaude } from "./provider-translation.js";
+import {
+  convertClaudeNonStreamToOpenAIResponses,
+  convertOpenAINonStreamToClaude,
+  handleClaudeStreamToOpenAI,
+  handleClaudeStreamToOpenAIResponses,
+  handleOpenAIStreamToClaude,
+  normalizeClaudePassthroughStream
+} from "./provider-translation.js";
+import { maybeRewriteAmpClientResponse } from "./amp-response.js";
 import { applyCachingMapping, mergeCachingHeaders } from "./cache-mapping.js";
 import { applyReasoningEffortMapping } from "./reasoning-effort.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
@@ -22,6 +30,7 @@ import {
   extractCodexFinalResponse,
   handleCodexStreamToOpenAI
 } from "../codex-response-transformer.js";
+import { toBoolean } from "./utils.js";
 
 async function toProviderError(response) {
   const raw = await response.text();
@@ -76,38 +85,45 @@ async function adaptProviderResponse({
   translate,
   sourceFormat,
   targetFormat,
-  fallbackModel
+  fallbackModel,
+  requestKind,
+  requestBody,
+  clientType
 }) {
+  const buildSuccessResponse = async (resultResponse) => ({
+    ok: true,
+    status: 200,
+    retryable: false,
+    response: await maybeRewriteAmpClientResponse(resultResponse, {
+      clientType,
+      requestBody,
+      stream
+    })
+  });
+
   if (stream) {
     if (!translate) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: passthroughResponseWithCors(response, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive"
-        })
-      };
+      return buildSuccessResponse(
+        sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE
+          ? normalizeClaudePassthroughStream(response)
+          : passthroughResponseWithCors(response, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive"
+          })
+      );
     }
 
     if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: handleOpenAIStreamToClaude(response)
-      };
+      return buildSuccessResponse(handleOpenAIStreamToClaude(response));
     }
 
     if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
-      return {
-        ok: true,
-        status: 200,
-        retryable: false,
-        response: handleClaudeStreamToOpenAI(response)
-      };
+      return buildSuccessResponse(
+        requestKind === "responses"
+          ? handleClaudeStreamToOpenAIResponses(response, requestBody, fallbackModel)
+          : handleClaudeStreamToOpenAI(response)
+      );
     }
 
     return {
@@ -126,12 +142,7 @@ async function adaptProviderResponse({
   }
 
   if (!translate) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: passthroughResponseWithCors(response)
-    };
+    return buildSuccessResponse(passthroughResponseWithCors(response));
   }
 
   const raw = await response.text();
@@ -152,21 +163,15 @@ async function adaptProviderResponse({
   }
 
   if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.OPENAI) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: jsonResponse(convertOpenAINonStreamToClaude(parsed, fallbackModel))
-    };
+    return buildSuccessResponse(jsonResponse(convertOpenAINonStreamToClaude(parsed, fallbackModel)));
   }
 
   if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE) {
-    return {
-      ok: true,
-      status: 200,
-      retryable: false,
-      response: jsonResponse(claudeToOpenAINonStreamResponse(parsed))
-    };
+    return buildSuccessResponse(
+      requestKind === "responses"
+        ? jsonResponse(convertClaudeNonStreamToOpenAIResponses(parsed, requestBody, fallbackModel))
+        : jsonResponse(claudeToOpenAINonStreamResponse(parsed))
+    );
   }
 
   return {
@@ -184,13 +189,43 @@ async function adaptProviderResponse({
   };
 }
 
+function isProviderDebugEnabled(env = {}) {
+  return toBoolean(
+    env?.LLM_ROUTER_DEBUG_ROUTING,
+    toBoolean(env?.LLM_ROUTER_DEBUG, false)
+  );
+}
+
+function extractToolTypes(body) {
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  return [...new Set(
+    tools
+      .map((tool) => String(tool?.type || "").trim())
+      .filter(Boolean)
+  )];
+}
+
+function logToolRouting({ env, clientType, candidate, originalBody, providerBody, sourceFormat, targetFormat } = {}) {
+  if (!isProviderDebugEnabled(env)) return;
+
+  const originalToolTypes = extractToolTypes(originalBody);
+  const providerToolTypes = extractToolTypes(providerBody);
+  if (originalToolTypes.length === 0 && providerToolTypes.length === 0) return;
+
+  console.warn(
+    `[llm-router] provider tool routing client=${clientType || "default"} candidate=${candidate?.providerId || "unknown"}/${candidate?.modelId || "unknown"} source=${sourceFormat} target=${targetFormat} original=${originalToolTypes.join(",") || "none"} upstream=${providerToolTypes.join(",") || "none"}`
+  );
+}
+
 export async function makeProviderCall({
   body,
   sourceFormat,
   stream,
   candidate,
+  requestKind,
   requestHeaders,
-  env
+  env,
+  clientType
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
@@ -232,6 +267,15 @@ export async function makeProviderCall({
     targetModel: candidate.backend,
     requestHeaders
   });
+  logToolRouting({
+    env,
+    clientType,
+    candidate,
+    originalBody: body,
+    providerBody,
+    sourceFormat,
+    targetFormat
+  });
 
   if (isSubscriptionProvider(provider)) {
     const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
@@ -270,8 +314,60 @@ export async function makeProviderCall({
         translate,
         sourceFormat,
         targetFormat,
-        fallbackModel
+        fallbackModel,
+        requestKind,
+        requestBody: body,
+        clientType
       });
+    }
+
+    if (requestKind === "responses") {
+      if (stream) {
+        return {
+          ok: true,
+          status: 200,
+          retryable: false,
+          response: await maybeRewriteAmpClientResponse(
+            passthroughResponseWithCors(subscriptionResult.response, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive"
+            }),
+            {
+              clientType,
+              requestBody: body,
+              stream
+            }
+          )
+        };
+      }
+
+      const parsedSubscriptionResponse = await extractCodexFinalResponse(subscriptionResult.response);
+      if (!parsedSubscriptionResponse) {
+        return {
+          ok: false,
+          status: 502,
+          retryable: true,
+          response: jsonResponse({
+            type: "error",
+            error: {
+              type: "api_error",
+              message: "Subscription provider stream did not contain a completed response payload."
+            }
+          }, 502)
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        retryable: false,
+        response: await maybeRewriteAmpClientResponse(jsonResponse(parsedSubscriptionResponse), {
+          clientType,
+          requestBody: body,
+          stream
+        })
+      };
     }
 
     if (stream) {
@@ -283,14 +379,22 @@ export async function makeProviderCall({
           ok: true,
           status: 200,
           retryable: false,
-          response: handleOpenAIStreamToClaude(openAIStreamResponse)
+          response: await maybeRewriteAmpClientResponse(handleOpenAIStreamToClaude(openAIStreamResponse), {
+            clientType,
+            requestBody: body,
+            stream
+          })
         };
       }
       return {
         ok: true,
         status: 200,
         retryable: false,
-        response: openAIStreamResponse
+        response: await maybeRewriteAmpClientResponse(openAIStreamResponse, {
+          clientType,
+          requestBody: body,
+          stream
+        })
       };
     }
 
@@ -318,7 +422,14 @@ export async function makeProviderCall({
         ok: true,
         status: 200,
         retryable: false,
-        response: jsonResponse(convertOpenAINonStreamToClaude(openAINonStreamResponse, fallbackModel))
+        response: await maybeRewriteAmpClientResponse(
+          jsonResponse(convertOpenAINonStreamToClaude(openAINonStreamResponse, fallbackModel)),
+          {
+            clientType,
+            requestBody: body,
+            stream
+          }
+        )
       };
     }
 
@@ -326,11 +437,15 @@ export async function makeProviderCall({
       ok: true,
       status: 200,
       retryable: false,
-      response: jsonResponse(openAINonStreamResponse)
+      response: await maybeRewriteAmpClientResponse(jsonResponse(openAINonStreamResponse), {
+        clientType,
+        requestBody: body,
+        stream
+      })
     };
   }
 
-  const providerUrl = resolveProviderUrl(provider, targetFormat);
+  const providerUrl = resolveProviderUrl(provider, targetFormat, requestKind);
   const headers = mergeCachingHeaders(
     buildProviderHeaders(provider, env, targetFormat),
     requestHeaders,
@@ -405,6 +520,9 @@ export async function makeProviderCall({
     translate,
     sourceFormat,
     targetFormat,
-    fallbackModel: candidate.backend
+    fallbackModel: candidate.backend,
+    requestKind,
+    requestBody: body,
+    clientType
   });
 }

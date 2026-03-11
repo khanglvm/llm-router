@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { FORMATS } from "../translator/index.js";
 import {
   CONFIG_VERSION,
+  DEFAULT_AMP_ENTITY_DEFINITIONS,
+  DEFAULT_AMP_SIGNATURE_DEFINITIONS,
+  DEFAULT_AMP_SUBAGENT_DEFINITIONS,
+  DEFAULT_MODEL_ALIAS_ID,
   assertSupportedRuntimeConfigVersion,
+  listConfiguredModels,
   migrateRuntimeConfig,
   normalizeRuntimeConfig,
   resolveRequestModel,
@@ -57,16 +62,19 @@ function createBaseRawConfig(overrides = {}) {
   };
 }
 
-test("normalizeRuntimeConfig keeps v1 configs idempotent", () => {
+test("normalizeRuntimeConfig migrates legacy defaults into the fixed default alias", () => {
   const normalized = normalizeRuntimeConfig(createBaseRawConfig());
 
-  assert.equal(normalized.version, 1);
-  assert.deepEqual(normalized.modelAliases, {});
+  assert.equal(normalized.version, 2);
+  assert.equal(normalized.defaultModel, "openrouter/gpt-4o-mini");
+  assert.deepEqual(Object.keys(normalized.modelAliases), [DEFAULT_MODEL_ALIAS_ID]);
+  assert.deepEqual(normalized.modelAliases[DEFAULT_MODEL_ALIAS_ID].targets.map((target) => target.ref), ["openrouter/gpt-4o-mini"]);
   assert.deepEqual(normalized.providers[0].rateLimits, []);
 
   const roundTrip = normalizeRuntimeConfig(JSON.parse(JSON.stringify(normalized)));
-  assert.equal(roundTrip.version, 1);
-  assert.deepEqual(roundTrip.modelAliases, {});
+  assert.equal(roundTrip.version, 2);
+  assert.deepEqual(Object.keys(roundTrip.modelAliases), [DEFAULT_MODEL_ALIAS_ID]);
+  assert.deepEqual(roundTrip.modelAliases[DEFAULT_MODEL_ALIAS_ID].targets.map((target) => target.ref), ["openrouter/gpt-4o-mini"]);
   assert.deepEqual(roundTrip.providers[0].rateLimits, []);
 });
 
@@ -81,6 +89,73 @@ test("normalizeRuntimeConfig upgrades explicit v1 to v2 when v2-only fields are 
   }));
 
   assert.equal(normalized.version, 2);
+});
+
+
+test("validateRuntimeConfig allows empty aliases including the fixed default alias", () => {
+  const normalized = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [],
+        fallbackTargets: []
+      },
+      coding: {
+        id: "coding",
+        strategy: "ordered",
+        targets: [],
+        fallbackTargets: []
+      }
+    },
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }]
+      }
+    ]
+  });
+
+  assert.deepEqual(validateRuntimeConfig(normalized), []);
+});
+
+test("resolveRequestedRoute returns 500 when the fixed default alias is empty", () => {
+  const config = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [],
+        fallbackTargets: []
+      }
+    },
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }]
+      }
+    ]
+  });
+
+  const defaultResolved = resolveRequestedRoute(config, DEFAULT_MODEL_ALIAS_ID, FORMATS.OPENAI);
+  assert.equal(defaultResolved.primary, null);
+  assert.equal(defaultResolved.statusCode, 500);
+  assert.match(defaultResolved.error || "", /no target candidates configured/i);
+
+  const smartResolved = resolveRequestModel(config, "smart", FORMATS.OPENAI);
+  assert.equal(smartResolved.primary, null);
+  assert.equal(smartResolved.statusCode, 500);
+  assert.match(smartResolved.error || "", /no target candidates configured/i);
 });
 
 test("assertSupportedRuntimeConfigVersion accepts future versions without version-diff failure", () => {
@@ -160,6 +235,35 @@ test("normalizeRuntimeConfig supports v2 aliases and provider rate limits", () =
   assert.equal(normalized.providers[0].rateLimits[0].requests, 20000);
   assert.deepEqual(normalized.providers[0].rateLimits[0].window, { unit: "month", size: 1 });
   assert.deepEqual(normalized.providers[0].rateLimits[0].metadata, { scope: "global" });
+});
+
+test("normalizeRuntimeConfig accepts quick-start rate-limit aliases", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKeyEnv: "OPENROUTER_API_KEY",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }],
+        rateLimits: [
+          {
+            id: "default",
+            name: "Default",
+            models: ["all"],
+            limit: 60,
+            window: { value: 1, unit: "minute" }
+          }
+        ]
+      }
+    ]
+  }));
+
+  assert.equal(normalized.providers[0].rateLimits[0].requests, 60);
+  assert.deepEqual(normalized.providers[0].rateLimits[0].window, { unit: "minute", size: 1 });
+  assert.equal(validateRuntimeConfig(normalized).length, 0);
 });
 
 test("validateRuntimeConfig accepts auto model routing strategy", () => {
@@ -486,6 +590,129 @@ test("resolveRequestedRoute expands alias requests into deterministic candidate 
   assert.equal(smartResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
 });
 
+test("resolveRequestModel prefers an explicit smart alias over the fixed default alias", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      },
+      smart: {
+        strategy: "ordered",
+        targets: [{ ref: "anthropic/claude-3-5-haiku" }]
+      }
+    }
+  }));
+
+  const smartResolved = resolveRequestModel(config, "smart", FORMATS.CLAUDE);
+  assert.equal(smartResolved.routeType, "alias");
+  assert.equal(smartResolved.routeRef, "smart");
+  assert.equal(smartResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+
+  const defaultResolved = resolveRequestModel(config, DEFAULT_MODEL_ALIAS_ID, FORMATS.CLAUDE);
+  assert.equal(defaultResolved.routeRef, DEFAULT_MODEL_ALIAS_ID);
+  assert.equal(defaultResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+});
+
+test("resolveRequestModel uses probed model formats when saved model formats are stale", () => {
+  const config = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        strategy: "ordered",
+        targets: [{ ref: "rc/claude-opus-4.6-CL" }]
+      },
+      smart: {
+        strategy: "ordered",
+        targets: [{ ref: "rc/claude-opus-4.6-CL" }]
+      }
+    },
+    providers: [
+      {
+        id: "rc",
+        name: "RamClouds",
+        baseUrlByFormat: {
+          openai: "https://ramclouds.me/v1",
+          claude: "https://ramclouds.me/anthropic"
+        },
+        format: "claude",
+        formats: ["claude", "openai"],
+        models: [
+          {
+            id: "claude-opus-4.6-CL",
+            formats: ["claude"]
+          }
+        ],
+        lastProbe: {
+          ok: true,
+          formats: ["claude", "openai"],
+          workingFormats: ["claude", "openai"],
+          models: ["claude-opus-4.6-CL"],
+          modelSupport: {
+            "claude-opus-4.6-CL": ["openai"]
+          },
+          modelPreferredFormat: {
+            "claude-opus-4.6-CL": "openai"
+          }
+        }
+      }
+    ]
+  });
+
+  const resolved = resolveRequestModel(config, "smart", FORMATS.CLAUDE);
+
+  assert.equal(resolved.routeType, "alias");
+  assert.equal(resolved.primary.requestModelId, "rc/claude-opus-4.6-CL");
+  assert.equal(resolved.primary.targetFormat, FORMATS.OPENAI);
+});
+
+test("listConfiguredModels reports probed endpoint support when saved model formats are stale", () => {
+  const config = normalizeRuntimeConfig({
+    version: CONFIG_VERSION,
+    providers: [
+      {
+        id: "rc",
+        name: "RamClouds",
+        baseUrlByFormat: {
+          openai: "https://ramclouds.me/v1",
+          claude: "https://ramclouds.me/anthropic"
+        },
+        format: "claude",
+        formats: ["claude", "openai"],
+        models: [
+          {
+            id: "claude-opus-4.6-CL",
+            formats: ["claude"]
+          }
+        ],
+        lastProbe: {
+          ok: true,
+          formats: ["claude", "openai"],
+          workingFormats: ["claude", "openai"],
+          models: ["claude-opus-4.6-CL"],
+          modelSupport: {
+            "claude-opus-4.6-CL": ["openai"]
+          },
+          modelPreferredFormat: {
+            "claude-opus-4.6-CL": "openai"
+          }
+        }
+      }
+    ]
+  });
+
+  const [openaiRow] = listConfiguredModels(config, { endpointFormat: FORMATS.OPENAI });
+  const [claudeRow] = listConfiguredModels(config, { endpointFormat: FORMATS.CLAUDE });
+
+  assert.deepEqual(openaiRow.formats, [FORMATS.OPENAI]);
+  assert.equal(openaiRow.endpoint_format_supported, true);
+  assert.deepEqual(claudeRow.formats, [FORMATS.OPENAI]);
+  assert.equal(claudeRow.endpoint_format_supported, false);
+});
+
 test("resolveRouteReference looks up direct refs and alias refs", () => {
   const config = normalizeRuntimeConfig(createBaseRawConfig({
     version: CONFIG_VERSION,
@@ -503,4 +730,616 @@ test("resolveRouteReference looks up direct refs and alias refs", () => {
   assert.equal(direct?.model?.id, "gpt-4o-mini");
   assert.equal(alias?.aliasId, "chat.default");
   assert.equal(alias?.alias?.targets?.[0]?.ref, "openrouter/gpt-4o-mini");
+});
+
+test("normalizeRuntimeConfig preserves AMP settings and aliases", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    ampcode: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_secret_123456",
+      restrictManagementToLocalhost: true,
+      proxyWebSearchToUpstream: true,
+      modelMappings: [
+        { from: "claude-opus-4.5", to: "anthropic/claude-3-5-haiku" }
+      ]
+    }
+  }));
+
+  assert.equal(normalized.amp.upstreamUrl, "https://ampcode.com/");
+  assert.equal(normalized.amp.upstreamApiKey, "amp_secret_123456");
+  assert.equal(normalized.amp.restrictManagementToLocalhost, true);
+  assert.equal(normalized.amp.proxyWebSearchToUpstream, true);
+  assert.deepEqual(normalized.amp.modelMappings, [
+    { from: "claude-opus-4.5", to: "anthropic/claude-3-5-haiku" }
+  ]);
+
+  const sanitized = validateRuntimeConfig(normalized);
+  assert.deepEqual(sanitized, []);
+  const display = normalizeRuntimeConfig(normalized);
+  assert.equal(display.amp.upstreamApiKey, "amp_secret_123456");
+});
+
+test("normalizeRuntimeConfig preserves new AMP schema fields", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      preset: "builtin",
+      defaultRoute: "openrouter/gpt-4o-mini",
+      routes: {
+        Smart: "anthropic/claude-3-5-haiku",
+        "@Google Gemini Flash Shared": "openrouter/gpt-4o-mini"
+      },
+      rawModelRoutes: [
+        { from: "gpt-*-codex*", to: "anthropic/claude-3-5-haiku" }
+      ],
+      overrides: {
+        entities: [
+          {
+            id: "Reviewer",
+            type: "feature",
+            match: ["Gemini 4 Pro"],
+            route: "anthropic/claude-3-5-haiku"
+          }
+        ],
+        signatures: [
+          {
+            id: "@Custom Signature",
+            match: ["opus*"]
+          }
+        ]
+      },
+      fallback: {
+        onUnknown: "default-route",
+        onAmbiguous: "none",
+        proxyUpstream: false
+      }
+    }
+  }));
+
+  assert.equal(normalized.amp.preset, "builtin");
+  assert.equal(normalized.amp.defaultRoute, "openrouter/gpt-4o-mini");
+  assert.deepEqual(normalized.amp.routes, {
+    smart: "anthropic/claude-3-5-haiku",
+    "@google-gemini-flash-shared": "openrouter/gpt-4o-mini"
+  });
+  assert.deepEqual(normalized.amp.rawModelRoutes, [
+    { from: "gpt-*-codex*", to: "anthropic/claude-3-5-haiku" }
+  ]);
+  assert.deepEqual(normalized.amp.overrides, {
+    entities: [
+      {
+        id: "reviewer",
+        type: "feature",
+        match: ["Gemini 4 Pro"],
+        route: "anthropic/claude-3-5-haiku"
+      }
+    ],
+    signatures: [
+      {
+        id: "@custom-signature",
+        match: ["opus*"]
+      }
+    ]
+  });
+  assert.deepEqual(normalized.amp.fallback, {
+    onUnknown: "default-route",
+    onAmbiguous: "none",
+    proxyUpstream: false
+  });
+});
+
+test("DEFAULT_AMP_ENTITY_DEFINITIONS and DEFAULT_AMP_SIGNATURE_DEFINITIONS preserve builtin AMP catalog", () => {
+  assert.ok(DEFAULT_AMP_ENTITY_DEFINITIONS.some((entry) => entry.id === "smart"));
+  assert.ok(DEFAULT_AMP_ENTITY_DEFINITIONS.some((entry) => entry.id === "title"));
+  assert.ok(DEFAULT_AMP_SIGNATURE_DEFINITIONS.some((entry) => entry.id === "@anthropic-haiku-shared"));
+  assert.ok(DEFAULT_AMP_SIGNATURE_DEFINITIONS.some((entry) => entry.id === "@google-gemini-flash-shared"));
+});
+
+test("resolveRequestModel applies new AMP entity routes using canonicalized model names", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      routes: {
+        smart: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "Claude Opus 4.6", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-entity");
+  assert.deepEqual(resolved.routeMetadata?.amp?.entities, ["smart"]);
+  assert.deepEqual(resolved.routeMetadata?.amp?.signatures, ["@anthropic-opus"]);
+});
+
+test("resolveRequestModel applies new AMP shared signature routes when multiple entities share one model family", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      routes: {
+        "@anthropic-haiku-shared": "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "Claude Haiku 4.5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-signature");
+  assert.deepEqual(resolved.routeMetadata?.amp?.entities, ["rush", "title"]);
+  assert.deepEqual(resolved.routeMetadata?.amp?.signatures, ["@anthropic-haiku-shared"]);
+});
+
+
+test("resolveRequestModel matches future AMP base-family versions without suffixed variants", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      routes: {
+        oracle: "anthropic/claude-3-5-haiku",
+        smart: "anthropic/claude-3-5-haiku",
+        librarian: "anthropic/claude-3-5-haiku",
+        "@anthropic-haiku-shared": "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const oracleResolved = resolveRequestModel(config, "gpt-6", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+  assert.equal(oracleResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(oracleResolved.routeType, "amp-entity");
+  assert.deepEqual(oracleResolved.routeMetadata?.amp?.entities, ["oracle"]);
+
+  const smartResolved = resolveRequestModel(config, "claude-opus-5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(smartResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(smartResolved.routeType, "amp-entity");
+  assert.deepEqual(smartResolved.routeMetadata?.amp?.entities, ["smart"]);
+
+  const librarianResolved = resolveRequestModel(config, "claude-sonnet-5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(librarianResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(librarianResolved.routeType, "amp-entity");
+  assert.deepEqual(librarianResolved.routeMetadata?.amp?.entities, ["librarian"]);
+
+  const haikuResolved = resolveRequestModel(config, "claude-haiku-5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(haikuResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(haikuResolved.routeType, "amp-signature");
+  assert.deepEqual(haikuResolved.routeMetadata?.amp?.signatures, ["@anthropic-haiku-shared"]);
+});
+
+test("resolveRequestModel excludes suffixed AMP base-family variants from built-in family matches", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      routes: {
+        oracle: "anthropic/claude-3-5-haiku",
+        smart: "anthropic/claude-3-5-haiku",
+        librarian: "anthropic/claude-3-5-haiku",
+        "@anthropic-haiku-shared": "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const oracleResolved = resolveRequestModel(config, "gpt-6-codex", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+  assert.equal(oracleResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(oracleResolved.routeType, "amp-default-model");
+
+  const smartResolved = resolveRequestModel(config, "claude-opus-5-thinking", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(smartResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(smartResolved.routeType, "amp-default-model");
+
+  const librarianResolved = resolveRequestModel(config, "claude-sonnet-5-thinking", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(librarianResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(librarianResolved.routeType, "amp-default-model");
+
+  const haikuResolved = resolveRequestModel(config, "claude-haiku-5-fast", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(haikuResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(haikuResolved.routeType, "amp-default-model");
+});
+
+test("resolveRequestModel prefers amp.defaultRoute over global defaultModel for new AMP schema", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "anthropic/claude-3-5-haiku",
+    amp: {
+      defaultRoute: "openrouter/gpt-4o-mini",
+      routes: {}
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "unknown-amp-model", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(resolved.routeType, "amp-default-route");
+});
+
+test("validateRuntimeConfig rejects invalid refs in new AMP schema routes", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      routes: {
+        smart: "missing.alias"
+      }
+    }
+  }));
+
+  const errors = validateRuntimeConfig(normalized);
+  assert.ok(errors.some((entry) => entry.includes("AMP route 'smart' references unknown alias 'missing.alias'")));
+});
+
+test("resolveRequestModel resolves AMP bare models and explicit mappings", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      modelMappings: [
+        { from: "claude-opus-*", to: "anthropic/claude-3-5-haiku" }
+      ]
+    }
+  }));
+
+  const bareResolved = resolveRequestModel(config, "gpt-4o-mini", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+  assert.equal(bareResolved.routeType, "amp-bare-model");
+  assert.equal(bareResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+
+  const mappedResolved = resolveRequestModel(config, "claude-opus-4.5", FORMATS.CLAUDE, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(mappedResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(mappedResolved.routeMetadata?.amp?.mappedFrom, "claude-opus-4.5");
+});
+
+test("resolveRequestModel honors AMP forceModelMappings before local bare-model lookup", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "gpt-4o-mini", to: "anthropic/claude-3-5-haiku" }
+      ]
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gpt-4o-mini", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeMetadata?.amp?.mappedFrom, "gpt-4o-mini");
+});
+
+test("resolveRequestModel applies AMP subagent mappings before generic model mappings", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        oracle: "anthropic/claude-3-5-haiku"
+      },
+      modelMappings: [
+        { from: "gpt-*", to: "openrouter/gpt-4o-mini" }
+      ]
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gpt-5.4", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-subagent");
+  assert.deepEqual(resolved.routeMetadata?.amp?.subagents, ["oracle"]);
+});
+
+
+test("resolveRequestModel applies AMP subagent mappings to future bare model families only", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        oracle: "anthropic/claude-3-5-haiku",
+        librarian: "anthropic/claude-3-5-haiku",
+        title: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const oracleResolved = resolveRequestModel(config, "gpt-5.5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+  assert.equal(oracleResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(oracleResolved.routeType, "amp-subagent");
+  assert.deepEqual(oracleResolved.routeMetadata?.amp?.subagents, ["oracle"]);
+
+  const librarianResolved = resolveRequestModel(config, "claude-sonnet-5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(librarianResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(librarianResolved.routeType, "amp-subagent");
+  assert.deepEqual(librarianResolved.routeMetadata?.amp?.subagents, ["librarian"]);
+
+  const titleResolved = resolveRequestModel(config, "claude-haiku-5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+  assert.equal(titleResolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(titleResolved.routeType, "amp-subagent");
+  assert.deepEqual(titleResolved.routeMetadata?.amp?.subagents, ["title"]);
+
+  const excludedResolved = resolveRequestModel(config, "gpt-5.5-codex", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+  assert.equal(excludedResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(excludedResolved.routeType, "amp-default-model");
+});
+
+test("resolveRequestModel applies AMP subagent mappings for current shared Gemini 2.5 Flash agents", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        search: "anthropic/claude-3-5-haiku",
+        "look at": "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gemini-2.5-flash", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "google"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-subagent");
+  assert.deepEqual(resolved.routeMetadata?.amp?.subagents, ["search", "look-at"]);
+});
+
+test("resolveRequestModel falls back unknown AMP subagent models to defaultModel", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {}
+  }));
+
+  const resolved = resolveRequestModel(config, "gpt-5.4", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(resolved.routeType, "amp-default-model");
+  assert.equal(resolved.routeMetadata?.amp?.mappedFrom, "gpt-5.4");
+});
+
+test("resolveRequestModel falls back when shared AMP subagent model mappings are partial", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        search: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gemini-2.5-flash", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "google"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(resolved.routeType, "amp-default-model");
+});
+
+test("DEFAULT_AMP_SUBAGENT_DEFINITIONS preserve current AMP profiles and compatibility aliases", () => {
+  assert.deepEqual(DEFAULT_AMP_SUBAGENT_DEFINITIONS, [
+    { id: "oracle", patterns: ["/^gpt-\\d+(?:\\.\\d+)?$/"] },
+    { id: "librarian", patterns: ["/^(?:claude-)?sonnet-\\d+(?:\\.\\d+)?$/"] },
+    { id: "title", patterns: ["/^(?:claude-)?haiku-\\d+(?:\\.\\d+)?$/"] },
+    { id: "painter", patterns: ["gemini-3-pro-image", "gemini-3-pro-image*"] },
+    { id: "search", patterns: ["gemini-2.5-flash", "gemini-2.5-flash*", "gemini-3-flash", "gemini-3-flash*"] },
+    { id: "look-at", patterns: ["gemini-2.5-flash", "gemini-2.5-flash*", "gemini-3-flash", "gemini-3-flash*"] },
+    { id: "handoff", patterns: ["gemini-3-flash", "gemini-3-flash*"] }
+  ]);
+});
+
+test("resolveRequestModel applies AMP subagent mappings for current shared Gemini 3 Flash agents", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        search: "anthropic/claude-3-5-haiku",
+        "look-at": "anthropic/claude-3-5-haiku",
+        handoff: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gemini-3-flash", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "google"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-subagent");
+  assert.deepEqual(resolved.routeMetadata?.amp?.subagents, ["search", "look-at", "handoff"]);
+});
+
+test("resolveRequestModel accepts AMP titling subagent mappings via current documented name", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        titling: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "claude-haiku-4.5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-subagent");
+  assert.deepEqual(resolved.routeMetadata?.amp?.subagents, ["title"]);
+});
+
+test("resolveRequestModel accepts AMP title subagent mappings via documented name", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentMappings: {
+        title: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "claude-haiku-4.5", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "anthropic"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-subagent");
+  assert.deepEqual(resolved.routeMetadata?.amp?.subagents, ["title"]);
+});
+
+
+test("normalizeRuntimeConfig preserves custom AMP subagent definitions", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      subagentDefinitions: [
+        { id: "planner", patterns: ["gpt-5.4", "gpt-5.4*"] },
+        { id: "planner", patterns: ["ignored*"] },
+        { id: "look_at", patterns: ["gemini-2.5-flash"] }
+      ]
+    }
+  }));
+
+  assert.deepEqual(normalized.amp.subagentDefinitions, [
+    { id: "planner", patterns: ["gpt-5.4", "gpt-5.4*"] },
+    { id: "look-at", patterns: ["gemini-2.5-flash"] }
+  ]);
+});
+
+test("normalizeRuntimeConfig canonicalizes AMP documented built-in aliases", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      subagentDefinitions: [
+        { id: "Title", patterns: ["claude-haiku-4.5"] },
+        { id: "Look At", patterns: ["gemini-2.5-flash"] }
+      ],
+      subagentMappings: {
+        titling: "anthropic/claude-3-5-haiku",
+        "look at": "openrouter/gpt-4o-mini"
+      }
+    }
+  }));
+
+  assert.deepEqual(normalized.amp.subagentDefinitions, [
+    { id: "title", patterns: ["claude-haiku-4.5"] },
+    { id: "look-at", patterns: ["gemini-2.5-flash"] }
+  ]);
+  assert.deepEqual(normalized.amp.subagentMappings, {
+    title: "anthropic/claude-3-5-haiku",
+    "look-at": "openrouter/gpt-4o-mini"
+  });
+});
+
+test("resolveRequestModel uses custom AMP subagent definitions and names", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentDefinitions: [
+        { id: "planner", patterns: ["gpt-5.4", "gpt-5.4*"] }
+      ],
+      subagentMappings: {
+        planner: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gpt-5.4", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "anthropic/claude-3-5-haiku");
+  assert.equal(resolved.routeType, "amp-subagent");
+  assert.deepEqual(resolved.routeMetadata?.amp?.subagents, ["planner"]);
+});
+
+test("resolveRequestModel falls back when custom AMP subagent definitions do not match", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      subagentDefinitions: [
+        { id: "planner", patterns: ["gpt-6*"] }
+      ],
+      subagentMappings: {
+        planner: "anthropic/claude-3-5-haiku"
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gpt-5.4", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(resolved.routeType, "amp-default-model");
 });

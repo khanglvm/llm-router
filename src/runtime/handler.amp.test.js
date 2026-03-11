@@ -1,0 +1,2028 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { gunzipSync, gzipSync } from "node:zlib";
+import { createFetchHandler } from "./handler.js";
+import { normalizeRuntimeConfig } from "./config.js";
+import { isAmpManagementPath, resolveApiRoute } from "./handler/request.js";
+
+function buildConfig(overrides = {}) {
+  return normalizeRuntimeConfig({
+    version: 2,
+    masterKey: "gw_amp_key",
+    defaultModel: "openrouter/gpt-4o-mini",
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key"
+    },
+    ...overrides
+  });
+}
+
+function jsonResponse(payload, status = 200, headers = undefined) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      ...(headers || {})
+    }
+  });
+}
+
+function sseResponse(events) {
+  return new Response(events.join(""), {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream"
+    }
+  });
+}
+
+function getHeaderMap(headersLike) {
+  const headers = new Headers(headersLike || {});
+  return Object.fromEntries(headers.entries());
+}
+
+async function readJson(response) {
+  return JSON.parse(await response.text());
+}
+
+async function readInitJsonBody(init = {}) {
+  if (init.body === undefined || init.body === null || init.body === "") {
+    return {};
+  }
+  const raw = await new Response(init.body).text();
+  return JSON.parse(raw || "{}");
+}
+
+function parseSsePayloads(raw) {
+  return String(raw || "")
+    .split(/\n\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => entry.replace(/^data:\s*/, ""))
+    .filter((entry) => entry && entry !== "[DONE]")
+    .map((entry) => JSON.parse(entry));
+}
+
+function parseSseEvents(raw) {
+  return String(raw || "")
+    .split(/\n\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => {
+      let event = "";
+      const dataLines = [];
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) {
+          event = line.slice(6).trim();
+          continue;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      const payloadText = dataLines.join("\n").trim();
+      return {
+        event,
+        payload: payloadText ? JSON.parse(payloadText) : null
+      };
+    });
+}
+
+test("resolveApiRoute recognizes AMP provider routes and management paths", () => {
+  const openAIRoute = resolveApiRoute("/api/provider/openai/v1/chat/completions", "POST");
+  const claudeRoute = resolveApiRoute("/api/provider/anthropic/v1/messages", "POST");
+  const responsesRoute = resolveApiRoute("/api/provider/openai/v1/responses", "POST");
+  const geminiRoute = resolveApiRoute("/api/provider/google/v1beta/models/gemini-2.5-pro:streamGenerateContent", "POST");
+  const publishersRoute = resolveApiRoute("/publishers/google/models/gemini-2.5-pro:generateContent", "POST");
+
+  assert.equal(openAIRoute?.clientType, "amp");
+  assert.equal(openAIRoute?.requestKind, "chat-completions");
+  assert.equal(claudeRoute?.sourceFormat, "claude");
+  assert.equal(responsesRoute?.requestKind, "responses");
+  assert.equal(geminiRoute?.type, "amp-gemini");
+  assert.equal(geminiRoute?.streamHint, true);
+  assert.equal(publishersRoute?.type, "amp-gemini");
+  assert.equal(isAmpManagementPath("/api/auth/callback"), true);
+  assert.equal(isAmpManagementPath("/threads"), true);
+  assert.equal(isAmpManagementPath("/openai/v1/chat/completions"), false);
+});
+
+test("createFetchHandler proxies AMP management routes with upstream credentials", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      method: init.method,
+      headers: getHeaderMap(init.headers)
+    };
+    return jsonResponse({ ok: true });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/auth/session", {
+      method: "GET",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "x-real-ip": "127.0.0.1"
+      }
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://ampcode.com/api/auth/session");
+    assert.equal(captured?.headers?.authorization, "Bearer amp_proxy_key");
+    assert.equal(captured?.headers?.["x-api-key"], "amp_proxy_key");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler strips client auth query params and identity headers before AMP upstream proxying", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      headers: getHeaderMap(init.headers)
+    };
+    return jsonResponse({ ok: true });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/auth/session?key=gw_amp_key&auth_token=gw_amp_key&safe=1", {
+      method: "GET",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "x-forwarded-for": "127.0.0.1",
+        "x-real-ip": "127.0.0.1",
+        "cf-connecting-ip": "127.0.0.1",
+        "sec-ch-ua": "\"Chromium\";v=\"123\""
+      }
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://ampcode.com/api/auth/session?safe=1");
+    assert.equal(captured?.headers?.authorization, "Bearer amp_proxy_key");
+    assert.equal(captured?.headers?.["x-api-key"], "amp_proxy_key");
+    assert.equal(captured?.headers?.["x-forwarded-for"], undefined);
+    assert.equal(captured?.headers?.["x-real-ip"], undefined);
+    assert.equal(captured?.headers?.["cf-connecting-ip"], undefined);
+    assert.equal(captured?.headers?.["sec-ch-ua"], undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler preserves gzipped AMP management request bodies when proxying upstream", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    const forwardedBody = init.body === undefined
+      ? Buffer.alloc(0)
+      : Buffer.from(await new Response(init.body).arrayBuffer());
+    captured = {
+      url: String(url),
+      headers: getHeaderMap(init.headers),
+      body: forwardedBody
+    };
+    return jsonResponse({ ok: true });
+  };
+
+  try {
+    const threadPayload = {
+      threadID: "T-test-thread",
+      messages: [
+        {
+          id: "msg_1",
+          role: "assistant",
+          content: "tool output"
+        }
+      ]
+    };
+    const compressedPayload = gzipSync(Buffer.from(JSON.stringify(threadPayload), "utf8"));
+
+    const response = await fetchHandler(new Request("http://router.local/api/internal?uploadThread", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "x-real-ip": "127.0.0.1"
+      },
+      body: compressedPayload
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://ampcode.com/api/internal?uploadThread");
+    assert.equal(captured?.headers?.["content-encoding"], "gzip");
+    assert.deepEqual(
+      JSON.parse(gunzipSync(captured?.body || Buffer.alloc(0)).toString("utf8")),
+      threadPayload
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler decompresses AMP upstream gzip responses without content-encoding", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    gzipSync(Buffer.from(JSON.stringify({
+      id: "user_123",
+      freeTierEligibleIfWorkspaceAllows: null,
+      dailyGrantEnabledIfWorkspaceAllows: null
+    }))),
+    {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    }
+  );
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/user", {
+      method: "GET",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "x-real-ip": "127.0.0.1"
+      }
+    }), {});
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.equal(payload?.id, "user_123");
+    assert.equal(payload?.freeTierEligibleIfWorkspaceAllows, true);
+    assert.equal(payload?.dailyGrantEnabledIfWorkspaceAllows, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler normalizes AMP free-tier status for management RPCs", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({
+    ok: true,
+    result: {
+      canUseAmpFree: false,
+      isDailyGrantEnabled: true,
+      features: []
+    }
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/internal?getUserFreeTierStatus", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "content-type": "application/json",
+        "x-real-ip": "127.0.0.1"
+      },
+      body: JSON.stringify({
+        method: "getUserFreeTierStatus",
+        params: {}
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.equal(payload?.result?.canUseAmpFree, true);
+    assert.equal(payload?.result?.isDailyGrantEnabled, false);
+    assert.deepEqual(payload?.result?.features, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler normalizes AMP user payload free-tier hints", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/internal" && parsed.searchParams.has("getUserInfo")) {
+      return jsonResponse({
+        ok: true,
+        result: {
+          id: "user_123",
+          freeTierEligibleIfWorkspaceAllows: null,
+          dailyGrantEnabledIfWorkspaceAllows: null
+        }
+      });
+    }
+    return jsonResponse({
+      id: "user_123",
+      freeTierEligibleIfWorkspaceAllows: null,
+      dailyGrantEnabledIfWorkspaceAllows: null
+    });
+  };
+
+  try {
+    const userResponse = await fetchHandler(new Request("http://router.local/api/user", {
+      method: "GET",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "x-real-ip": "127.0.0.1"
+      }
+    }), {});
+    const userPayload = await readJson(userResponse);
+    assert.equal(userPayload?.freeTierEligibleIfWorkspaceAllows, true);
+    assert.equal(userPayload?.dailyGrantEnabledIfWorkspaceAllows, false);
+
+    const infoResponse = await fetchHandler(new Request("http://router.local/api/internal?getUserInfo", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "content-type": "application/json",
+        "x-real-ip": "127.0.0.1"
+      },
+      body: JSON.stringify({
+        method: "getUserInfo",
+        params: {}
+      })
+    }), {});
+    const infoPayload = await readJson(infoResponse);
+    assert.equal(infoPayload?.result?.freeTierEligibleIfWorkspaceAllows, true);
+    assert.equal(infoPayload?.result?.dailyGrantEnabledIfWorkspaceAllows, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler blocks AMP management routes from non-localhost when configured", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_proxy_key",
+      restrictManagementToLocalhost: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    return jsonResponse({ ok: true });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/auth/session", {
+      method: "GET",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "x-real-ip": "192.168.1.55"
+      }
+    }), {});
+
+    assert.equal(response.status, 403);
+    assert.equal(called, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler accepts Google-style auth header for AMP Gemini routes", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1/models", {
+      method: "GET",
+      headers: {
+        "x-goog-api-key": "gw_amp_key"
+      }
+    }), {});
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.ok(Array.isArray(payload.models));
+    assert.equal(payload.models[0]?.name, "models/gpt-4o-mini");
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler falls back to AMP upstream for unresolved AMP provider models", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: []
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      headers: getHeaderMap(init.headers),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({ ok: true });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer gw_amp_key",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5-amp-only",
+        messages: [{ role: "user", content: "hello" }],
+        stream: false
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://ampcode.com/api/provider/openai/v1/chat/completions");
+    assert.equal(captured?.body?.model, "gpt-5-amp-only");
+    assert.equal(captured?.headers?.authorization, "Bearer amp_upstream_key");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler resolves AMP bare models locally before upstream fallback", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "chatcmpl_1",
+      object: "chat.completion",
+      created: 1730000000,
+      model: "gpt-4o-mini",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "ok" },
+          finish_reason: "stop"
+        }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "hello" }],
+        stream: false
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert.equal(captured?.body?.model, "gpt-4o-mini");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler serves AMP Gemini models locally", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1beta/models", {
+      method: "GET"
+    }), {});
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.ok(Array.isArray(payload.models));
+    assert.deepEqual(payload.models[0], {
+      name: "models/gpt-4o-mini",
+      baseModelId: "gpt-4o-mini",
+      displayName: "gpt-4o-mini",
+      description: "OpenRouter / gpt-4o-mini",
+      supportedGenerationMethods: ["generateContent", "streamGenerateContent"]
+    });
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler falls back unknown AMP Anthropic subagent models to defaultModel locally", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "openrouter/gpt-4o-mini",
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key"
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "chatcmpl_amp_default_1",
+      object: "chat.completion",
+      created: 1730000000,
+      model: "gpt-4o-mini",
+      choices: [
+        { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4.5",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hello" }]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert.equal(captured?.body?.model, "gpt-4o-mini");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler routes current AMP Oracle profile through configured subagent mapping", { concurrency: false }, async () => {
+  const config = buildConfig({
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      subagentMappings: {
+        oracle: "openrouter/gpt-4o-mini"
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "chatcmpl_amp_oracle_1",
+      object: "chat.completion",
+      created: 1730000000,
+      model: "gpt-4o-mini",
+      choices: [
+        { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        messages: [{ role: "user", content: "hello oracle" }]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert.equal(captured?.body?.model, "gpt-4o-mini");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler routes AMP smart-style requests through new AMP entity routes", { concurrency: false }, async () => {
+  const config = buildConfig({
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      routes: {
+        smart: "openrouter/gpt-4o-mini"
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "chatcmpl_amp_smart_1",
+      object: "chat.completion",
+      created: 1730000000,
+      model: "gpt-4o-mini",
+      choices: [
+        { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "Claude Opus 4.6",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hello smart" }]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert.equal(captured?.body?.model, "gpt-4o-mini");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler can disable AMP upstream proxy when new AMP fallback policy says none", { concurrency: false }, async () => {
+  const config = buildConfig({
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      routes: {},
+      fallback: {
+        onUnknown: "none",
+        proxyUpstream: false
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    return jsonResponse({ ok: true });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "unknown-amp-model",
+        messages: [{ role: "user", content: "hello" }]
+      })
+    }), {});
+
+    assert.equal(response.status, 400);
+    assert.equal(called, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler exposes AMP Gemini model metadata through local fallback", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "openrouter/gpt-4o-mini"
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1beta/models/gemini-2.5-flash", {
+      method: "GET"
+    }), {});
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.equal(payload.name, "models/gemini-2.5-flash");
+    assert.equal(payload.baseModelId, "gemini-2.5-flash");
+    assert.match(String(payload.description || ""), /fallback/i);
+  } finally {
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler translates AMP Gemini generateContent locally", { concurrency: false }, async () => {
+  const config = buildConfig({
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "*", to: "openrouter/gpt-4o-mini" }
+      ]
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      headers: getHeaderMap(init.headers),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "chatcmpl_amp_1",
+      object: "chat.completion",
+      created: 1730000000,
+      model: "gpt-4o-mini",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "ok from bridge" },
+          finish_reason: "stop"
+        }
+      ],
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 4,
+        total_tokens: 16
+      }
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1beta/models/gemini-2.5-pro:generateContent", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: "hello" }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 128
+        }
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert.equal(captured?.body?.model, "gpt-4o-mini");
+    assert.deepEqual(captured?.body?.messages, [
+      { role: "user", content: "hello" }
+    ]);
+    assert.equal(captured?.body?.stream, false);
+    assert.equal(captured?.body?.temperature, 0.2);
+    assert.equal(captured?.body?.max_tokens, 128);
+
+    const payload = await readJson(response);
+    assert.equal(payload.model, "gemini-2.5-pro");
+    assert.equal(payload.candidates[0]?.content?.role, "model");
+    assert.equal(payload.candidates[0]?.content?.parts?.[0]?.text, "ok from bridge");
+    assert.equal(payload.candidates[0]?.finishReason, "STOP");
+    assert.equal(payload.usageMetadata?.totalTokenCount, 16);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler translates AMP Gemini streamGenerateContent locally", { concurrency: false }, async () => {
+  const config = buildConfig({
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "*", to: "openrouter/gpt-4o-mini" }
+      ]
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => sseResponse([
+    'data: {"id":"chatcmpl_chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}\n\n',
+    'data: {"id":"chatcmpl_chunk_2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" world"}}]}\n\n',
+    'data: {"id":"chatcmpl_chunk_3","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n',
+    'data: [DONE]\n\n'
+  ]);
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1beta/models/gemini-2.5-pro:streamGenerateContent", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: "hello" }]
+          }
+        ]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.match(String(response.headers.get("content-type") || ""), /text\/event-stream/i);
+
+    const raw = await response.text();
+    const payloads = parseSsePayloads(raw);
+    assert.equal(payloads[0]?.candidates?.[0]?.content?.parts?.[0]?.text, "Hello");
+    assert.equal(payloads[1]?.candidates?.[0]?.content?.parts?.[0]?.text, " world");
+    assert.equal(payloads[2]?.candidates?.[0]?.finishReason, "STOP");
+    assert.equal(payloads[3]?.usageMetadata?.totalTokenCount, 12);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler routes OpenAI responses requests to provider /responses endpoint", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  globalThis.fetch = async (url) => {
+    capturedUrl = String(url);
+    return jsonResponse({
+      id: "resp_1",
+      object: "response",
+      model: "gpt-4o-mini",
+      output: []
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/openai/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "openrouter/gpt-4o-mini",
+        input: "hello"
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(capturedUrl, "https://openrouter.ai/api/v1/responses");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler translates AMP OpenAI responses requests for Claude providers", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "zai/glm-5",
+    providers: [
+      {
+        id: "zai",
+        name: "Z.AI",
+        baseUrl: "https://api.z.ai/api/anthropic/v1",
+        format: "claude",
+        models: [
+          {
+            id: "glm-5",
+            aliases: ["gpt-5.3-codex"]
+          }
+        ]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return sseResponse([
+      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_router_1\",\"model\":\"glm-5\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+      "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+      "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+      "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+      "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}\n\n",
+      "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    ]);
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.3-codex",
+        stream: true,
+        instructions: "Answer directly.",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Reply with OK." }]
+          }
+        ]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://api.z.ai/api/anthropic/v1/messages");
+    assert.equal(captured?.body?.model, "glm-5");
+    assert.equal(captured?.body?.messages?.length, 1);
+    assert.equal(captured?.body?.messages?.[0]?.role, "user");
+    assert.equal(captured?.body?.messages?.[0]?.content?.[0]?.text, "Reply with OK.");
+    assert.equal(captured?.body?.system, "Answer directly.");
+
+    const raw = await response.text();
+    const events = parseSseEvents(raw);
+    const eventNames = events.map((entry) => entry.event);
+    assert.deepEqual(eventNames, [
+      "response.created",
+      "response.in_progress",
+      "response.output_item.added",
+      "response.content_part.added",
+      "response.output_text.delta",
+      "response.output_text.done",
+      "response.content_part.done",
+      "response.output_item.done",
+      "response.completed"
+    ]);
+    assert.equal(events[4]?.payload?.delta, "OK");
+    assert.equal(events[8]?.payload?.response?.object, "response");
+    assert.equal(events[8]?.payload?.response?.model, "gpt-5.3-codex");
+    assert.equal(events[8]?.payload?.response?.output?.[0]?.content?.[0]?.text, "OK");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler normalizes Claude passthrough streams for AMP free mode", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return sseResponse([
+      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_router_free\",\"model\":\"claude-3-5-haiku\",\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n\n",
+      "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+      "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I can't discuss that.\"}}\n\n",
+      "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+      "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    ]);
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-3-5-haiku",
+        stream: true,
+        max_tokens: 128,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Reply briefly." }]
+          }
+        ]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured?.body?.model, "claude-3-5-haiku");
+
+    const raw = await response.text();
+    const events = parseSseEvents(raw);
+    assert.deepEqual(events.map((entry) => entry.event), [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]);
+    assert.equal(events[4]?.payload?.delta?.stop_reason, "end_turn");
+    assert.equal(events[4]?.payload?.usage?.input_tokens, 6);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler normalizes Claude passthrough tool_use streams for AMP free mode", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => sseResponse([
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_router_free_tool\",\"model\":\"claude-3-5-haiku\",\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Read\",\"input\":{\"path\":\"/tmp/demo\"}}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+  ]);
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-3-5-haiku",
+        stream: true,
+        max_tokens: 128,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Read a file." }]
+          }
+        ]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    const raw = await response.text();
+    const events = parseSseEvents(raw);
+    assert.deepEqual(events.map((entry) => entry.event), [
+      "message_start",
+      "content_block_start",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]);
+    assert.equal(events[3]?.payload?.delta?.stop_reason, "tool_use");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler normalizes Claude non-stream tool_use stop_reason for AMP", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({
+    id: "msg_router_free_tool_json",
+    type: "message",
+    role: "assistant",
+    model: "claude-3-5-haiku",
+    content: [
+      { type: "text", text: "I will read it." },
+      { type: "tool_use", id: "tool_2", name: "Read", input: { path: "/tmp/demo" } }
+    ],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 5, output_tokens: 1 }
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-3-5-haiku",
+        max_tokens: 128,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Read a file." }]
+          }
+        ]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.equal(payload.stop_reason, "tool_use");
+    assert.equal(payload.content?.[1]?.type, "tool_use");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler maps AMP Gemini googleSearch tools onto Claude web search", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "*", to: "anthropic/claude-3-5-haiku" }
+      ]
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "msg_amp_search",
+      type: "message",
+      role: "assistant",
+      model: "claude-3-5-haiku",
+      content: [{ type: "text", text: "search-ok" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 2 }
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1beta/models/gemini-2.5-flash:generateContent", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: "Search online for llm-router release notes." }]
+          }
+        ],
+        tools: [
+          { googleSearch: {} }
+        ]
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured?.body?.model, "claude-3-5-haiku");
+    assert.deepEqual(captured?.body?.tools, [
+      {
+        type: "web_search_20250305",
+        name: "web_search"
+      }
+    ]);
+    assert.equal(response.headers.get("x-llm-router-tool-types"), "web_search");
+    assert.match(String(response.headers.get("x-llm-router-tool-routing") || ""), /amp-web-search/);
+
+    const payload = await readJson(response);
+    assert.equal(payload.candidates[0]?.content?.parts?.[0]?.text, "search-ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler can proxy AMP web search requests upstream when enabled", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      proxyWebSearchToUpstream: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      headers: getHeaderMap(init.headers),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "resp_amp_upstream_search",
+      object: "response",
+      model: "smart",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "amp upstream search results" }]
+        }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "smart",
+        input: "Search online for llm-router release notes.",
+        tools: [
+          { type: "web_search" }
+        ],
+        tool_choice: "required"
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://ampcode.com/api/provider/openai/v1/responses");
+    assert.equal(captured?.headers?.authorization, "Bearer amp_upstream_key");
+    assert.equal(captured?.headers?.["x-api-key"], "amp_upstream_key");
+    assert.deepEqual(captured?.body?.tools, [
+      { type: "web_search" }
+    ]);
+    assert.equal(response.headers.get("x-llm-router-tool-types"), "web_search");
+    assert.equal(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:proxy-upstream");
+
+    const payload = await readJson(response);
+    assert.equal(payload.output?.[0]?.content?.[0]?.text, "amp upstream search results");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler can proxy AMP Gemini web search requests upstream when enabled", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      proxyWebSearchToUpstream: true
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      headers: getHeaderMap(init.headers),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [{ text: "amp upstream gemini search results" }]
+          },
+          finishReason: "STOP"
+        }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/google/v1beta/models/gemini-2.5-flash:generateContent", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: "Search online for llm-router release notes." }]
+          }
+        ],
+        tools: [
+          { googleSearch: {} }
+        ]
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://ampcode.com/api/provider/google/v1beta/models/gemini-2.5-flash:generateContent");
+    assert.equal(captured?.headers?.authorization, "Bearer amp_upstream_key");
+    assert.equal(captured?.headers?.["x-api-key"], "amp_upstream_key");
+    assert.deepEqual(captured?.body?.tools, [
+      { googleSearch: {} }
+    ]);
+    assert.equal(response.headers.get("x-llm-router-tool-types"), "web_search");
+    assert.equal(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:proxy-upstream");
+
+    const payload = await readJson(response);
+    assert.equal(payload.candidates?.[0]?.content?.parts?.[0]?.text, "amp upstream gemini search results");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler prefers non-Codex routes for AMP web search responses", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "chat.search",
+    modelAliases: {
+      "chat.search": {
+        strategy: "ordered",
+        targets: [
+          { ref: "chatgpt/gpt-5.3-codex" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "chatgpt",
+        name: "ChatGPT Subscription",
+        type: "subscription",
+        subscriptionType: "chatgpt-codex",
+        subscriptionProfile: "personal",
+        format: "openai",
+        models: [{ id: "gpt-5.3-codex" }]
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "msg_amp_response_search",
+      type: "message",
+      role: "assistant",
+      model: "claude-3-5-haiku",
+      content: [{ type: "text", text: "response-search-ok" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 4, output_tokens: 2 }
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "chat.search",
+        input: "Search online for llm-router release notes.",
+        tools: [
+          { type: "web_search" }
+        ],
+        tool_choice: "required"
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured?.body?.model, "claude-3-5-haiku");
+    assert.deepEqual(captured?.body?.tools, [
+      {
+        type: "web_search_20250305",
+        name: "web_search"
+      }
+    ]);
+    assert.equal(response.headers.get("x-llm-router-selected-candidate"), "anthropic/claude-3-5-haiku");
+    assert.equal(response.headers.get("x-llm-router-tool-types"), "web_search");
+    assert.equal(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:prefer-non-codex");
+
+    const payload = await readJson(response);
+    assert.equal(payload.object, "response");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler rewrites AMP Claude mapped responses back to the requested model", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "gpt-5.2", to: "anthropic/claude-3-5-haiku" }
+      ]
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  let captured = null;
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      body: await readInitJsonBody(init)
+    };
+    return jsonResponse({
+      id: "msg_amp_mapped",
+      type: "message",
+      role: "assistant",
+      model: "claude-3-5-haiku",
+      content: [
+        { type: "thinking", thinking: "Inspecting tools..." },
+        { type: "tool_use", id: "tool_1", name: "web_search", input: {} },
+        { type: "text", text: "done" }
+      ],
+      stop_reason: "tool_use",
+      usage: { input_tokens: 3, output_tokens: 2 }
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.2",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "Search for docs." }]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.equal(captured?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured?.body?.model, "claude-3-5-haiku");
+
+    const payload = await readJson(response);
+    assert.equal(payload.model, "gpt-5.2");
+    assert.deepEqual(payload.content, [
+      { type: "tool_use", id: "tool_1", name: "web_search", input: {} },
+      { type: "text", text: "done" }
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler rewrites AMP Claude stream model names back to the requested model", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "gpt-5.2", to: "anthropic/claude-3-5-haiku" }
+      ]
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => sseResponse([
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_stream","model":"claude-3-5-haiku","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":1}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ]);
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.2",
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: "user", content: "Say OK." }]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    assert.match(String(response.headers.get("content-type") || ""), /text\/event-stream/i);
+
+    const events = parseSseEvents(await response.text());
+    assert.equal(events[0]?.payload?.message?.model, "gpt-5.2");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler strips streamed Claude thinking blocks before AMP tool_use blocks", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "openrouter/gpt-4o-mini",
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini", aliases: ["gpt-5.3-codex"] }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => sseResponse([
+    'data: {"id":"resp_tool_stream","object":"chat.completion.chunk","created":1730001111,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":"Plan the read","tool_calls":null},"finish_reason":null}]}\n\n',
+    'data: {"id":"resp_tool_stream","object":"chat.completion.chunk","created":1730001111,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"index":0,"id":"call_read_1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}\n\n',
+    'data: {"id":"resp_tool_stream","object":"chat.completion.chunk","created":1730001111,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"README.md\\"}"}}]},"finish_reason":null}]}\n\n',
+    'data: {"id":"resp_tool_stream","object":"chat.completion.chunk","created":1730001111,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":4,"total_tokens":6}}\n\n',
+    'data: [DONE]\n\n'
+  ]);
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.3-codex",
+        max_tokens: 256,
+        stream: true,
+        messages: [{ role: "user", content: "Read README.md" }]
+      })
+    }), {});
+
+    assert.equal(response.status, 200);
+    const events = parseSseEvents(await response.text());
+    assert.deepEqual(events.map((entry) => entry.event), [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]);
+    assert.equal(events[0]?.payload?.message?.model, "gpt-5.3-codex");
+    assert.equal(events[1]?.payload?.content_block?.type, "tool_use");
+    assert.equal(events[1]?.payload?.index, 0);
+    assert.equal(events[2]?.payload?.delta?.type, "input_json_delta");
+    assert.equal(events[2]?.payload?.index, 0);
+    assert.equal(events[4]?.payload?.delta?.stop_reason, "tool_use");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler falls back when AMP web search returns semantic credits refusal", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "chat.search",
+    modelAliases: {
+      "chat.search": {
+        strategy: "ordered",
+        targets: [
+          { ref: "anthropic/claude-3-5-haiku" },
+          { ref: "openrouter/gpt-4o-mini" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      },
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const payload = await readInitJsonBody(init);
+    calls.push({
+      url: String(url),
+      body: payload
+    });
+
+    if (String(url).includes("/messages")) {
+      return jsonResponse({
+        id: "msg_search_refusal",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [{ type: "text", text: "Web search credits are unavailable in this session" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 4, output_tokens: 2 }
+      });
+    }
+
+    return jsonResponse({
+      id: "resp_search_success",
+      object: "response",
+      model: "gpt-4o-mini",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "final web results" }]
+        }
+      ]
+    });
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "chat.search",
+        input: "Search online for llm-router release notes.",
+        tools: [
+          { type: "web_search" }
+        ],
+        tool_choice: "required"
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls[1]?.url, "https://openrouter.ai/api/v1/responses");
+    assert.equal(response.headers.get("x-llm-router-selected-candidate"), "openrouter/gpt-4o-mini");
+    assert.match(String(response.headers.get("x-llm-router-attempts") || ""), /search_unavailable/);
+
+    const payload = await readJson(response);
+    assert.equal(payload.output?.[0]?.content?.[0]?.text, "final web results");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});

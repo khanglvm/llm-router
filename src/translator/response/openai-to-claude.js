@@ -26,26 +26,7 @@ export function openaiToClaudeResponse(chunk, state) {
   }
 
   // First chunk - send message_start
-  if (!state.messageStartSent) {
-    state.messageStartSent = true;
-    state.messageId = chunk.id?.replace("chatcmpl-", "") || `msg_${Date.now()}`;
-    state.model = chunk.model || "unknown";
-    state.nextBlockIndex = 0;
-    
-    results.push({
-      type: "message_start",
-      message: {
-        id: state.messageId,
-        type: "message",
-        role: "assistant",
-        model: state.model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 }
-      }
-    });
-  }
+  ensureMessageStart(state, results, chunk);
 
   // Handle thinking/reasoning content
   const reasoningContent = delta?.reasoning_content || delta?.reasoning;
@@ -70,7 +51,8 @@ export function openaiToClaudeResponse(chunk, state) {
   }
 
   // Handle regular content
-  if (delta?.content) {
+  const textDelta = normalizeTextDelta(delta?.content);
+  if (textDelta) {
     stopThinkingBlock(state, results);
 
     if (!state.textBlockStarted) {
@@ -87,7 +69,7 @@ export function openaiToClaudeResponse(chunk, state) {
     results.push({
       type: "content_block_delta",
       index: state.textBlockIndex,
-      delta: { type: "text_delta", text: delta.content }
+      delta: { type: "text_delta", text: textDelta }
     });
   }
 
@@ -95,32 +77,12 @@ export function openaiToClaudeResponse(chunk, state) {
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
-
-      if (tc.id) {
-        stopThinkingBlock(state, results);
-        stopTextBlock(state, results);
-
-        const toolBlockIndex = state.nextBlockIndex++;
-        state.toolCalls.set(idx, { 
-          id: tc.id, 
-          name: tc.function?.name || "", 
-          blockIndex: toolBlockIndex 
-        });
-        
-        results.push({
-          type: "content_block_start",
-          index: toolBlockIndex,
-          content_block: {
-            type: "tool_use",
-            id: tc.id,
-            name: tc.function?.name || "",
-            input: {}
-          }
-        });
-      }
+      const toolInfo = ensureToolUseBlock(state, results, idx, {
+        id: tc.id,
+        name: tc.function?.name
+      });
 
       if (tc.function?.arguments) {
-        const toolInfo = state.toolCalls.get(idx);
         if (toolInfo) {
           results.push({
             type: "content_block_delta",
@@ -132,31 +94,215 @@ export function openaiToClaudeResponse(chunk, state) {
     }
   }
 
-  // Finish
-  if (choice.finish_reason) {
-    stopThinkingBlock(state, results);
-    stopTextBlock(state, results);
-
-    // Stop all tool blocks
-    for (const [, toolInfo] of state.toolCalls) {
+  if (delta?.function_call && typeof delta.function_call === "object") {
+    const toolInfo = ensureToolUseBlock(state, results, 0, {
+      id: delta.function_call.id,
+      name: delta.function_call.name
+    });
+    if (toolInfo && delta.function_call.arguments) {
       results.push({
-        type: "content_block_stop",
-        index: toolInfo.blockIndex
+        type: "content_block_delta",
+        index: toolInfo.blockIndex,
+        delta: { type: "input_json_delta", partial_json: delta.function_call.arguments }
       });
     }
+  }
 
+  emitFinalChoiceMessageFallback(choice?.message, state, results);
+
+  // Finish
+  if (choice.finish_reason) {
     state.finishReason = choice.finish_reason;
-    
-    const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
-    results.push({
-      type: "message_delta",
-      delta: { stop_reason: convertFinishReason(choice.finish_reason) },
-      usage: finalUsage
-    });
-    results.push({ type: "message_stop" });
+    results.push(...finalizeOpenAIToClaudeStream(state));
   }
 
   return results.length > 0 ? results : null;
+}
+
+function normalizeTextDelta(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if ((part.type === "text" || part.type === "output_text") && typeof part.text === "string") {
+        return part.text;
+      }
+      return "";
+    })
+    .join("");
+}
+
+function ensureToolUseBlock(state, results, index, { id, name } = {}) {
+  if (!state?.toolCalls || !(state.toolCalls instanceof Map)) return null;
+  const normalizedIndex = Number.isFinite(index) ? Number(index) : 0;
+  const existing = state.toolCalls.get(normalizedIndex);
+  if (existing) return existing;
+
+  const toolName = typeof name === "string" && name.trim() ? name.trim() : "tool";
+  const toolId = typeof id === "string" && id.trim()
+    ? id.trim()
+    : `tool_${state.messageId || "call"}_${normalizedIndex}`;
+
+  stopThinkingBlock(state, results);
+  stopTextBlock(state, results);
+
+  const toolBlockIndex = state.nextBlockIndex++;
+  const toolInfo = {
+    id: toolId,
+    name: toolName,
+    blockIndex: toolBlockIndex,
+    closed: false
+  };
+  state.toolCalls.set(normalizedIndex, toolInfo);
+
+  results.push({
+    type: "content_block_start",
+    index: toolBlockIndex,
+    content_block: {
+      type: "tool_use",
+      id: toolId,
+      name: toolName,
+      input: {}
+    }
+  });
+
+  return toolInfo;
+}
+
+function normalizeMessageToolCalls(message) {
+  const toolCalls = Array.isArray(message?.tool_calls)
+    ? message.tool_calls.filter((call) => call && typeof call === "object")
+    : [];
+
+  if (message?.function_call && typeof message.function_call === "object") {
+    toolCalls.push({
+      id: message.function_call.id,
+      function: {
+        name: message.function_call.name,
+        arguments: message.function_call.arguments
+      }
+    });
+  }
+
+  return toolCalls;
+}
+
+function emitTextDelta(text, state, results) {
+  if (!text) return;
+  stopThinkingBlock(state, results);
+
+  if (!state.textBlockStarted) {
+    state.textBlockIndex = state.nextBlockIndex++;
+    state.textBlockStarted = true;
+    state.textBlockClosed = false;
+    results.push({
+      type: "content_block_start",
+      index: state.textBlockIndex,
+      content_block: { type: "text", text: "" }
+    });
+  }
+
+  results.push({
+    type: "content_block_delta",
+    index: state.textBlockIndex,
+    delta: { type: "text_delta", text }
+  });
+}
+
+function emitFinalChoiceMessageFallback(message, state, results) {
+  if (!message || typeof message !== "object") return;
+
+  const hasTextOutput = state.textBlockStarted || state.textBlockClosed;
+  if (!hasTextOutput) {
+    const fallbackText = normalizeTextDelta(message.content)
+      || (typeof message.refusal === "string" ? message.refusal : "");
+    emitTextDelta(fallbackText, state, results);
+  }
+
+  const hasToolOutput = state.toolCalls instanceof Map && state.toolCalls.size > 0;
+  if (hasToolOutput) return;
+
+  const toolCalls = normalizeMessageToolCalls(message);
+  for (let index = 0; index < toolCalls.length; index += 1) {
+    const toolCall = toolCalls[index];
+    if (!toolCall || typeof toolCall !== "object") continue;
+    const toolInfo = ensureToolUseBlock(state, results, toolCall.index ?? index, {
+      id: toolCall.id,
+      name: toolCall.function?.name
+    });
+    if (toolInfo && toolCall.function?.arguments) {
+      results.push({
+        type: "content_block_delta",
+        index: toolInfo.blockIndex,
+        delta: { type: "input_json_delta", partial_json: toolCall.function.arguments }
+      });
+    }
+  }
+}
+
+function ensureMessageStart(state, results, chunk = undefined) {
+  if (state.messageStartSent) return;
+  state.messageStartSent = true;
+  state.messageId = chunk?.id?.replace("chatcmpl-", "") || state.messageId || `msg_${Date.now()}`;
+  state.model = chunk?.model || state.model || "unknown";
+  state.nextBlockIndex = Number.isFinite(state.nextBlockIndex) ? state.nextBlockIndex : 0;
+
+  results.push({
+    type: "message_start",
+    message: {
+      id: state.messageId,
+      type: "message",
+      role: "assistant",
+      model: state.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 }
+    }
+  });
+}
+
+export function finalizeOpenAIToClaudeStream(state, { force = false } = {}) {
+  const results = [];
+  if (!state || (!state.messageStartSent && !force)) return results;
+
+  if (!state.messageStartSent) {
+    ensureMessageStart(state, results);
+  }
+
+  stopThinkingBlock(state, results);
+  stopTextBlock(state, results);
+
+  for (const [, toolInfo] of state.toolCalls) {
+    if (toolInfo?.closed) continue;
+    results.push({
+      type: "content_block_stop",
+      index: toolInfo.blockIndex
+    });
+    toolInfo.closed = true;
+  }
+
+  if (!state.messageDeltaSent) {
+    const hasToolCalls = state.toolCalls instanceof Map && state.toolCalls.size > 0;
+    const normalizedFinishReason = hasToolCalls && (!state.finishReason || state.finishReason === "stop")
+      ? "tool_calls"
+      : (state.finishReason || "stop");
+    results.push({
+      type: "message_delta",
+      delta: { stop_reason: convertFinishReason(normalizedFinishReason) },
+      usage: state.usage || { input_tokens: 0, output_tokens: 0 }
+    });
+    state.messageDeltaSent = true;
+  }
+
+  if (!state.messageStopSent) {
+    results.push({ type: "message_stop" });
+    state.messageStopSent = true;
+  }
+
+  return results;
 }
 
 /**
@@ -169,6 +315,7 @@ function stopThinkingBlock(state, results) {
     index: state.thinkingBlockIndex
   });
   state.thinkingBlockStarted = false;
+  state.thinkingBlockIndex = null;
 }
 
 /**
@@ -191,6 +338,7 @@ function convertFinishReason(reason) {
   switch (reason) {
     case "stop": return "end_turn";
     case "length": return "max_tokens";
+    case "function_call": return "tool_use";
     case "tool_calls": return "tool_use";
     default: return "end_turn";
   }

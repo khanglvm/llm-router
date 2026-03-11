@@ -2,8 +2,10 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
+import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
 
 const DEFAULT_INSTANCE_STATE_FILENAME = ".llm-router.runtime.json";
+const MAX_START_OUTPUT_CHARS = 4000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -25,8 +27,8 @@ function normalizeRuntimeState(raw) {
 
   return {
     pid,
-    host: String(raw.host || "127.0.0.1"),
-    port: Number.isFinite(Number(raw.port)) ? Number(raw.port) : 8787,
+    host: String(raw.host || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isFinite(Number(raw.port)) ? Number(raw.port) : FIXED_LOCAL_ROUTER_PORT,
     configPath: String(raw.configPath || ""),
     watchConfig: normalizeBoolean(raw.watchConfig, true),
     watchBinary: normalizeBoolean(raw.watchBinary, true),
@@ -36,6 +38,46 @@ function normalizeRuntimeState(raw) {
     startedAt: String(raw.startedAt || new Date().toISOString()),
     version: String(raw.version || "")
   };
+}
+
+function normalizeHost(value, fallback = FIXED_LOCAL_ROUTER_HOST) {
+  return String(value || fallback).trim() || fallback;
+}
+
+function normalizeCliPath(value) {
+  const target = String(value || "").trim();
+  if (!target) return "";
+  return path.isAbsolute(target) ? target : path.resolve(target);
+}
+
+function appendRecentOutput(current, chunk, maxChars = MAX_START_OUTPUT_CHARS) {
+  if (!chunk) return current;
+  const combined = `${current}${chunk}`;
+  return combined.length > maxChars ? combined.slice(-maxChars) : combined;
+}
+
+function formatStartFailureMessage(baseMessage, { stderr = "", stdout = "" } = {}) {
+  const detail = String(stderr || "").trim() || String(stdout || "").trim();
+  return detail ? `${baseMessage}\n${detail}` : baseMessage;
+}
+
+function runtimeMatchesStartOptions(runtime, {
+  configPath,
+  host = FIXED_LOCAL_ROUTER_HOST,
+  port = FIXED_LOCAL_ROUTER_PORT,
+  watchConfig = true,
+  watchBinary = true,
+  requireAuth = false
+} = {}) {
+  const normalized = normalizeRuntimeState(runtime);
+  if (!normalized) return false;
+
+  return normalizeHost(normalized.host) === normalizeHost(host)
+    && Number(normalized.port) === Number(port)
+    && String(normalized.configPath || "").trim() === String(configPath || "").trim()
+    && normalized.watchConfig === normalizeBoolean(watchConfig, true)
+    && normalized.watchBinary === normalizeBoolean(watchBinary, true)
+    && normalized.requireAuth === normalizeBoolean(requireAuth, false);
 }
 
 export function getRuntimeStatePath() {
@@ -154,8 +196,8 @@ export function buildStartArgsFromState(state) {
   if (!target) {
     return {
       configPath: "",
-      host: "127.0.0.1",
-      port: 8787,
+      host: FIXED_LOCAL_ROUTER_HOST,
+      port: FIXED_LOCAL_ROUTER_PORT,
       watchConfig: true,
       watchBinary: true,
       requireAuth: false
@@ -171,16 +213,42 @@ export function buildStartArgsFromState(state) {
   };
 }
 
-export function spawnDetachedStart({
+export async function waitForRuntimeMatch(options = {}, deps = {}) {
+  const getActiveRuntimeStateFn = typeof deps.getActiveRuntimeState === "function"
+    ? deps.getActiveRuntimeState
+    : getActiveRuntimeState;
+  const timeoutMs = Number.isFinite(Number(deps.timeoutMs)) ? Math.max(250, Number(deps.timeoutMs)) : 8000;
+  const pollIntervalMs = Number.isFinite(Number(deps.pollIntervalMs)) ? Math.max(50, Number(deps.pollIntervalMs)) : 125;
+  const requireManagedByStartup = deps.requireManagedByStartup === true;
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const runtime = await getActiveRuntimeStateFn().catch(() => null);
+    if (runtimeMatchesStartOptions(runtime, options)
+      && (!requireManagedByStartup || runtime?.managedByStartup)) {
+      return runtime;
+    }
+    await sleep(pollIntervalMs);
+  }
+
+  return null;
+}
+
+export function spawnStartProcess({
   cliPath,
   configPath,
-  host = "127.0.0.1",
-  port = 8787,
+  host = FIXED_LOCAL_ROUTER_HOST,
+  port = FIXED_LOCAL_ROUTER_PORT,
   watchConfig = true,
   watchBinary = true,
   requireAuth = false
-}) {
-  const finalCliPath = String(cliPath || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim();
+}, {
+  detached = true,
+  stdio = "ignore",
+  unref = false,
+  env = process.env
+} = {}) {
+  const finalCliPath = normalizeCliPath(cliPath || env.LLM_ROUTER_CLI_PATH || process.argv[1] || "");
   if (!finalCliPath) throw new Error("Cannot spawn llm-router start: CLI path is unknown.");
 
   const args = [
@@ -193,14 +261,147 @@ export function spawnDetachedStart({
     `--watch-binary=${watchBinary ? "true" : "false"}`,
     `--require-auth=${requireAuth ? "true" : "false"}`
   ];
+
   const child = spawn(process.execPath, args, {
-    detached: true,
-    stdio: "ignore",
+    detached,
+    stdio,
     env: {
-      ...process.env,
+      ...env,
       LLM_ROUTER_CLI_PATH: finalCliPath
     }
   });
+
+  if (unref) child.unref();
+  return child;
+}
+
+export async function startDetachedRouterService(options = {}, deps = {}) {
+  const getActiveRuntimeStateFn = typeof deps.getActiveRuntimeState === "function"
+    ? deps.getActiveRuntimeState
+    : getActiveRuntimeState;
+  const spawnStartProcessFn = typeof deps.spawnStartProcess === "function"
+    ? deps.spawnStartProcess
+    : spawnStartProcess;
+  const timeoutMs = Number.isFinite(Number(deps.timeoutMs)) ? Math.max(250, Number(deps.timeoutMs)) : 8000;
+  const pollIntervalMs = Number.isFinite(Number(deps.pollIntervalMs)) ? Math.max(50, Number(deps.pollIntervalMs)) : 125;
+
+  let child;
+  try {
+    child = spawnStartProcessFn(options, {
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      unref: false,
+      env: deps.env || process.env
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  let childError = null;
+  let childExit = null;
+  let stdout = "";
+  let stderr = "";
+  const onStdout = (chunk) => {
+    stdout = appendRecentOutput(stdout, chunk);
+  };
+  const onStderr = (chunk) => {
+    stderr = appendRecentOutput(stderr, chunk);
+  };
+  child.stdout?.setEncoding?.("utf8");
+  child.stderr?.setEncoding?.("utf8");
+  child.stdout?.on?.("data", onStdout);
+  child.stderr?.on?.("data", onStderr);
+  child.once("error", (error) => {
+    childError = error;
+  });
+  child.once("exit", (code, signal) => {
+    childExit = { code, signal };
+  });
+
+  const cleanupChildIo = () => {
+    child.stdout?.off?.("data", onStdout);
+    child.stderr?.off?.("data", onStderr);
+    child.stdout?.destroy?.();
+    child.stderr?.destroy?.();
+  };
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const runtime = await getActiveRuntimeStateFn().catch(() => null);
+    if (runtimeMatchesStartOptions(runtime, options)) {
+      cleanupChildIo();
+      child.unref();
+      return {
+        ok: true,
+        pid: child.pid,
+        runtime
+      };
+    }
+
+    if (childError) {
+      cleanupChildIo();
+      return {
+        ok: false,
+        errorMessage: formatStartFailureMessage(
+          childError instanceof Error ? childError.message : String(childError),
+          { stderr, stdout }
+        )
+      };
+    }
+
+    if (childExit) {
+      cleanupChildIo();
+      return {
+        ok: false,
+        errorMessage: formatStartFailureMessage(
+          `llm-router exited before becoming ready (${childExit.signal || childExit.code || "unknown"}).`,
+          { stderr, stdout }
+        ),
+        exitCode: childExit.code,
+        signal: childExit.signal || ""
+      };
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  cleanupChildIo();
   child.unref();
+  return {
+    ok: false,
+    errorMessage: formatStartFailureMessage(
+      `Timed out waiting for llm-router to start on http://${normalizeHost(options.host)}:${Number(options.port || FIXED_LOCAL_ROUTER_PORT)}.`,
+      { stderr, stdout }
+    ),
+    pid: child.pid
+  };
+}
+
+export function spawnDetachedStart({
+  cliPath,
+  configPath,
+  host = FIXED_LOCAL_ROUTER_HOST,
+  port = FIXED_LOCAL_ROUTER_PORT,
+  watchConfig = true,
+  watchBinary = true,
+  requireAuth = false
+}) {
+  const child = spawnStartProcess({
+    cliPath,
+    configPath,
+    host,
+    port,
+    watchConfig,
+    watchBinary,
+    requireAuth
+  }, {
+    detached: true,
+    stdio: "ignore",
+    unref: true,
+    env: process.env
+  });
   return child.pid;
 }

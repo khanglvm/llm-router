@@ -1,4 +1,5 @@
 import { promises as fsPromises } from "node:fs";
+import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
@@ -19,6 +20,7 @@ import {
 } from "../node/config-store.js";
 import { probeProvider, probeProviderEndpointMatrix } from "../node/provider-probe.js";
 import { runStartCommand } from "../node/start-command.js";
+import { runWebCommand } from "../node/web-command.js";
 import { resolveListenPort } from "../node/listen-port.js";
 import { installStartup, restartStartup, startupStatus, stopStartup, uninstallStartup } from "../node/startup-manager.js";
 import {
@@ -31,8 +33,12 @@ import {
 import {
   CONFIG_VERSION,
   configHasProvider,
+  DEFAULT_AMP_ENTITY_DEFINITIONS,
+  DEFAULT_AMP_SIGNATURE_DEFINITIONS,
+  DEFAULT_AMP_SUBAGENT_DEFINITIONS,
   DEFAULT_PROVIDER_USER_AGENT,
   maskSecret,
+  normalizeRuntimeConfig,
   PROVIDER_ID_PATTERN,
   sanitizeConfigForDisplay,
   validateRuntimeConfig
@@ -41,6 +47,11 @@ import {
   CODEX_SUBSCRIPTION_MODELS,
   CLAUDE_CODE_SUBSCRIPTION_MODELS
 } from "../runtime/subscription-constants.js";
+import {
+  LOCAL_ROUTER_HOST,
+  LOCAL_ROUTER_ORIGIN,
+  LOCAL_ROUTER_PORT
+} from "../shared/local-router-defaults.js";
 import { FORMATS } from "../translator/index.js";
 import {
   CLOUDFLARE_ACCOUNT_ID_ENV_NAME,
@@ -84,23 +95,28 @@ const MODEL_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const MODEL_ROUTING_STRATEGY_OPTIONS = [
   {
     value: "auto",
-    label: "Auto"
+    label: "Auto",
+    hint: "recommended"
   },
   {
     value: "ordered",
-    label: "Ordered"
+    label: "Ordered",
+    hint: "try routes in order"
   },
   {
     value: "round-robin",
-    label: "Round-robin"
+    label: "Round-robin",
+    hint: "even spread"
   },
   {
     value: "weighted-rr",
-    label: "Weighted round-robin"
+    label: "Weighted round-robin",
+    hint: "respect weights"
   },
   {
     value: "quota-aware-weighted-rr",
-    label: "Quota-aware weighted round-robin"
+    label: "Quota-aware weighted round-robin",
+    hint: "favor routes with quota left"
   }
 ];
 const MODEL_ALIAS_STRATEGIES = MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => option.value);
@@ -174,6 +190,337 @@ export {
 
 function canPrompt() {
   return Boolean(process.stdout.isTTY && process.stdin.isTTY);
+}
+
+function canUseInteractivePrompts(context, requiredMethods = ["select", "text", "confirm"]) {
+  const prompts = context?.prompts;
+  const hasMethods = Boolean(prompts) && requiredMethods.every((method) => typeof prompts?.[method] === "function");
+  return Boolean((canPrompt() && hasMethods) || (context?.forcePrompt === true && hasMethods));
+}
+
+const PROMPT_CANCELLED = Symbol("prompt-cancelled");
+
+function isPromptCancelledError(error) {
+  if (!error) return false;
+  if (error === PROMPT_CANCELLED) return true;
+  const name = String(error?.name || "").trim().toLowerCase();
+  const message = String(error?.message || error || "").trim().toLowerCase();
+  return name === "aborterror"
+    || message.includes("cancel")
+    || message.includes("canceled")
+    || message.includes("cancelled")
+    || message.includes("aborted")
+    || message.includes("escape");
+}
+
+async function runPromptWithEscape(promiseFactory) {
+  try {
+    return await promiseFactory();
+  } catch (error) {
+    if (isPromptCancelledError(error)) return PROMPT_CANCELLED;
+    throw error;
+  }
+}
+
+function emitInteractiveResult(context, result) {
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  const error = typeof context?.terminal?.error === "function" ? context.terminal.error.bind(context.terminal) : line;
+  if (!result) return;
+  if (result.ok === false) {
+    error?.(String(result.errorMessage || result.data || "Operation failed."));
+    return;
+  }
+  if (result.data) {
+    line?.(String(result.data));
+  }
+}
+
+function normalizeAmpClientSettingsScope(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized || normalized === "global" || normalized === "user") return "global";
+  if (normalized === "workspace" || normalized === "project") return "workspace";
+  return "";
+}
+
+export function normalizeAmpClientProxyUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return "";
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return "";
+  }
+
+  parsed.username = "";
+  parsed.password = "";
+  parsed.hash = "";
+  parsed.search = "";
+
+  const normalizedPath = parsed.pathname.replace(/\/+$/, "") || "/";
+  parsed.pathname = normalizedPath;
+  const out = parsed.toString();
+  return normalizedPath === "/" && out.endsWith("/") ? out.slice(0, -1) : out;
+}
+
+export function resolveAmpClientSettingsFilePath({
+  scope = "global",
+  explicitPath = "",
+  cwd = process.cwd(),
+  env = process.env,
+  homeDir = os.homedir()
+} = {}) {
+  const direct = String(explicitPath || "").trim();
+  if (direct) return path.resolve(direct);
+
+  const normalizedScope = normalizeAmpClientSettingsScope(scope) || "global";
+  if (normalizedScope === "workspace") {
+    return path.resolve(cwd, ".amp", "settings.json");
+  }
+
+  const envOverride = String(env?.AMP_SETTINGS_FILE || "").trim();
+  if (envOverride) return path.resolve(envOverride);
+
+  const configHome = String(env?.XDG_CONFIG_HOME || "").trim() || path.join(homeDir, ".config");
+  return path.join(configHome, "amp", "settings.json");
+}
+
+export function resolveAmpClientSecretsFilePath({
+  explicitPath = "",
+  env = process.env,
+  homeDir = os.homedir()
+} = {}) {
+  const direct = String(explicitPath || env?.AMP_SECRETS_FILE || "").trim();
+  if (direct) return path.resolve(direct);
+
+  const dataHome = String(env?.XDG_DATA_HOME || "").trim() || path.join(homeDir, ".local", "share");
+  return path.join(dataHome, "amp", "secrets.json");
+}
+
+async function readJsonObjectFile(filePath, label) {
+  try {
+    const raw = await fsPromises.readFile(filePath, "utf8");
+    const parsed = raw.trim() ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${label} must contain a JSON object.`);
+    }
+    return {
+      data: parsed,
+      existed: true
+    };
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return {
+        data: {},
+        existed: false
+      };
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error(`${label} contains invalid JSON.`);
+    }
+    throw error;
+  }
+}
+
+async function writeJsonObjectFile(filePath, data) {
+  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+  await fsPromises.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await fsPromises.chmod(filePath, 0o600);
+}
+
+async function findAmpClientApiKeyForUrl(endpointUrl, {
+  env = process.env,
+  homeDir = os.homedir(),
+  explicitSecretsFile = ""
+} = {}) {
+  const normalizedUrl = normalizeAmpClientProxyUrl(endpointUrl);
+  if (!normalizedUrl) return "";
+
+  try {
+    const secretsFilePath = resolveAmpClientSecretsFilePath({
+      explicitPath: explicitSecretsFile,
+      env,
+      homeDir
+    });
+    const secretsState = await readJsonObjectFile(secretsFilePath, `AMP secrets file '${secretsFilePath}'`);
+    const candidates = dedupeList([
+      `apiKey@${normalizedUrl}`,
+      normalizedUrl.endsWith("/") ? `apiKey@${normalizedUrl.slice(0, -1)}` : `apiKey@${normalizedUrl}/`
+    ]);
+    for (const fieldName of candidates) {
+      const value = String(secretsState.data?.[fieldName] || "").trim();
+      if (value) return value;
+    }
+  } catch {
+    // Ignore discovery errors and fall through to manual prompt.
+  }
+
+  return "";
+}
+
+function hasConfiguredAmpRouting(amp) {
+  const source = amp && typeof amp === "object" && !Array.isArray(amp) ? amp : {};
+  if (String(source.defaultRoute || "").trim()) return true;
+  if (Array.isArray(source.rawModelRoutes) && source.rawModelRoutes.length > 0) return true;
+  if (Array.isArray(source.modelMappings) && source.modelMappings.length > 0) return true;
+  if (source.routes && typeof source.routes === "object" && Object.keys(source.routes).length > 0) return true;
+  if (source.subagentMappings && typeof source.subagentMappings === "object" && Object.keys(source.subagentMappings).length > 0) return true;
+  return false;
+}
+
+function resolveAmpBootstrapRouteRef(config) {
+  const configuredDefault = String(config?.defaultModel || "").trim();
+  if (configuredDefault) return configuredDefault;
+
+  for (const provider of Array.isArray(config?.providers) ? config.providers : []) {
+    if (provider?.enabled === false) continue;
+    const providerId = String(provider?.id || "").trim();
+    if (!providerId) continue;
+    const firstModel = Array.isArray(provider?.models)
+      ? provider.models.find((entry) => String(entry?.id || "").trim())
+      : null;
+    if (firstModel?.id) return `${providerId}/${firstModel.id}`;
+  }
+
+  return "";
+}
+
+async function maybeBootstrapAmpPatchDefaults({
+  config,
+  amp,
+  patchPlan,
+  env = process.env,
+  homeDir = os.homedir()
+} = {}) {
+  const base = await applyAmpRecommendedAmpConnectionDefaults({
+    amp,
+    patchPlan,
+    env,
+    homeDir
+  });
+  const nextAmp = base.amp;
+  let changed = base.changed === true;
+  const discoveredUpstreamApiKey = base.discoveredUpstreamApiKey === true;
+
+  if (!hasConfiguredAmpRouting(nextAmp)) {
+    const bootstrapRouteRef = resolveAmpBootstrapRouteRef(config);
+    if (!bootstrapRouteRef) {
+      return {
+        amp: nextAmp,
+        changed,
+        bootstrapRouteRef: "",
+        discoveredUpstreamApiKey,
+        error: "AMP bootstrap needs defaultModel (or at least one provider model) when patching AMP client files without explicit AMP routes. Set defaultModel first or pass --amp-default-route."
+      };
+    }
+    nextAmp.defaultRoute = bootstrapRouteRef;
+    changed = true;
+    return {
+      amp: nextAmp,
+      changed,
+      bootstrapRouteRef,
+      discoveredUpstreamApiKey,
+      error: ""
+    };
+  }
+
+  return {
+    amp: nextAmp,
+    changed,
+    bootstrapRouteRef: String(nextAmp.defaultRoute || "").trim(),
+    discoveredUpstreamApiKey,
+    error: ""
+  };
+}
+
+async function applyAmpRecommendedAmpConnectionDefaults({
+  amp,
+  patchPlan,
+  env = process.env,
+  homeDir = os.homedir()
+} = {}) {
+  const nextAmp = amp && typeof amp === "object" && !Array.isArray(amp)
+    ? structuredClone(amp)
+    : {};
+  let changed = false;
+  let discoveredUpstreamApiKey = false;
+
+  if (!String(nextAmp.upstreamUrl || "").trim()) {
+    nextAmp.upstreamUrl = "https://ampcode.com";
+    changed = true;
+  }
+
+  if (nextAmp.restrictManagementToLocalhost !== true) {
+    nextAmp.restrictManagementToLocalhost = true;
+    changed = true;
+  }
+
+  if (!String(nextAmp.upstreamApiKey || "").trim()) {
+    const discoveredUpstreamApiKeyValue = await findAmpClientApiKeyForUrl(nextAmp.upstreamUrl, {
+      env,
+      homeDir,
+      explicitSecretsFile: patchPlan?.secretsFilePath || ""
+    });
+    if (discoveredUpstreamApiKeyValue) {
+      nextAmp.upstreamApiKey = discoveredUpstreamApiKeyValue;
+      changed = true;
+      discoveredUpstreamApiKey = true;
+    }
+  }
+
+  if (!String(nextAmp.preset || "").trim()) {
+    nextAmp.preset = "builtin";
+    changed = true;
+  }
+
+  return {
+    amp: nextAmp,
+    changed,
+    discoveredUpstreamApiKey,
+    error: ""
+  };
+}
+
+export async function patchAmpClientConfigFiles({
+  settingsFilePath,
+  secretsFilePath,
+  endpointUrl,
+  apiKey
+} = {}) {
+  const normalizedUrl = normalizeAmpClientProxyUrl(endpointUrl);
+  const normalizedApiKey = String(apiKey || "").trim();
+  const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveAmpClientSettingsFilePath()).trim());
+  const resolvedSecretsPath = path.resolve(String(secretsFilePath || resolveAmpClientSecretsFilePath()).trim());
+
+  if (!normalizedUrl) {
+    throw new Error("AMP client endpoint URL must be a valid http:// or https:// URL.");
+  }
+  if (!normalizedApiKey) {
+    throw new Error("AMP client API key is required.");
+  }
+
+  const settingsState = await readJsonObjectFile(resolvedSettingsPath, `AMP settings file '${resolvedSettingsPath}'`);
+  settingsState.data["amp.url"] = normalizedUrl;
+  await writeJsonObjectFile(resolvedSettingsPath, settingsState.data);
+
+  const secretsState = await readJsonObjectFile(resolvedSecretsPath, `AMP secrets file '${resolvedSecretsPath}'`);
+  const secretFieldName = `apiKey@${normalizedUrl}`;
+  secretsState.data[secretFieldName] = normalizedApiKey;
+  await writeJsonObjectFile(resolvedSecretsPath, secretsState.data);
+
+  return {
+    settingsFilePath: resolvedSettingsPath,
+    secretsFilePath: resolvedSecretsPath,
+    endpointUrl: normalizedUrl,
+    secretFieldName,
+    settingsCreated: !settingsState.existed,
+    secretsCreated: !secretsState.existed
+  };
 }
 
 function readArg(args, names, fallback = undefined) {
@@ -307,6 +654,1417 @@ function parseJsonObjectArg(value, fieldName) {
   }
 }
 
+function normalizeAmpModelMappingEntry(entry) {
+  if (!entry) return null;
+
+  if (typeof entry === "string") {
+    const text = String(entry).trim();
+    if (!text) return null;
+    const separator = text.includes("=>") ? "=>" : (text.includes("->") ? "->" : "");
+    if (!separator) {
+      throw new Error(`Invalid AMP model mapping '${text}'. Use 'from => to'.`);
+    }
+    const separatorIndex = text.indexOf(separator);
+    const from = text.slice(0, separatorIndex).trim();
+    const to = text.slice(separatorIndex + separator.length).trim();
+    if (!from || !to) {
+      throw new Error(`Invalid AMP model mapping '${text}'. Both source and target are required.`);
+    }
+    return { from, to };
+  }
+
+  if (typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("AMP model mappings must be objects or 'from => to' strings.");
+  }
+
+  const from = String(entry.from ?? entry.match ?? entry.pattern ?? entry.model ?? "").trim();
+  const to = String(entry.to ?? entry.target ?? entry.route ?? entry.ref ?? "").trim();
+  if (!from || !to) {
+    throw new Error("AMP model mapping objects must include non-empty 'from' and 'to' values.");
+  }
+  return { from, to };
+}
+
+function parseAmpModelMappingsArg(value, fieldName = "--amp-model-mappings") {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeAmpModelMappingEntry(entry)).filter(Boolean);
+  }
+
+  if (typeof value === "object") {
+    return [normalizeAmpModelMappingEntry(value)].filter(Boolean);
+  }
+
+  const text = String(value).trim();
+  if (!text) return [];
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.map((entry) => normalizeAmpModelMappingEntry(entry)).filter(Boolean);
+    }
+    if (parsed && typeof parsed === "object") {
+      return [normalizeAmpModelMappingEntry(parsed)].filter(Boolean);
+    }
+  } catch {
+    // Fall through to the lightweight line-based parser below.
+  }
+
+  const entries = text
+    .split(/\r?\n|,(?=(?:[^"]*"[^"]*")*[^"]*$)/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (entries.length === 0) return [];
+
+  try {
+    return entries.map((entry) => normalizeAmpModelMappingEntry(entry)).filter(Boolean);
+  } catch (error) {
+    throw new Error(`${fieldName} must be JSON or a newline/comma separated list of 'from => to' mappings. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function normalizeAmpRouteIdInput(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.startsWith("@")) {
+    return `@${text.slice(1).trim().toLowerCase().replace(/[\s_]+/g, "-")}`;
+  }
+  return normalizeAmpSubagentIdInput(text);
+}
+
+function normalizeAmpRouteMappingEntry(entry) {
+  if (typeof entry === "string") {
+    const text = String(entry).trim();
+    if (!text) return null;
+    const separator = text.includes("=>") ? "=>" : (text.includes("->") ? "->" : "");
+    if (!separator) {
+      throw new Error(`Invalid AMP route mapping '${text}'. Use 'entity-or-signature => route'.`);
+    }
+    const separatorIndex = text.indexOf(separator);
+    const key = normalizeAmpRouteIdInput(text.slice(0, separatorIndex));
+    const to = String(text.slice(separatorIndex + separator.length) || "").trim();
+    if (!key || !to) {
+      throw new Error(`Invalid AMP route mapping '${text}'. Both route key and target are required.`);
+    }
+    return { key, to };
+  }
+
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("AMP routes must be objects or 'entity => route' strings.");
+  }
+
+  const key = normalizeAmpRouteIdInput(entry.key ?? entry.id ?? entry.name ?? entry.agent ?? entry.subagent ?? entry.signature);
+  const to = String(entry.to ?? entry.target ?? entry.route ?? entry.ref ?? "").trim();
+  if (!key || !to) {
+    throw new Error("AMP route objects must include non-empty route key and target values.");
+  }
+  return { key, to };
+}
+
+function parseAmpRoutesArg(value, fieldName = "--amp-routes") {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  if (Array.isArray(value)) {
+    return Object.fromEntries(value.map((entry) => {
+      const normalized = normalizeAmpRouteMappingEntry(entry);
+      return [normalized.key, normalized.to];
+    }));
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, to]) => [normalizeAmpRouteIdInput(key), String(to || "").trim()]).filter(([key, to]) => key && to));
+  }
+
+  const text = String(value).trim();
+  if (!text) return {};
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return Object.fromEntries(parsed.map((entry) => {
+        const normalized = normalizeAmpRouteMappingEntry(entry);
+        return [normalized.key, normalized.to];
+      }));
+    }
+    if (parsed && typeof parsed === "object") {
+      return Object.fromEntries(Object.entries(parsed).map(([key, to]) => [normalizeAmpRouteIdInput(key), String(to || "").trim()]).filter(([key, to]) => key && to));
+    }
+  } catch {
+    // Fall through to line-based parser.
+  }
+
+  const entries = text
+    .split(/\r?\n|,(?=(?:[^"]*"[^"]*")*[^"]*$)/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  try {
+    return Object.fromEntries(entries.map((entry) => {
+      const normalized = normalizeAmpRouteMappingEntry(entry);
+      return [normalized.key, normalized.to];
+    }));
+  } catch (error) {
+    throw new Error(`${fieldName} must be JSON or a newline/comma separated list of 'entity-or-signature => route' mappings. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function parseAmpOverridesArg(value, fieldName = "--amp-overrides") {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "object") return value;
+
+  const text = String(value).trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("AMP overrides must be a JSON object.");
+    }
+    return parsed;
+  } catch (error) {
+    throw new Error(`${fieldName} must be a JSON object. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function normalizeAmpSubagentMappingEntry(entry) {
+  if (typeof entry === "string") {
+    const parts = entry.split(/=>|->|:/).map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      return { agent: parts[0], to: parts.slice(1).join(":") };
+    }
+    throw new Error("AMP subagent mappings must use the format 'subagent => route'.");
+  }
+
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("AMP subagent mappings must be objects or 'subagent => route' strings.");
+  }
+
+  const agent = String(entry.agent ?? entry.subagent ?? entry.name ?? entry.id ?? "").trim();
+  const to = String(entry.to ?? entry.target ?? entry.route ?? entry.ref ?? "").trim();
+  if (!agent || !to) {
+    throw new Error("AMP subagent mapping objects must include non-empty 'agent' and 'to' values.");
+  }
+  return { agent, to };
+}
+
+function parseAmpSubagentMappingsArg(value, fieldName = "--amp-subagent-mappings") {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  if (Array.isArray(value)) {
+    return Object.fromEntries(value.map((entry) => {
+      const normalized = normalizeAmpSubagentMappingEntry(entry);
+      return [normalized.agent, normalized.to];
+    }));
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([agent, to]) => [agent, String(to || "").trim()]).filter(([, to]) => to));
+  }
+
+  const text = String(value).trim();
+  if (!text) return {};
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return Object.fromEntries(parsed.map((entry) => {
+        const normalized = normalizeAmpSubagentMappingEntry(entry);
+        return [normalized.agent, normalized.to];
+      }));
+    }
+    if (parsed && typeof parsed === "object") {
+      return Object.fromEntries(Object.entries(parsed).map(([agent, to]) => [agent, String(to || "").trim()]).filter(([, to]) => to));
+    }
+  } catch {
+    // Fall through to the lightweight line-based parser below.
+  }
+
+  const entries = text
+    .split(/\r?\n|,(?=(?:[^"]*"[^"]*")*[^"]*$)/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  try {
+    return Object.fromEntries(entries.map((entry) => {
+      const normalized = normalizeAmpSubagentMappingEntry(entry);
+      return [normalized.agent, normalized.to];
+    }));
+  } catch (error) {
+    throw new Error(`${fieldName} must be JSON or a newline/comma separated list of 'subagent => route' mappings. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+
+function normalizeAmpSubagentDefinitionEntry(entry) {
+  if (typeof entry === "string") {
+    const parts = entry.split(/=>|->|:/).map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      return { id: parts[0], patterns: parts.slice(1).join(":").split(/[|,]/).map((part) => part.trim()).filter(Boolean) };
+    }
+    throw new Error("AMP subagent definitions must use the format 'subagent => model-pattern|model-pattern'.");
+  }
+
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("AMP subagent definitions must be objects or 'subagent => model-pattern' strings.");
+  }
+
+  const id = String(entry.id ?? entry.agent ?? entry.subagent ?? entry.name ?? entry.key ?? "").trim();
+  const patterns = [];
+  for (const value of [entry.patterns, entry.matches, entry.models, entry.model, entry.pattern]) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const text = String(item || "").trim();
+        if (text) patterns.push(text);
+      }
+      continue;
+    }
+    const text = String(value || "").trim();
+    if (!text) continue;
+    for (const item of text.split(/[|,]/)) {
+      const pattern = item.trim();
+      if (pattern) patterns.push(pattern);
+    }
+  }
+
+  if (!id || patterns.length === 0) {
+    throw new Error("AMP subagent definition objects must include non-empty 'id' and at least one model pattern.");
+  }
+  return { id, patterns };
+}
+
+function parseAmpSubagentDefinitionsArg(value, fieldName = "--amp-subagent-definitions") {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeAmpSubagentDefinitionEntry(entry));
+  }
+
+  const text = typeof value === "string" ? value.trim() : "";
+  if (typeof value === "object" && !Array.isArray(value)) {
+    if (value && Array.isArray(value.definitions)) {
+      return value.definitions.map((entry) => normalizeAmpSubagentDefinitionEntry(entry));
+    }
+    return Object.entries(value || {}).map(([id, patterns]) => normalizeAmpSubagentDefinitionEntry({ id, patterns }));
+  }
+
+  if (!text) return [];
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.map((entry) => normalizeAmpSubagentDefinitionEntry(entry));
+    }
+    if (parsed && typeof parsed === "object") {
+      if (Array.isArray(parsed.definitions)) {
+        return parsed.definitions.map((entry) => normalizeAmpSubagentDefinitionEntry(entry));
+      }
+      return Object.entries(parsed).map(([id, patterns]) => normalizeAmpSubagentDefinitionEntry({ id, patterns }));
+    }
+  } catch {
+    // Fall through to line-based parser.
+  }
+
+  const entries = text
+    .split(/\r?\n|,(?=(?:[^"]*"[^"]*")*[^"]*$)/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  try {
+    return entries.map((entry) => normalizeAmpSubagentDefinitionEntry(entry));
+  } catch (error) {
+    throw new Error(`${fieldName} must be JSON or a newline/comma separated list of 'subagent => model-pattern|pattern' definitions. ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function normalizeAmpSubagentIdInput(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return "";
+  if (["lookat", "look-at", "look_at", "look at"].includes(text)) return "look-at";
+  if (["title", "titling"].includes(text)) return "title";
+  return text;
+}
+
+function parseAmpPatternListInput(value) {
+  const text = Array.isArray(value) ? value.join("\n") : String(value || "");
+  return dedupeList(
+    text
+      .split(/\r?\n|[|,]/)
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean)
+  );
+}
+
+function cloneAmpSubagentDefinitionEntries(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => ({
+      id: normalizeAmpSubagentIdInput(entry?.id),
+      patterns: parseAmpPatternListInput(entry?.patterns || [])
+    }))
+    .filter((entry) => entry.id && entry.patterns.length > 0);
+}
+
+function getEffectiveAmpSubagentDefinitions(amp) {
+  return cloneAmpSubagentDefinitionEntries(
+    Array.isArray(amp?.subagentDefinitions)
+      ? amp.subagentDefinitions
+      : DEFAULT_AMP_SUBAGENT_DEFINITIONS
+  );
+}
+
+function ensureAmpSubagentMappingsObject(amp) {
+  if (!amp.subagentMappings || typeof amp.subagentMappings !== "object" || Array.isArray(amp.subagentMappings)) {
+    amp.subagentMappings = {};
+  }
+  return amp.subagentMappings;
+}
+
+function ensureCustomAmpSubagentDefinitions(amp) {
+  if (!Array.isArray(amp.subagentDefinitions)) {
+    amp.subagentDefinitions = getEffectiveAmpSubagentDefinitions(amp);
+  } else {
+    amp.subagentDefinitions = cloneAmpSubagentDefinitionEntries(amp.subagentDefinitions);
+  }
+  return amp.subagentDefinitions;
+}
+
+function buildAmpModelMappingPromptOptions(mappings) {
+  return (Array.isArray(mappings) ? mappings : []).map((entry, index) => ({
+    value: String(index),
+    label: `${entry?.from || "(match)"} -> ${entry?.to || "(route)"}`
+  }));
+}
+
+function buildAmpSubagentPromptOptions(amp) {
+  const mappings = amp?.subagentMappings && typeof amp.subagentMappings === "object" ? amp.subagentMappings : {};
+  return getEffectiveAmpSubagentDefinitions(amp).map((entry) => ({
+    value: entry.id,
+    label: `${entry.id} | ${(entry.patterns || []).join(" | ")} | ${mappings[entry.id] || "defaultModel"}`
+  }));
+}
+
+function buildAmpSubagentReviewRows(amp) {
+  const mappings = amp?.subagentMappings && typeof amp.subagentMappings === "object" ? amp.subagentMappings : {};
+  return getEffectiveAmpSubagentDefinitions(amp).map((entry) => ([
+    entry.id,
+    (entry.patterns || []).join(" | ") || "(not set)",
+    mappings[entry.id] || "defaultModel"
+  ]));
+}
+
+function buildAmpClientPatchSection(result) {
+  return "AMP Client Files\n" + renderAsciiTable(["Field", "Value"], [
+    ["Settings File", result?.settingsFilePath || "(not set)"],
+    ["Secrets File", result?.secretsFilePath || "(not set)"],
+    ["Endpoint URL", result?.endpointUrl || "(not set)"],
+    ["Secret Field", result?.secretFieldName || "(not set)"],
+    ["Created Settings File", formatYesNo(result?.settingsCreated === true)],
+    ["Created Secrets File", formatYesNo(result?.secretsCreated === true)]
+  ]);
+}
+
+function buildAmpRouteTargetPromptOptions(config, {
+  includeClearOption = false,
+  clearValue = "__clear__",
+  clearLabel = "Clear mapping",
+  clearHint = "use AMP default routing"
+} = {}) {
+  const options = [];
+  if (includeClearOption) {
+    options.push({
+      value: clearValue,
+      label: clearLabel,
+      hint: clearHint
+    });
+  }
+
+  for (const [aliasId, alias] of Object.entries(config?.modelAliases || {})) {
+    options.push({
+      value: aliasId,
+      label: aliasId,
+      hint: `alias · ${summarizeAliasPromptHint(alias)}`
+    });
+  }
+
+  for (const provider of (config?.providers || [])) {
+    if (!provider || provider.enabled === false) continue;
+    for (const model of (provider.models || [])) {
+      if (!model || model.enabled === false || !String(model.id || "").trim()) continue;
+      const routeRef = `${provider.id}/${model.id}`;
+      options.push({
+        value: routeRef,
+        label: routeRef,
+        hint: summarizeProviderPromptHint(provider)
+      });
+    }
+  }
+
+  const seen = new Set();
+  return options.filter((option) => {
+    if (!option || seen.has(option.value)) return false;
+    seen.add(option.value);
+    return true;
+  });
+}
+
+function resolvePreferredAmpRoute(config, amp) {
+  return String(amp?.defaultRoute || "").trim() || resolveAmpBootstrapRouteRef(config);
+}
+
+async function promptAmpRouteTarget(context, config, {
+  message,
+  initialValue = "",
+  includeClearOption = false,
+  clearLabel = "Clear mapping",
+  clearHint = "use AMP default routing",
+  textPlaceholder = "chat.default"
+} = {}) {
+  const options = buildAmpRouteTargetPromptOptions(config, {
+    includeClearOption,
+    clearLabel,
+    clearHint
+  });
+  const normalizedInitial = String(initialValue || "").trim();
+
+  if (options.length > 0) {
+    const explicitInitial = options.some((option) => option.value === normalizedInitial)
+      ? normalizedInitial
+      : undefined;
+    const selection = await context.prompts.select({
+      message,
+      options,
+      initialValue: explicitInitial
+    });
+    return selection === "__clear__" ? "" : String(selection || "").trim();
+  }
+
+  return String(await context.prompts.text({
+    message,
+    required: includeClearOption !== true,
+    initialValue: normalizedInitial,
+    placeholder: textPlaceholder,
+    validate: (value) => {
+      const candidate = String(value || "").trim();
+      if (!candidate && includeClearOption) return undefined;
+      return candidate ? undefined : "Choose a model alias or provider/model route.";
+    }
+  }) || "").trim();
+}
+
+function getAmpDefaultMatchForRouteKey(routeKey) {
+  const key = String(routeKey || "").trim();
+  if (!key) return "";
+
+  const signatureMatch = DEFAULT_AMP_SIGNATURE_DEFINITIONS.find((entry) => entry?.id === key);
+  if (signatureMatch?.defaultMatch) return String(signatureMatch.defaultMatch).trim();
+
+  const entityMatch = DEFAULT_AMP_ENTITY_DEFINITIONS.find((entry) => entry?.id === key);
+  if (!entityMatch) return "";
+
+  const defaultMatches = [...new Set((entityMatch.signatures || [])
+    .map((signatureId) => DEFAULT_AMP_SIGNATURE_DEFINITIONS.find((entry) => entry?.id === signatureId)?.defaultMatch)
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))];
+
+  return defaultMatches.length === 1 ? defaultMatches[0] : defaultMatches.join(" | ");
+}
+
+function buildAmpSimpleRouteOptions(amp) {
+  const configuredRoutes = amp?.routes && typeof amp.routes === "object" && !Array.isArray(amp.routes)
+    ? amp.routes
+    : {};
+  return DEFAULT_AMP_ENTITY_DEFINITIONS.map((entry) => {
+    const defaultMatch = getAmpDefaultMatchForRouteKey(entry.id);
+    return {
+      value: entry.id,
+      label: entry.id,
+      hint: configuredRoutes[entry.id]
+        ? `${defaultMatch || entry.description} · ${configuredRoutes[entry.id]}`
+        : `${defaultMatch || entry.description}`
+    };
+  });
+}
+
+function buildAmpKnownRouteKeySet() {
+  return new Set([
+    ...DEFAULT_AMP_ENTITY_DEFINITIONS.map((entry) => entry.id),
+    ...DEFAULT_AMP_SIGNATURE_DEFINITIONS.map((entry) => entry.id)
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+}
+
+const KNOWN_AMP_ROUTE_KEYS = buildAmpKnownRouteKeySet();
+
+function isKnownAmpRouteKey(value) {
+  return KNOWN_AMP_ROUTE_KEYS.has(String(value || "").trim());
+}
+
+function ensureAmpRouteCollections(amp) {
+  if (!amp.routes || typeof amp.routes !== "object" || Array.isArray(amp.routes)) {
+    amp.routes = {};
+  }
+  if (!Array.isArray(amp.rawModelRoutes)) {
+    amp.rawModelRoutes = [];
+  }
+}
+
+function buildAmpEditableRouteEntries(amp) {
+  ensureAmpRouteCollections(amp);
+
+  const builtInRouteEntries = DEFAULT_AMP_ENTITY_DEFINITIONS.map((entry) => {
+    const defaultMatch = getAmpDefaultMatchForRouteKey(entry.id);
+    return {
+      id: `route:${entry.id}`,
+      source: "route",
+      routeKey: entry.id,
+      inbound: entry.id,
+      editableInbound: defaultMatch || entry.id,
+      outbound: String(amp.routes?.[entry.id] || "").trim(),
+      label: entry.id,
+      defaultMatch,
+      hint: `${entry.id} · ${String(amp.routes?.[entry.id] || "").trim() || "uses default route"}`
+    };
+  });
+
+  const configuredRouteEntries = Object.entries(amp.routes || {})
+    .filter(([key]) => !DEFAULT_AMP_ENTITY_DEFINITIONS.some((entry) => entry.id === key))
+    .map(([key, target]) => {
+      const defaultMatch = getAmpDefaultMatchForRouteKey(key);
+      return {
+        id: `route:${key}`,
+        source: "route",
+        routeKey: key,
+        inbound: key,
+        outbound: String(target || "").trim(),
+        label: defaultMatch || key,
+        defaultMatch,
+        hint: `${key} · ${String(target || "").trim() || "(not set)"}`
+      };
+    });
+
+  const rawRouteEntries = (amp.rawModelRoutes || []).map((mapping, index) => ({
+    id: `raw:${index}`,
+    source: "raw",
+    index,
+    inbound: String(mapping?.from || "").trim(),
+    outbound: String(mapping?.to || "").trim(),
+    label: String(mapping?.from || "").trim() || `(route ${index + 1})`,
+    hint: String(mapping?.to || "").trim() || "(not set)"
+  }));
+
+  return [...builtInRouteEntries, ...configuredRouteEntries, ...rawRouteEntries].filter((entry) => entry.inbound || entry.outbound);
+}
+
+function buildAmpEditableRouteOptions(amp) {
+  return buildAmpEditableRouteEntries(amp).map((entry) => ({
+    value: entry.id,
+    label: entry.label,
+    hint: entry.source === "raw"
+      ? `wildcard/raw → ${entry.hint}`
+      : `route → ${entry.hint}`
+  }));
+}
+
+function findAmpEditableRouteEntry(amp, entryId) {
+  return buildAmpEditableRouteEntries(amp).find((entry) => entry.id === entryId) || null;
+}
+
+function upsertAmpEditableRoute(amp, currentEntry, {
+  inbound,
+  outbound
+} = {}) {
+  ensureAmpRouteCollections(amp);
+
+  const nextInbound = String(inbound ?? currentEntry?.inbound ?? "").trim();
+  const nextOutbound = String(outbound ?? currentEntry?.outbound ?? "").trim();
+  const preferredRouteKey = currentEntry?.source === "route"
+    ? String(currentEntry.routeKey || "").trim()
+    : "";
+  const preferredDefaultMatch = preferredRouteKey
+    ? String(currentEntry?.defaultMatch || "").trim()
+    : "";
+  const nextKnownRouteKey = isKnownAmpRouteKey(nextInbound)
+    ? nextInbound
+    : (preferredRouteKey && preferredDefaultMatch && nextInbound === preferredDefaultMatch ? preferredRouteKey : "");
+  if (!nextInbound) {
+    throw new Error("Inbound AMP model is required.");
+  }
+  if (!nextOutbound) {
+    throw new Error("Outbound AMP route is required.");
+  }
+
+  if (currentEntry?.source === "route" && currentEntry.routeKey) {
+    delete amp.routes[currentEntry.routeKey];
+  }
+  if (currentEntry?.source === "raw" && Number.isInteger(currentEntry.index)) {
+    amp.rawModelRoutes.splice(currentEntry.index, 1);
+  }
+
+  if (nextKnownRouteKey) {
+    amp.routes[nextKnownRouteKey] = nextOutbound;
+    return findAmpEditableRouteEntry(amp, `route:${nextKnownRouteKey}`);
+  }
+
+  amp.rawModelRoutes.push({ from: nextInbound, to: nextOutbound });
+  return findAmpEditableRouteEntry(amp, `raw:${amp.rawModelRoutes.length - 1}`);
+}
+
+function printAmpInboundModelHelp(context, entry = null) {
+  const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  const routeKey = String(entry?.routeKey || entry?.inbound || "").trim();
+  const defaultMatch = getAmpDefaultMatchForRouteKey(routeKey);
+  info?.("Inbound AMP model matches what AMP sends before llm-router chooses a local route.");
+  line?.("Use built-in keys like smart/rush/deep/oracle or your own wildcard pattern like gpt-*-codex*.");
+  if (defaultMatch) {
+    line?.(`Default built-in match for '${routeKey}': ${defaultMatch}`);
+  }
+  line?.("Reference: https://ampcode.com/models");
+}
+
+function printAmpQuickSetupGuide(context, config) {
+  const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  const recommendedRoute = resolveAmpBootstrapRouteRef(config);
+  info?.("Quick setup patches AMP to use your local llm-router, then picks one default route.");
+  line?.(`Recommended default route: ${recommendedRoute || "(set a model alias like chat.default first)"}`);
+  line?.("You can map smart/rush/deep/oracle later from 'Common AMP routes'.");
+}
+
+function printAmpWizardReview(context, amp, patchPlan = null) {
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  line?.(buildAmpConfigSection(amp));
+  if (patchPlan) {
+    line?.(buildAmpClientPatchSection({
+      ...patchPlan,
+      secretFieldName: `apiKey@${patchPlan.endpointUrl}`,
+      settingsCreated: false,
+      secretsCreated: false
+    }));
+  }
+}
+
+function normalizeAmpLoopbackHost(value) {
+  const host = String(value || "").trim();
+  if (!host) return "127.0.0.1";
+  if (["0.0.0.0", "::", "::0", "[::]", "::1", "localhost"].includes(host)) return "127.0.0.1";
+  return host;
+}
+
+function formatHostForHttpUrl(host) {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+async function suggestAmpClientProxyUrl() {
+  return LOCAL_ROUTER_ORIGIN;
+}
+
+async function promptAmpProxySettings(context, amp) {
+  const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
+  const upstreamUrlInput = await context.prompts.text({
+    message: "AMP upstream URL (blank disables upstream proxy)",
+    required: false,
+    initialValue: String(amp.upstreamUrl || "https://ampcode.com")
+  });
+  const normalizedUpstreamUrl = normalizeAmpClientProxyUrl(upstreamUrlInput);
+
+  let suggestedUpstreamApiKey = String(amp.upstreamApiKey || "").trim();
+  if (!suggestedUpstreamApiKey && normalizedUpstreamUrl) {
+    const discoveredApiKey = await findAmpClientApiKeyForUrl(normalizedUpstreamUrl);
+    if (discoveredApiKey) {
+      const useDiscoveredKey = await context.prompts.confirm({
+        message: `Use the API key already stored in AMP secrets for ${normalizedUpstreamUrl}? (${maskSecret(discoveredApiKey)})`,
+        initialValue: true
+      });
+      if (useDiscoveredKey) {
+        suggestedUpstreamApiKey = discoveredApiKey;
+      }
+    }
+  }
+  if (!suggestedUpstreamApiKey) {
+    info?.("AMP upstream API key was not found in the local AMP config/secrets files.");
+    info?.("Open https://ampcode.com/settings, copy an API key, then paste it below.");
+  }
+
+  const upstreamApiKey = await context.prompts.text({
+    message: "AMP upstream API key (blank clears)",
+    required: false,
+    initialValue: suggestedUpstreamApiKey
+  });
+  const restrictManagementToLocalhost = await context.prompts.confirm({
+    message: "Restrict AMP management proxying to localhost?",
+    initialValue: amp.restrictManagementToLocalhost === true
+  });
+  const forceModelMappings = await context.prompts.confirm({
+    message: "Apply AMP model mappings before local bare-model lookup?",
+    initialValue: amp.forceModelMappings === true
+  });
+
+  amp.upstreamUrl = String(upstreamUrlInput || "").trim();
+  amp.upstreamApiKey = String(upstreamApiKey || "").trim();
+  amp.restrictManagementToLocalhost = restrictManagementToLocalhost === true;
+  amp.forceModelMappings = forceModelMappings === true;
+}
+
+async function promptAmpModelMappingWizard(context, { initialMapping = null } = {}) {
+  const from = await context.prompts.text({
+    message: "AMP mode/model match pattern",
+    required: true,
+    initialValue: String(initialMapping?.from || ""),
+    placeholder: "gpt-5.4*",
+    validate: (value) => String(value || "").trim() ? undefined : "Match pattern is required."
+  });
+  const to = await context.prompts.text({
+    message: "Route target alias or provider/model",
+    required: true,
+    initialValue: String(initialMapping?.to || ""),
+    placeholder: "chat.default",
+    validate: (value) => String(value || "").trim() ? undefined : "Route target is required."
+  });
+  const confirm = await context.prompts.confirm({
+    message: initialMapping ? "Save AMP mapping changes?" : "Create this AMP mapping?",
+    initialValue: true
+  });
+  if (!confirm) {
+    return { mapping: null, cancelled: true };
+  }
+  return {
+    mapping: {
+      from: String(from || "").trim(),
+      to: String(to || "").trim()
+    },
+    cancelled: false
+  };
+}
+
+async function manageAmpModelMappingsWizard(context, amp) {
+  amp.modelMappings = Array.isArray(amp.modelMappings) ? [...amp.modelMappings] : [];
+
+  while (true) {
+    const action = await context.prompts.select({
+      message: "AMP mode/model mappings",
+      options: [
+        { value: "review", label: "Review mappings" },
+        { value: "add", label: "Add mapping" },
+        { value: "edit", label: "Edit mapping" },
+        { value: "remove", label: "Remove mapping" },
+        { value: "clear", label: "Clear all mappings" },
+        { value: "back", label: "Back" }
+      ]
+    });
+
+    if (action === "back") return;
+    if (action === "review") {
+      const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+      line?.("AMP Mode/Model Mappings\n" + renderAsciiTable(["Match", "Route"], buildAmpModelMappingRows(amp.modelMappings || []), {
+        emptyMessage: "No AMP model mappings configured."
+      }));
+      continue;
+    }
+    if (action === "clear") {
+      const confirm = await context.prompts.confirm({
+        message: "Clear all AMP mode/model mappings?",
+        initialValue: false
+      });
+      if (confirm) amp.modelMappings = [];
+      continue;
+    }
+
+    if ((action === "edit" || action === "remove") && (amp.modelMappings || []).length === 0) {
+      const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+      line?.("No AMP model mappings configured.");
+      continue;
+    }
+
+    if (action === "remove") {
+      const selectedIndex = Number.parseInt(await context.prompts.select({
+        message: "Remove AMP mode/model mapping",
+        options: buildAmpModelMappingPromptOptions(amp.modelMappings)
+      }), 10);
+      const selected = amp.modelMappings[selectedIndex];
+      const confirm = await context.prompts.confirm({
+        message: `Remove '${selected?.from || "(match)"} -> ${selected?.to || "(route)"}'?`,
+        initialValue: false
+      });
+      if (confirm) amp.modelMappings.splice(selectedIndex, 1);
+      continue;
+    }
+
+    const selectedIndex = action === "edit"
+      ? Number.parseInt(await context.prompts.select({
+          message: "Edit AMP mode/model mapping",
+          options: buildAmpModelMappingPromptOptions(amp.modelMappings)
+        }), 10)
+      : -1;
+    const wizard = await promptAmpModelMappingWizard(context, {
+      initialMapping: action === "edit" ? amp.modelMappings[selectedIndex] : null
+    });
+    if (!wizard.mapping) continue;
+    if (action === "edit") {
+      amp.modelMappings[selectedIndex] = wizard.mapping;
+    } else {
+      amp.modelMappings.push(wizard.mapping);
+    }
+  }
+}
+
+async function promptAmpSubagentWizard(context, {
+  initialDefinition = null,
+  initialTarget = "",
+  existingIds = []
+} = {}) {
+  const originalId = normalizeAmpSubagentIdInput(initialDefinition?.id || "");
+  const idInput = await context.prompts.text({
+    message: "AMP subagent name",
+    required: true,
+    initialValue: String(initialDefinition?.id || ""),
+    placeholder: "oracle",
+    validate: (value) => {
+      const normalized = normalizeAmpSubagentIdInput(value);
+      if (!normalized) return "Subagent name is required.";
+      if (existingIds.includes(normalized) && normalized !== originalId) {
+        return `Subagent '${normalized}' already exists.`;
+      }
+      return undefined;
+    }
+  });
+  const patternsInput = await context.prompts.text({
+    message: "Vendor model / mode patterns (comma, pipe, or newline separated)",
+    required: true,
+    initialValue: (initialDefinition?.patterns || []).join("\n"),
+    placeholder: "gpt-5.4\ngpt-5.4*",
+    validate: (value) => parseAmpPatternListInput(value).length > 0 ? undefined : "At least one pattern is required."
+  });
+  const targetInput = await context.prompts.text({
+    message: "Local route target alias or provider/model (blank uses defaultModel)",
+    required: false,
+    initialValue: String(initialTarget || ""),
+    placeholder: "chat.default"
+  });
+  const confirm = await context.prompts.confirm({
+    message: initialDefinition ? "Save AMP subagent changes?" : "Create this AMP subagent?",
+    initialValue: true
+  });
+  if (!confirm) {
+    return { entry: null, target: "", cancelled: true };
+  }
+
+  return {
+    entry: {
+      id: normalizeAmpSubagentIdInput(idInput),
+      patterns: parseAmpPatternListInput(patternsInput)
+    },
+    target: String(targetInput || "").trim(),
+    cancelled: false
+  };
+}
+
+async function manageAmpSubagentsWizard(context, amp) {
+  ensureAmpSubagentMappingsObject(amp);
+
+  while (true) {
+    const usingBuiltins = !Array.isArray(amp.subagentDefinitions);
+    const action = await context.prompts.select({
+      message: usingBuiltins ? "AMP subagents (built-in definitions)" : "AMP subagents (custom definitions)",
+      options: [
+        { value: "review", label: "Review subagents" },
+        { value: "add", label: "Add subagent" },
+        { value: "edit", label: "Edit subagent" },
+        { value: "remove", label: "Remove subagent" },
+        { value: "reset", label: "Reset to built-in defaults" },
+        { value: "back", label: "Back" }
+      ]
+    });
+
+    if (action === "back") return;
+    if (action === "review") {
+      const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+      line?.("AMP Subagents\n" + renderAsciiTable(["Subagent", "Model Patterns", "Route"], buildAmpSubagentReviewRows(amp), {
+        emptyMessage: "No AMP subagent definitions configured."
+      }));
+      continue;
+    }
+    if (action === "reset") {
+      const confirm = await context.prompts.confirm({
+        message: "Reset AMP subagent definitions to built-in defaults?",
+        initialValue: usingBuiltins !== true
+      });
+      if (confirm) {
+        delete amp.subagentDefinitions;
+        const defaultIds = new Set(DEFAULT_AMP_SUBAGENT_DEFINITIONS.map((entry) => entry.id));
+        for (const key of Object.keys(amp.subagentMappings || {})) {
+          if (!defaultIds.has(key)) delete amp.subagentMappings[key];
+        }
+      }
+      continue;
+    }
+
+    const effectiveDefinitions = getEffectiveAmpSubagentDefinitions(amp);
+    if ((action === "edit" || action === "remove") && effectiveDefinitions.length === 0) {
+      const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+      line?.("No AMP subagent definitions configured.");
+      continue;
+    }
+
+    if (action === "remove") {
+      ensureCustomAmpSubagentDefinitions(amp);
+      const selectedId = await context.prompts.select({
+        message: "Remove AMP subagent",
+        options: buildAmpSubagentPromptOptions(amp)
+      });
+      const confirm = await context.prompts.confirm({
+        message: `Remove AMP subagent '${selectedId}'?`,
+        initialValue: false
+      });
+      if (!confirm) continue;
+      amp.subagentDefinitions = (amp.subagentDefinitions || []).filter((entry) => entry.id !== selectedId);
+      delete amp.subagentMappings[selectedId];
+      continue;
+    }
+
+    const selectedId = action === "edit"
+      ? await context.prompts.select({
+          message: "Edit AMP subagent",
+          options: buildAmpSubagentPromptOptions(amp)
+        })
+      : "";
+
+    ensureCustomAmpSubagentDefinitions(amp);
+    const existingDefinitions = amp.subagentDefinitions || [];
+    const initialDefinition = action === "edit"
+      ? existingDefinitions.find((entry) => entry.id === selectedId) || null
+      : null;
+    const initialTarget = action === "edit"
+      ? String(amp.subagentMappings?.[selectedId] || "")
+      : "";
+
+    const wizard = await promptAmpSubagentWizard(context, {
+      initialDefinition,
+      initialTarget,
+      existingIds: existingDefinitions
+        .map((entry) => entry.id)
+        .filter((id) => id !== selectedId)
+    });
+    if (!wizard.entry) continue;
+
+    if (action === "edit") {
+      amp.subagentDefinitions = existingDefinitions.map((entry) => entry.id === selectedId ? wizard.entry : entry);
+      if (selectedId !== wizard.entry.id) {
+        const priorTarget = amp.subagentMappings[selectedId];
+        delete amp.subagentMappings[selectedId];
+        if (priorTarget && !wizard.target) {
+          amp.subagentMappings[wizard.entry.id] = priorTarget;
+        }
+      }
+    } else {
+      amp.subagentDefinitions.push(wizard.entry);
+    }
+
+    if (wizard.target) {
+      amp.subagentMappings[wizard.entry.id] = wizard.target;
+    } else {
+      delete amp.subagentMappings[wizard.entry.id];
+    }
+  }
+}
+
+async function promptAmpClientPatchPlan(context, {
+  config,
+  currentPlan = null,
+  cwd = process.cwd(),
+  env = process.env
+} = {}) {
+  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+  const scope = normalizeAmpClientSettingsScope(await context.prompts.select({
+    message: "Where should AMP use llm-router?",
+    options: [
+      { value: "workspace", label: "This workspace", hint: ".amp/settings.json" },
+      { value: "global", label: "All projects", hint: "~/.config/amp/settings.json" }
+    ],
+    initialValue: normalizeAmpClientSettingsScope(currentPlan?.scope) || "workspace"
+  })) || "workspace";
+
+  const endpointUrl = normalizeAmpClientProxyUrl(await suggestAmpClientProxyUrl());
+  if (!endpointUrl) {
+    throw new Error("Could not determine a local llm-router URL for AMP patching.");
+  }
+  line?.(`AMP will send requests to ${endpointUrl}.`);
+
+  let apiKey = String(currentPlan?.apiKey || config?.masterKey || "").trim();
+  if (apiKey) {
+    const useSuggestedKey = await context.prompts.confirm({
+      message: `Use this llm-router key for AMP? (${maskSecret(apiKey)})`,
+      initialValue: true
+    });
+    if (!useSuggestedKey) apiKey = "";
+  }
+  if (!apiKey) {
+    apiKey = await promptSecretInput(context, {
+      message: "llm-router API key for AMP",
+      required: true,
+      validate: (value) => String(value || "").trim() ? undefined : "API key is required."
+    });
+  }
+
+  const settingsFilePath = resolveAmpClientSettingsFilePath({
+    scope,
+    cwd,
+    env
+  });
+  const secretsFilePath = resolveAmpClientSecretsFilePath({ env });
+  const confirm = await context.prompts.confirm({
+    message: `Update AMP now? Settings: ${settingsFilePath} | Secrets: ${secretsFilePath}`,
+    initialValue: true
+  });
+  if (!confirm) return null;
+
+  return {
+    scope,
+    settingsFilePath,
+    secretsFilePath,
+    endpointUrl,
+    apiKey: String(apiKey || "").trim()
+  };
+}
+
+async function resolveAmpClientPatchPlanFromArgs(context, {
+  config,
+  cwd = process.cwd(),
+  env = process.env
+} = {}) {
+  const args = context.args || {};
+  const patchFlag = readArg(args, ["patch-amp-client-config", "patchAmpClientConfig"], undefined);
+  const rawScope = readArg(args, ["amp-client-settings-scope", "ampClientSettingsScope"], undefined);
+  const explicitSettingsFile = readArg(args, ["amp-client-settings-file", "ampClientSettingsFile"], undefined);
+  const explicitSecretsFile = readArg(args, ["amp-client-secrets-file", "ampClientSecretsFile"], undefined);
+  const explicitEndpointUrl = readArg(args, ["amp-client-url", "ampClientUrl"], undefined);
+  const explicitApiKey = readArg(args, ["amp-client-api-key", "ampClientApiKey"], undefined);
+  const patchArgsPresent = [
+    rawScope,
+    explicitSettingsFile,
+    explicitSecretsFile,
+    explicitEndpointUrl,
+    explicitApiKey
+  ].some((value) => value !== undefined);
+  const shouldPatch = patchArgsPresent || toBoolean(patchFlag, false);
+  if (!shouldPatch) return { plan: null, error: "" };
+
+  const scope = normalizeAmpClientSettingsScope(rawScope || "global");
+  if (!scope) {
+    return { plan: null, error: `Invalid amp-client-settings-scope '${rawScope}'. Use global or workspace.` };
+  }
+
+  const endpointUrl = normalizeAmpClientProxyUrl(explicitEndpointUrl ?? await suggestAmpClientProxyUrl());
+  if (!endpointUrl) {
+    return { plan: null, error: "amp-client-url must be a valid http:// or https:// URL." };
+  }
+
+  let apiKey = String(explicitApiKey ?? config?.masterKey ?? "").trim();
+  if (!apiKey && canUseInteractivePrompts(context, ["text", "confirm"])) {
+    apiKey = await promptSecretInput(context, {
+      message: "Local llm-router API key to store in AMP secrets.json",
+      required: true,
+      validate: (value) => String(value || "").trim() ? undefined : "API key is required."
+    });
+  }
+  if (!String(apiKey || "").trim()) {
+    return { plan: null, error: "amp-client-api-key is required (or set masterKey in config) when patching AMP client files with the local llm-router gateway key." };
+  }
+
+  return {
+    plan: {
+      scope,
+      settingsFilePath: resolveAmpClientSettingsFilePath({
+        scope,
+        explicitPath: explicitSettingsFile || "",
+        cwd,
+        env
+      }),
+      secretsFilePath: resolveAmpClientSecretsFilePath({
+        explicitPath: explicitSecretsFile || "",
+        env
+      }),
+      endpointUrl,
+      apiKey
+    },
+    error: ""
+  };
+}
+
+function cloneAmpConfigDraft(amp) {
+  const normalized = normalizeRuntimeConfig({ amp }).amp || {};
+  return structuredClone(normalized);
+}
+
+async function runAmpQuickSetupWizard(context, {
+  config,
+  amp,
+  patchPlan,
+  cwd = process.cwd(),
+  env = process.env
+} = {}) {
+  printAmpQuickSetupGuide(context, config);
+
+  const nextPatchPlan = await promptAmpClientPatchPlan(context, {
+    config,
+    currentPlan: patchPlan,
+    cwd,
+    env
+  });
+  if (!nextPatchPlan) {
+    return {
+      patchPlan,
+      errorMessage: ""
+    };
+  }
+
+  const connectionDefaults = await applyAmpRecommendedAmpConnectionDefaults({
+    amp,
+    patchPlan: nextPatchPlan,
+    env,
+    homeDir: os.homedir()
+  });
+  if (connectionDefaults.error) {
+    return {
+      patchPlan: nextPatchPlan,
+      errorMessage: connectionDefaults.error
+    };
+  }
+
+  Object.assign(amp, connectionDefaults.amp);
+  const initialRoute = resolvePreferredAmpRoute(config, amp);
+  if (!initialRoute) {
+    return {
+      patchPlan: nextPatchPlan,
+      errorMessage: "Quick setup needs at least one model alias or provider/model route. Add a provider first, or set defaultModel."
+    };
+  }
+
+  const defaultRoute = await promptAmpRouteTarget(context, config, {
+    message: "Default AMP route",
+    initialValue: initialRoute,
+    textPlaceholder: "chat.default"
+  });
+  if (!defaultRoute) {
+    return {
+      patchPlan: nextPatchPlan,
+      errorMessage: "A default AMP route is required for quick setup."
+    };
+  }
+
+  amp.defaultRoute = defaultRoute;
+  return {
+    patchPlan: nextPatchPlan,
+    errorMessage: ""
+  };
+}
+
+async function manageAmpRouteEntryWizard(context, config, amp, entry) {
+  let currentEntry = entry;
+
+  while (currentEntry) {
+    const action = await promptSelectWithEscape(context, {
+      message: `AMP route · ${currentEntry.label || currentEntry.inbound}`,
+      options: [
+        { value: "inbound", label: "Inbound model", hint: currentEntry.editableInbound || currentEntry.inbound },
+        { value: "outbound", label: "Outbound model", hint: currentEntry.outbound || "(not set)" }
+      ]
+    });
+
+    if (action === PROMPT_CANCELLED) return;
+
+    if (action === "inbound") {
+      printAmpInboundModelHelp(context, currentEntry);
+      const nextInbound = await promptTextWithEscape(context, {
+        message: "Inbound AMP model / route key",
+        required: true,
+        initialValue: currentEntry.editableInbound || currentEntry.inbound,
+        placeholder: "smart or gpt-*-codex*",
+        validate: (value) => String(value || "").trim() ? undefined : "Inbound model is required."
+      });
+      if (nextInbound === PROMPT_CANCELLED) continue;
+      currentEntry = upsertAmpEditableRoute(amp, currentEntry, {
+        inbound: nextInbound,
+        outbound: currentEntry.outbound
+      });
+      continue;
+    }
+
+    const nextOutbound = await runPromptWithEscape(() => promptAmpRouteTarget(context, config, {
+      message: `Outbound model for ${currentEntry.label || currentEntry.inbound}`,
+      initialValue: currentEntry.outbound,
+      textPlaceholder: "chat.default"
+    }));
+    if (nextOutbound === PROMPT_CANCELLED) continue;
+    currentEntry = upsertAmpEditableRoute(amp, currentEntry, {
+      inbound: currentEntry.inbound,
+      outbound: nextOutbound
+    });
+  }
+}
+
+async function manageAmpSimpleRoutesWizard(context, config, amp) {
+  ensureAmpRouteCollections(amp);
+
+  while (true) {
+    const action = await promptSelectWithEscape(context, {
+      message: "AMP routing",
+      options: [
+        {
+          value: "default-route",
+          label: "Default AMP route",
+          hint: resolvePreferredAmpRoute(config, amp) || "(not set)"
+        },
+        {
+          value: "add-custom-route",
+          label: "Add custom route",
+          hint: "map key or wildcard"
+        },
+        ...buildAmpEditableRouteOptions(amp)
+      ]
+    });
+
+    if (action === PROMPT_CANCELLED) return;
+
+    if (action === "default-route") {
+      const nextDefaultRoute = await runPromptWithEscape(() => promptAmpRouteTarget(context, config, {
+        message: "Default AMP route",
+        initialValue: resolvePreferredAmpRoute(config, amp),
+        includeClearOption: true,
+        clearLabel: "Use llm-router defaultModel",
+        clearHint: config.defaultModel || "no global defaultModel set",
+        textPlaceholder: "chat.default"
+      }));
+      if (nextDefaultRoute === PROMPT_CANCELLED) continue;
+      amp.defaultRoute = nextDefaultRoute;
+      continue;
+    }
+
+    if (action === "add-custom-route") {
+      printAmpInboundModelHelp(context);
+      const inbound = await promptTextWithEscape(context, {
+        message: "Inbound AMP model / route key",
+        required: true,
+        placeholder: "smart or gpt-*-codex*",
+        validate: (value) => String(value || "").trim() ? undefined : "Inbound model is required."
+      });
+      if (inbound === PROMPT_CANCELLED) continue;
+
+      const outbound = await runPromptWithEscape(() => promptAmpRouteTarget(context, config, {
+        message: `Outbound model for ${String(inbound || "").trim()}`,
+        initialValue: amp.defaultRoute || resolvePreferredAmpRoute(config, amp) || "",
+        textPlaceholder: "chat.default"
+      }));
+      if (outbound === PROMPT_CANCELLED) continue;
+
+      upsertAmpEditableRoute(amp, null, { inbound, outbound });
+      continue;
+    }
+
+    const entry = findAmpEditableRouteEntry(amp, action);
+    if (!entry) continue;
+    await manageAmpRouteEntryWizard(context, config, amp, entry);
+  }
+}
+
+async function runAmpAdvancedWizard(context, {
+  amp,
+  config,
+  patchPlan,
+  cwd = process.cwd(),
+  env = process.env
+} = {}) {
+  let nextPatchPlan = patchPlan;
+
+  while (true) {
+    const action = await context.prompts.select({
+      message: "AMP advanced",
+      options: [
+        { value: "proxy", label: "Upstream / proxy", hint: "ampcode.com and upstream key" },
+        { value: "mappings", label: "Legacy model-pattern mappings", hint: "advanced fallback matching" },
+        { value: "subagents", label: "Legacy subagents", hint: "custom subagent patterns" },
+        { value: "back", label: "Back", hint: "return to AMP setup" }
+      ]
+    });
+
+    if (action === "back") {
+      return { patchPlan: nextPatchPlan, errorMessage: "" };
+    }
+    if (action === "proxy") {
+      await promptAmpProxySettings(context, amp);
+      continue;
+    }
+    if (action === "mappings") {
+      await manageAmpModelMappingsWizard(context, amp);
+      continue;
+    }
+    if (action === "subagents") {
+      await manageAmpSubagentsWizard(context, amp);
+      continue;
+    }
+  }
+}
+
+async function runAmpConfigWizard(context, {
+  config,
+  currentAmp,
+  cwd = process.cwd(),
+  env = process.env
+} = {}) {
+  const amp = cloneAmpConfigDraft(currentAmp);
+  let patchPlan = null;
+
+  while (true) {
+    const action = await promptSelectWithEscape(context, {
+      message: "AMP setting",
+      options: [
+        { value: "patch-client", label: "Connect AMP", hint: "patch AMP config" },
+        { value: "routing", label: "Routing", hint: "default route and custom AMP routes" },
+        { value: "upstream", label: "Upstream", hint: "ampcode.com and upstream key" },
+        { value: "review", label: "Review config", hint: "show current AMP draft" }
+      ]
+    });
+
+    if (action === PROMPT_CANCELLED) {
+      return { amp, patchPlan, cancelled: false };
+    }
+    if (action === "review") {
+      printAmpWizardReview(context, amp, patchPlan);
+      continue;
+    }
+    if (action === "patch-client") {
+      const nextPatchPlan = await runPromptWithEscape(() => promptAmpClientPatchPlan(context, {
+        config,
+        currentPlan: patchPlan,
+        cwd,
+        env
+      }));
+      if (nextPatchPlan === PROMPT_CANCELLED || !nextPatchPlan) {
+        continue;
+      }
+      patchPlan = nextPatchPlan;
+      if (patchPlan) {
+        const connectionDefaults = await applyAmpRecommendedAmpConnectionDefaults({
+          amp,
+          patchPlan,
+          env,
+          homeDir: os.homedir()
+        });
+        if (connectionDefaults.error) {
+          return { amp: null, patchPlan: null, cancelled: false, errorMessage: connectionDefaults.error };
+        }
+        Object.assign(amp, connectionDefaults.amp);
+      }
+      continue;
+    }
+    if (action === "routing") {
+      await manageAmpSimpleRoutesWizard(context, config, amp);
+      continue;
+    }
+    const upstreamResult = await runPromptWithEscape(() => promptAmpProxySettings(context, amp));
+    if (upstreamResult === PROMPT_CANCELLED) continue;
+  }
+}
+
 function hasHeaderName(headers, name) {
   const lower = String(name).toLowerCase();
   return Object.keys(headers || {}).some((key) => key.toLowerCase() === lower);
@@ -428,10 +2186,7 @@ function printProviderInputGuidance(context) {
   const warn = typeof context?.terminal?.warn === "function" ? context.terminal.warn.bind(context.terminal) : null;
   const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
   const output = warn || line;
-  output?.(
-    "Compliance notice: Using provider resources through llm-router may violate provider terms. " +
-    "You are solely responsible for compliance; llm-router maintainers take no responsibility for misuse."
-  );
+  output?.("Compliance: using provider resources through llm-router may violate provider terms. Continue only if you're allowed to do so.");
 }
 
 function trimOuterPunctuation(value) {
@@ -1246,6 +3001,85 @@ function formatModelAliasStrategyLabel(strategy) {
   return MODEL_ROUTING_STRATEGY_OPTIONS.find((option) => option.value === normalized)?.label || normalized;
 }
 
+function formatItemCount(count, singular, plural = `${singular}s`) {
+  const safeCount = Number.isFinite(Number(count)) ? Number(count) : 0;
+  return `${safeCount} ${safeCount === 1 ? singular : plural}`;
+}
+
+function summarizeProviderPromptHint(provider) {
+  if (!provider || typeof provider !== "object") return "";
+  const parts = [];
+  const providerName = String(provider.name || "").trim();
+  const providerId = String(provider.id || "").trim();
+  if (providerName && providerName !== providerId) parts.push(providerName);
+  parts.push(normalizeProviderTypeInput(provider.type) === PROVIDER_TYPE_SUBSCRIPTION ? "OAuth" : "API key");
+  parts.push(formatItemCount((provider.models || []).length, "model"));
+  return parts.join(" · ");
+}
+
+function buildProviderPromptOptions(providers, { includeCreateOption = false, createLabel = "New provider", createHint = "connect API key or OAuth" } = {}) {
+  return [
+    ...(includeCreateOption
+      ? [{ value: "__new__", label: createLabel, hint: createHint }]
+      : []),
+    ...(providers || []).map((provider) => ({
+      value: provider.id,
+      label: provider.id || provider.name || "(unknown provider)",
+      hint: summarizeProviderPromptHint(provider)
+    }))
+  ];
+}
+
+function summarizeAliasPromptHint(alias) {
+  if (!alias || typeof alias !== "object") return "";
+  const targetCount = Array.isArray(alias.targets) ? alias.targets.length : 0;
+  const fallbackCount = Array.isArray(alias.fallbackTargets) ? alias.fallbackTargets.length : 0;
+  const parts = [
+    formatModelAliasStrategyLabel(alias.strategy),
+    formatItemCount(targetCount, "target")
+  ];
+  if (fallbackCount > 0) parts.push(formatItemCount(fallbackCount, "fallback"));
+  return parts.join(" · ");
+}
+
+function buildAliasPromptOptions(aliases, {
+  includeCreateOption = false,
+  createLabel = "New alias",
+  createHint = "group routes under one name"
+} = {}) {
+  const entries = Object.entries(aliases || {});
+  return [
+    ...(includeCreateOption
+      ? [{ value: "__new__", label: createLabel, hint: createHint }]
+      : []),
+    ...entries.map(([aliasId, alias]) => ({
+      value: aliasId,
+      label: aliasId,
+      hint: summarizeAliasPromptHint(alias)
+    }))
+  ];
+}
+
+function countConfiguredRateLimitBuckets(config) {
+  return (config?.providers || []).reduce((sum, provider) => sum + (provider?.rateLimits || []).length, 0);
+}
+
+function countConfiguredFallbackRoutes(config) {
+  return (config?.providers || []).reduce((sum, provider) => {
+    return sum + (provider?.models || []).filter((model) => Array.isArray(model?.fallbackModels) && model.fallbackModels.length > 0).length;
+  }, 0);
+}
+
+function hasConfiguredAmp(config) {
+  const amp = config?.amp;
+  if (!amp || typeof amp !== "object") return false;
+  return Object.values(amp).some((value) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === "object") return Object.keys(value).length > 0;
+    return String(value || "").trim() !== "";
+  });
+}
+
 function formatReportCell(value, { fallback = "-", maxLength = 180 } = {}) {
   const compact = String(value ?? "")
     .replace(/\s+/g, " ")
@@ -1439,6 +3273,75 @@ function buildProviderRateLimitReport({
   );
 }
 
+function buildAmpModelMappingRows(mappings) {
+  return (mappings || []).map((mapping) => ([
+    mapping?.from || "(not set)",
+    mapping?.to || "(not set)"
+  ]));
+}
+
+function buildAmpSubagentMappingRows(mappings) {
+  return Object.entries(mappings && typeof mappings === "object" ? mappings : {}).map(([agent, to]) => ([
+    agent || "(not set)",
+    to || "(not set)"
+  ]));
+}
+
+function buildAmpRouteRows(mappings) {
+  return Object.entries(mappings && typeof mappings === "object" ? mappings : {}).map(([key, to]) => ([
+    key || "(not set)",
+    to || "(not set)"
+  ]));
+}
+
+function buildAmpSubagentDefinitionRows(definitions) {
+  return (Array.isArray(definitions) ? definitions : []).map((entry) => ([
+    entry?.id || "(not set)",
+    Array.isArray(entry?.patterns) ? entry.patterns.join(" | ") : "(not set)"
+  ]));
+}
+
+function buildAmpConfigSection(amp) {
+  const source = amp && typeof amp === "object" && !Array.isArray(amp) ? amp : {};
+  const subagentMappings = source.subagentMappings && typeof source.subagentMappings === "object" ? source.subagentMappings : {};
+  const subagentDefinitions = Array.isArray(source.subagentDefinitions) ? source.subagentDefinitions : undefined;
+  const routes = source.routes && typeof source.routes === "object" ? source.routes : {};
+  const rawModelRoutes = Array.isArray(source.rawModelRoutes) ? source.rawModelRoutes : [];
+  return joinReportSections(
+    "AMP / Amp CLI\n" + renderAsciiTable(["Field", "Value"], [
+      ["Upstream URL", source.upstreamUrl || "(disabled)"],
+      ["Upstream API Key", source.upstreamApiKey || "(not set)"],
+      ["Restrict Management To Localhost", formatYesNo(source.restrictManagementToLocalhost === true)],
+      ["Force Model Mappings", formatYesNo(source.forceModelMappings === true)],
+      ["Preset", source.preset || "builtin"],
+      ["AMP Default Route", source.defaultRoute || "(global defaultModel)"],
+      ["AMP Route Count", String(Object.keys(routes).length)],
+      ["AMP Raw Model Route Count", String(rawModelRoutes.length)],
+      ["AMP Overrides", source.overrides ? "configured" : "(none)"],
+      ["Model Mapping Count", String((source.modelMappings || []).length)],
+      ["Subagent Mapping Count", String(Object.keys(subagentMappings).length)],
+      ["Subagent Definition Count", subagentDefinitions === undefined ? "default" : String(subagentDefinitions.length)]
+    ]),
+    "AMP Entity / Signature Routes\n" + renderAsciiTable(["Key", "Route"], buildAmpRouteRows(routes), {
+      emptyMessage: "No AMP routes configured."
+    }),
+    "AMP Raw Model Routes\n" + renderAsciiTable(["Match", "Route"], buildAmpModelMappingRows(rawModelRoutes), {
+      emptyMessage: "No AMP raw model routes configured."
+    }),
+    "AMP Model Mappings\n" + renderAsciiTable(["Match", "Route"], buildAmpModelMappingRows(source.modelMappings || []), {
+      emptyMessage: "No AMP model mappings configured."
+    }),
+    "AMP Subagent Definitions\n" + renderAsciiTable(["Subagent", "Model Patterns"], buildAmpSubagentDefinitionRows(subagentDefinitions || []), {
+      emptyMessage: subagentDefinitions === undefined
+        ? "Using built-in AMP subagent definitions."
+        : "No AMP subagent definitions configured."
+    }),
+    "AMP Subagent Mappings\n" + renderAsciiTable(["Subagent", "Route"], buildAmpSubagentMappingRows(subagentMappings), {
+      emptyMessage: "No AMP subagent mappings configured."
+    })
+  );
+}
+
 function buildProviderConfigSection(provider) {
   const infoRows = [
     ["Provider ID", provider?.id || "(unknown)"],
@@ -1496,6 +3399,7 @@ export function summarizeConfig(config, configPath, { includeSecrets = false } =
       ["Default Route", target?.defaultModel || "(not set)"],
       ["Master Key", target?.masterKey || "(not set)"]
     ]),
+    buildAmpConfigSection(target?.amp),
     "Providers\n" + renderAsciiTable(
       ["Provider ID", "Name", "Type", "Request Formats", "Models", "Rate-Limit Buckets"],
       providerSummaryRows,
@@ -2316,6 +4220,31 @@ function formatConfigValidationError(errors) {
   return (errors || []).map((line) => String(line || "").trim()).filter(Boolean).join(" ");
 }
 
+function subtractValidationErrors(afterErrors, beforeErrors) {
+  const counts = new Map();
+  for (const error of (beforeErrors || []).map((entry) => String(entry || "").trim()).filter(Boolean)) {
+    counts.set(error, (counts.get(error) || 0) + 1);
+  }
+
+  const introduced = [];
+  for (const error of (afterErrors || []).map((entry) => String(entry || "").trim()).filter(Boolean)) {
+    const remaining = counts.get(error) || 0;
+    if (remaining > 0) {
+      counts.set(error, remaining - 1);
+      continue;
+    }
+    introduced.push(error);
+  }
+  return introduced;
+}
+
+function findIntroducedConfigValidationErrors(previousConfig, nextConfig) {
+  const validationOptions = { requireProvider: false, requireMasterKey: false };
+  const previousErrors = validateRuntimeConfig(previousConfig, validationOptions);
+  const nextErrors = validateRuntimeConfig(nextConfig, validationOptions);
+  return subtractValidationErrors(nextErrors, previousErrors);
+}
+
 export function upsertModelAliasInConfig(config, {
   aliasId,
   strategy,
@@ -2393,7 +4322,7 @@ export function upsertModelAliasInConfig(config, {
   const nextSerialized = serializeStable(nextAlias);
   next.modelAliases[normalizedAliasId] = nextAlias;
 
-  const validationErrors = validateRuntimeConfig(next, { requireProvider: false, requireMasterKey: false });
+  const validationErrors = findIntroducedConfigValidationErrors(config, next);
   if (validationErrors.length > 0) {
     return {
       config: config,
@@ -2576,7 +4505,7 @@ export function setProviderRateLimitsInConfig(config, {
   }
 
   provider.rateLimits = Array.from(currentById.values());
-  const validationErrors = validateRuntimeConfig(next, { requireProvider: false, requireMasterKey: false });
+  const validationErrors = findIntroducedConfigValidationErrors(config, next);
   if (validationErrors.length > 0) {
     return {
       config,
@@ -2601,6 +4530,29 @@ function setMasterKeyInConfig(config, masterKey) {
   };
 }
 
+function setAmpConfigInConfig(config, amp) {
+  const next = normalizeRuntimeConfig({
+    ...config,
+    amp
+  });
+  const validationErrors = validateRuntimeConfig(next, { requireProvider: false, requireMasterKey: false });
+  if (validationErrors.length > 0) {
+    return {
+      config,
+      changed: false,
+      reason: formatConfigValidationError(validationErrors),
+      amp: config?.amp || {}
+    };
+  }
+
+  return {
+    config: next,
+    changed: serializeStable(config?.amp || {}) !== serializeStable(next.amp || {}),
+    reason: "",
+    amp: next.amp || {}
+  };
+}
+
 async function resolveUpsertInput(context, existingConfig) {
   const args = context.args || {};
   const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
@@ -2611,14 +4563,12 @@ async function resolveUpsertInput(context, existingConfig) {
 
   if (canPrompt() && !argProviderId && providers.length > 0) {
     const choice = await context.prompts.select({
-      message: "Provider config action",
-      options: [
-        { value: "__new__", label: "Add new provider" },
-        ...providers.map((provider) => ({
-          value: provider.id,
-          label: `Edit ${provider.id}`
-        }))
-      ]
+      message: "Provider",
+      options: buildProviderPromptOptions(providers, {
+        includeCreateOption: true,
+        createLabel: "New provider",
+        createHint: "connect API key or OAuth"
+      })
     });
     if (choice !== "__new__") {
       selectedExisting = providers.find((p) => p.id === choice) || null;
@@ -2687,19 +4637,21 @@ async function resolveUpsertInput(context, existingConfig) {
   );
   let providerType = initialProviderType;
   if (canPrompt()) {
-    printProviderInputGuidance(context);
+    if (!selectedExisting) printProviderInputGuidance(context);
     if (!hasProviderTypeArg) {
       providerType = await context.prompts.select({
-        message: "Provider auth mode",
+        message: "Auth method",
         initialValue: providerType,
         options: [
           {
             value: PROVIDER_TYPE_STANDARD,
-            label: "API Key"
+            label: "API key",
+            hint: "standard provider endpoint"
           },
           {
             value: PROVIDER_TYPE_SUBSCRIPTION,
-            label: "OAuth"
+            label: "OAuth",
+            hint: "ChatGPT Codex or Claude Code"
           }
         ]
       });
@@ -2711,11 +4663,12 @@ async function resolveUpsertInput(context, existingConfig) {
     : "";
   if (providerType === PROVIDER_TYPE_SUBSCRIPTION && canPrompt() && !hasSubscriptionTypeArg) {
     subscriptionType = await context.prompts.select({
-      message: "Subscription provider",
+      message: "Subscription",
       initialValue: subscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX,
       options: SUBSCRIPTION_PROVIDER_PRESETS.map((preset) => ({
         value: preset.subscriptionType,
-        label: preset.label
+        label: preset.label,
+        hint: preset.subscriptionType === SUBSCRIPTION_TYPE_CHATGPT_CODEX ? "OpenAI account login" : "Anthropic account login"
       }))
     });
   }
@@ -2731,7 +4684,7 @@ async function resolveUpsertInput(context, existingConfig) {
 
   const name = canPrompt()
     ? await context.prompts.text({
-        message: "Provider Friendly Name (unique, shown in management screen)",
+        message: "Provider name",
         required: true,
         initialValue: defaultName,
         placeholder: providerType === PROVIDER_TYPE_SUBSCRIPTION
@@ -2755,7 +4708,7 @@ async function resolveUpsertInput(context, existingConfig) {
 
   const providerId = canPrompt()
     ? (baseProviderId || await context.prompts.text({
-        message: "Provider ID (auto-slug from Friendly Name; editable)",
+        message: "Provider ID",
         required: true,
         initialValue: generatedProviderId,
         placeholder: providerType === PROVIDER_TYPE_SUBSCRIPTION
@@ -3670,10 +5623,7 @@ async function doRemoveProvider(context) {
     }
     providerId = await context.prompts.select({
       message: "Remove provider",
-      options: config.providers.map((provider) => ({
-        value: provider.id,
-        label: provider.id
-      }))
+      options: buildProviderPromptOptions(config.providers)
     });
   }
 
@@ -3719,11 +5669,8 @@ async function doRemoveModel(context) {
         return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: "No providers configured." };
       }
       providerId = await context.prompts.select({
-        message: "Select provider",
-        options: config.providers.map((provider) => ({
-          value: provider.id,
-          label: provider.id
-        }))
+        message: "Provider",
+        options: buildProviderPromptOptions(config.providers)
       });
     }
     const provider = config.providers.find((p) => p.id === providerId);
@@ -3735,7 +5682,7 @@ async function doRemoveModel(context) {
         return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Provider '${providerId}' has no models.` };
       }
       modelId = await context.prompts.select({
-        message: `Remove model from ${providerId}`,
+        message: "Remove model",
         options: provider.models.map((model) => ({
           value: model.id,
           label: model.id
@@ -3788,11 +5735,8 @@ async function doSetModelFallbacks(context) {
         return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: "No providers configured." };
       }
       providerId = await context.prompts.select({
-        message: "Select provider for silent-fallback",
-        options: config.providers.map((provider) => ({
-          value: provider.id,
-          label: provider.id
-        }))
+        message: "Provider",
+        options: buildProviderPromptOptions(config.providers)
       });
     }
 
@@ -3807,7 +5751,7 @@ async function doSetModelFallbacks(context) {
         return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Provider '${providerId}' has no models.` };
       }
       modelId = await context.prompts.select({
-        message: `Select source model from ${providerId}`,
+        message: "Source model",
         options: provider.models.map((model) => ({
           value: model.id,
           label: model.id
@@ -3837,7 +5781,7 @@ async function doSetModelFallbacks(context) {
       line?.("No other models available. Silent-fallback list will be cleared.");
     } else {
       selectedFallbacks = await context.prompts.multiselect({
-        message: `Silent-fallback models for ${providerId}/${sourceModelId}`,
+        message: `Fallback routes for ${providerId}/${sourceModelId}`,
         options: fallbackOptions,
         initialValues,
         required: false
@@ -3927,22 +5871,14 @@ async function doUpsertModelAlias(context) {
 
   if (canPrompt()) {
     const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
-    const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
-    info?.("A model alias lets you group models from multiple providers behind one model name.");
-    line?.("Routing strategy decides how requests are distributed across the alias targets.");
+    info?.("Aliases group multiple routes under one name; strategy controls how traffic is spread.");
 
     if (!aliasId) {
       const aliasIds = Object.keys(aliases);
       if (aliasIds.length > 0) {
         const selected = await context.prompts.select({
-          message: "Model alias action",
-          options: [
-            { value: "__new__", label: "Create new alias" },
-            ...aliasIds.map((id) => ({
-              value: id,
-              label: `Edit ${id}`
-            }))
-          ]
+          message: "Alias",
+          options: buildAliasPromptOptions(aliases, { includeCreateOption: true })
         });
         if (selected !== "__new__") aliasId = selected;
       }
@@ -3966,10 +5902,11 @@ async function doUpsertModelAlias(context) {
 
     const selectedStrategy = normalizeModelAliasStrategy(strategyArg || existingAlias?.strategy || "auto") || "auto";
     const strategy = await context.prompts.select({
-      message: "Model alias routing strategy",
+      message: "Strategy",
       options: MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => ({
         value: option.value,
-        label: option.label
+        label: option.label,
+        hint: option.hint
       })),
       initialValue: selectedStrategy
     });
@@ -3977,7 +5914,7 @@ async function doUpsertModelAlias(context) {
     if (!hasTargetsArg) {
       const defaultTargets = formatAliasTargetsForSummary(existingAlias?.targets || []);
       targetsInput = await context.prompts.text({
-        message: "Alias targets (<ref>@<weight>, comma-separated)",
+        message: "Primary routes (<route>@<weight>)",
         required: true,
         initialValue: defaultTargets === "(none)" ? "" : defaultTargets,
         placeholder: "openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2"
@@ -3987,7 +5924,7 @@ async function doUpsertModelAlias(context) {
     if (!clearFallbackTargets && !hasFallbackTargetsArg) {
       const defaultFallbacks = formatAliasTargetsForSummary(existingAlias?.fallbackTargets || []);
       fallbackTargetsInput = await context.prompts.text({
-        message: "Alias fallback targets (optional; same syntax)",
+        message: "Fallback routes (optional)",
         required: false,
         initialValue: defaultFallbacks === "(none)" ? "" : defaultFallbacks,
         placeholder: "openrouter/gpt-4o"
@@ -4064,11 +6001,8 @@ async function doRemoveModelAlias(context) {
     }
 
     aliasId = await context.prompts.select({
-      message: "Remove model alias",
-      options: aliasEntries.map((id) => ({
-        value: id,
-        label: id
-      }))
+      message: "Remove alias",
+      options: buildAliasPromptOptions(config.modelAliases || {})
     });
   }
 
@@ -4094,9 +6028,7 @@ async function doRemoveModelAlias(context) {
 function printRateLimitBucketIntro(context) {
   if (!canPrompt()) return;
   const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
-  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
-  info?.("A bucket is a request cap for a time window.");
-  line?.("You can add multiple buckets to the same models, for example 40/minute and 600/6 hours.");
+  info?.("Buckets cap requests over time. You can stack them, for example 40/min + 600/6h.");
 }
 
 function buildProviderRateLimitReview(provider) {
@@ -4110,7 +6042,8 @@ function buildProviderRateLimitReview(provider) {
 function buildRateLimitBucketPromptOptions(provider) {
   return (provider?.rateLimits || []).map((bucket) => ({
     value: bucket.id,
-    label: `${formatRateLimitBucketLabel(bucket)} (${summarizeRateLimitBucketCap(bucket)})`
+    label: formatRateLimitBucketLabel(bucket),
+    hint: `${summarizeRateLimitBucketCap(bucket)} · ${formatRateLimitBucketScopeLabel(bucket)}`
   }));
 }
 
@@ -4301,11 +6234,8 @@ async function doSetProviderRateLimits(context) {
         return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: "No providers configured." };
       }
       providerId = await context.prompts.select({
-        message: "Select provider for rate-limit buckets",
-        options: config.providers.map((provider) => ({
-          value: provider.id,
-          label: provider.id
-        }))
+        message: "Provider",
+        options: buildProviderPromptOptions(config.providers)
       });
     }
 
@@ -4331,12 +6261,12 @@ async function doSetProviderRateLimits(context) {
     if (!hasDirectInputs) {
       printRateLimitBucketIntro(context);
       const action = await context.prompts.select({
-        message: "Rate-limit bucket action",
+        message: "Rate limits",
         options: [
-          { value: "create", label: "Create bucket(s)" },
-          { value: "edit", label: "Edit existing bucket" },
-          { value: "remove", label: "Remove bucket" },
-          { value: "review", label: "Review current buckets" }
+          { value: "create", label: "Create", hint: "add one or more buckets" },
+          { value: "edit", label: "Edit", hint: "change an existing bucket" },
+          { value: "remove", label: "Remove", hint: "delete a bucket" },
+          { value: "review", label: "Review", hint: "show current buckets" }
         ]
       });
 
@@ -4365,7 +6295,7 @@ async function doSetProviderRateLimits(context) {
         }
 
         const selectedBucketId = await context.prompts.select({
-          message: `Remove rate-limit bucket from ${providerId}`,
+          message: "Remove bucket",
           options: bucketOptions
         });
         const selectedBucket = (provider.rateLimits || []).find((bucket) => bucket.id === selectedBucketId);
@@ -4418,7 +6348,7 @@ async function doSetProviderRateLimits(context) {
         }
 
         const selectedBucketId = await context.prompts.select({
-          message: `Edit rate-limit bucket on ${providerId}`,
+          message: "Edit bucket",
           options: bucketOptions
         });
         const selectedBucket = (provider.rateLimits || []).find((bucket) => bucket.id === selectedBucketId);
@@ -4778,9 +6708,312 @@ async function doSetMasterKey(context) {
   };
 }
 
+async function doSetAmpConfig(context) {
+  const args = context.args || {};
+  const cwd = context.cwd || process.cwd();
+  const env = context.env || process.env;
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const currentAmp = config?.amp && typeof config.amp === "object" && !Array.isArray(config.amp)
+    ? config.amp
+    : {};
+
+  const clearUpstreamUrl = toBoolean(readArg(args, ["clear-amp-upstream-url", "clearAmpUpstreamUrl"], false), false);
+  const clearUpstreamApiKey = toBoolean(readArg(args, ["clear-amp-upstream-api-key", "clearAmpUpstreamApiKey"], false), false);
+  const clearModelMappings = toBoolean(readArg(args, ["clear-amp-model-mappings", "clearAmpModelMappings"], false), false);
+  const clearSubagentMappings = toBoolean(readArg(args, ["clear-amp-subagent-mappings", "clearAmpSubagentMappings"], false), false);
+  const clearSubagentDefinitions = toBoolean(readArg(args, ["clear-amp-subagent-definitions", "clearAmpSubagentDefinitions"], false), false);
+  const resetSubagentDefinitions = toBoolean(readArg(args, ["reset-amp-subagent-definitions", "resetAmpSubagentDefinitions"], false), false);
+  const clearDefaultRoute = toBoolean(readArg(args, ["clear-amp-default-route", "clearAmpDefaultRoute"], false), false);
+  const clearRoutes = toBoolean(readArg(args, ["clear-amp-routes", "clearAmpRoutes"], false), false);
+  const clearRawModelRoutes = toBoolean(readArg(args, ["clear-amp-raw-model-routes", "clearAmpRawModelRoutes"], false), false);
+  const clearOverrides = toBoolean(readArg(args, ["clear-amp-overrides", "clearAmpOverrides"], false), false);
+
+  let upstreamUrl = readArg(args, ["amp-upstream-url", "ampUpstreamUrl"], undefined);
+  let upstreamApiKey = readArg(args, ["amp-upstream-api-key", "ampUpstreamApiKey"], undefined);
+  let restrictManagementToLocalhost = readArg(args, ["amp-restrict-management-to-localhost", "ampRestrictManagementToLocalhost"], undefined);
+  let forceModelMappings = readArg(args, ["amp-force-model-mappings", "ampForceModelMappings"], undefined);
+  let modelMappingsInput = readArg(args, ["amp-model-mappings", "ampModelMappings"], undefined);
+  let subagentMappingsInput = readArg(args, ["amp-subagent-mappings", "ampSubagentMappings"], undefined);
+  let subagentDefinitionsInput = readArg(args, ["amp-subagent-definitions", "ampSubagentDefinitions"], undefined);
+  let ampPreset = readArg(args, ["amp-preset", "ampPreset"], undefined);
+  let ampDefaultRoute = readArg(args, ["amp-default-route", "ampDefaultRoute"], undefined);
+  let ampRoutesInput = readArg(args, ["amp-routes", "ampRoutes"], undefined);
+  let ampRawModelRoutesInput = readArg(args, ["amp-raw-model-routes", "ampRawModelRoutes"], undefined);
+  let ampOverridesInput = readArg(args, ["amp-overrides", "ampOverrides"], undefined);
+
+  const patchArgNames = [
+    "patch-amp-client-config",
+    "patchAmpClientConfig",
+    "amp-client-settings-scope",
+    "ampClientSettingsScope",
+    "amp-client-settings-file",
+    "ampClientSettingsFile",
+    "amp-client-secrets-file",
+    "ampClientSecretsFile",
+    "amp-client-url",
+    "ampClientUrl",
+    "amp-client-api-key",
+    "ampClientApiKey"
+  ];
+  const hasPatchArgs = patchArgNames.some((name) => args[name] !== undefined);
+  const hasExplicitAmpArgs = [
+    upstreamUrl,
+    upstreamApiKey,
+    restrictManagementToLocalhost,
+    forceModelMappings,
+    ampPreset,
+    ampDefaultRoute,
+    ampRoutesInput,
+    ampRawModelRoutesInput,
+    ampOverridesInput,
+    modelMappingsInput,
+    subagentMappingsInput,
+    subagentDefinitionsInput
+  ].some((value) => value !== undefined) || clearUpstreamUrl || clearUpstreamApiKey || clearModelMappings || clearSubagentMappings || clearSubagentDefinitions || resetSubagentDefinitions || clearDefaultRoute || clearRoutes || clearRawModelRoutes || clearOverrides;
+  const hasExplicitArgs = hasExplicitAmpArgs || hasPatchArgs;
+
+  let nextAmp;
+  let patchPlan = null;
+  let bootstrapDefaultsApplied = false;
+  let bootstrapDefaultRoute = "";
+  let bootstrapDiscoveredUpstreamApiKey = false;
+
+  if (canUseInteractivePrompts(context) && !hasExplicitArgs) {
+    const wizard = await runAmpConfigWizard(context, {
+      config,
+      currentAmp,
+      cwd,
+      env
+    });
+    if (wizard.errorMessage) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: wizard.errorMessage
+      };
+    }
+    if (wizard.cancelled) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_FAILURE,
+        errorMessage: "Cancelled."
+      };
+    }
+    nextAmp = wizard.amp || currentAmp;
+    patchPlan = wizard.patchPlan || null;
+    if (patchPlan && serializeStable(currentAmp || {}) === serializeStable(nextAmp || {})) {
+      const bootstrap = await maybeBootstrapAmpPatchDefaults({
+        config,
+        amp: nextAmp,
+        patchPlan,
+        env,
+        homeDir: os.homedir()
+      });
+      if (bootstrap.error) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: bootstrap.error
+        };
+      }
+      nextAmp = bootstrap.amp;
+      bootstrapDefaultsApplied = bootstrap.changed === true;
+      bootstrapDefaultRoute = bootstrap.bootstrapRouteRef || "";
+      bootstrapDiscoveredUpstreamApiKey = bootstrap.discoveredUpstreamApiKey === true;
+    }
+  } else {
+    if (!hasExplicitArgs) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: "No AMP config changes requested. Run 'llm-router config' for the interactive AMP wizard or pass --amp-* flags."
+      };
+    }
+
+    nextAmp = {
+      ...currentAmp,
+      ...(clearUpstreamUrl ? { upstreamUrl: "" } : {}),
+      ...(clearUpstreamApiKey ? { upstreamApiKey: "" } : {}),
+      ...(clearDefaultRoute ? { defaultRoute: "" } : {}),
+      ...(clearSubagentMappings ? { subagentMappings: {} } : {}),
+      ...(clearSubagentDefinitions ? { subagentDefinitions: [] } : {}),
+      ...(clearRoutes ? { routes: {} } : {}),
+      ...(clearRawModelRoutes ? { rawModelRoutes: [] } : {}),
+      ...(clearOverrides ? { overrides: {} } : {})
+    };
+
+    if (upstreamUrl !== undefined) {
+      nextAmp.upstreamUrl = String(upstreamUrl || "").trim();
+    }
+    if (upstreamApiKey !== undefined) {
+      nextAmp.upstreamApiKey = String(upstreamApiKey || "").trim();
+    }
+    if (restrictManagementToLocalhost !== undefined) {
+      nextAmp.restrictManagementToLocalhost = toBoolean(
+        restrictManagementToLocalhost,
+        currentAmp.restrictManagementToLocalhost === true
+      );
+    }
+    if (forceModelMappings !== undefined) {
+      nextAmp.forceModelMappings = toBoolean(
+        forceModelMappings,
+        currentAmp.forceModelMappings === true
+      );
+    }
+    if (ampPreset !== undefined) {
+      nextAmp.preset = String(ampPreset || "").trim();
+    }
+    if (ampDefaultRoute !== undefined) {
+      nextAmp.defaultRoute = String(ampDefaultRoute || "").trim();
+    }
+    if (clearRoutes) {
+      nextAmp.routes = {};
+    } else {
+      const parsedRoutes = parseAmpRoutesArg(ampRoutesInput, "--amp-routes");
+      if (parsedRoutes !== undefined) {
+        nextAmp.routes = parsedRoutes;
+      }
+    }
+    if (clearRawModelRoutes) {
+      nextAmp.rawModelRoutes = [];
+    } else {
+      const parsedRawModelRoutes = parseAmpModelMappingsArg(ampRawModelRoutesInput, "--amp-raw-model-routes");
+      if (parsedRawModelRoutes !== undefined) {
+        nextAmp.rawModelRoutes = parsedRawModelRoutes;
+      }
+    }
+    if (clearOverrides) {
+      nextAmp.overrides = {};
+    } else {
+      const parsedOverrides = parseAmpOverridesArg(ampOverridesInput, "--amp-overrides");
+      if (parsedOverrides !== undefined) {
+        nextAmp.overrides = parsedOverrides;
+      }
+    }
+    if (clearModelMappings) {
+      nextAmp.modelMappings = [];
+    } else {
+      const parsedMappings = parseAmpModelMappingsArg(modelMappingsInput, "--amp-model-mappings");
+      if (parsedMappings !== undefined) {
+        nextAmp.modelMappings = parsedMappings;
+      }
+    }
+    if (clearSubagentMappings) {
+      nextAmp.subagentMappings = {};
+    } else {
+      const parsedSubagentMappings = parseAmpSubagentMappingsArg(subagentMappingsInput, "--amp-subagent-mappings");
+      if (parsedSubagentMappings !== undefined) {
+        nextAmp.subagentMappings = parsedSubagentMappings;
+      }
+    }
+    if (resetSubagentDefinitions) {
+      delete nextAmp.subagentDefinitions;
+    } else if (clearSubagentDefinitions) {
+      nextAmp.subagentDefinitions = [];
+    } else {
+      const parsedSubagentDefinitions = parseAmpSubagentDefinitionsArg(subagentDefinitionsInput, "--amp-subagent-definitions");
+      if (parsedSubagentDefinitions !== undefined) {
+        nextAmp.subagentDefinitions = parsedSubagentDefinitions;
+      }
+    }
+
+    const patchResolution = await resolveAmpClientPatchPlanFromArgs(context, {
+      config,
+      cwd,
+      env
+    });
+    if (patchResolution.error) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: patchResolution.error
+      };
+    }
+    patchPlan = patchResolution.plan;
+    if (patchPlan && !hasExplicitAmpArgs) {
+      const bootstrap = await maybeBootstrapAmpPatchDefaults({
+        config,
+        amp: nextAmp,
+        patchPlan,
+        env,
+        homeDir: os.homedir()
+      });
+      if (bootstrap.error) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_VALIDATION,
+          errorMessage: bootstrap.error
+        };
+      }
+      nextAmp = bootstrap.amp;
+      bootstrapDefaultsApplied = bootstrap.changed === true;
+      bootstrapDefaultRoute = bootstrap.bootstrapRouteRef || "";
+      bootstrapDiscoveredUpstreamApiKey = bootstrap.discoveredUpstreamApiKey === true;
+    }
+  }
+
+  const updated = setAmpConfigInConfig(config, nextAmp);
+  if (!updated.changed && updated.reason) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: updated.reason
+    };
+  }
+
+  await writeConfigFile(updated.config, configPath);
+
+  let patchResult = null;
+  if (patchPlan) {
+    try {
+      patchResult = await patchAmpClientConfigFiles(patchPlan);
+    } catch (error) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_FAILURE,
+        errorMessage: `AMP config was saved to ${configPath}, but patching AMP client files failed: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+  }
+
+  let title = updated.changed ? "AMP Config Updated" : "AMP Config Saved";
+  if (patchResult) title += " + Client Patched";
+  if (bootstrapDefaultsApplied) title += " + Defaults Bootstrapped";
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      title,
+      [
+        ["Config File", configPath],
+        ["Config Changed", formatYesNo(updated.changed === true)],
+        ["AMP Client Files Patched", formatYesNo(Boolean(patchResult))],
+        ["AMP Defaults Bootstrapped", formatYesNo(bootstrapDefaultsApplied)],
+        ["Bootstrap Default Route", bootstrapDefaultRoute || "(none)"],
+        ["Upstream Key Auto-Discovered", formatYesNo(bootstrapDiscoveredUpstreamApiKey)]
+      ],
+      [
+        buildAmpConfigSection(updated.amp),
+        ...(patchResult ? [buildAmpClientPatchSection(patchResult)] : [])
+      ]
+    )
+  };
+}
+
 async function doStartupInstall(context) {
   const configPath = readArg(context.args, ["config", "configPath"], getDefaultConfigPath());
-  const host = String(readArg(context.args, ["host"], "127.0.0.1"));
+  const host = LOCAL_ROUTER_HOST;
   const port = resolveListenPort({ explicitPort: readArg(context.args, ["port"]) });
   const watchConfig = toBoolean(readArg(context.args, ["watch-config", "watchConfig"], true), true);
   const watchBinary = toBoolean(readArg(context.args, ["watch-binary", "watchBinary"], true), true);
@@ -4890,36 +7123,1209 @@ async function doStartupStatus(context) {
   };
 }
 
+async function promptSelectWithEscape(context, options) {
+  return runPromptWithEscape(() => context.prompts.select(options));
+}
+
+async function promptTextWithEscape(context, options) {
+  return runPromptWithEscape(() => context.prompts.text(options));
+}
+
+function listProviderModelIds(provider) {
+  return dedupeList((provider?.models || []).map((model) => model?.id).filter(Boolean));
+}
+
+function buildInteractiveConfigRootSections(config) {
+  const providers = config?.providers || [];
+  const providerCount = providers.length;
+  const modelCount = providers.reduce((sum, provider) => sum + listProviderModelIds(provider).length, 0);
+  const aliasCount = Object.keys(config?.modelAliases || {}).length;
+  const hasMasterKey = Boolean(String(config?.masterKey || "").trim());
+  const ampConfigured = hasConfiguredAmp(config);
+
+  return [
+    {
+      value: "providers",
+      label: "Providers",
+      hint: providerCount > 0 ? `${formatItemCount(providerCount, "provider")} connected` : "add your first provider"
+    },
+    {
+      value: "models",
+      label: "Models",
+      hint: modelCount > 0 ? `${formatItemCount(modelCount, "model")} configured` : "edit provider model lists"
+    },
+    {
+      value: "model-alias",
+      label: "Model Alias",
+      hint: aliasCount > 0 ? `${formatItemCount(aliasCount, "alias")} configured` : "group routes under one name"
+    },
+    {
+      value: "amp",
+      label: "AMP",
+      hint: ampConfigured ? "proxy + routes configured" : "configure AMP routing"
+    },
+    {
+      value: "startup",
+      label: "Startup",
+      hint: "run llm-router automatically"
+    },
+    {
+      value: "other-settings",
+      label: "Other setting",
+      hint: hasMasterKey ? "master key, fallbacks, review" : "master key missing"
+    }
+  ];
+}
+
+function buildProviderSelectionOptionsForModels(providers) {
+  return (providers || []).map((provider) => ({
+    value: provider.id,
+    label: provider.id,
+    hint: formatItemCount(listProviderModelIds(provider).length, "model")
+  }));
+}
+
+function providerSupportsMultipleFormats(provider) {
+  const formats = dedupeList([...(provider?.formats || []), provider?.format].filter(Boolean));
+  return formats.length > 1;
+}
+
+function repairDefaultModelReference(config, preferredProviderId = "") {
+  const next = structuredClone(config);
+  const defaultModel = String(next.defaultModel || "").trim();
+  if (!defaultModel) return next;
+  if (Object.prototype.hasOwnProperty.call(next.modelAliases || {}, defaultModel)) return next;
+
+  const slashIndex = defaultModel.indexOf("/");
+  if (slashIndex <= 0) return next;
+  const providerId = defaultModel.slice(0, slashIndex).trim();
+  const modelId = defaultModel.slice(slashIndex + 1).trim();
+  const provider = (next.providers || []).find((entry) => entry?.id === providerId);
+  const exists = (provider?.models || []).some((model) => model?.id === modelId || (model?.aliases || []).includes(modelId));
+  if (exists) return next;
+
+  const fallbackProvider = (next.providers || []).find((entry) => entry?.id === preferredProviderId && (entry?.models || []).length > 0)
+    || (next.providers || []).find((entry) => (entry?.models || []).length > 0);
+  next.defaultModel = fallbackProvider?.models?.[0]
+    ? `${fallbackProvider.id}/${fallbackProvider.models[0].id}`
+    : undefined;
+  return next;
+}
+
+function buildUpdatedProviderModels(existingProvider, requestedModelIds, probe = null) {
+  const existingById = new Map((existingProvider?.models || []).map((model) => [model.id, model]));
+  const probeModelSupport = probe?.modelSupport && typeof probe.modelSupport === "object" ? probe.modelSupport : {};
+  const probePreferredFormat = probe?.modelPreferredFormat && typeof probe.modelPreferredFormat === "object"
+    ? probe.modelPreferredFormat
+    : {};
+
+  return dedupeList(requestedModelIds).map((modelId) => {
+    const existing = existingById.get(modelId);
+    if (existing) return existing;
+    const preferredFormat = probePreferredFormat[modelId];
+    const formats = preferredFormat
+      ? [preferredFormat]
+      : dedupeList(probeModelSupport[modelId] || []);
+    return formats.length > 0
+      ? { id: modelId, formats }
+      : { id: modelId };
+  });
+}
+
+async function saveUpdatedProviderConfig(configPath, config, provider, {
+  setDefaultModel = false
+} = {}) {
+  const nextConfig = repairDefaultModelReference(applyConfigChanges(config, {
+    provider,
+    setDefaultModel
+  }), provider?.id);
+  return writeConfigFile(nextConfig, configPath);
+}
+
+async function editProviderNameInteractive(context, configPath, providerId) {
+  const config = await readConfigFile(configPath);
+  const provider = (config.providers || []).find((entry) => entry.id === providerId);
+  if (!provider) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
+  }
+
+  const nextName = await promptTextWithEscape(context, {
+    message: "Provider name",
+    required: true,
+    initialValue: String(provider.name || provider.id || ""),
+    validate: (value) => {
+      const candidate = String(value || "").trim();
+      if (!candidate) return "Provider Friendly Name is required.";
+      const duplicate = findProviderByFriendlyName(config.providers || [], candidate, { excludeId: provider.id });
+      return duplicate ? `Provider Friendly Name '${candidate}' already exists (provider-id: ${duplicate.id}). Use a unique name.` : undefined;
+    }
+  });
+  if (nextName === PROMPT_CANCELLED) return null;
+
+  const saved = await saveUpdatedProviderConfig(configPath, config, {
+    ...provider,
+    name: String(nextName || "").trim()
+  });
+  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport("Provider Name Updated", [
+      ["Provider ID", updated.id],
+      ["Provider Name", updated.name || updated.id]
+    ])
+  };
+}
+
+async function editProviderEndpointsInteractive(context, configPath, providerId) {
+  const config = await readConfigFile(configPath);
+  const provider = (config.providers || []).find((entry) => entry.id === providerId);
+  if (!provider) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
+  }
+  if (normalizeProviderTypeInput(provider.type) === PROVIDER_TYPE_SUBSCRIPTION) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `Provider '${providerId}' uses OAuth-managed endpoints. Add a new provider if you need a different subscription route.`
+    };
+  }
+
+  const endpointsInput = await promptTextWithEscape(context, {
+    message: "Provider endpoints (comma-separated URLs)",
+    required: true,
+    initialValue: providerEndpointsFromConfig(provider).join(","),
+    validate: (value) => validateEndpointListInput(value)
+  });
+  if (endpointsInput === PROMPT_CANCELLED) return null;
+
+  const endpoints = parseEndpointListInput(endpointsInput);
+  maybeReportInputCleanup(context, "endpoint", endpointsInput, endpoints);
+
+  let nextProvider = {
+    ...provider,
+    baseUrl: endpoints[0] || "",
+    baseUrlByFormat: undefined
+  };
+
+  if (endpoints.length > 1 || providerSupportsMultipleFormats(provider)) {
+    if (!String(provider.apiKey || "").trim()) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: `Provider '${providerId}' needs a stored apiKey before auto-detecting endpoint formats.`
+      };
+    }
+
+    const probe = await probeProviderEndpointMatrix({
+      endpoints,
+      models: listProviderModelIds(provider),
+      apiKey: provider.apiKey,
+      extraHeaders: provider.headers,
+      requestsPerMinute: DEFAULT_PROBE_REQUESTS_PER_MINUTE,
+      progressCallback: probeProgressReporter(context)
+    });
+
+    if (!Array.isArray(probe?.workingFormats) || probe.workingFormats.length === 0) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_FAILURE,
+        errorMessage: "Endpoint auto-detection failed. Re-enter the endpoints or keep the previous value."
+      };
+    }
+
+    nextProvider = buildProviderFromConfigInput({
+      providerId: provider.id,
+      name: provider.name,
+      baseUrl: probe.baseUrl,
+      openaiBaseUrl: probe.baseUrlByFormat?.openai,
+      claudeBaseUrl: probe.baseUrlByFormat?.claude,
+      apiKey: provider.apiKey,
+      headers: provider.headers,
+      models: listProviderModelIds(provider),
+      format: probe.preferredFormat || provider.format,
+      formats: probe.workingFormats,
+      probe
+    });
+    nextProvider.rateLimits = provider.rateLimits || [];
+  }
+
+  const saved = await saveUpdatedProviderConfig(configPath, config, nextProvider);
+  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || nextProvider;
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport("Provider Endpoints Updated", [
+      ["Provider ID", updated.id],
+      ["Endpoint Count", String(providerEndpointsFromConfig(updated).length)]
+    ], [
+      "Endpoint Mapping\n" + renderAsciiTable(["Endpoint Type", "URL"], buildProviderEndpointRows(updated), {
+        emptyMessage: "No endpoints configured."
+      })
+    ])
+  };
+}
+
+async function editProviderHeadersInteractive(context, configPath, providerId) {
+  const config = await readConfigFile(configPath);
+  const provider = (config.providers || []).find((entry) => entry.id === providerId);
+  if (!provider) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
+  }
+
+  const headersInput = await promptTextWithEscape(context, {
+    message: "Custom headers JSON",
+    initialValue: JSON.stringify(applyDefaultHeaders(provider.headers || {}, { force: true }))
+  });
+  if (headersInput === PROMPT_CANCELLED) return null;
+
+  const saved = await saveUpdatedProviderConfig(configPath, config, {
+    ...provider,
+    headers: applyDefaultHeaders(parseJsonObjectArg(headersInput, "Custom headers"), { force: true })
+  });
+  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport("Provider Headers Updated", [
+      ["Provider ID", updated.id],
+      ["Header Count", String(Object.keys(updated.headers || {}).length)]
+    ])
+  };
+}
+
+async function removeProviderInteractive(context, configPath, providerId) {
+  const config = await readConfigFile(configPath);
+  const provider = (config.providers || []).find((entry) => entry.id === providerId);
+  if (!provider) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
+  }
+
+  const confirm = await runPromptWithEscape(() => context.prompts.confirm({
+    message: `Delete provider '${providerId}'?`,
+    initialValue: false
+  }));
+  if (confirm === PROMPT_CANCELLED || !confirm) return null;
+
+  let nextConfig = removeProvider(config, providerId);
+  nextConfig = repairDefaultModelReference(nextConfig);
+  await writeConfigFile(nextConfig, configPath);
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: `Removed provider '${providerId}'.`
+  };
+}
+
+async function manageProviderRateLimitsInteractive(context, configPath, providerId) {
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    const provider = (config.providers || []).find((entry) => entry.id === providerId);
+    if (!provider) {
+      return {
+        ok: false,
+        mode: context.mode,
+        exitCode: EXIT_VALIDATION,
+        errorMessage: `Provider '${providerId}' not found.`
+      };
+    }
+
+    printRateLimitBucketIntro(context);
+    const action = await promptSelectWithEscape(context, {
+      message: `Rate limits · ${providerId}`,
+      options: [
+        { value: "create", label: "Create", hint: "add one or more buckets" },
+        { value: "edit", label: "Edit", hint: provider.rateLimits?.length ? "change an existing bucket" : "none yet" },
+        { value: "remove", label: "Remove", hint: provider.rateLimits?.length ? "delete a bucket" : "none yet" },
+        { value: "review", label: "Review", hint: "show current buckets" }
+      ]
+    });
+
+    if (action === PROMPT_CANCELLED) return lastResult;
+
+    if (action === "review") {
+      lastResult = {
+        ok: true,
+        mode: context.mode,
+        exitCode: EXIT_SUCCESS,
+        data: buildProviderRateLimitReview(provider)
+      };
+      emitInteractiveResult(context, lastResult);
+      continue;
+    }
+
+    if (action === "remove") {
+      const bucketOptions = buildRateLimitBucketPromptOptions(provider);
+      if (bucketOptions.length === 0) {
+        lastResult = {
+          ok: true,
+          mode: context.mode,
+          exitCode: EXIT_SUCCESS,
+          data: buildProviderRateLimitReview(provider)
+        };
+        emitInteractiveResult(context, lastResult);
+        continue;
+      }
+
+      const bucketId = await promptSelectWithEscape(context, {
+        message: "Remove bucket",
+        options: bucketOptions
+      });
+      if (bucketId === PROMPT_CANCELLED) continue;
+
+      const confirm = await runPromptWithEscape(() => context.prompts.confirm({
+        message: `Remove '${bucketId}'?`,
+        initialValue: false
+      }));
+      if (confirm === PROMPT_CANCELLED || !confirm) continue;
+
+      const updated = setProviderRateLimitsInConfig(config, {
+        providerId,
+        removeBucketId: String(bucketId || "")
+      });
+      if (!updated.changed && updated.reason) {
+        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+        emitInteractiveResult(context, lastResult);
+        continue;
+      }
+      await writeConfigFile(updated.config, configPath);
+      lastResult = {
+        ok: true,
+        mode: context.mode,
+        exitCode: EXIT_SUCCESS,
+        data: buildProviderRateLimitReport({
+          title: `Rate-Limit Bucket Removed: ${bucketId}`,
+          providerId,
+          rateLimits: updated.rateLimits || []
+        })
+      };
+      emitInteractiveResult(context, lastResult);
+      continue;
+    }
+
+    if (action === "edit") {
+      const bucketOptions = buildRateLimitBucketPromptOptions(provider);
+      if (bucketOptions.length === 0) {
+        lastResult = {
+          ok: true,
+          mode: context.mode,
+          exitCode: EXIT_SUCCESS,
+          data: buildProviderRateLimitReview(provider)
+        };
+        emitInteractiveResult(context, lastResult);
+        continue;
+      }
+      const bucketId = await promptSelectWithEscape(context, {
+        message: "Edit bucket",
+        options: bucketOptions
+      });
+      if (bucketId === PROMPT_CANCELLED) continue;
+      const bucket = (provider.rateLimits || []).find((entry) => entry.id === bucketId) || null;
+      const reservedIds = new Set((provider.rateLimits || []).map((entry) => entry.id));
+      const wizard = await promptRateLimitBucketWizard(context, { provider, initialBucket: bucket, reservedIds });
+      if (!wizard?.bucket) {
+        if (wizard?.cancelled) continue;
+        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: wizard?.reason || "Invalid bucket input." };
+        emitInteractiveResult(context, lastResult);
+        continue;
+      }
+
+      const updated = setProviderRateLimitsInConfig(config, {
+        providerId,
+        buckets: [wizard.bucket],
+        replaceBuckets: false
+      });
+      if (!updated.changed && updated.reason) {
+        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+        emitInteractiveResult(context, lastResult);
+        continue;
+      }
+      await writeConfigFile(updated.config, configPath);
+      lastResult = {
+        ok: true,
+        mode: context.mode,
+        exitCode: EXIT_SUCCESS,
+        data: buildProviderRateLimitReport({
+          title: "Rate-Limit Buckets Updated",
+          providerId,
+          rateLimits: updated.rateLimits || []
+        })
+      };
+      emitInteractiveResult(context, lastResult);
+      continue;
+    }
+
+    const reservedIds = new Set((provider.rateLimits || []).map((entry) => entry.id));
+    const newBuckets = [];
+    let keepAdding = true;
+    while (keepAdding) {
+      const wizard = await promptRateLimitBucketWizard(context, { provider, reservedIds });
+      if (!wizard?.bucket) {
+        if (wizard?.cancelled) break;
+        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: wizard?.reason || "Invalid bucket input." };
+        emitInteractiveResult(context, lastResult);
+        keepAdding = false;
+        continue;
+      }
+      newBuckets.push(wizard.bucket);
+      reservedIds.add(wizard.bucket.id);
+      keepAdding = await runPromptWithEscape(() => context.prompts.confirm({
+        message: "Add another bucket?",
+        initialValue: false
+      }));
+      if (keepAdding === PROMPT_CANCELLED) keepAdding = false;
+    }
+
+    if (newBuckets.length === 0) continue;
+
+    const updated = setProviderRateLimitsInConfig(config, {
+      providerId,
+      buckets: newBuckets,
+      replaceBuckets: false
+    });
+    if (!updated.changed && updated.reason) {
+      lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+      emitInteractiveResult(context, lastResult);
+      continue;
+    }
+    await writeConfigFile(updated.config, configPath);
+    lastResult = {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildProviderRateLimitReport({
+        title: "Rate-Limit Buckets Updated",
+        providerId,
+        rateLimits: updated.rateLimits || []
+      })
+    };
+    emitInteractiveResult(context, lastResult);
+  }
+}
+
+async function manageProviderDetailsInteractive(context, configPath, providerId) {
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    const provider = (config.providers || []).find((entry) => entry.id === providerId);
+    if (!provider) return { result: lastResult, removed: true };
+
+    const action = await promptSelectWithEscape(context, {
+      message: `Provider · ${providerId}`,
+      options: [
+        { value: "edit-name", label: "Edit name", hint: provider.name || provider.id },
+        { value: "edit-endpoint", label: "Edit endpoint", hint: providerEndpointsFromConfig(provider).join(", ") || "not set" },
+        { value: "edit-headers", label: "Edit headers", hint: `${Object.keys(provider.headers || {}).length} configured` },
+        { value: "edit-rate-limit", label: "Edit rate limit", hint: formatItemCount((provider.rateLimits || []).length, "bucket") },
+        { value: "remove-provider", label: "Remove provider", hint: "delete this provider" }
+      ]
+    });
+
+    if (action === PROMPT_CANCELLED) {
+      return { result: lastResult, removed: false };
+    }
+
+    let result = null;
+    if (action === "edit-name") result = await editProviderNameInteractive(context, configPath, providerId);
+    if (action === "edit-endpoint") result = await editProviderEndpointsInteractive(context, configPath, providerId);
+    if (action === "edit-headers") result = await editProviderHeadersInteractive(context, configPath, providerId);
+    if (action === "edit-rate-limit") result = await manageProviderRateLimitsInteractive(context, configPath, providerId);
+    if (action === "remove-provider") {
+      result = await removeProviderInteractive(context, configPath, providerId);
+      if (result?.ok) {
+        emitInteractiveResult(context, result);
+        return { result, removed: true };
+      }
+    }
+
+    if (!result) continue;
+    lastResult = result;
+    emitInteractiveResult(context, result);
+  }
+}
+
+async function manageProvidersInteractive(context, configPath) {
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    const selection = await promptSelectWithEscape(context, {
+      message: "Providers",
+      options: buildProviderPromptOptions(config.providers || [], {
+        includeCreateOption: true,
+        createLabel: "Add new",
+        createHint: "connect API key or OAuth"
+      })
+    });
+
+    if (selection === PROMPT_CANCELLED) {
+      return { result: lastResult };
+    }
+
+    if (selection === "__new__") {
+      const result = await doUpsertProvider(context);
+      lastResult = result;
+      emitInteractiveResult(context, result);
+      continue;
+    }
+
+    const detail = await manageProviderDetailsInteractive(context, configPath, String(selection || ""));
+    if (detail?.result) lastResult = detail.result;
+  }
+}
+
+async function probeNewStandardProviderModels(context, provider, requestedModelIds, newModelIds) {
+  if (!String(provider?.apiKey || "").trim()) {
+    return {
+      ok: false,
+      errorMessage: `Provider '${provider?.id || "(unknown)"}' needs a stored apiKey before auto-testing new models.`
+    };
+  }
+
+  const endpoints = providerEndpointsFromConfig(provider);
+  if (endpoints.length === 0) {
+    return {
+      ok: false,
+      errorMessage: `Provider '${provider?.id || "(unknown)"}' has no endpoints to test against.`
+    };
+  }
+
+  let nextRequestedModelIds = [...requestedModelIds];
+  let pendingModels = [...newModelIds];
+  const confirmedModels = new Set();
+  let combinedProbe = {
+    models: [],
+    modelSupport: {},
+    modelPreferredFormat: {}
+  };
+
+  while (pendingModels.length > 0) {
+    const probe = await probeProviderEndpointMatrix({
+      endpoints,
+      models: pendingModels,
+      apiKey: provider.apiKey,
+      extraHeaders: provider.headers,
+      requestsPerMinute: DEFAULT_PROBE_REQUESTS_PER_MINUTE,
+      progressCallback: probeProgressReporter(context)
+    });
+
+    combinedProbe = {
+      ...combinedProbe,
+      models: dedupeList([...(combinedProbe.models || []), ...(probe?.models || [])]),
+      modelSupport: {
+        ...(combinedProbe.modelSupport || {}),
+        ...(probe?.modelSupport || {})
+      },
+      modelPreferredFormat: {
+        ...(combinedProbe.modelPreferredFormat || {}),
+        ...(probe?.modelPreferredFormat || {})
+      }
+    };
+
+    for (const modelId of (probe?.models || [])) {
+      confirmedModels.add(modelId);
+    }
+
+    const unresolvedModels = dedupeList(
+      Array.isArray(probe?.unresolvedModels) && probe.unresolvedModels.length > 0
+        ? probe.unresolvedModels
+        : pendingModels.filter((modelId) => !confirmedModels.has(modelId))
+    );
+
+    if (unresolvedModels.length === 0) {
+      return {
+        ok: true,
+        requestedModelIds: nextRequestedModelIds,
+        probe: combinedProbe
+      };
+    }
+
+    const renamedInput = await promptTextWithEscape(context, {
+      message: "Undetected new models (update names, comma-separated; blank removes them)",
+      required: false,
+      initialValue: unresolvedModels.join(","),
+      validate: (value) => validateProviderModelListInput(value, { allowEmpty: true })
+    });
+    if (renamedInput === PROMPT_CANCELLED) {
+      return {
+        ok: false,
+        errorMessage: "Cancelled while updating undetected model names."
+      };
+    }
+
+    const renamedModels = parseProviderModelListInput(renamedInput);
+    maybeReportInputCleanup(context, "model", renamedInput, renamedModels);
+    nextRequestedModelIds = dedupeList([
+      ...nextRequestedModelIds.filter((modelId) => !unresolvedModels.includes(modelId)),
+      ...renamedModels
+    ]);
+    pendingModels = renamedModels.filter((modelId) => !confirmedModels.has(modelId));
+  }
+
+  return {
+    ok: true,
+    requestedModelIds: nextRequestedModelIds,
+    probe: combinedProbe
+  };
+}
+
+async function editProviderModelsInteractive(context, configPath, providerId) {
+  const config = await readConfigFile(configPath);
+  const provider = (config.providers || []).find((entry) => entry.id === providerId);
+  if (!provider) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
+  }
+
+  const currentModelIds = listProviderModelIds(provider);
+  const modelsInput = await promptTextWithEscape(context, {
+    message: `Models · ${providerId} (comma-separated)`,
+    required: true,
+    initialValue: currentModelIds.join(","),
+    validate: (value) => validateProviderModelListInput(value)
+  });
+  if (modelsInput === PROMPT_CANCELLED) return null;
+
+  let requestedModelIds = parseProviderModelListInput(modelsInput);
+  maybeReportInputCleanup(context, "model", modelsInput, requestedModelIds);
+
+  if (serializeStable(requestedModelIds) === serializeStable(currentModelIds)) {
+    const saved = await saveUpdatedProviderConfig(configPath, config, {
+      ...provider,
+      models: buildUpdatedProviderModels(provider, requestedModelIds)
+    });
+    const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildOperationReport("Provider Models Saved", [
+        ["Provider ID", updated.id],
+        ["Model Count", String(listProviderModelIds(updated).length)],
+        ["New Models Tested", "0"]
+      ])
+    };
+  }
+
+  const newModelIds = requestedModelIds.filter((modelId) => !currentModelIds.includes(modelId));
+  let probe = null;
+
+  if (newModelIds.length > 0) {
+    if (normalizeProviderTypeInput(provider.type) === PROVIDER_TYPE_SUBSCRIPTION) {
+      try {
+        await ensureSubscriptionAuthenticated(context, {
+          profile: provider.subscriptionProfile || provider.id,
+          subscriptionType: provider.subscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX,
+          forceLogin: false,
+          deviceCode: false
+        });
+      } catch (error) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_FAILURE,
+          errorMessage: `Subscription OAuth login failed: ${error instanceof Error ? error.message : String(error)}`
+        };
+      }
+
+      const result = await probeSubscriptionModels(context, {
+        providerId: provider.id,
+        providerName: provider.name,
+        subscriptionType: provider.subscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX,
+        subscriptionProfile: provider.subscriptionProfile || provider.id,
+        models: newModelIds,
+        headers: provider.headers
+      });
+      if (!result?.ok) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_FAILURE,
+          errorMessage: [
+            "New subscription model test failed.",
+            ...(result?.failures || []).map((entry) => `${entry.modelId}: ${entry.details}`)
+          ].join(" ")
+        };
+      }
+      probe = result.probe;
+    } else {
+      const result = await probeNewStandardProviderModels(context, provider, requestedModelIds, newModelIds);
+      if (!result.ok) {
+        return {
+          ok: false,
+          mode: context.mode,
+          exitCode: EXIT_FAILURE,
+          errorMessage: result.errorMessage
+        };
+      }
+      requestedModelIds = result.requestedModelIds;
+      probe = result.probe;
+    }
+  }
+
+  const saved = await saveUpdatedProviderConfig(configPath, config, {
+    ...provider,
+    models: buildUpdatedProviderModels(provider, requestedModelIds, probe)
+  });
+  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport("Provider Models Updated", [
+      ["Provider ID", updated.id],
+      ["Model Count", String(listProviderModelIds(updated).length)],
+      ["New Models Tested", String(newModelIds.length)]
+    ], [
+      "Models\n" + renderAsciiTable(["Model", "Request Format(s)", "Silent Fallbacks"], buildProviderModelRows(updated), {
+        emptyMessage: "No models configured."
+      })
+    ])
+  };
+}
+
+async function manageModelsInteractive(context, configPath) {
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    if (!config.providers.length) {
+      return {
+        result: {
+          ok: true,
+          mode: context.mode,
+          exitCode: EXIT_SUCCESS,
+          data: "No providers configured."
+        }
+      };
+    }
+
+    const providerId = await promptSelectWithEscape(context, {
+      message: "Models",
+      options: buildProviderSelectionOptionsForModels(config.providers)
+    });
+    if (providerId === PROMPT_CANCELLED) {
+      return { result: lastResult };
+    }
+
+    const result = await editProviderModelsInteractive(context, configPath, String(providerId || ""));
+    if (!result) continue;
+    lastResult = result;
+    emitInteractiveResult(context, result);
+  }
+}
+
+async function createModelAliasInteractive(context, configPath) {
+  const config = await readConfigFile(configPath);
+  const aliasId = await promptTextWithEscape(context, {
+    message: "Alias ID (e.g. chat.default)",
+    required: true,
+    validate: (value) => {
+      const candidate = String(value || "").trim();
+      if (!candidate) return "Alias ID is required.";
+      if (!MODEL_ALIAS_ID_PATTERN.test(candidate)) return "Use letters/numbers and . _ : - separators.";
+      return undefined;
+    }
+  });
+  if (aliasId === PROMPT_CANCELLED) return null;
+
+  const strategy = await promptSelectWithEscape(context, {
+    message: "Strategy",
+    options: MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => ({
+      value: option.value,
+      label: option.label,
+      hint: option.hint
+    })),
+    initialValue: "auto"
+  });
+  if (strategy === PROMPT_CANCELLED) return null;
+
+  const targets = await promptTextWithEscape(context, {
+    message: "Primary routes (<route>@<weight>)",
+    required: true,
+    placeholder: "openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2"
+  });
+  if (targets === PROMPT_CANCELLED) return null;
+
+  const fallbackTargets = await promptTextWithEscape(context, {
+    message: "Fallback routes (optional)",
+    required: false,
+    placeholder: "openrouter/gpt-4o"
+  });
+  if (fallbackTargets === PROMPT_CANCELLED) return null;
+
+  const updated = upsertModelAliasInConfig(config, {
+    aliasId: String(aliasId || "").trim(),
+    strategy,
+    targets,
+    fallbackTargets
+  });
+  if (!updated.changed && updated.reason) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+  }
+  await writeConfigFile(updated.config, configPath);
+  const savedAliasId = updated.aliasId || String(aliasId || "").trim();
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildModelAliasSavedReport(savedAliasId, updated.config.modelAliases?.[savedAliasId])
+  };
+}
+
+async function manageModelAliasDetailsInteractive(context, configPath, aliasId) {
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    const alias = config.modelAliases?.[aliasId];
+    if (!alias) return { result: lastResult, removed: true };
+
+    const action = await promptSelectWithEscape(context, {
+      message: `Model Alias · ${aliasId}`,
+      options: [
+        { value: "edit-strategy", label: "Edit strategy", hint: formatModelAliasStrategyLabel(alias.strategy) },
+        { value: "edit-targets", label: "Edit targets", hint: formatItemCount((alias.targets || []).length, "target") },
+        { value: "edit-fallback-targets", label: "Edit fallback targets", hint: formatItemCount((alias.fallbackTargets || []).length, "fallback") },
+        { value: "remove-alias", label: "Remove alias", hint: "delete this alias" }
+      ]
+    });
+
+    if (action === PROMPT_CANCELLED) return { result: lastResult, removed: false };
+
+    let result = null;
+    if (action === "edit-strategy") {
+      const strategy = await promptSelectWithEscape(context, {
+        message: "Strategy",
+        options: MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => ({
+          value: option.value,
+          label: option.label,
+          hint: option.hint
+        })),
+        initialValue: normalizeModelAliasStrategy(alias.strategy || "auto") || "auto"
+      });
+      if (strategy === PROMPT_CANCELLED) continue;
+      const updated = upsertModelAliasInConfig(config, { aliasId, strategy });
+      if (!updated.changed && updated.reason) {
+        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+      } else {
+        await writeConfigFile(updated.config, configPath);
+        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildModelAliasSavedReport(aliasId, updated.config.modelAliases?.[aliasId]) };
+      }
+    }
+
+    if (action === "edit-targets") {
+      const targetsInput = await promptTextWithEscape(context, {
+        message: "Primary routes (<route>@<weight>)",
+        required: true,
+        initialValue: formatAliasTargetsForSummary(alias.targets || []) === "(none)" ? "" : formatAliasTargetsForSummary(alias.targets || [])
+      });
+      if (targetsInput === PROMPT_CANCELLED) continue;
+      const updated = upsertModelAliasInConfig(config, { aliasId, targets: targetsInput });
+      if (!updated.changed && updated.reason) {
+        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+      } else {
+        await writeConfigFile(updated.config, configPath);
+        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildModelAliasSavedReport(aliasId, updated.config.modelAliases?.[aliasId]) };
+      }
+    }
+
+    if (action === "edit-fallback-targets") {
+      const fallbackInput = await promptTextWithEscape(context, {
+        message: "Fallback routes (optional)",
+        required: false,
+        initialValue: formatAliasTargetsForSummary(alias.fallbackTargets || []) === "(none)" ? "" : formatAliasTargetsForSummary(alias.fallbackTargets || [])
+      });
+      if (fallbackInput === PROMPT_CANCELLED) continue;
+      const updated = upsertModelAliasInConfig(config, {
+        aliasId,
+        fallbackTargets: fallbackInput,
+        clearFallbackTargets: String(fallbackInput || "").trim() === ""
+      });
+      if (!updated.changed && updated.reason) {
+        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
+      } else {
+        await writeConfigFile(updated.config, configPath);
+        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildModelAliasSavedReport(aliasId, updated.config.modelAliases?.[aliasId]) };
+      }
+    }
+
+    if (action === "remove-alias") {
+      const confirm = await runPromptWithEscape(() => context.prompts.confirm({
+        message: `Remove model alias '${aliasId}'?`,
+        initialValue: false
+      }));
+      if (confirm === PROMPT_CANCELLED || !confirm) continue;
+      const removal = removeModelAliasFromConfig(config, aliasId);
+      if (!removal.changed) {
+        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: removal.reason };
+      } else {
+        await writeConfigFile(removal.config, configPath);
+        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Removed model alias '${removal.aliasId}'.` };
+        emitInteractiveResult(context, result);
+        return { result, removed: true };
+      }
+    }
+
+    if (!result) continue;
+    lastResult = result;
+    emitInteractiveResult(context, result);
+  }
+}
+
+async function manageModelAliasesInteractive(context, configPath) {
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    const selection = await promptSelectWithEscape(context, {
+      message: "Model Alias",
+      options: buildAliasPromptOptions(config.modelAliases || {}, {
+        includeCreateOption: true,
+        createLabel: "Add new Alias",
+        createHint: "group routes under one name"
+      })
+    });
+
+    if (selection === PROMPT_CANCELLED) return { result: lastResult };
+
+    if (selection === "__new__") {
+      const result = await createModelAliasInteractive(context, configPath);
+      if (!result) continue;
+      lastResult = result;
+      emitInteractiveResult(context, result);
+      continue;
+    }
+
+    const detail = await manageModelAliasDetailsInteractive(context, configPath, String(selection || ""));
+    if (detail?.result) lastResult = detail.result;
+  }
+}
+
+async function manageStartupInteractive(context) {
+  const selection = await promptSelectWithEscape(context, {
+    message: "Startup",
+    options: [
+      { value: "startup-install", label: "Install", hint: "enable OS startup" },
+      { value: "startup-status", label: "Status", hint: "check installed/running" },
+      { value: "startup-uninstall", label: "Uninstall", hint: "remove OS startup" },
+      { value: "__back__", label: "Back", hint: "return to root" }
+    ]
+  });
+
+  if (selection === PROMPT_CANCELLED || selection === "__back__") return null;
+  if (selection === "startup-install") return doStartupInstall(context);
+  if (selection === "startup-status") return doStartupStatus(context);
+  return doStartupUninstall(context);
+}
+
+async function manageOtherSettingsInteractive(context) {
+  const configPath = readArg(context.args || {}, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const selection = await promptSelectWithEscape(context, {
+    message: "Other setting",
+    options: [
+      { value: "set-master-key", label: "Master key", hint: config.masterKey ? "update or rotate" : "protect access" },
+      { value: "set-model-fallbacks", label: "Fallbacks", hint: countConfiguredFallbackRoutes(config) > 0 ? "edit silent failover" : "add silent failover" },
+      { value: "list", label: "Config summary", hint: "providers, aliases, AMP" },
+      { value: "list-routing", label: "Routing summary", hint: "routing-focused view" },
+      { value: "migrate-config", label: "Migrate config", hint: "upgrade schema version" },
+      { value: "__back__", label: "Back", hint: "return to root" }
+    ]
+  });
+
+  if (selection === PROMPT_CANCELLED || selection === "__back__") return null;
+  if (selection === "set-master-key") return doSetMasterKey(context);
+  if (selection === "set-model-fallbacks") return doSetModelFallbacks(context);
+  if (selection === "list") return doListConfig(context);
+  if (selection === "list-routing") return doListRouting(context);
+  return doMigrateConfig(context);
+}
+
+async function runInteractiveConfigMenu(context) {
+  const configPath = readArg(context.args || {}, ["config", "configPath"], getDefaultConfigPath());
+  let lastResult = null;
+
+  while (true) {
+    const config = await readConfigFile(configPath);
+    const sectionId = await promptSelectWithEscape(context, {
+      message: "What do you want to manage?",
+      options: buildInteractiveConfigRootSections(config)
+    });
+
+    if (sectionId === PROMPT_CANCELLED) {
+      return lastResult || {
+        ok: true,
+        mode: context.mode,
+        exitCode: EXIT_SUCCESS,
+        data: "No changes made."
+      };
+    }
+
+    let result = null;
+    if (sectionId === "providers") {
+      const managed = await manageProvidersInteractive(context, configPath);
+      result = managed?.result || null;
+    }
+    if (sectionId === "models") {
+      const managed = await manageModelsInteractive(context, configPath);
+      result = managed?.result || null;
+    }
+    if (sectionId === "model-alias") {
+      const managed = await manageModelAliasesInteractive(context, configPath);
+      result = managed?.result || null;
+    }
+    if (sectionId === "amp") {
+      result = await doSetAmpConfig(context);
+    }
+    if (sectionId === "startup") {
+      result = await manageStartupInteractive(context);
+    }
+    if (sectionId === "other-settings") {
+      result = await manageOtherSettingsInteractive(context);
+    }
+
+    if (result) lastResult = result;
+  }
+}
+
+function buildConfigMenuSections(config) {
+  const providerCount = (config?.providers || []).length;
+  const modelCount = (config?.providers || []).reduce((sum, provider) => sum + (provider?.models || []).length, 0);
+  const aliasCount = Object.keys(config?.modelAliases || {}).length;
+  const fallbackCount = countConfiguredFallbackRoutes(config);
+  const bucketCount = countConfiguredRateLimitBuckets(config);
+  const hasMasterKey = Boolean(String(config?.masterKey || "").trim());
+  const ampConfigured = hasConfiguredAmp(config);
+
+  return [
+    {
+      value: "providers",
+      label: "Providers",
+      hint: providerCount > 0
+        ? `${formatItemCount(providerCount, "provider")} · ${formatItemCount(modelCount, "model")}`
+        : "connect your first provider",
+      operations: [
+        { value: "upsert-provider", label: "Add or edit", hint: "API key or OAuth" },
+        { value: "remove-provider", label: "Remove provider", hint: providerCount > 0 ? "delete a provider" : "none yet" },
+        { value: "remove-model", label: "Remove model", hint: modelCount > 0 ? "trim a provider model list" : "none yet" }
+      ]
+    },
+    {
+      value: "routing",
+      label: "Routing",
+      hint: aliasCount > 0 || fallbackCount > 0 || bucketCount > 0
+        ? [
+            formatItemCount(aliasCount, "alias"),
+            formatItemCount(fallbackCount, "fallback"),
+            formatItemCount(bucketCount, "bucket")
+          ].join(" · ")
+        : "aliases, fallbacks, limits",
+      operations: [
+        { value: "upsert-model-alias", label: "Aliases", hint: aliasCount > 0 ? "create or edit" : "group routes" },
+        { value: "remove-model-alias", label: "Remove alias", hint: aliasCount > 0 ? "delete an alias" : "none yet" },
+        { value: "set-model-fallbacks", label: "Fallbacks", hint: fallbackCount > 0 ? "edit silent failover" : "add silent failover" },
+        { value: "set-provider-rate-limits", label: "Rate limits", hint: bucketCount > 0 ? "edit request caps" : "add request caps" }
+      ]
+    },
+    {
+      value: "security",
+      label: "Security",
+      hint: hasMasterKey ? "master key set" : "master key missing",
+      operations: [
+        { value: "set-master-key", label: "Master key", hint: hasMasterKey ? "update or rotate" : "protect access" }
+      ]
+    },
+    {
+      value: "amp",
+      label: "AMP",
+      hint: ampConfigured ? "proxy + routes configured" : "Amp CLI proxy + routing",
+      operations: [
+        { value: "set-amp-config", label: "AMP setup", hint: "proxy, mappings, client patch" }
+      ]
+    },
+    {
+      value: "startup",
+      label: "Startup",
+      hint: "run llm-router automatically",
+      operations: [
+        { value: "startup-install", label: "Install", hint: "enable OS startup" },
+        { value: "startup-status", label: "Status", hint: "check installed/running" },
+        { value: "startup-uninstall", label: "Uninstall", hint: "remove OS startup" }
+      ]
+    },
+    {
+      value: "review",
+      label: "Review",
+      hint: "see current config",
+      operations: [
+        { value: "list", label: "Config summary", hint: "providers, aliases, AMP" },
+        { value: "list-routing", label: "Routing summary", hint: "same config view, routing-focused" }
+      ]
+    },
+    {
+      value: "advanced",
+      label: "Advanced",
+      hint: "schema migration",
+      operations: [
+        { value: "migrate-config", label: "Migrate config", hint: "upgrade schema version" }
+      ]
+    }
+  ];
+}
+
 async function resolveConfigOperation(context) {
   const opArg = String(readArg(context.args, ["operation", "op"], "") || "").trim();
   if (opArg) return opArg;
 
-  if (canPrompt()) {
-    return context.prompts.select({
-      message: "Config operation",
-      options: [
-        { value: "upsert-provider", label: "Add/Edit provider" },
-        { value: "remove-provider", label: "Remove provider" },
-        { value: "remove-model", label: "Remove model from provider" },
-        { value: "upsert-model-alias", label: "Add/Edit model alias" },
-        { value: "remove-model-alias", label: "Remove model alias" },
-        { value: "set-provider-rate-limits", label: "Manage provider rate-limit buckets" },
-        { value: "set-model-fallbacks", label: "Set model silent-fallbacks" },
-        { value: "set-master-key", label: "Set worker master key" },
-        { value: "migrate-config", label: "Migrate config schema version" },
-        { value: "list", label: "Show config summary" },
-        { value: "list-routing", label: "Show routing summary" },
-        { value: "startup-install", label: "Install OS startup" },
-        { value: "startup-status", label: "Show OS startup status" },
-        { value: "startup-uninstall", label: "Uninstall OS startup" }
-      ]
-    });
+  if (canUseInteractivePrompts(context, ["select"])) {
+    const configPath = readArg(context.args || {}, ["config", "configPath"], getDefaultConfigPath());
+    const config = await readConfigFile(configPath);
+
+    while (true) {
+      const sections = buildConfigMenuSections(config);
+      const sectionId = await context.prompts.select({
+        message: "What do you want to manage?",
+        options: sections.map((section) => ({
+          value: section.value,
+          label: section.label,
+          hint: section.hint
+        }))
+      });
+      const section = sections.find((entry) => entry.value === sectionId);
+      if (!section) break;
+      if (section.operations.length === 1) return section.operations[0].value;
+
+      const operation = await context.prompts.select({
+        message: section.label,
+        options: [
+          ...section.operations,
+          { value: "__back__", label: "Back", hint: "pick another section" }
+        ]
+      });
+      if (operation === "__back__") continue;
+      return operation;
+    }
   }
 
   return "list";
 }
 
 async function runConfigAction(context) {
+  const explicitOperation = String(readArg(context?.args || {}, ["operation", "op"], "") || "").trim();
+  if (!explicitOperation && canUseInteractivePrompts(context, ["select", "text", "confirm"])) {
+    return runInteractiveConfigMenu(context);
+  }
+
   const op = await resolveConfigOperation(context);
 
   switch (op) {
@@ -4944,6 +8350,9 @@ async function runConfigAction(context) {
       return doSetModelFallbacks(context);
     case "set-master-key":
       return doSetMasterKey(context);
+    case "set-amp-config":
+    case "set-amp":
+      return doSetAmpConfig(context);
     case "migrate-config":
       return doMigrateConfig(context);
     case "list":
@@ -4966,22 +8375,49 @@ async function runConfigAction(context) {
   }
 }
 
+async function runWebAction(context) {
+  const args = context.args || {};
+  const result = await runWebCommand({
+    configPath: readArg(args, ["config", "configPath"], getDefaultConfigPath()),
+    host: String(readArg(args, ["host"], "127.0.0.1")),
+    port: readArg(args, ["port"], 8788),
+    open: toBoolean(readArg(args, ["open"], true), true),
+    routerHost: LOCAL_ROUTER_HOST,
+    routerPort: LOCAL_ROUTER_PORT,
+    routerWatchConfig: toBoolean(readArg(args, ["router-watch-config", "routerWatchConfig"], true), true),
+    routerWatchBinary: toBoolean(readArg(args, ["router-watch-binary", "routerWatchBinary"], true), true),
+    routerRequireAuth: toBoolean(readArg(args, ["router-require-auth", "routerRequireAuth"], false), false),
+    allowRemoteClients: toBoolean(readArg(args, ["allow-remote-clients", "allowRemoteClients"], false), false),
+    cliPathForRouter: process.argv[1],
+    onLine: (line) => context.terminal.line(line),
+    onError: (line) => context.terminal.error(line)
+  });
+
+  return {
+    ok: result.ok,
+    mode: context.mode,
+    exitCode: result.exitCode,
+    data: result.data,
+    errorMessage: result.errorMessage
+  };
+}
+
 async function runStartAction(context) {
   const args = context.args || {};
   const result = await runStartCommand({
     configPath: readArg(args, ["config", "configPath"], getDefaultConfigPath()),
-    host: String(readArg(args, ["host"], "127.0.0.1")),
+    host: LOCAL_ROUTER_HOST,
     port: resolveListenPort({ explicitPort: readArg(args, ["port"]) }),
     watchConfig: toBoolean(readArg(args, ["watch-config", "watchConfig"], true), true),
     watchBinary: toBoolean(readArg(args, ["watch-binary", "watchBinary"], true), true),
     requireAuth: toBoolean(readArg(args, ["require-auth", "requireAuth"], false), false),
     onStartupConflict: canPrompt() && typeof context?.prompts?.select === "function"
       ? ({ port }) => context.prompts.select({
-        message: `Startup-managed llm-router is already running on port ${port}. Choose how to continue`,
+        message: `Port ${port} is already used by the startup service`,
         options: [
-          { value: "restart-startup", label: "Restart startup-managed instance (latest version)" },
-          { value: "stop-and-start-here", label: "Stop running instance and start here" },
-          { value: "exit", label: "Exit" }
+          { value: "restart-startup", label: "Restart service", hint: "keep startup mode" },
+          { value: "stop-and-start-here", label: "Run here instead", hint: "stop the startup service first" },
+          { value: "exit", label: "Cancel" }
         ]
       })
       : undefined,
@@ -5584,7 +9020,7 @@ async function runAiHelpAction(context) {
   }
 
   const runtimeConfigPathForDisplay = runtimeConfigPath ? toHomeRelativePath(runtimeConfigPath) : "";
-  const gatewayBaseUrlForGuide = liveTest.baseUrl || (serverRunning ? `http://${runtimeState.host}:${runtimeState.port}` : "http://127.0.0.1:8787");
+  const gatewayBaseUrlForGuide = liveTest.baseUrl || (serverRunning ? `http://${runtimeState.host}:${runtimeState.port}` : LOCAL_ROUTER_ORIGIN);
   const authGuideHeaders = runtimeRequiresAuth ? ["Authorization: Bearer <master_key>"] : [];
 
   const lines = [
@@ -6165,7 +9601,7 @@ async function runDeployAction(context) {
       "Post-deploy checks:",
       `- dig +short ${deployHost} @1.1.1.1`,
       `- curl -I https://${deployHost}/anthropic`,
-      `- Claude Code base URL: https://${deployHost}/anthropic (no :8787)`
+      `- Claude Code base URL: https://${deployHost}/anthropic (no local port suffix)`
     ].join("\n")
     : "";
 
@@ -6198,7 +9634,7 @@ async function runDeployAction(context) {
           ? renderListSection("Post-Deploy Checks", [
             `dig +short ${deployHost} @1.1.1.1`,
             `curl -I https://${deployHost}/anthropic`,
-            `Claude Code base URL: https://${deployHost}/anthropic (no :8787)`
+            `Claude Code base URL: https://${deployHost}/anthropic (no local port suffix)`
           ])
           : ""
       ]
@@ -6644,18 +10080,16 @@ const routerModule = {
       actionId: "start",
       description: "Start local llm-router route.",
       tui: { steps: ["start-server"] },
-      commandline: { requiredArgs: [], optionalArgs: ["host", "port", "config", "watch-config", "watch-binary", "require-auth"] },
+      commandline: { requiredArgs: [], optionalArgs: ["config", "watch-config", "watch-binary", "require-auth"] },
       help: {
         summary: "Start local llm-router on localhost. Hot-reloads config in memory and auto-relaunches after llm-router upgrades.",
         args: [
-          { name: "host", required: false, description: "Listen host.", example: "--host=127.0.0.1" },
-          { name: "port", required: false, description: "Listen port (or use LLM_ROUTER_PORT / PORT env).", example: "--port=8787" },
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" },
           { name: "watch-config", required: false, description: "Hot-reload config in memory without process restart.", example: "--watch-config=true" },
           { name: "watch-binary", required: false, description: "Watch for llm-router upgrades and relaunch the latest version.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require local API auth using config.masterKey.", example: "--require-auth=true" }
         ],
-        examples: ["llm-router start", "LLM_ROUTER_PORT=3001 llm-router start", "llm-router start --require-auth=true"],
+        examples: ["llm-router start", "llm-router start --require-auth=true"],
         useCases: [
           {
             name: "run local route",
@@ -6666,6 +10100,35 @@ const routerModule = {
         keybindings: ["Ctrl+C stop"]
       },
       run: runStartAction
+    },
+    {
+      actionId: "web",
+      description: "Open a local Claude-light web console for config editing and router control.",
+      tui: { steps: ["open-web-console"] },
+      commandline: { requiredArgs: [], optionalArgs: ["host", "port", "config", "open", "router-watch-config", "router-watch-binary", "router-require-auth", "allow-remote-clients"] },
+      help: {
+        summary: "Launch the browser-based llm-router console with a richer UI for editing config JSON, probing providers, and starting or stopping the local router.",
+        args: [
+          { name: "host", required: false, description: "Web console listen host.", example: "--host=127.0.0.1" },
+          { name: "port", required: false, description: "Web console listen port (or use LLM_ROUTER_WEB_PORT / PORT env).", example: "--port=8788" },
+          { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" },
+          { name: "open", required: false, description: "Open the browser automatically.", example: "--open=true" },
+          { name: "router-watch-config", required: false, description: "Default watch-config value for the managed router.", example: "--router-watch-config=true" },
+          { name: "router-watch-binary", required: false, description: "Default watch-binary value for the managed router.", example: "--router-watch-binary=true" },
+          { name: "router-require-auth", required: false, description: "Default auth requirement for the managed router.", example: "--router-require-auth=false" },
+          { name: "allow-remote-clients", required: false, description: "Allow non-localhost browser access to the management UI (not recommended).", example: "--allow-remote-clients=true" }
+        ],
+        examples: ["llm-router web", "llm-router web --port=9090", "llm-router web --open=false"],
+        useCases: [
+          {
+            name: "manage router in browser",
+            description: "Use a Claude-light web UI to edit config, probe providers, and control the local route server.",
+            command: "llm-router web"
+          }
+        ],
+        keybindings: ["Exit Web button", "Ctrl+C stop"]
+      },
+      run: runWebAction
     },
     {
       actionId: "stop",
@@ -6771,11 +10234,12 @@ const routerModule = {
     },
     {
       actionId: "config",
-      description: "Config manager for providers/models/master-key/startup service.",
+      description: "Config manager for providers/models/master-key/AMP/startup service.",
       tui: { steps: ["select-operation", "execute"] },
       commandline: {
         requiredArgs: [],
         optionalArgs: [
+          "tui",
           "operation",
           "op",
           "config",
@@ -6819,6 +10283,34 @@ const routerModule = {
           "generate-master-key",
           "master-key-length",
           "master-key-prefix",
+          "amp-upstream-url",
+          "amp-upstream-api-key",
+          "amp-restrict-management-to-localhost",
+          "amp-force-model-mappings",
+          "amp-preset",
+          "amp-default-route",
+          "amp-routes",
+          "amp-raw-model-routes",
+          "amp-overrides",
+          "amp-model-mappings",
+          "amp-subagent-definitions",
+          "amp-subagent-mappings",
+          "patch-amp-client-config",
+          "amp-client-settings-scope",
+          "amp-client-settings-file",
+          "amp-client-secrets-file",
+          "amp-client-url",
+          "amp-client-api-key",
+          "clear-amp-upstream-url",
+          "clear-amp-upstream-api-key",
+          "clear-amp-default-route",
+          "clear-amp-routes",
+          "clear-amp-raw-model-routes",
+          "clear-amp-overrides",
+          "clear-amp-model-mappings",
+          "clear-amp-subagent-definitions",
+          "reset-amp-subagent-definitions",
+          "clear-amp-subagent-mappings",
           "target-version",
           "create-backup",
           "backup",
@@ -6834,8 +10326,9 @@ const routerModule = {
         ]
       },
       help: {
-        summary: "Manage providers, model aliases, rate-limit buckets, master key, and OS startup. TUI by default; commandline via --operation.",
+        summary: "Manage providers, model aliases, rate-limit buckets, AMP proxy settings, master key, and OS startup. `llm-router config` opens the web console by default; use --tui for the terminal UI or --operation for direct commandline actions.",
         args: [
+          { name: "tui", required: false, description: "Open the terminal UI instead of the default browser-based console when using `llm-router config`.", example: "--tui" },
           { name: "operation", required: false, description: "Config operation (optional; prompts if omitted).", example: "--operation=upsert-provider" },
           { name: "provider-id", required: false, description: "Provider id (lowercase letters/numbers/dashes).", example: "--provider-id=openrouter-primary" },
           { name: "name", required: false, description: "Provider Friendly Name (must be unique; shown in management screen).", example: "--name=OpenRouter Primary" },
@@ -6874,10 +10367,36 @@ const routerModule = {
           { name: "generate-master-key", required: false, description: "Generate a strong master key automatically (set-master-key flow).", example: "--generate-master-key=true" },
           { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
           { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
+          { name: "amp-upstream-url", required: false, description: "AMP upstream base URL for management proxying and unresolved fallback routing.", example: "--amp-upstream-url=https://ampcode.com" },
+          { name: "amp-upstream-api-key", required: false, description: "AMP upstream API key used when llm-router proxies AMP management routes.", example: "--amp-upstream-api-key=amp_..." },
+          { name: "amp-restrict-management-to-localhost", required: false, description: "Restrict AMP management proxy routes to localhost clients.", example: "--amp-restrict-management-to-localhost=true" },
+          { name: "amp-force-model-mappings", required: false, description: "Apply AMP model mappings before local bare-model lookup.", example: "--amp-force-model-mappings=true" },
+          { name: "amp-preset", required: false, description: "New AMP schema preset: builtin (default) or none.", example: "--amp-preset=builtin" },
+          { name: "amp-default-route", required: false, description: "New AMP schema fallback route ref used before global defaultModel.", example: "--amp-default-route=chat.default" },
+          { name: "amp-routes", required: false, description: "New AMP schema entity/signature routes as JSON object or 'key => route' entries.", example: "--amp-routes=\"smart => chat.smart, @google-gemini-flash-shared => chat.tools\"" },
+          { name: "amp-raw-model-routes", required: false, description: "New AMP schema raw model routes as JSON or 'match => route' entries.", example: "--amp-raw-model-routes=\"gpt-*-codex* => chat.deep\"" },
+          { name: "amp-overrides", required: false, description: "New AMP schema override catalog JSON object with entities/signatures arrays.", example: "--amp-overrides='{\"entities\":[{\"id\":\"reviewer\",\"type\":\"feature\",\"match\":[\"gemini-4-pro*\"],\"route\":\"chat.review\"}]}'" },
+          { name: "amp-model-mappings", required: false, description: "AMP model mappings as JSON or 'from => to' entries separated by newlines/commas.", example: "--amp-model-mappings=\"* => rc/gpt-5.3-codex\"" },
+          { name: "amp-subagent-definitions", required: false, description: "AMP subagent definitions as JSON or 'agent => model-pattern|pattern' entries separated by newlines/commas.", example: "--amp-subagent-definitions=\"oracle => gpt-5.4|gpt-5.4*, planner => gpt-6*\"" },
+          { name: "amp-subagent-mappings", required: false, description: "AMP subagent mappings as JSON object or 'agent => route' entries separated by newlines/commas.", example: "--amp-subagent-mappings=\"oracle => rc/gpt-5.3-codex, librarian => rc/gpt-5.3-codex\"" },
+          { name: "patch-amp-client-config", required: false, description: "Patch AMP local settings/secrets so only amp.url and apiKey@<url> point to this llm-router gateway.", example: "--patch-amp-client-config=true" },
+          { name: "amp-client-settings-scope", required: false, description: "AMP settings scope when patching: global or workspace.", example: "--amp-client-settings-scope=workspace" },
+          { name: "amp-client-settings-file", required: false, description: "Explicit AMP settings.json path override for patching.", example: "--amp-client-settings-file=./.amp/settings.json" },
+          { name: "amp-client-secrets-file", required: false, description: "Explicit AMP secrets.json path override for patching.", example: "--amp-client-secrets-file=~/.local/share/amp/secrets.json" },
+          { name: "amp-client-url", required: false, description: "Local llm-router URL written to AMP settings as amp.url when patching.", example: `--amp-client-url=${LOCAL_ROUTER_ORIGIN}` },
+          { name: "amp-client-api-key", required: false, description: "Local llm-router gateway key written to AMP secrets as apiKey@<url> when patching.", example: "--amp-client-api-key=gw_..." },
+          { name: "clear-amp-upstream-url", required: false, description: "Clear the AMP upstream URL.", example: "--clear-amp-upstream-url=true" },
+          { name: "clear-amp-upstream-api-key", required: false, description: "Clear the AMP upstream API key.", example: "--clear-amp-upstream-api-key=true" },
+          { name: "clear-amp-default-route", required: false, description: "Clear the new AMP schema defaultRoute.", example: "--clear-amp-default-route=true" },
+          { name: "clear-amp-routes", required: false, description: "Clear all new AMP schema entity/signature routes.", example: "--clear-amp-routes=true" },
+          { name: "clear-amp-raw-model-routes", required: false, description: "Clear all new AMP schema raw model routes.", example: "--clear-amp-raw-model-routes=true" },
+          { name: "clear-amp-overrides", required: false, description: "Clear all new AMP schema override entries.", example: "--clear-amp-overrides=true" },
+          { name: "clear-amp-model-mappings", required: false, description: "Clear all AMP model mappings.", example: "--clear-amp-model-mappings=true" },
+          { name: "clear-amp-subagent-definitions", required: false, description: "Clear all custom AMP subagent definitions so unmatched AMP models fall back to defaultModel.", example: "--clear-amp-subagent-definitions=true" },
+          { name: "reset-amp-subagent-definitions", required: false, description: "Reset AMP subagent definitions back to llm-router built-ins.", example: "--reset-amp-subagent-definitions=true" },
+          { name: "clear-amp-subagent-mappings", required: false, description: "Clear all AMP subagent mappings.", example: "--clear-amp-subagent-mappings=true" },
           { name: "target-version", required: false, description: "For migrate-config: target schema version.", example: "--target-version=2" },
           { name: "create-backup", required: false, description: "For migrate-config: create backup before write.", example: "--create-backup=true" },
-          { name: "host", required: false, description: "For startup-install: listen host.", example: "--host=127.0.0.1" },
-          { name: "port", required: false, description: "For startup-install/start: listen port (or LLM_ROUTER_PORT / PORT env).", example: "--port=8787" },
           { name: "watch-config", required: false, description: "For startup-install/start: enable in-memory config hot reload.", example: "--watch-config=true" },
           { name: "watch-binary", required: false, description: "For startup-install: detect llm-router upgrades and auto-relaunch under OS startup.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require masterKey auth for local start/startup-install.", example: "--require-auth=true" },
@@ -6885,6 +10404,7 @@ const routerModule = {
         ],
         examples: [
           "llm-router config",
+          "llm-router config --tui",
           "llm-router config --operation=upsert-provider --provider-id=ramclouds --name=RamClouds --api-key=sk-... --endpoints=https://ramclouds.me,https://ramclouds.me/v1 --models=claude-opus-4-6-thinking,gpt-5.3-codex",
           "llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default",
           "llm-router config --operation=upsert-provider --provider-id=claude-sub --name=\"Claude Sub\" --type=subscription --subscription-type=claude-code --subscription-profile=default",
@@ -6896,6 +10416,12 @@ const routerModule = {
           "llm-router config --operation=migrate-config --target-version=2 --create-backup=true",
           "llm-router config --operation=set-model-fallbacks --provider-id=openrouter --model=gpt-4o --fallback-models=anthropic/claude-3-7-sonnet,openrouter/gpt-4.1-mini",
           "llm-router config --operation=remove-model --provider-id=openrouter --model=gpt-4o",
+          `llm-router config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN}`,
+          "llm-router config --operation=set-amp-config --amp-default-route=chat.default --amp-routes=\"smart => chat.smart, rush => chat.fast, @google-gemini-flash-shared => chat.tools\"",
+          "llm-router config --operation=set-amp-config --amp-preset=builtin --amp-raw-model-routes=\"gpt-*-codex* => chat.deep\" --amp-overrides='{\"entities\":[{\"id\":\"reviewer\",\"type\":\"feature\",\"match\":[\"gemini-4-pro*\"],\"route\":\"chat.review\"}]}'",
+          "llm-router config --operation=set-amp-config --amp-upstream-url=https://ampcode.com --amp-upstream-api-key=amp_... --amp-force-model-mappings=true --amp-model-mappings=\"* => rc/gpt-5.3-codex\"",
+          "llm-router config --operation=set-amp-config --amp-subagent-mappings=\"oracle => rc/gpt-5.3-codex, librarian => rc/gpt-5.3-codex, search => rc/gpt-5.3-codex, look-at => rc/gpt-5.3-codex\"",
+          `llm-router config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN} --amp-client-api-key=gw_...`,
           "llm-router config --operation=list-routing",
           "llm-router config --operation=startup-install"
         ],

@@ -11,6 +11,7 @@ import {
   migrateRuntimeConfig,
   normalizeRuntimeConfig
 } from "../runtime/config.js";
+import { sanitizePersistedLocalServerConfig } from "./local-server-settings.js";
 
 export const DEFAULT_CONFIG_FILENAME = ".llm-router.json";
 
@@ -18,38 +19,68 @@ export function getDefaultConfigPath() {
   return path.join(os.homedir(), DEFAULT_CONFIG_FILENAME);
 }
 
-export async function readConfigFile(filePath = getDefaultConfigPath(), options = {}) {
+function normalizePersistedConfig(config, normalizeOptions = undefined) {
+  return sanitizePersistedLocalServerConfig(
+    normalizeRuntimeConfig(config, normalizeOptions)
+  );
+}
+
+export async function readConfigFileState(filePath = getDefaultConfigPath(), options = {}) {
   const autoMigrate = options.autoMigrate !== false;
   const persistMigrated = options.persistMigrated !== false;
   const migrateToVersion = options && Object.prototype.hasOwnProperty.call(options, "migrateToVersion")
     ? options.migrateToVersion
     : CONFIG_VERSION;
+  const normalizeOptions = autoMigrate ? { migrateToVersion } : undefined;
+
   try {
     const raw = await fs.readFile(filePath, "utf8");
     const parsedRaw = raw.trim() ? JSON.parse(raw) : {};
-    const normalizeOptions = autoMigrate ? { migrateToVersion } : undefined;
-    const normalized = normalizeRuntimeConfig(parsedRaw, normalizeOptions);
+    const normalized = normalizePersistedConfig(parsedRaw, normalizeOptions);
+    const payload = `${JSON.stringify(normalized, null, 2)}\n`;
+    const changed = payload !== raw;
+    let persisted = false;
+    let persistError;
 
-    if (autoMigrate && persistMigrated) {
-      const payload = `${JSON.stringify(normalized, null, 2)}\n`;
-      if (payload !== raw) {
-        try {
-          await fs.writeFile(filePath, payload, { encoding: "utf8", mode: 0o600 });
-          await fs.chmod(filePath, 0o600);
-        } catch {
-          // Silent best-effort persistence: keep migrated config in memory even if disk write fails.
-        }
+    if (autoMigrate && persistMigrated && changed) {
+      try {
+        await fs.writeFile(filePath, payload, { encoding: "utf8", mode: 0o600 });
+        await fs.chmod(filePath, 0o600);
+        persisted = true;
+      } catch (error) {
+        persistError = error;
       }
     }
 
-    return normalized;
+    return {
+      config: normalized,
+      exists: true,
+      changed,
+      persisted,
+      persistError,
+      beforeVersion: detectRuntimeConfigVersion(parsedRaw),
+      afterVersion: normalized.version
+    };
   } catch (error) {
     if (error && typeof error === "object" && error.code === "ENOENT") {
-      const normalizeOptions = autoMigrate ? { migrateToVersion } : undefined;
-      return normalizeRuntimeConfig({}, normalizeOptions);
+      const normalized = normalizePersistedConfig({}, normalizeOptions);
+      return {
+        config: normalized,
+        exists: false,
+        changed: false,
+        persisted: false,
+        persistError: undefined,
+        beforeVersion: undefined,
+        afterVersion: normalized.version
+      };
     }
     throw error;
   }
+}
+
+export async function readConfigFile(filePath = getDefaultConfigPath(), options = {}) {
+  const result = await readConfigFileState(filePath, options);
+  return result.config;
 }
 
 export async function configFileExists(filePath = getDefaultConfigPath()) {
@@ -68,7 +99,7 @@ export async function writeConfigFile(config, filePath = getDefaultConfigPath(),
   const normalizeOptions = options && Object.prototype.hasOwnProperty.call(options, "migrateToVersion")
     ? { migrateToVersion: options.migrateToVersion }
     : undefined;
-  const normalized = normalizeRuntimeConfig(config, normalizeOptions);
+  const normalized = normalizePersistedConfig(config, normalizeOptions);
   const folder = path.dirname(filePath);
   await fs.mkdir(folder, { recursive: true });
   const payload = `${JSON.stringify(normalized, null, 2)}\n`;
@@ -90,7 +121,7 @@ export async function migrateConfigFile(filePath = getDefaultConfigPath(), {
   const rawConfig = rawText.trim() ? JSON.parse(rawText) : {};
   const beforeVersion = detectRuntimeConfigVersion(rawConfig);
   const migratedRaw = migrateRuntimeConfig(rawConfig, { targetVersion });
-  const normalized = normalizeRuntimeConfig(migratedRaw, { migrateToVersion: targetVersion });
+  const normalized = normalizePersistedConfig(migratedRaw, { migrateToVersion: targetVersion });
   const payload = `${JSON.stringify(normalized, null, 2)}\n`;
   const changed = payload !== rawText;
 

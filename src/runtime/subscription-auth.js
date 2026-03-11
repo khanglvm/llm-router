@@ -188,7 +188,6 @@ export async function getValidAccessToken(profileId, options = {}) {
  * @param {string} redirectUri - Redirect URI used in auth request
  * @param {Object} [options] - Options
  * @param {string} [options.subscriptionType] - Subscription type
- * @param {string} [options.state] - OAuth state
  * @returns {Promise<Object>} Token data
  */
 async function exchangeCodeForTokens(code, codeVerifier, redirectUri, options = {}) {
@@ -200,9 +199,6 @@ async function exchangeCodeForTokens(code, codeVerifier, redirectUri, options = 
     redirect_uri: redirectUri,
     client_id: config.clientId
   };
-  if (typeof options.state === 'string' && options.state.trim()) {
-    body.state = options.state.trim();
-  }
 
   const response = await fetch(config.tokenUrl, {
     method: 'POST',
@@ -295,8 +291,7 @@ export async function loginWithBrowser(profileId, options = {}) {
         }
 
         const tokens = await exchangeCodeForTokens(code, pkce.verifier, redirectUri, {
-          subscriptionType: options.subscriptionType,
-          state
+          subscriptionType: options.subscriptionType
         });
         await saveTokens(tokenProfileKey, tokens);
 

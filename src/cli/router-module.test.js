@@ -22,6 +22,7 @@ import {
   parseAliasTargetListInput,
   parseEndpointListInput,
   parseRateLimitWindowInput,
+  patchAmpClientConfigFiles,
   resolveCloudflareApiTokenFromEnv,
   setProviderRateLimitsInConfig,
   shouldConfirmLargeWorkerConfigDeploy,
@@ -35,6 +36,7 @@ import {
   CODEX_SUBSCRIPTION_MODELS,
   CLAUDE_CODE_SUBSCRIPTION_MODELS
 } from "../runtime/subscription-constants.js";
+import { LOCAL_ROUTER_ORIGIN } from "../shared/local-router-defaults.js";
 
 // Test configuration from environment
 const TEST_HOSTNAME = process.env.LLM_ROUTER_TEST_HOSTNAME || "router.example.com";
@@ -65,6 +67,68 @@ function createConfigContext(args, overrides = {}) {
     prompts: {},
     ...overrides
   };
+}
+
+function createQueuedPrompts(entries) {
+  const queue = [...entries];
+  const take = (type) => {
+    assert.ok(queue.length > 0, `No queued answer left for ${type}`);
+    const next = queue.shift();
+    if (next && typeof next === "object" && next.type === "cancel") {
+      throw new Error("Prompt cancelled");
+    }
+    if (next && typeof next === "object" && "type" in next) {
+      assert.equal(next.type, type);
+      return next.value;
+    }
+    if (next === "__cancel__") {
+      throw new Error("Prompt cancelled");
+    }
+    return next;
+  };
+
+  return {
+    select: async () => take("select"),
+    text: async () => take("text"),
+    confirm: async () => take("confirm"),
+    password: async () => take("password"),
+    multiselect: async () => take("multiselect"),
+    remaining: () => [...queue]
+  };
+}
+
+function jsonResponse(body, { status = 200, headers = {} } = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      ...headers
+    }
+  });
+}
+
+function installFetchMock(t, handler) {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === "string" ? input : input.url;
+    const method = String(init?.method || "GET").toUpperCase();
+    let body = null;
+    if (typeof init?.body === "string" && init.body.trim()) {
+      try {
+        body = JSON.parse(init.body);
+      } catch {
+        body = null;
+      }
+    }
+    const call = { url, method, body };
+    calls.push(call);
+    return handler(call);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  return calls;
 }
 
 async function createTempConfigFile(t, config) {
@@ -478,6 +542,15 @@ test("summarizeConfig includes aliases and provider rate-limit buckets", () => {
         ]
       }
     ],
+    amp: {
+      upstreamUrl: "https://ampcode.com/",
+      upstreamApiKey: "amp_secret_123456",
+      restrictManagementToLocalhost: true,
+      forceModelMappings: true,
+      modelMappings: [
+        { from: "*", to: "openrouter/gpt-4o-mini" }
+      ]
+    },
     modelAliases: {
       "chat.default": {
         strategy: "round-robin",
@@ -488,6 +561,9 @@ test("summarizeConfig includes aliases and provider rate-limit buckets", () => {
   }, "/tmp/config.json");
 
   assert.match(summary, /Current Router Configuration/);
+  assert.match(summary, /AMP \/ Amp CLI/);
+  assert.match(summary, /amp_\.\.\.3456/);
+  assert.match(summary, /openrouter\/gpt-4o-mini/);
   assert.match(summary, /Model Aliases/);
   assert.match(summary, /chat\.default/);
   assert.match(summary, /Round-robin/);
@@ -495,6 +571,659 @@ test("summarizeConfig includes aliases and provider rate-limit buckets", () => {
   assert.match(summary, /Rate-Limit Buckets/);
   assert.match(summary, /Monthly cap/);
   assert.match(summary, /20,000 requests/);
+});
+
+test("patchAmpClientConfigFiles preserves unrelated AMP client fields", async (t) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-client-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const settingsFilePath = path.join(tempDir, "settings.json");
+  const secretsFilePath = path.join(tempDir, "secrets.json");
+  await fs.writeFile(settingsFilePath, `${JSON.stringify({ theme: "dark", "amp.url": "http://old.local:8787" }, null, 2)}
+`, "utf8");
+  await fs.writeFile(secretsFilePath, `${JSON.stringify({ otherSecret: "keep-me", "apiKey@http://old.local:8787": "old-key" }, null, 2)}
+`, "utf8");
+
+  const result = await patchAmpClientConfigFiles({
+    settingsFilePath,
+    secretsFilePath,
+    endpointUrl: "http://127.0.0.1:9898/",
+    apiKey: "gw_test_key"
+  });
+
+  assert.equal(result.endpointUrl, "http://127.0.0.1:9898");
+  assert.equal(result.secretFieldName, "apiKey@http://127.0.0.1:9898");
+  assert.equal(result.settingsCreated, false);
+  assert.equal(result.secretsCreated, false);
+
+  const nextSettings = JSON.parse(await fs.readFile(settingsFilePath, "utf8"));
+  const nextSecrets = JSON.parse(await fs.readFile(secretsFilePath, "utf8"));
+  assert.deepEqual(nextSettings, {
+    theme: "dark",
+    "amp.url": "http://127.0.0.1:9898"
+  });
+  assert.deepEqual(nextSecrets, {
+    otherSecret: "keep-me",
+    "apiKey@http://old.local:8787": "old-key",
+    "apiKey@http://127.0.0.1:9898": "gw_test_key"
+  });
+});
+
+test("interactive set-amp-config patches AMP and edits default routing from the new AMP menu", async (t) => {
+  const configAction = getConfigAction();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-quick-"));
+  const emptyDataHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-xdg-"));
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master",
+    defaultModel: "chat.default",
+    modelAliases: {
+      "chat.default": {
+        strategy: "auto",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  });
+  const prompts = createQueuedPrompts([
+    { type: "select", value: "patch-client" },
+    { type: "select", value: "workspace" },
+    { type: "confirm", value: true },
+    { type: "confirm", value: true },
+    { type: "select", value: "routing" },
+    { type: "select", value: "default-route" },
+    { type: "select", value: "chat.default" },
+    { type: "cancel" },
+    { type: "cancel" }
+  ]);
+
+  t.after(async () => {
+    await fs.rm(emptyDataHome, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath
+  }, {
+    cwd: tempDir,
+    env: {
+      ...process.env,
+      XDG_DATA_HOME: emptyDataHome
+    },
+    forcePrompt: true,
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(prompts.remaining(), []);
+
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.upstreamUrl, "https://ampcode.com/");
+  assert.equal(next.amp.restrictManagementToLocalhost, true);
+  assert.equal(next.amp.preset, "builtin");
+  assert.equal(next.amp.defaultRoute, "chat.default");
+
+  const settingsFilePath = path.join(tempDir, ".amp", "settings.json");
+  const secretsFilePath = path.join(emptyDataHome, "amp", "secrets.json");
+  const nextSettings = JSON.parse(await fs.readFile(settingsFilePath, "utf8"));
+  const nextSecrets = JSON.parse(await fs.readFile(secretsFilePath, "utf8"));
+  assert.deepEqual(nextSettings, {
+    "amp.url": LOCAL_ROUTER_ORIGIN
+  });
+  assert.equal(nextSecrets[`apiKey@${LOCAL_ROUTER_ORIGIN}`], "gw_local_master");
+});
+
+test("interactive set-amp-config edits AMP upstream from the new root menu", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const infoLogs = [];
+  const prompts = createQueuedPrompts([
+    { type: "select", value: "upstream" },
+    { type: "text", value: "https://ampcode.com" },
+    { type: "text", value: "amp_secret_123456" },
+    { type: "confirm", value: true },
+    { type: "confirm", value: true },
+    { type: "cancel" }
+  ]);
+
+  const previousXdgDataHome = process.env.XDG_DATA_HOME;
+  const emptyDataHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-xdg-"));
+  process.env.XDG_DATA_HOME = emptyDataHome;
+  t.after(async () => {
+    if (previousXdgDataHome === undefined) {
+      delete process.env.XDG_DATA_HOME;
+    } else {
+      process.env.XDG_DATA_HOME = previousXdgDataHome;
+    }
+    await fs.rm(emptyDataHome, { recursive: true, force: true });
+  });
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath
+  }, {
+    forcePrompt: true,
+    terminal: {
+      line() {},
+      info(message) { infoLogs.push(String(message)); },
+      warn() {},
+      error() {}
+    },
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(prompts.remaining(), []);
+  assert.ok(infoLogs.some((message) => message.includes("https://ampcode.com/settings")));
+
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.upstreamUrl, "https://ampcode.com/");
+  assert.equal(next.amp.upstreamApiKey, "amp_secret_123456");
+  assert.equal(next.amp.restrictManagementToLocalhost, true);
+  assert.equal(next.amp.forceModelMappings, true);
+});
+
+test("interactive set-amp-config edits existing AMP routes with inbound and outbound fields", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master",
+    defaultModel: "chat.default",
+    modelAliases: {
+      "chat.default": {
+        strategy: "auto",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      },
+      "chat.deep": {
+        strategy: "auto",
+        targets: [{ ref: "anthropic/claude-3-5-haiku" }]
+      }
+    },
+    amp: {
+      routes: {}
+    }
+  });
+  const lineLogs = [];
+  const seenRoutingOptions = [];
+  const seenRouteEditorMessages = [];
+  const seenTextPrompts = [];
+  const queue = ["routing", "route:smart", "outbound", "chat.deep", "inbound", "gpt-*-codex*", "__cancel__", "__cancel__", "__cancel__"];
+  const take = (type) => {
+    assert.ok(queue.length > 0, `No queued answer left for ${type}`);
+    const next = queue.shift();
+    if (next === "__cancel__") throw new Error("Prompt cancelled");
+    return next;
+  };
+  const prompts = {
+    select: async ({ message, options }) => {
+      if (message === "AMP routing") {
+        seenRoutingOptions.push((options || []).map((option) => ({
+          value: option.value,
+          label: option.label,
+          hint: option.hint
+        })));
+      }
+      if (String(message || "").startsWith("AMP route · ")) {
+        seenRouteEditorMessages.push(String(message));
+      }
+      return take("select");
+    },
+    text: async (options) => {
+      seenTextPrompts.push({
+        message: options?.message,
+        initialValue: options?.initialValue,
+        placeholder: options?.placeholder
+      });
+      return take("text");
+    },
+    confirm: async () => take("confirm"),
+    password: async () => take("password"),
+    multiselect: async () => take("multiselect"),
+    remaining: () => [...queue]
+  };
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath
+  }, {
+    forcePrompt: true,
+    terminal: {
+      line(message) { lineLogs.push(String(message)); },
+      info() {},
+      warn() {},
+      error() {}
+    },
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(prompts.remaining(), []);
+
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.routes.smart, undefined);
+  assert.deepEqual(next.amp.rawModelRoutes, [
+    { from: "gpt-*-codex*", to: "chat.deep" }
+  ]);
+  const smartOption = seenRoutingOptions.flat().find((option) => option.value === "route:smart");
+  assert.equal(smartOption?.label, "smart");
+  assert.match(String(smartOption?.hint || ""), /smart/i);
+  assert.ok(seenRouteEditorMessages.includes("AMP route · smart"));
+  assert.ok(seenTextPrompts.some((prompt) => prompt.message === "Inbound AMP model / route key" && prompt.initialValue === "claude-opus-{number}"));
+  assert.ok(lineLogs.some((message) => message.includes("Default built-in match for 'smart': claude-opus-{number}")));
+  assert.ok(lineLogs.some((message) => message.includes("https://ampcode.com/models")));
+});
+
+test("interactive config shows the new root menu sections", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+
+  const seenLabels = [];
+  const prompts = {
+    select: async ({ options }) => {
+      seenLabels.push((options || []).map((option) => option.label));
+      throw new Error("Prompt cancelled");
+    },
+    text: async () => { throw new Error("Prompt cancelled"); },
+    confirm: async () => { throw new Error("Prompt cancelled"); }
+  };
+
+  const result = await configAction.run(createConfigContext({
+    config: configPath
+  }, {
+    forcePrompt: true,
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  assert.equal(String(result.data || ""), "No changes made.");
+  assert.deepEqual(seenLabels[0], [
+    "Providers",
+    "Models",
+    "Model Alias",
+    "AMP",
+    "Startup",
+    "Other setting"
+  ]);
+});
+
+test("interactive config root menu lets users go back and pick another section", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const prompts = createQueuedPrompts([
+    { type: "select", value: "startup" },
+    { type: "select", value: "__back__" },
+    { type: "select", value: "other-settings" },
+    { type: "select", value: "list-routing" },
+    { type: "cancel" }
+  ]);
+
+  const result = await configAction.run(createConfigContext({
+    config: configPath
+  }, {
+    forcePrompt: true,
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Providers/);
+  assert.deepEqual(prompts.remaining(), []);
+});
+
+test("interactive providers menu edits one field and returns to the detail screen", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const prompts = createQueuedPrompts([
+    { type: "select", value: "providers" },
+    { type: "select", value: "openrouter" },
+    { type: "select", value: "edit-name" },
+    { type: "text", value: "OpenRouter Prime" },
+    { type: "cancel" },
+    { type: "cancel" },
+    { type: "cancel" }
+  ]);
+
+  const result = await configAction.run(createConfigContext({
+    config: configPath
+  }, {
+    forcePrompt: true,
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.providers.find((entry) => entry.id === "openrouter")?.name, "OpenRouter Prime");
+  assert.match(String(result.data || ""), /Provider Name Updated/);
+  assert.deepEqual(prompts.remaining(), []);
+});
+
+test("interactive models menu only probes new models and lets users rename undetected entries", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const calls = installFetchMock(t, ({ url, method, body }) => {
+    if (method === "GET" && url.endsWith("/models")) {
+      return jsonResponse({ object: "list", data: [] });
+    }
+
+    if (method === "POST" && url.endsWith("/chat/completions") && body?.model === "__llm_router_probe__") {
+      return jsonResponse({ error: { message: "model not found" } }, { status: 400 });
+    }
+
+    if (method === "POST" && url.endsWith("/chat/completions") && body?.model === "gpt-5-codx") {
+      return jsonResponse({ error: { message: "model not found" } }, { status: 404 });
+    }
+
+    if (method === "POST" && url.endsWith("/chat/completions") && body?.model === "gpt-5-codex") {
+      return jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "ok" } }] });
+    }
+
+    return jsonResponse({ error: { message: `unhandled ${method} ${url}` } }, { status: 500 });
+  });
+
+  const prompts = createQueuedPrompts([
+    { type: "select", value: "models" },
+    { type: "select", value: "openrouter" },
+    { type: "text", value: "gpt-4o-mini,gpt-5-codx" },
+    { type: "text", value: "gpt-5-codex" },
+    { type: "cancel" },
+    { type: "cancel" }
+  ]);
+
+  const result = await configAction.run(createConfigContext({
+    config: configPath
+  }, {
+    forcePrompt: true,
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.deepEqual(next.providers.find((entry) => entry.id === "openrouter")?.models.map((model) => model.id), [
+    "gpt-4o-mini",
+    "gpt-5-codex"
+  ]);
+  const probedModels = calls
+    .filter((entry) => entry.method === "POST" && entry.url.endsWith("/chat/completions") && entry.body?.model && entry.body.model !== "__llm_router_probe__")
+    .map((entry) => entry.body.model);
+  assert.deepEqual(probedModels, ["gpt-5-codx", "gpt-5-codex"]);
+  assert.match(String(result.data || ""), /Provider Models Updated/);
+  assert.deepEqual(prompts.remaining(), []);
+});
+
+test("interactive model alias menu edits an existing alias directly", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    modelAliases: {
+      "chat.default": {
+        strategy: "auto",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  });
+  const prompts = createQueuedPrompts([
+    { type: "select", value: "model-alias" },
+    { type: "select", value: "chat.default" },
+    { type: "select", value: "edit-targets" },
+    { type: "text", value: "anthropic/claude-3-5-haiku@2" },
+    { type: "cancel" },
+    { type: "cancel" },
+    { type: "cancel" }
+  ]);
+
+  const result = await configAction.run(createConfigContext({
+    config: configPath
+  }, {
+    forcePrompt: true,
+    prompts
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.deepEqual(next.modelAliases["chat.default"].targets, [
+    { ref: "anthropic/claude-3-5-haiku", weight: 2 }
+  ]);
+  assert.match(String(result.data || ""), /Model Alias Saved/);
+  assert.deepEqual(prompts.remaining(), []);
+});
+
+test("non-interactive set-amp-config can patch AMP client files with local gateway key", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-patch-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const settingsFilePath = path.join(tempDir, "settings.json");
+  const secretsFilePath = path.join(tempDir, "secrets.json");
+  await fs.writeFile(secretsFilePath, `${JSON.stringify({
+    "apiKey@https://ampcode.com/": "amp_upstream_secret"
+  }, null, 2)}
+`, "utf8");
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "patch-amp-client-config": "true",
+    "amp-client-settings-file": settingsFilePath,
+    "amp-client-secrets-file": secretsFilePath,
+    "amp-client-url": "http://127.0.0.1:9797"
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /AMP Client Files/);
+  assert.match(String(result.data || ""), /AMP Defaults Bootstrapped[\s|]+Yes/);
+  assert.match(String(result.data || ""), /Bootstrap Default Route[\s|]+openrouter\/gpt-4o-mini/);
+
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.upstreamUrl, "https://ampcode.com/");
+  assert.equal(next.amp.upstreamApiKey, "amp_upstream_secret");
+  assert.equal(next.amp.restrictManagementToLocalhost, true);
+  assert.equal(next.amp.preset, "builtin");
+  assert.equal(next.amp.defaultRoute, "openrouter/gpt-4o-mini");
+
+  const nextSettings = JSON.parse(await fs.readFile(settingsFilePath, "utf8"));
+  const nextSecrets = JSON.parse(await fs.readFile(secretsFilePath, "utf8"));
+  assert.deepEqual(nextSettings, {
+    "amp.url": "http://127.0.0.1:9797"
+  });
+  assert.deepEqual(nextSecrets, {
+    "apiKey@https://ampcode.com/": "amp_upstream_secret",
+    "apiKey@http://127.0.0.1:9797": "gw_local_master"
+  });
+});
+
+test("non-interactive set-amp-config patch flow preserves explicit AMP routing config", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-patch-explicit-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const settingsFilePath = path.join(tempDir, "settings.json");
+  const secretsFilePath = path.join(tempDir, "secrets.json");
+  await fs.writeFile(secretsFilePath, `${JSON.stringify({
+    "apiKey@https://ampcode.com/": "amp_upstream_secret"
+  }, null, 2)}
+`, "utf8");
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "patch-amp-client-config": "true",
+    "amp-client-settings-file": settingsFilePath,
+    "amp-client-secrets-file": secretsFilePath,
+    "amp-client-url": "http://127.0.0.1:9797",
+    "amp-default-route": "anthropic/claude-3-5-haiku",
+    "amp-routes": '{"smart":"openrouter/gpt-4o-mini"}'
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.defaultRoute, "anthropic/claude-3-5-haiku");
+  assert.deepEqual(next.amp.routes, {
+    smart: "openrouter/gpt-4o-mini"
+  });
+  assert.doesNotMatch(String(result.data || ""), /AMP Defaults Bootstrapped[\s|]+Yes/);
+});
+
+test("non-interactive set-amp-config writes expected config", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "amp-upstream-url": "https://ampcode.com",
+    "amp-upstream-api-key": "amp_secret_123456",
+    "amp-restrict-management-to-localhost": "true",
+    "amp-force-model-mappings": "true",
+    "amp-model-mappings": '[{"from":"*","to":"rc/gpt-5.3-codex"}]',
+    "amp-subagent-mappings": '{"oracle":"rc/gpt-5.3-codex","librarian":"rc/gpt-5.3-codex"}'
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.upstreamUrl, "https://ampcode.com/");
+  assert.equal(next.amp.upstreamApiKey, "amp_secret_123456");
+  assert.equal(next.amp.restrictManagementToLocalhost, true);
+  assert.equal(next.amp.forceModelMappings, true);
+  assert.deepEqual(next.amp.modelMappings, [
+    { from: "*", to: "rc/gpt-5.3-codex" }
+  ]);
+  assert.deepEqual(next.amp.subagentMappings, {
+    oracle: "rc/gpt-5.3-codex",
+    librarian: "rc/gpt-5.3-codex"
+  });
+});
+
+test("non-interactive set-amp-config writes new AMP schema fields", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "amp-preset": "builtin",
+    "amp-default-route": "openrouter/gpt-4o-mini",
+    "amp-routes": '{"smart":"anthropic/claude-3-5-haiku","@google-gemini-flash-shared":"openrouter/gpt-4o-mini"}',
+    "amp-raw-model-routes": '[{"from":"gpt-*-codex*","to":"anthropic/claude-3-5-haiku"}]',
+    "amp-overrides": '{"entities":[{"id":"reviewer","type":"feature","match":["gemini-4-pro*"],"route":"anthropic/claude-3-5-haiku"}]}'
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.preset, "builtin");
+  assert.equal(next.amp.defaultRoute, "openrouter/gpt-4o-mini");
+  assert.deepEqual(next.amp.routes, {
+    smart: "anthropic/claude-3-5-haiku",
+    "@google-gemini-flash-shared": "openrouter/gpt-4o-mini"
+  });
+  assert.deepEqual(next.amp.rawModelRoutes, [
+    { from: "gpt-*-codex*", to: "anthropic/claude-3-5-haiku" }
+  ]);
+  assert.deepEqual(next.amp.overrides, {
+    entities: [
+      {
+        id: "reviewer",
+        type: "feature",
+        match: ["gemini-4-pro*"],
+        route: "anthropic/claude-3-5-haiku"
+      }
+    ]
+  });
+});
+
+
+test("non-interactive set-amp-config writes custom AMP subagent definitions", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "amp-subagent-definitions": '[{"id":"planner","patterns":["gpt-5.4","gpt-5.4*"]},{"id":"searcher","patterns":["gemini-3-flash"]}]',
+    "amp-subagent-mappings": '{"planner":"rc/gpt-5.3-codex"}'
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.deepEqual(next.amp.subagentDefinitions, [
+    { id: "planner", patterns: ["gpt-5.4", "gpt-5.4*"] },
+    { id: "searcher", patterns: ["gemini-3-flash"] }
+  ]);
+  assert.deepEqual(next.amp.subagentMappings, {
+    planner: "rc/gpt-5.3-codex"
+  });
+});
+
+test("non-interactive set-amp-config normalizes documented AMP subagent aliases", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "amp-subagent-definitions": '[{"id":"Title","patterns":["claude-haiku-4.5"]},{"id":"Look At","patterns":["gemini-2.5-flash"]}]',
+    "amp-subagent-mappings": '{"titling":"rc/gpt-5.3-codex","look at":"rc/gpt-5.3-codex"}'
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.deepEqual(next.amp.subagentDefinitions, [
+    { id: "title", patterns: ["claude-haiku-4.5"] },
+    { id: "look-at", patterns: ["gemini-2.5-flash"] }
+  ]);
+  assert.deepEqual(next.amp.subagentMappings, {
+    title: "rc/gpt-5.3-codex",
+    "look-at": "rc/gpt-5.3-codex"
+  });
+});
+
+test("non-interactive set-amp-config can reset custom AMP subagent definitions to defaults", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    amp: {
+      subagentDefinitions: [
+        { id: "planner", patterns: ["gpt-5.4"] }
+      ],
+      subagentMappings: {
+        planner: "openrouter/gpt-4o-mini"
+      }
+    }
+  });
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-amp-config",
+    config: configPath,
+    "reset-amp-subagent-definitions": "true"
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.amp.subagentDefinitions, undefined);
+  assert.deepEqual(next.amp.subagentMappings, {
+    planner: "openrouter/gpt-4o-mini"
+  });
 });
 
 test("non-interactive upsert-model-alias writes expected config", async (t) => {
@@ -514,11 +1243,11 @@ test("non-interactive upsert-model-alias writes expected config", async (t) => {
   const next = await readConfigFile(configPath);
   assert.equal(next.modelAliases["chat.default"].strategy, "quota-aware-weighted-rr");
   assert.deepEqual(next.modelAliases["chat.default"].targets, [
-    { ref: "openrouter/gpt-4o-mini", weight: 3, metadata: undefined },
-    { ref: "anthropic/claude-3-5-haiku", weight: 2, metadata: undefined }
+    { ref: "openrouter/gpt-4o-mini", weight: 3 },
+    { ref: "anthropic/claude-3-5-haiku", weight: 2 }
   ]);
   assert.deepEqual(next.modelAliases["chat.default"].fallbackTargets, [
-    { ref: "openrouter/gpt-4o", weight: undefined, metadata: undefined }
+    { ref: "openrouter/gpt-4o" }
   ]);
 });
 
@@ -815,8 +1544,7 @@ test("non-interactive set-provider-rate-limits writes expected config", async (t
       id: "openrouter-all-month",
       models: ["all"],
       requests: 20000,
-      window: { unit: "month", size: 1 },
-      metadata: undefined
+      window: { unit: "month", size: 1 }
     }
   ]);
 });
@@ -844,10 +1572,37 @@ test("non-interactive set-provider-rate-limits can auto-generate bucket id from 
       name: "Monthly cap",
       models: ["all"],
       requests: 20000,
-      window: { unit: "month", size: 1 },
-      metadata: undefined
+      window: { unit: "month", size: 1 }
     }
   ]);
+});
+
+test("non-interactive set-provider-rate-limits ignores pre-existing stale alias refs", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    modelAliases: {
+      "chat.default": {
+        strategy: "auto",
+        targets: [{ ref: "rc/claude-opus-4-6" }]
+      }
+    }
+  });
+
+  const result = await configAction.run(createConfigContext({
+    operation: "set-provider-rate-limits",
+    config: configPath,
+    "provider-id": "openrouter",
+    "bucket-id": "openrouter-all-month",
+    "bucket-models": "all",
+    "bucket-requests": "20000",
+    "bucket-window": "month:1"
+  }));
+
+  assert.equal(result.ok, true);
+  const next = await readConfigFile(configPath);
+  assert.equal(next.providers.find((entry) => entry.id === "openrouter")?.rateLimits?.[0]?.id, "openrouter-all-month");
+  assert.equal(next.modelAliases["chat.default"].targets[0].ref, "rc/claude-opus-4-6");
 });
 
 test("setProviderRateLimitsInConfig resolves generated bucket id collisions deterministically", () => {

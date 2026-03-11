@@ -143,6 +143,94 @@ test("makeProviderCall translates Claude request for subscription Codex provider
   assert.equal(claudeJson.content?.[0]?.text, "subscription-ok");
 });
 
+test("makeProviderCall promotes Claude system prompts into Codex instructions", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("personal", {
+    accessToken: "token-abc",
+    refreshToken: "refresh-abc",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "openid"
+  });
+
+  const originalFetch = globalThis.fetch;
+  let capturedRequest = null;
+  globalThis.fetch = async (url, init = {}) => {
+    capturedRequest = {
+      url: String(url),
+      headers: init.headers || {},
+      body: JSON.parse(String(init.body || "{}"))
+    };
+    return new Response(JSON.stringify({
+      id: "resp_system_1",
+      object: "response",
+      created_at: 1730000100,
+      model: "gpt-5.3-codex",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: "system-ok"
+            }
+          ]
+        }
+      ],
+      usage: {
+        input_tokens: 4,
+        output_tokens: 2,
+        total_tokens: 6
+      }
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "chatgpt/gpt-5.3-codex",
+      system: "You are Claude Code. Focus on deterministic git conflict resolution.",
+      max_tokens: 64,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Fix the merge conflict." }]
+        }
+      ]
+    },
+    sourceFormat: FORMATS.CLAUDE,
+    stream: false,
+    candidate: buildSubscriptionCandidate(),
+    requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(capturedRequest?.url, CODEX_ENDPOINT);
+  assert.equal(
+    capturedRequest?.body?.instructions,
+    "You are Claude Code. Focus on deterministic git conflict resolution."
+  );
+  assert.equal(capturedRequest?.body?.input?.[0]?.role, "user");
+  assert.equal(capturedRequest?.body?.input?.[0]?.content?.[0]?.text, "Fix the merge conflict.");
+  const claudeJson = await result.response.json();
+  assert.equal(claudeJson.content?.[0]?.text, "system-ok");
+});
+
 test("makeProviderCall returns auth error when subscription profile is not logged in", { concurrency: false }, async (t) => {
   const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
   const originalHome = process.env.HOME;
@@ -381,6 +469,142 @@ test("makeProviderCall converts streaming subscription response to Claude SSE ev
   assert.match(streamPayload, /event: content_block_delta/);
   assert.match(streamPayload, /pong/);
   assert.match(streamPayload, /event: message_stop/);
+});
+
+test("makeProviderCall preserves Codex Responses SSE for OpenAI responses requests", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("personal", {
+    accessToken: "token-abc",
+    refreshToken: "refresh-abc",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "openid"
+  });
+
+  const responseSse = [
+    "event: response.created",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_stream\",\"created_at\":1730000004,\"model\":\"gpt-5.3-codex\"}}",
+    "",
+    "event: response.output_item.added",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_item_1\",\"call_id\":\"call_read_1\",\"name\":\"read\",\"arguments\":\"\"}}",
+    "",
+    "event: response.function_call_arguments.delta",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_item_1\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}",
+    "",
+    "event: response.completed",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_stream\",\"object\":\"response\",\"created_at\":1730000004,\"model\":\"gpt-5.3-codex\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_item_1\",\"call_id\":\"call_read_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":4,\"total_tokens\":6},\"incomplete_details\":null}}",
+    "",
+    ""
+  ].join("\n");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(responseSse, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "chatgpt/gpt-5.3-codex",
+      stream: true,
+      tools: [{ type: "function", function: { name: "read", parameters: { type: "object" } } }],
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Read README.md" }]
+        }
+      ]
+    },
+    sourceFormat: FORMATS.OPENAI,
+    stream: true,
+    candidate: buildSubscriptionCandidate(),
+    requestKind: "responses",
+    requestHeaders: new Headers(),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  const raw = await result.response.text();
+  assert.match(raw, /event: response\.created/);
+  assert.match(raw, /event: response\.function_call_arguments\.delta/);
+  assert.match(raw, /call_read_1/);
+  assert.doesNotMatch(raw, /chat\.completion\.chunk/);
+});
+
+test("makeProviderCall reconstructs Codex Responses JSON for non-stream OpenAI responses requests", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("personal", {
+    accessToken: "token-abc",
+    refreshToken: "refresh-abc",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "openid"
+  });
+
+  const responseSse = [
+    "event: response.created",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_json\",\"created_at\":1730000005,\"model\":\"gpt-5.3-codex\"}}",
+    "",
+    "event: response.completed",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_json\",\"object\":\"response\",\"created_at\":1730000005,\"model\":\"gpt-5.3-codex\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_item_2\",\"call_id\":\"call_web_1\",\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"llm-router\\\"}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":4,\"total_tokens\":6},\"incomplete_details\":null}}",
+    "",
+    ""
+  ].join("\n");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(responseSse, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "chatgpt/gpt-5.3-codex",
+      tools: [{ type: "web_search" }],
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Search the web for llm-router" }]
+        }
+      ]
+    },
+    sourceFormat: FORMATS.OPENAI,
+    stream: false,
+    candidate: buildSubscriptionCandidate(),
+    requestKind: "responses",
+    requestHeaders: new Headers(),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  const payload = await result.response.json();
+  assert.equal(payload.object, "response");
+  assert.equal(payload.model, "gpt-5.3-codex");
+  assert.equal(payload.output?.[0]?.type, "function_call");
+  assert.equal(payload.output?.[0]?.name, "web_search");
+  assert.equal(payload.output?.[0]?.arguments, "{\"query\":\"llm-router\"}");
 });
 
 test("makeProviderCall sends Claude OAuth subscription requests with Anthropic headers", { concurrency: false }, async (t) => {

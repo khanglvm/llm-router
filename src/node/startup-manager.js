@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
 
 const SERVICE_NAME = "llm-router";
 const LAUNCH_AGENT_ID = "dev.llm-router";
@@ -40,30 +41,46 @@ function runCommand(command, args, { cwd } = {}) {
   };
 }
 
-function resolveCliEntryPath() {
-  const nodeBinDir = path.dirname(process.execPath);
+export function resolveStartupCliEntryPath({
+  execPath = process.execPath,
+  env = process.env,
+  argv = process.argv,
+  exists = existsSync
+} = {}) {
+  const envCliPath = String(env?.LLM_ROUTER_CLI_PATH || "").trim();
+  if (envCliPath && exists(envCliPath)) {
+    return envCliPath;
+  }
+
+  const argvCliPath = String(argv?.[1] || "").trim();
+  if (argvCliPath && exists(argvCliPath)) {
+    return path.resolve(argvCliPath);
+  }
+
+  const nodeBinDir = path.dirname(execPath);
   for (const binName of ["llm-router", "llm-router-route"]) {
     const candidate = path.join(nodeBinDir, binName);
-    if (existsSync(candidate)) return candidate;
+    if (exists(candidate)) return candidate;
   }
-  if (process.env.LLM_ROUTER_CLI_PATH && existsSync(process.env.LLM_ROUTER_CLI_PATH)) {
-    return process.env.LLM_ROUTER_CLI_PATH;
-  }
-  if (process.env.LLM_ROUTER_CLI_PATH) return process.env.LLM_ROUTER_CLI_PATH;
-  if (process.argv[1]) return path.resolve(process.argv[1]);
+
+  if (envCliPath) return envCliPath;
+  if (argvCliPath) return path.resolve(argvCliPath);
   throw new Error("Unable to resolve llm-router CLI entry path.");
 }
 
-function makeExecArgs({ configPath, host, port, watchConfig, watchBinary, requireAuth }) {
+function makeExecArgs({ configPath }) {
   return [
     "start",
-    `--config=${configPath}`,
-    `--host=${host}`,
-    `--port=${port}`,
-    `--watch-config=${watchConfig ? "true" : "false"}`,
-    `--watch-binary=${watchBinary ? "true" : "false"}`,
-    `--require-auth=${requireAuth ? "true" : "false"}`
+    `--config=${configPath}`
   ];
+}
+
+function isMissingServiceMessage(value) {
+  const text = String(value || "").toLowerCase();
+  return text.includes("could not find service")
+    || text.includes("service could not be found")
+    || text.includes("does not exist as a service")
+    || text.includes("unit llm-router.service could not be found");
 }
 
 function buildLaunchAgentPlist({ nodePath, cliPath, configPath, host, port, watchConfig, watchBinary, requireAuth }) {
@@ -129,18 +146,18 @@ WantedBy=default.target
 `;
 }
 
-async function installDarwin({ configPath, host, port, watchConfig, watchBinary, requireAuth }) {
+async function installDarwin({ configPath, host, port, watchConfig, watchBinary, requireAuth, cliPath }) {
   const launchAgentsDir = path.join(os.homedir(), "Library", "LaunchAgents");
   const plistPath = path.join(launchAgentsDir, `${LAUNCH_AGENT_ID}.plist`);
   const nodePath = process.execPath;
-  const cliPath = resolveCliEntryPath();
+  const resolvedCliPath = String(cliPath || "").trim() || resolveStartupCliEntryPath();
 
   await fs.mkdir(launchAgentsDir, { recursive: true });
   await fs.mkdir(path.join(os.homedir(), "Library", "Logs"), { recursive: true });
 
   const content = buildLaunchAgentPlist({
     nodePath,
-    cliPath,
+    cliPath: resolvedCliPath,
     configPath,
     host,
     port,
@@ -201,6 +218,7 @@ async function statusDarwin() {
 
   const domain = resolveDarwinDomain();
   const listResult = runCommand("launchctl", ["print", `${domain}/${LAUNCH_AGENT_ID}`]);
+  const rawDetail = listResult.ok ? listResult.stdout : (listResult.stderr || listResult.stdout);
 
   return {
     manager: "launchd",
@@ -208,7 +226,11 @@ async function statusDarwin() {
     installed,
     running: listResult.ok,
     filePath: plistPath,
-    detail: listResult.ok ? listResult.stdout : (listResult.stderr || listResult.stdout)
+    detail: !installed
+      ? "Startup service is not installed."
+      : (!listResult.ok && isMissingServiceMessage(rawDetail))
+        ? "Startup service is installed but not currently loaded."
+        : (rawDetail || (listResult.ok ? "LaunchAgent is running." : "LaunchAgent is not running."))
   };
 }
 
@@ -232,16 +254,16 @@ async function restartDarwin() {
   return statusDarwin();
 }
 
-async function installLinux({ configPath, host, port, watchConfig, watchBinary, requireAuth }) {
+async function installLinux({ configPath, host, port, watchConfig, watchBinary, requireAuth, cliPath }) {
   const systemdDir = path.join(os.homedir(), ".config", "systemd", "user");
   const servicePath = path.join(systemdDir, `${SERVICE_NAME}.service`);
   const nodePath = process.execPath;
-  const cliPath = resolveCliEntryPath();
+  const resolvedCliPath = String(cliPath || "").trim() || resolveStartupCliEntryPath();
 
   await fs.mkdir(systemdDir, { recursive: true });
   const content = buildSystemdService({
     nodePath,
-    cliPath,
+    cliPath: resolvedCliPath,
     configPath,
     host,
     port,
@@ -255,9 +277,16 @@ async function installLinux({ configPath, host, port, watchConfig, watchBinary, 
   if (!daemonReload.ok) {
     throw new Error(daemonReload.stderr || daemonReload.stdout || "systemctl daemon-reload failed.");
   }
-  const enableNow = runCommand("systemctl", ["--user", "enable", "--now", `${SERVICE_NAME}.service`]);
-  if (!enableNow.ok) {
-    throw new Error(enableNow.stderr || enableNow.stdout || "systemctl enable --now failed.");
+  const enable = runCommand("systemctl", ["--user", "enable", `${SERVICE_NAME}.service`]);
+  if (!enable.ok) {
+    throw new Error(enable.stderr || enable.stdout || "systemctl enable failed.");
+  }
+  const restart = runCommand("systemctl", ["--user", "restart", `${SERVICE_NAME}.service`]);
+  if (!restart.ok) {
+    const start = runCommand("systemctl", ["--user", "start", `${SERVICE_NAME}.service`]);
+    if (!start.ok) {
+      throw new Error(start.stderr || start.stdout || restart.stderr || restart.stdout || "systemctl restart failed.");
+    }
   }
 
   return {
@@ -297,13 +326,18 @@ async function statusLinux() {
   }
 
   const isActive = runCommand("systemctl", ["--user", "is-active", `${SERVICE_NAME}.service`]);
+  const rawDetail = isActive.stdout || isActive.stderr;
   return {
     manager: "systemd-user",
     serviceId: `${SERVICE_NAME}.service`,
     installed,
     running: isActive.ok && isActive.stdout.trim() === "active",
     filePath: servicePath,
-    detail: isActive.stdout || isActive.stderr
+    detail: !installed
+      ? "Startup service is not installed."
+      : (!isActive.ok && isMissingServiceMessage(rawDetail))
+        ? "Startup service is installed but currently stopped."
+        : (rawDetail || (isActive.ok ? "Systemd user service is active." : "Systemd user service is not active."))
   };
 }
 
@@ -328,11 +362,12 @@ async function restartLinux() {
 export async function installStartup(options) {
   const payload = {
     configPath: options.configPath,
-    host: options.host || "127.0.0.1",
-    port: options.port || 8787,
+    host: FIXED_LOCAL_ROUTER_HOST,
+    port: FIXED_LOCAL_ROUTER_PORT,
     watchConfig: options.watchConfig !== false,
     watchBinary: options.watchBinary !== false,
-    requireAuth: options.requireAuth === true
+    requireAuth: options.requireAuth === true,
+    cliPath: String(options.cliPath || "").trim()
   };
 
   if (process.platform === "darwin") return installDarwin(payload);

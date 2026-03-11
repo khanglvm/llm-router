@@ -8,6 +8,7 @@ import { watch as fsWatch } from "node:fs";
 import { Readable } from "node:stream";
 import { createFetchHandler } from "../runtime/handler.js";
 import { readConfigFile, getDefaultConfigPath } from "./config-store.js";
+import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
 
 const DEFAULT_CONFIG_RELOAD_DEBOUNCE_MS = 300;
 const MAX_CONFIG_RELOAD_DEBOUNCE_MS = 5000;
@@ -233,8 +234,8 @@ async function writeFetchResponseToNode(res, response) {
 }
 
 export async function startLocalRouteServer({
-  port = 8787,
-  host = "127.0.0.1",
+  port = FIXED_LOCAL_ROUTER_PORT,
+  host = FIXED_LOCAL_ROUTER_HOST,
   configPath = getDefaultConfigPath(),
   watchConfig = true,
   configReloadDebounceMs = process.env.LLM_ROUTER_CONFIG_RELOAD_DEBOUNCE_MS,

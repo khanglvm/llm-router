@@ -1039,6 +1039,19 @@ export async function probeProviderEndpointMatrix(options) {
       unresolvedModelSet.delete(modelId);
       break;
     }
+
+    const resolvedFormats = modelFormatsMap[modelId] ? [...modelFormatsMap[modelId]] : [];
+    const resolvedOwner = modelOwnerById.get(modelId) || null;
+    emitProgress({
+      phase: "model-done",
+      model: modelId,
+      confirmed: resolvedFormats.length > 0,
+      formats: resolvedFormats,
+      endpoint: resolvedOwner?.endpoint || null,
+      format: resolvedOwner?.format || null,
+      completedModels: models.length - unresolvedModelSet.size,
+      totalModels: models.length
+    });
   }
 
   for (const row of endpointRows) {

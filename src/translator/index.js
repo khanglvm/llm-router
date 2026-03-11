@@ -62,7 +62,9 @@ export function initState(sourceFormat) {
     finishReason: null,
     usage: null,
     messageStartSent: false,
-    textBlockClosed: false
+    textBlockClosed: false,
+    messageDeltaSent: false,
+    messageStopSent: false
   };
 }
 

@@ -40,7 +40,9 @@ export function buildRouteDebugState(enabled, resolved) {
     strategy: resolved?.routeStrategy || "ordered",
     selectedCandidate: "",
     skippedCandidates: [],
-    attempts: []
+    attempts: [],
+    toolTypes: "",
+    toolRouting: ""
   };
 }
 
@@ -70,6 +72,15 @@ export function setRouteSelectedCandidate(debugState, candidate, { overwrite = f
   debugState.selectedCandidate = candidateRef(candidate);
 }
 
+export function setRouteToolDebug(debugState, toolTypes, toolRouting = "") {
+  if (!debugState?.enabled) return;
+  const normalizedToolTypes = Array.isArray(toolTypes)
+    ? toolTypes.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  debugState.toolTypes = normalizedToolTypes.join(",");
+  debugState.toolRouting = String(toolRouting || "").trim();
+}
+
 export function withRouteDebugHeaders(response, debugState) {
   if (!debugState?.enabled || !(response instanceof Response)) {
     return response;
@@ -94,6 +105,16 @@ export function withRouteDebugHeaders(response, debugState) {
   const attempts = toSafeHeaderValue(debugState.attempts.join(","));
   if (attempts) {
     headers.set("x-llm-router-attempts", attempts);
+  }
+
+  const toolTypes = toSafeHeaderValue(debugState.toolTypes);
+  if (toolTypes) {
+    headers.set("x-llm-router-tool-types", toolTypes);
+  }
+
+  const toolRouting = toSafeHeaderValue(debugState.toolRouting);
+  if (toolRouting) {
+    headers.set("x-llm-router-tool-routing", toolRouting);
   }
 
   return new Response(response.body, {

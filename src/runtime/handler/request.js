@@ -1,4 +1,5 @@
 import { FORMATS } from "../../translator/index.js";
+import { extractAmpGeminiRouteInfo } from "./amp-gemini.js";
 import { toNonNegativeInteger } from "./utils.js";
 
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024;
@@ -7,6 +8,130 @@ const MAX_MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 60_000;
 const MIN_UPSTREAM_TIMEOUT_MS = 1_000;
 const MAX_UPSTREAM_TIMEOUT_MS = 300_000;
+const AMP_API_PROVIDER_PREFIX = "/api/provider/";
+const AMP_MANAGEMENT_ROOT_PREFIXES = [
+  "/auth",
+  "/threads",
+  "/docs",
+  "/settings"
+];
+const AMP_MANAGEMENT_ROOT_EXACT_PATHS = new Set([
+  "/threads.rss",
+  "/news.rss"
+]);
+const AMP_MANAGEMENT_API_PREFIXES = [
+  "/api/auth",
+  "/api/user",
+  "/api/threads",
+  "/api/meta",
+  "/api/internal",
+  "/api/otel",
+  "/api/tab",
+  "/api/docs",
+  "/api/settings"
+];
+
+function hasPathPrefix(path, prefix) {
+  return path === prefix || path.startsWith(`${prefix}/`);
+}
+
+function resolveAmpProviderRoute(path, method) {
+  const isGet = method === "GET";
+  const isPost = method === "POST";
+
+  const geminiRoute = extractAmpGeminiRouteInfo(path);
+  if (geminiRoute) {
+    if (geminiRoute.type === "models" && isGet) {
+      return { type: "amp-gemini-models", clientType: "amp", providerHint: "google", requestKind: "gemini-models" };
+    }
+    if (geminiRoute.type === "model" && isGet) {
+      return { type: "amp-gemini-model", clientType: "amp", providerHint: "google", requestKind: "gemini-model", modelHint: geminiRoute.model };
+    }
+    if (geminiRoute.type === "request" && isPost) {
+      return {
+        type: "amp-gemini",
+        clientType: "amp",
+        providerHint: "google",
+        requestKind: "gemini",
+        modelHint: geminiRoute.model,
+        methodHint: geminiRoute.method,
+        streamHint: geminiRoute.stream
+      };
+    }
+  }
+
+  if (!path.startsWith(AMP_API_PROVIDER_PREFIX)) return null;
+
+  const suffix = path.slice(AMP_API_PROVIDER_PREFIX.length);
+  const slashIndex = suffix.indexOf("/");
+  if (slashIndex <= 0) return null;
+
+  const providerHint = suffix.slice(0, slashIndex).trim().toLowerCase();
+  const providerPath = `/${suffix.slice(slashIndex + 1)}`;
+
+  if (isGet && ["/models", "/v1/models"].includes(providerPath)) {
+    return {
+      type: "models",
+      sourceFormat: providerHint === "anthropic" ? FORMATS.CLAUDE : FORMATS.OPENAI,
+      clientType: "amp",
+      providerHint,
+      requestKind: "models"
+    };
+  }
+
+  if (providerHint === "google") {
+    return {
+      type: "amp-proxy",
+      clientType: "amp",
+      providerHint,
+      requestKind: "gemini-upstream-fallback"
+    };
+  }
+
+  if (!isPost) return null;
+
+  if (["/messages", "/v1/messages"].includes(providerPath)) {
+    return {
+      type: "route",
+      sourceFormat: FORMATS.CLAUDE,
+      clientType: "amp",
+      providerHint,
+      requestKind: "messages"
+    };
+  }
+
+  if (["/chat/completions", "/v1/chat/completions"].includes(providerPath)) {
+    return {
+      type: "route",
+      sourceFormat: FORMATS.OPENAI,
+      clientType: "amp",
+      providerHint,
+      requestKind: "chat-completions"
+    };
+  }
+
+  if (["/completions", "/v1/completions"].includes(providerPath)) {
+    return {
+      type: "route",
+      sourceFormat: FORMATS.OPENAI,
+      clientType: "amp",
+      providerHint,
+      requestKind: "completions"
+    };
+  }
+
+  if (["/responses", "/v1/responses"].includes(providerPath)) {
+    return {
+      type: "route",
+      sourceFormat: FORMATS.OPENAI,
+      clientType: "amp",
+      providerHint,
+      requestKind: "responses"
+    };
+  }
+
+  return null;
+}
 
 export function resolveMaxRequestBodyBytes(env = {}) {
   const configured = toNonNegativeInteger(
@@ -98,34 +223,52 @@ export function normalizePath(pathname) {
   return pathname;
 }
 
+export function isAmpManagementPath(pathname) {
+  const path = normalizePath(pathname);
+  if (AMP_MANAGEMENT_ROOT_EXACT_PATHS.has(path)) return true;
+  if (AMP_MANAGEMENT_ROOT_PREFIXES.some((prefix) => hasPathPrefix(path, prefix))) return true;
+  return AMP_MANAGEMENT_API_PREFIXES.some((prefix) => hasPathPrefix(path, prefix));
+}
+
 export function resolveApiRoute(pathname, method) {
   const path = normalizePath(pathname);
   const isGet = method === "GET";
   const isPost = method === "POST";
 
+  const ampRoute = resolveAmpProviderRoute(path, method);
+  if (ampRoute) return ampRoute;
+
   if (isGet && ["/anthropic/v1/models", "/anthropic/models"].includes(path)) {
-    return { type: "models", sourceFormat: FORMATS.CLAUDE };
+    return { type: "models", sourceFormat: FORMATS.CLAUDE, requestKind: "models" };
   }
 
   if (isGet && ["/openai/v1/models", "/openai/models"].includes(path)) {
-    return { type: "models", sourceFormat: FORMATS.OPENAI };
+    return { type: "models", sourceFormat: FORMATS.OPENAI, requestKind: "models" };
   }
 
   if (isGet && ["/v1/models", "/models"].includes(path)) {
-    return { type: "models", sourceFormat: "auto" };
+    return { type: "models", sourceFormat: "auto", requestKind: "models" };
   }
 
   if (isPost && ["/v1/messages", "/messages", "/anthropic", "/anthropic/v1/messages", "/anthropic/messages"].includes(path)) {
-    return { type: "route", sourceFormat: FORMATS.CLAUDE };
+    return { type: "route", sourceFormat: FORMATS.CLAUDE, requestKind: "messages" };
   }
 
   if (isPost && ["/v1/chat/completions", "/chat/completions", "/openai", "/openai/v1/chat/completions", "/openai/chat/completions"].includes(path)) {
-    return { type: "route", sourceFormat: FORMATS.OPENAI };
+    return { type: "route", sourceFormat: FORMATS.OPENAI, requestKind: "chat-completions" };
+  }
+
+  if (isPost && ["/v1/completions", "/completions", "/openai/v1/completions", "/openai/completions"].includes(path)) {
+    return { type: "route", sourceFormat: FORMATS.OPENAI, requestKind: "completions" };
+  }
+
+  if (isPost && ["/v1/responses", "/responses", "/openai/v1/responses", "/openai/responses"].includes(path)) {
+    return { type: "route", sourceFormat: FORMATS.OPENAI, requestKind: "responses" };
   }
 
   // Unified root endpoint: infer user format from request payload/headers.
   if (isPost && ["/", "/v1", "/route", "/router"].includes(path)) {
-    return { type: "route", sourceFormat: "auto" };
+    return { type: "route", sourceFormat: "auto", requestKind: "unified" };
   }
 
   return null;

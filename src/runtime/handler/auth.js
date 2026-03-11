@@ -2,8 +2,23 @@ function parseAuthToken(request) {
   const authHeader = request.headers.get("Authorization");
   if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7).trim();
   if (authHeader && !authHeader.startsWith("Bearer ")) return authHeader.trim();
-  const apiKey = request.headers.get("x-api-key");
-  return apiKey ? apiKey.trim() : "";
+
+  for (const headerName of ["x-api-key", "x-goog-api-key"]) {
+    const headerValue = request.headers.get(headerName);
+    if (headerValue) return headerValue.trim();
+  }
+
+  try {
+    const url = new URL(request.url);
+    for (const key of ["key", "api_key", "auth_token"]) {
+      const value = url.searchParams.get(key);
+      if (value) return value.trim();
+    }
+  } catch {
+    // Ignore malformed request URLs and continue with empty token.
+  }
+
+  return "";
 }
 
 function timingSafeStringEqual(left, right) {
