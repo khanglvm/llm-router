@@ -1583,6 +1583,307 @@ test("createFetchHandler intercepts AMP web search locally when alternate search
   }
 });
 
+test("createFetchHandler intercepts AMP web search locally when only hosted routes are configured", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      },
+      {
+        id: "rc",
+        name: "RamClouds",
+        baseUrl: "https://ramclouds.me",
+        format: "openai",
+        formats: ["openai"],
+        apiKey: "rc_test_key",
+        models: [{ id: "gpt-5.4", formats: ["openai"] }]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "rc/gpt-5.4",
+          providerId: "rc",
+          model: "gpt-5.4"
+        }
+      ]
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const normalizedUrl = String(url);
+    const body = await readInitJsonBody(init);
+    captured.push({
+      url: normalizedUrl,
+      body
+    });
+
+    if (normalizedUrl === "https://api.anthropic.com/v1/messages" && captured.filter((entry) => entry.url === normalizedUrl).length === 1) {
+      return jsonResponse({
+        id: "msg_amp_hosted_search_1",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_web_1",
+            name: "web_search",
+            input: {
+              query: "latest llm-router release notes"
+            }
+          }
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 6, output_tokens: 2 }
+      });
+    }
+
+    if (normalizedUrl === "https://ramclouds.me/v1/responses") {
+      return jsonResponse({
+        id: "resp_hosted_search",
+        object: "response",
+        model: "gpt-5.4",
+        output: [
+          { id: "ws_1", type: "web_search_call", status: "completed" },
+          {
+            id: "msg_1",
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                text: "The latest LLM Router release notes were published on example.com/releases."
+              }
+            ]
+          }
+        ]
+      });
+    }
+
+    if (normalizedUrl === "https://api.anthropic.com/v1/messages" && captured.filter((entry) => entry.url === normalizedUrl).length === 2) {
+      return jsonResponse({
+        id: "msg_amp_hosted_search_2",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [
+          { type: "text", text: "Here is the final answer after hosted local search." }
+        ],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 18, output_tokens: 6 }
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${normalizedUrl}`);
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "smart",
+        max_tokens: 256,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Search the web for llm-router release notes." }]
+          }
+        ],
+        tools: [
+          {
+            type: "web_search_20250305",
+            name: "web_search"
+          }
+        ]
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured.length, 3);
+    assert.equal(captured[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured[1]?.url, "https://ramclouds.me/v1/responses");
+    assert.equal(captured[1]?.body?.model, "gpt-5.4");
+    assert.equal(captured[1]?.body?.tools?.[0]?.type, "web_search");
+    assert.equal(captured[2]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured[0]?.body?.tools?.[0]?.name, "web_search");
+    assert.equal(captured[2]?.body?.tools, undefined);
+    assert.match(JSON.stringify(captured[2]?.body?.messages || []), /example\.com\/releases/);
+    assert.notEqual(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:proxy-upstream");
+
+    const payload = await readJson(response);
+    assert.equal(payload.content?.[0]?.type, "text");
+    assert.match(payload.content?.[0]?.text || "", /final answer after hosted local search/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("createFetchHandler intercepts AMP read_web_page locally without AMP credits", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const normalizedUrl = String(url);
+    const body = init?.body ? await readInitJsonBody(init) : {};
+    captured.push({
+      url: normalizedUrl,
+      body
+    });
+
+    if (normalizedUrl === "https://api.anthropic.com/v1/messages" && captured.filter((entry) => entry.url === normalizedUrl).length === 1) {
+      return jsonResponse({
+        id: "msg_amp_read_1",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_read_1",
+            name: "read_web_page",
+            input: {
+              url: "https://platform.claude.com/docs/en/about-claude/models/overview"
+            }
+          }
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 6, output_tokens: 2 }
+      });
+    }
+
+    if (normalizedUrl === "https://platform.claude.com/docs/en/about-claude/models/overview") {
+      return new Response(`<!doctype html>
+        <html>
+          <head><title>Claude Models Overview</title></head>
+          <body>
+            <main>
+              <table>
+                <caption>Latest models comparison</caption>
+                <tr><th>Model</th><th>Context window</th></tr>
+                <tr><td>Claude Sonnet 4</td><td>200K</td></tr>
+                <tr><td>Claude Haiku 3.5</td><td>200K</td></tr>
+              </table>
+            </main>
+          </body>
+        </html>`, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8"
+        }
+      });
+    }
+
+    if (normalizedUrl === "https://api.anthropic.com/v1/messages" && captured.filter((entry) => entry.url === normalizedUrl).length === 2) {
+      return jsonResponse({
+        id: "msg_amp_read_2",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [
+          { type: "text", text: "Extracted the latest models comparison table locally." }
+        ],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 18, output_tokens: 6 }
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${normalizedUrl}`);
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "smart",
+        max_tokens: 256,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Open the Claude models overview page and extract the latest models comparison table." }]
+          }
+        ],
+        tools: [
+          {
+            name: "read_web_page",
+            input_schema: {
+              type: "object",
+              properties: {
+                url: { type: "string" }
+              },
+              required: ["url"]
+            }
+          }
+        ]
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured.length, 3);
+    assert.equal(captured[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured[0]?.body?.tools?.[0]?.name, "read_web_page");
+    assert.equal(captured[1]?.url, "https://platform.claude.com/docs/en/about-claude/models/overview");
+    assert.equal(captured[2]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured[2]?.body?.tools, undefined);
+    assert.match(JSON.stringify(captured[2]?.body?.messages || []), /Latest models comparison/);
+    assert.match(JSON.stringify(captured[2]?.body?.messages || []), /Claude Sonnet 4/);
+    assert.notEqual(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:proxy-upstream");
+
+    const payload = await readJson(response);
+    assert.match(payload.content?.[0]?.text || "", /Extracted the latest models comparison table locally/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
 test("createFetchHandler can proxy AMP web search requests upstream when enabled", { concurrency: false }, async () => {
   const config = buildConfig({
     defaultModel: "anthropic/claude-3-5-haiku",

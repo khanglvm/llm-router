@@ -4,6 +4,19 @@
 
 import { FORMATS } from "../formats.js";
 
+const WEB_SEARCH_TOOL_NAME = "web_search";
+const WEB_SEARCH_FUNCTION_PARAMETERS = {
+  type: "object",
+  properties: {
+    query: {
+      type: "string",
+      description: "The search query to run against the web."
+    }
+  },
+  required: ["query"],
+  additionalProperties: false
+};
+
 function cloneCacheControl(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const type = typeof value.type === "string" ? value.type.trim() : "";
@@ -38,6 +51,33 @@ function convertClaudeSystemToOpenAIContent(system) {
     return parts[0].text;
   }
   return parts;
+}
+
+function normalizeWebSearchType(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isClaudeNativeWebSearchTool(tool) {
+  if (!tool || typeof tool !== "object") return false;
+  const normalizedType = normalizeWebSearchType(tool.type);
+  return normalizedType === "web_search"
+    || (normalizedType.startsWith("web_search_") && !normalizedType.startsWith("web_search_preview"));
+}
+
+function convertClaudeWebSearchTool(tool) {
+  const description = typeof tool?.description === "string" && tool.description.trim()
+    ? tool.description.trim()
+    : "Search the web for current information, news, documentation, or real-time facts.";
+  const cacheControl = cloneCacheControl(tool?.cache_control);
+  return {
+    type: "function",
+    function: {
+      name: WEB_SEARCH_TOOL_NAME,
+      description,
+      parameters: WEB_SEARCH_FUNCTION_PARAMETERS
+    },
+    ...(cacheControl ? { cache_control: cacheControl } : {})
+  };
 }
 
 /**
@@ -89,6 +129,9 @@ export function claudeToOpenAIRequest(model, body, stream) {
   // Tools
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = body.tools.map(tool => {
+      if (isClaudeNativeWebSearchTool(tool)) {
+        return convertClaudeWebSearchTool(tool);
+      }
       const cacheControl = cloneCacheControl(tool.cache_control);
       return {
         type: "function",

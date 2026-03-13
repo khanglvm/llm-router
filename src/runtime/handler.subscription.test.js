@@ -231,6 +231,113 @@ test("makeProviderCall promotes Claude system prompts into Codex instructions", 
   assert.equal(claudeJson.content?.[0]?.text, "system-ok");
 });
 
+test("makeProviderCall maps prior assistant turns to output_text for Codex responses replay", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("personal", {
+    accessToken: "token-abc",
+    refreshToken: "refresh-abc",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "openid"
+  });
+
+  const originalFetch = globalThis.fetch;
+  let capturedRequest = null;
+  globalThis.fetch = async (url, init = {}) => {
+    capturedRequest = {
+      url: String(url),
+      headers: init.headers || {},
+      body: JSON.parse(String(init.body || "{}"))
+    };
+    return new Response(JSON.stringify({
+      id: "resp_followup_1",
+      object: "response",
+      created_at: 1730000200,
+      model: "gpt-5.3-codex",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "output_text",
+              text: "followup-ok"
+            }
+          ]
+        }
+      ],
+      usage: {
+        input_tokens: 8,
+        output_tokens: 3,
+        total_tokens: 11
+      }
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "chatgpt/gpt-5.3-codex",
+      max_tokens: 64,
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Inspect the routing issue." }]
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "I traced the first request successfully." }]
+        },
+        {
+          role: "user",
+          content: [{ type: "text", text: "Continue and check the second request." }]
+        }
+      ]
+    },
+    sourceFormat: FORMATS.CLAUDE,
+    stream: false,
+    candidate: buildSubscriptionCandidate(),
+    requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(capturedRequest?.url, CODEX_ENDPOINT);
+  assert.deepEqual(capturedRequest?.body?.input, [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Inspect the routing issue." }]
+    },
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "I traced the first request successfully." }]
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Continue and check the second request." }]
+    }
+  ]);
+
+  const claudeJson = await result.response.json();
+  assert.equal(claudeJson.content?.[0]?.text, "followup-ok");
+});
+
 test("makeProviderCall returns auth error when subscription profile is not logged in", { concurrency: false }, async (t) => {
   const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
   const originalHome = process.env.HOME;

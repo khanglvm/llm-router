@@ -31,6 +31,25 @@ function buildOpenAICandidate(providerOverrides = {}) {
   };
 }
 
+function buildClaudeCandidate(providerOverrides = {}) {
+  return {
+    provider: {
+      id: "anthropic",
+      name: "Anthropic",
+      baseUrl: "https://api.anthropic.com",
+      format: FORMATS.CLAUDE,
+      formats: [FORMATS.CLAUDE],
+      models: [{ id: "claude-sonnet-4-6" }],
+      ...providerOverrides
+    },
+    providerId: "anthropic",
+    modelId: "claude-sonnet-4-6",
+    requestModelId: "anthropic/claude-sonnet-4-6",
+    targetFormat: FORMATS.CLAUDE,
+    backend: "claude-sonnet-4-6"
+  };
+}
+
 test("makeProviderCall retries OpenAI responses hosted web search with web_search when preview tool names are rejected", { concurrency: false }, async () => {
   const calls = [];
   const originalFetch = globalThis.fetch;
@@ -175,6 +194,140 @@ test("makeProviderCall applies configured OpenAI responses hosted web search too
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.body?.tools?.[0]?.type, "web_search");
     assert.equal(calls[0]?.body?.tool_choice, "required");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("makeProviderCall intercepts native Claude web search locally for non-AMP clients", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const normalizedUrl = String(url);
+    if (normalizedUrl.startsWith("https://api.search.brave.com/")) {
+      calls.push({
+        url: normalizedUrl,
+        kind: "search"
+      });
+      return jsonResponse({
+        web: {
+          results: [
+            {
+              title: "LLM Router Release Notes",
+              url: "https://example.com/releases",
+              description: "Latest release notes for llm-router."
+            }
+          ]
+        }
+      });
+    }
+
+    const body = JSON.parse(String(init.body || "{}"));
+    calls.push({
+      url: normalizedUrl,
+      kind: "provider",
+      body
+    });
+
+    if (calls.filter((entry) => entry.kind === "provider").length === 1) {
+      return jsonResponse({
+        id: "msg_native_search",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_web_1",
+            name: "web_search",
+            input: {
+              query: "llm-router latest release notes"
+            }
+          }
+        ],
+        stop_reason: "tool_use",
+        usage: {
+          input_tokens: 12,
+          output_tokens: 4
+        }
+      });
+    }
+
+    return jsonResponse({
+      id: "msg_native_search_final",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [
+        {
+          type: "text",
+          text: "The latest llm-router release notes are available and summarize the current release."
+        }
+      ],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 18,
+        output_tokens: 10
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "smart",
+        max_tokens: 256,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Search the web for llm-router latest release notes." }]
+          }
+        ],
+        tools: [
+          {
+            type: "web_search_20250305"
+          }
+        ]
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: false,
+      candidate: buildClaudeCandidate(),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      runtimeConfig: {
+        webSearch: {
+          providers: [
+            {
+              id: "brave",
+              apiKey: "brave_test_key",
+              count: 3,
+              limit: 10,
+              remaining: 10
+            }
+          ]
+        }
+      },
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls[0]?.body?.tools?.length, 1);
+    assert.equal(calls[0]?.body?.tools?.[0]?.name, "web_search");
+    assert.equal(calls[0]?.body?.tools?.[0]?.input_schema?.properties?.query?.type, "string");
+    assert.match(calls[1]?.url || "", /^https:\/\/api\.search\.brave\.com\//);
+    assert.equal(calls[2]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls[2]?.body?.tools, undefined);
+    assert.match(String(calls[2]?.body?.system || ""), /You just performed web searches/);
+    assert.equal(calls[2]?.body?.messages?.at(-1)?.role, "user");
+    assert.equal(calls[2]?.body?.messages?.at(-1)?.content?.[0]?.type, "tool_result");
+    assert.match(String(calls[2]?.body?.messages?.at(-1)?.content?.[0]?.content || ""), /LLM Router Release Notes/);
+
+    const payload = await result.response.json();
+    assert.equal(payload.type, "message");
+    assert.equal(payload.content?.[0]?.type, "text");
+    assert.match(String(payload.content?.[0]?.text || ""), /latest llm-router release notes/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -334,3 +334,36 @@ test("normalizeClaudePassthroughStream synthesizes terminal message_delta before
   assert.equal(events[4]?.payload?.usage?.input_tokens, 6);
   assert.equal(events[4]?.payload?.usage?.output_tokens, 0);
 });
+
+test("normalizeClaudePassthroughStream closes an unfinished message before a second message_start", async () => {
+  const claudeStream = [
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_a","model":"claude-haiku-4-5","usage":{"input_tokens":6,"output_tokens":0}}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial answer"}}\n\n',
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_b","model":"claude-haiku-4-5","usage":{"input_tokens":7,"output_tokens":0}}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Fresh answer"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":7,"output_tokens":2}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ].join("");
+
+  const response = normalizeClaudePassthroughStream(new Response(claudeStream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream"
+    }
+  }));
+
+  const bodyText = await response.text();
+  const events = parseSseEvents(bodyText);
+  const eventNames = events.map((entry) => entry.event);
+  const secondStartIndex = eventNames.indexOf("message_start", 1);
+  const firstStopIndex = eventNames.indexOf("message_stop");
+
+  assert.equal(eventNames.filter((name) => name === "message_start").length, 2);
+  assert.ok(firstStopIndex > -1);
+  assert.ok(secondStartIndex > firstStopIndex);
+  assert.equal(events[firstStopIndex - 1]?.event, "message_delta");
+  assert.equal(events[secondStartIndex + 2]?.event, "content_block_delta");
+});

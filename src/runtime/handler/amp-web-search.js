@@ -12,10 +12,14 @@ import {
 import { isSubscriptionProvider, makeSubscriptionProviderCall } from "../subscription-provider.js";
 
 const SEARCH_TOOL_NAME = "web_search";
+const READ_WEB_PAGE_TOOL_NAME = "read_web_page";
 const DEFAULT_SEARCH_COUNT = 5;
 const MIN_SEARCH_COUNT = 1;
 const MAX_SEARCH_COUNT = 20;
 const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_READ_WEB_PAGE_TEXT_CHARS = 24_000;
+const MAX_READ_WEB_PAGE_TABLES = 8;
+const MAX_READ_WEB_PAGE_TABLE_ROWS = 40;
 const SEARCH_ROUTE_KEY = "route:amp-web-search";
 const HOSTED_WEB_SEARCH_TEST_QUERY = "Find the sunrise time in Paris today and cite the source.";
 const SEARCH_SYSTEM_INSTRUCTION = [
@@ -64,6 +68,18 @@ const WEB_SEARCH_FUNCTION_PARAMETERS = {
   additionalProperties: false
 };
 
+const READ_WEB_PAGE_FUNCTION_PARAMETERS = {
+  type: "object",
+  properties: {
+    url: {
+      type: "string",
+      description: "The absolute URL of the web page to read."
+    }
+  },
+  required: ["url"],
+  additionalProperties: true
+};
+
 const OPENAI_WEB_SEARCH_TOOL = Object.freeze({
   type: "function",
   function: {
@@ -77,6 +93,21 @@ const CLAUDE_WEB_SEARCH_TOOL = Object.freeze({
   name: SEARCH_TOOL_NAME,
   description: "Search the web for current information, news, documentation, or real-time facts.",
   input_schema: WEB_SEARCH_FUNCTION_PARAMETERS
+});
+
+const OPENAI_READ_WEB_PAGE_TOOL = Object.freeze({
+  type: "function",
+  function: {
+    name: READ_WEB_PAGE_TOOL_NAME,
+    description: "Fetch and extract the readable text and table content from a web page URL.",
+    parameters: READ_WEB_PAGE_FUNCTION_PARAMETERS
+  }
+});
+
+const CLAUDE_READ_WEB_PAGE_TOOL = Object.freeze({
+  name: READ_WEB_PAGE_TOOL_NAME,
+  description: "Fetch and extract the readable text and table content from a web page URL.",
+  input_schema: READ_WEB_PAGE_FUNCTION_PARAMETERS
 });
 
 function toInteger(value, fallback, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -128,6 +159,119 @@ function stripHtml(text) {
     .trim();
 }
 
+function clampText(value, maxChars = MAX_READ_WEB_PAGE_TEXT_CHARS) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 15)).trimEnd()}\n[truncated]`;
+}
+
+function stripHtmlPreservingLines(text) {
+  const normalized = String(text || "")
+    .replace(/<(br|hr)\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|section|article|main|header|footer|aside|nav|li|tr|h1|h2|h3|h4|h5|h6|ul|ol|table)>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<\/t[dh]>/gi, " | ")
+    .replace(/<t[dh]\b[^>]*>/gi, " ")
+    .replace(/<[^>]+>/g, " ");
+  return normalized
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&#x27;|&#39;/gi, "'")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function extractHtmlTitle(html) {
+  return stripHtml((String(html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
+}
+
+function extractPreferredHtmlSection(html) {
+  const normalized = String(html || "");
+  for (const tagName of ["main", "article", "body"]) {
+    const match = normalized.match(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i"));
+    if (match?.[1]) return match[1];
+  }
+  return normalized;
+}
+
+function removeHtmlNoise(html) {
+  return String(html || "")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<template\b[\s\S]*?<\/template>/gi, " ");
+}
+
+function extractHtmlTables(html) {
+  const tableBlocks = [...String(html || "").matchAll(/<table\b[\s\S]*?<\/table>/gi)].slice(0, MAX_READ_WEB_PAGE_TABLES);
+  const tables = [];
+
+  for (let index = 0; index < tableBlocks.length; index += 1) {
+    const tableHtml = tableBlocks[index]?.[0] || "";
+    const caption = stripHtml((tableHtml.match(/<caption\b[^>]*>([\s\S]*?)<\/caption>/i) || [])[1] || "");
+    const rowBlocks = [...tableHtml.matchAll(/<tr\b[\s\S]*?<\/tr>/gi)].slice(0, MAX_READ_WEB_PAGE_TABLE_ROWS);
+    const rows = rowBlocks.map((rowBlock) => {
+      const rowHtml = rowBlock?.[0] || "";
+      return [...rowHtml.matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)]
+        .map((cellMatch) => stripHtml(cellMatch?.[1] || ""))
+        .filter((cell) => cell.length > 0);
+    }).filter((row) => row.length > 0);
+
+    if (rows.length === 0) continue;
+    const formattedRows = rows.map((row) => `| ${row.join(" | ")} |`).join("\n");
+    tables.push([
+      caption ? `Table ${tables.length + 1}: ${caption}` : `Table ${tables.length + 1}:`,
+      formattedRows
+    ].join("\n"));
+  }
+
+  return tables;
+}
+
+function formatReadWebPageHtml(url, html) {
+  const cleanHtml = removeHtmlNoise(html);
+  const title = extractHtmlTitle(cleanHtml);
+  const mainSection = extractPreferredHtmlSection(cleanHtml);
+  const tables = extractHtmlTables(mainSection);
+  const pageText = clampText(stripHtmlPreservingLines(mainSection));
+  const sections = [
+    `URL: ${url}`
+  ];
+
+  if (title) sections.push(`Title: ${title}`);
+  if (tables.length > 0) sections.push(`Tables:\n${tables.join("\n\n")}`);
+  if (pageText) sections.push(`Page text:\n${pageText}`);
+
+  return sections.join("\n\n").trim();
+}
+
+function formatReadWebPageBody(url, bodyText, contentType = "") {
+  const sections = [
+    `URL: ${url}`
+  ];
+  const normalizedContentType = String(contentType || "").trim();
+  if (normalizedContentType) sections.push(`Content-Type: ${normalizedContentType}`);
+  sections.push(`Page text:\n${clampText(bodyText) || "[No readable page text extracted]"}`);
+  return sections.join("\n\n").trim();
+}
+
+function looksLikeHtml(contentType, bodyText) {
+  const normalizedContentType = String(contentType || "").toLowerCase();
+  if (normalizedContentType.includes("text/html") || normalizedContentType.includes("application/xhtml+xml")) {
+    return true;
+  }
+  const sample = String(bodyText || "").trim().slice(0, 512).toLowerCase();
+  return sample.startsWith("<!doctype html") || sample.startsWith("<html") || sample.includes("<body");
+}
+
 function formatSearchResults(results) {
   const lines = [];
   for (let index = 0; index < results.length; index += 1) {
@@ -155,6 +299,34 @@ function hasSearchToolType(type) {
 function hasSearchToolName(name) {
   const normalized = String(name || "").trim().toLowerCase();
   return normalized === SEARCH_TOOL_NAME || normalized === "web_search_preview";
+}
+
+function hasReadWebPageToolName(name) {
+  return String(name || "").trim().toLowerCase() === READ_WEB_PAGE_TOOL_NAME;
+}
+
+function hasInterceptableTool(tool) {
+  if (!tool || typeof tool !== "object") return false;
+  return hasSearchToolType(tool.type)
+    || hasSearchToolName(tool.name)
+    || hasSearchToolName(tool.function?.name)
+    || hasReadWebPageToolName(tool.name)
+    || hasReadWebPageToolName(tool.function?.name);
+}
+
+function hasInterceptableToolName(name) {
+  return hasSearchToolName(name) || hasReadWebPageToolName(name);
+}
+
+function getToolName(tool) {
+  if (!tool || typeof tool !== "object") return "";
+  if (hasReadWebPageToolName(tool.name) || hasReadWebPageToolName(tool.function?.name)) {
+    return READ_WEB_PAGE_TOOL_NAME;
+  }
+  if (hasSearchToolType(tool.type) || hasSearchToolName(tool.name) || hasSearchToolName(tool.function?.name)) {
+    return SEARCH_TOOL_NAME;
+  }
+  return "";
 }
 
 function dedupeStrings(values = []) {
@@ -1076,20 +1248,25 @@ export async function executeAmpWebSearch(query, runtimeConfig = {}, env = {}, o
 }
 
 export function shouldInterceptAmpWebSearch({ clientType, originalBody, runtimeConfig, env }) {
-  if (clientType !== "amp") return false;
   const tools = Array.isArray(originalBody?.tools) ? originalBody.tools : [];
-  if (!tools.some((tool) => {
-    if (!tool || typeof tool !== "object") return false;
-    return hasSearchToolType(tool.type) || hasSearchToolName(tool.name) || hasSearchToolName(tool.function?.name);
-  })) {
+  const requestedToolNames = dedupeStrings(tools.map((tool) => getToolName(tool)).filter(Boolean));
+  if (requestedToolNames.length === 0) {
     return false;
   }
-  return resolveAmpWebSearchConfig(runtimeConfig, env).providers.some((provider) => {
+  const readyProviders = resolveAmpWebSearchConfig(runtimeConfig, env).providers.filter((provider) => {
     if (!isSearchProviderConfigured(provider)) return false;
     if (!isHostedSearchProvider(provider)) return true;
     const resolvedRoute = getResolvedHostedSearchRoute(runtimeConfig, provider);
     return Boolean(resolvedRoute && supportsResolvedHostedSearchRoute(resolvedRoute.provider, resolvedRoute.model));
   });
+  if (readyProviders.length === 0) {
+    return clientType === "amp" && requestedToolNames.includes(READ_WEB_PAGE_TOOL_NAME);
+  }
+  if (clientType === "amp") {
+    if (requestedToolNames.includes(READ_WEB_PAGE_TOOL_NAME)) return true;
+    return true;
+  }
+  return true;
 }
 
 export function rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat) {
@@ -1101,21 +1278,22 @@ export function rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat) {
     };
   }
 
-  let hasWebSearch = false;
+  const interceptedToolNames = new Set();
   const nextTools = [];
   for (const tool of tools) {
     if (!tool || typeof tool !== "object") {
       nextTools.push(tool);
       continue;
     }
-    if (hasSearchToolType(tool.type) || hasSearchToolName(tool.name) || hasSearchToolName(tool.function?.name)) {
-      hasWebSearch = true;
+    const toolName = getToolName(tool);
+    if (toolName) {
+      interceptedToolNames.add(toolName);
       continue;
     }
     nextTools.push(tool);
   }
 
-  if (!hasWebSearch) {
+  if (interceptedToolNames.size === 0) {
     return {
       providerBody,
       hasWebSearch: false
@@ -1123,9 +1301,11 @@ export function rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat) {
   }
 
   if (targetFormat === FORMATS.OPENAI) {
-    nextTools.push(OPENAI_WEB_SEARCH_TOOL);
+    if (interceptedToolNames.has(SEARCH_TOOL_NAME)) nextTools.push(OPENAI_WEB_SEARCH_TOOL);
+    if (interceptedToolNames.has(READ_WEB_PAGE_TOOL_NAME)) nextTools.push(OPENAI_READ_WEB_PAGE_TOOL);
   } else if (targetFormat === FORMATS.CLAUDE) {
-    nextTools.push(CLAUDE_WEB_SEARCH_TOOL);
+    if (interceptedToolNames.has(SEARCH_TOOL_NAME)) nextTools.push(CLAUDE_WEB_SEARCH_TOOL);
+    if (interceptedToolNames.has(READ_WEB_PAGE_TOOL_NAME)) nextTools.push(CLAUDE_READ_WEB_PAGE_TOOL);
   }
 
   return {
@@ -1141,7 +1321,7 @@ function extractOpenAIChatProbe(payload) {
   const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
   const message = choice?.message && typeof choice.message === "object" ? choice.message : null;
   const toolCalls = Array.isArray(message?.tool_calls)
-    ? message.tool_calls.filter((item) => hasSearchToolName(item?.function?.name))
+    ? message.tool_calls.filter((item) => hasInterceptableToolName(item?.function?.name))
     : [];
 
   return {
@@ -1171,7 +1351,7 @@ function normalizeResponseInput(input) {
 
 function extractOpenAIResponsesProbe(payload) {
   const output = Array.isArray(payload?.output) ? payload.output : [];
-  const toolCalls = output.filter((item) => item?.type === "function_call" && hasSearchToolName(item?.name));
+  const toolCalls = output.filter((item) => item?.type === "function_call" && hasInterceptableToolName(item?.name));
   const assistantInputItems = output
     .filter((item) => item && item.type !== "reasoning")
     .map((item) => {
@@ -1204,7 +1384,7 @@ function extractOpenAIResponsesProbe(payload) {
 function extractClaudeProbe(payload) {
   const content = Array.isArray(payload?.content) ? payload.content : [];
   const assistantContent = content.filter((item) => item?.type !== "thinking" && item?.type !== "redacted_thinking");
-  const toolCalls = assistantContent.filter((item) => item?.type === "tool_use" && hasSearchToolName(item?.name));
+  const toolCalls = assistantContent.filter((item) => item?.type === "tool_use" && hasInterceptableToolName(item?.name));
 
   return {
     hasWebSearchCalls: toolCalls.length > 0,
@@ -1240,11 +1420,128 @@ function extractQueryFromToolCall(toolCall) {
   return "";
 }
 
+function extractUrlFromToolCall(toolCall) {
+  if (!toolCall || typeof toolCall !== "object") return "";
+  for (const candidate of [
+    toolCall?.input?.url,
+    toolCall?.input?.uri,
+    toolCall?.input?.href
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  const parsedArguments = parseJsonSafely(toolCall?.arguments, {});
+  for (const candidate of [parsedArguments?.url, parsedArguments?.uri, parsedArguments?.href]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  const parsedFunctionArguments = parseJsonSafely(toolCall?.function?.arguments, {});
+  for (const candidate of [parsedFunctionArguments?.url, parsedFunctionArguments?.uri, parsedFunctionArguments?.href]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  for (const candidate of [toolCall?.function?.url, toolCall?.function?.uri, toolCall?.function?.href]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return "";
+}
+
+function getToolCallName(toolCall) {
+  return getToolName(toolCall);
+}
+
 function buildToolResultText(query, searchText) {
   const normalizedQuery = String(query || "").trim();
   const normalizedResults = String(searchText || "").trim() || "[No search results available]";
   if (!normalizedQuery) return normalizedResults;
   return `Web search results for "${normalizedQuery}":\n\n${normalizedResults}`;
+}
+
+function buildReadWebPageResultText(url, pageText) {
+  const normalizedUrl = String(url || "").trim();
+  const normalizedPageText = String(pageText || "").trim() || "[Unable to extract web page content]";
+  if (!normalizedUrl) return normalizedPageText;
+  return `Web page content from "${normalizedUrl}":\n\n${normalizedPageText}`;
+}
+
+async function executeAmpReadWebPage(url) {
+  const normalizedUrl = String(url || "").trim();
+  if (!normalizedUrl) {
+    return {
+      text: "[Missing URL for read_web_page]",
+      providerId: READ_WEB_PAGE_TOOL_NAME,
+      backend: READ_WEB_PAGE_TOOL_NAME,
+      tag: READ_WEB_PAGE_TOOL_NAME
+    };
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(normalizedUrl);
+  } catch {
+    return {
+      text: `[Invalid URL for read_web_page: ${normalizedUrl}]`,
+      providerId: READ_WEB_PAGE_TOOL_NAME,
+      backend: READ_WEB_PAGE_TOOL_NAME,
+      tag: READ_WEB_PAGE_TOOL_NAME
+    };
+  }
+
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    return {
+      text: `[Unsupported URL protocol for read_web_page: ${parsedUrl.protocol}]`,
+      providerId: READ_WEB_PAGE_TOOL_NAME,
+      backend: READ_WEB_PAGE_TOOL_NAME,
+      tag: READ_WEB_PAGE_TOOL_NAME
+    };
+  }
+
+  try {
+    const response = await runFetchWithTimeout(parsedUrl.toString(), {
+      headers: {
+        Accept: "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8",
+        "User-Agent": "llm-router"
+      }
+    });
+    if (!response.ok) {
+      return {
+        text: `[Failed to read web page: ${await readSearchProviderError(response)}]`,
+        providerId: READ_WEB_PAGE_TOOL_NAME,
+        backend: READ_WEB_PAGE_TOOL_NAME,
+        tag: READ_WEB_PAGE_TOOL_NAME
+      };
+    }
+
+    const contentType = String(response.headers.get("content-type") || "").trim();
+    const bodyText = await response.text();
+    const formattedText = looksLikeHtml(contentType, bodyText)
+      ? formatReadWebPageHtml(parsedUrl.toString(), bodyText)
+      : formatReadWebPageBody(parsedUrl.toString(), bodyText, contentType);
+
+    return {
+      text: formattedText,
+      providerId: READ_WEB_PAGE_TOOL_NAME,
+      backend: READ_WEB_PAGE_TOOL_NAME,
+      tag: READ_WEB_PAGE_TOOL_NAME
+    };
+  } catch (error) {
+    return {
+      text: `[Failed to read web page: ${error instanceof Error ? error.message : String(error)}]`,
+      providerId: READ_WEB_PAGE_TOOL_NAME,
+      backend: READ_WEB_PAGE_TOOL_NAME,
+      tag: READ_WEB_PAGE_TOOL_NAME
+    };
+  }
+}
+
+async function executeAmpInterceptedToolCall(toolCall, runtimeConfig, env, options = {}) {
+  const toolName = getToolCallName(toolCall);
+  if (toolName === READ_WEB_PAGE_TOOL_NAME) {
+    return executeAmpReadWebPage(extractUrlFromToolCall(toolCall));
+  }
+  return executeAmpWebSearch(
+    extractQueryFromToolCall(toolCall),
+    runtimeConfig,
+    env,
+    options
+  );
 }
 
 function mergeClaudeSystemInstruction(system, instruction) {
@@ -1270,7 +1567,7 @@ function mergeOpenAIInstructions(originalInstructions, instruction) {
 
 export function buildAmpWebSearchFollowUp(providerBody, probePayload, probe, searchResultsByCall, { targetFormat, requestKind, stream }) {
   const toolCalls = Array.isArray(probe?.toolCalls) ? probe.toolCalls : [];
-  const normalizedSearchResults = Array.isArray(searchResultsByCall)
+  const normalizedToolResults = Array.isArray(searchResultsByCall)
     ? searchResultsByCall
     : [];
 
@@ -1278,10 +1575,15 @@ export function buildAmpWebSearchFollowUp(providerBody, probePayload, probe, sea
     const toolResults = toolCalls.map((toolCall, index) => ({
       type: "tool_result",
       tool_use_id: toolCall.id || `tool_${index + 1}`,
-      content: buildToolResultText(
-        extractQueryFromToolCall(toolCall),
-        normalizedSearchResults[index]?.text
-      )
+      content: getToolCallName(toolCall) === READ_WEB_PAGE_TOOL_NAME
+        ? buildReadWebPageResultText(
+            extractUrlFromToolCall(toolCall),
+            normalizedToolResults[index]?.text
+          )
+        : buildToolResultText(
+            extractQueryFromToolCall(toolCall),
+            normalizedToolResults[index]?.text
+          )
     }));
     return {
       ...providerBody,
@@ -1305,10 +1607,15 @@ export function buildAmpWebSearchFollowUp(providerBody, probePayload, probe, sea
     const toolOutputs = toolCalls.map((toolCall, index) => ({
       type: "function_call_output",
       call_id: toolCall.call_id || toolCall.id || `call_${index + 1}`,
-      output: buildToolResultText(
-        extractQueryFromToolCall(toolCall),
-        normalizedSearchResults[index]?.text
-      )
+      output: getToolCallName(toolCall) === READ_WEB_PAGE_TOOL_NAME
+        ? buildReadWebPageResultText(
+            extractUrlFromToolCall(toolCall),
+            normalizedToolResults[index]?.text
+          )
+        : buildToolResultText(
+            extractQueryFromToolCall(toolCall),
+            normalizedToolResults[index]?.text
+          )
     }));
     return {
       ...providerBody,
@@ -1331,10 +1638,15 @@ export function buildAmpWebSearchFollowUp(providerBody, probePayload, probe, sea
   const toolMessages = toolCalls.map((toolCall, index) => ({
     role: "tool",
     tool_call_id: toolCall.id || `call_${index + 1}`,
-    content: buildToolResultText(
-      extractQueryFromToolCall(toolCall),
-      normalizedSearchResults[index]?.text
-    )
+    content: getToolCallName(toolCall) === READ_WEB_PAGE_TOOL_NAME
+      ? buildReadWebPageResultText(
+          extractUrlFromToolCall(toolCall),
+          normalizedToolResults[index]?.text
+        )
+      : buildToolResultText(
+          extractQueryFromToolCall(toolCall),
+          normalizedToolResults[index]?.text
+        )
   }));
   const nextMessages = Array.isArray(providerBody.messages) ? providerBody.messages.slice() : [];
   const hasLeadingSystem = nextMessages[0]?.role === "system";
@@ -1880,8 +2192,8 @@ export async function maybeInterceptAmpWebSearch({
 
   const searchResultsByCall = [];
   for (const toolCall of (probe.toolCalls || [])) {
-    searchResultsByCall.push(await executeAmpWebSearch(
-      extractQueryFromToolCall(toolCall),
+    searchResultsByCall.push(await executeAmpInterceptedToolCall(
+      toolCall,
       runtimeConfig,
       env,
       {

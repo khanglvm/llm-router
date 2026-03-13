@@ -889,6 +889,16 @@ export function normalizeClaudePassthroughStream(response) {
     state.messageStopped = true;
   }
 
+  function beginNextClaudeMessage() {
+    state.messageStarted = false;
+    state.messageStopped = false;
+    state.terminalDeltaSeen = false;
+    state.hasToolUse = false;
+    state.stopReason = null;
+    state.stopSequence = undefined;
+    state.usage = undefined;
+  }
+
   function processBlock(block, controller) {
     if (!block || !block.trim()) return;
     const parsedBlock = parseSseBlock(block);
@@ -913,6 +923,10 @@ export function normalizeClaudePassthroughStream(response) {
 
     const eventType = String(payload?.type || parsedBlock.eventType || "").trim();
     if (eventType === "message_start") {
+      if (state.messageStarted && !state.messageStopped) {
+        finalizeClaudeMessage(controller);
+        beginNextClaudeMessage();
+      }
       state.messageStarted = true;
       mergeClaudeUsage(state, payload.message?.usage);
       enqueueRawBlock(controller, block);

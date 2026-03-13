@@ -109,7 +109,7 @@ test("transformRequestForCodex preserves tool call history after lifting system 
     {
       type: "message",
       role: "assistant",
-      content: [{ type: "input_text", text: "I'll check git status first." }]
+      content: [{ type: "output_text", text: "I'll check git status first." }]
     },
     {
       type: "function_call",

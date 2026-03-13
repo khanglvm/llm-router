@@ -193,10 +193,15 @@ function normalizeMessageRole(role) {
   return 'user';
 }
 
-function normalizeInputMessageContent(content) {
+function getResponsesTextPartTypeForRole(role) {
+  return normalizeMessageRole(role) === 'assistant' ? 'output_text' : 'input_text';
+}
+
+function normalizeInputMessageContent(content, role) {
+  const textPartType = getResponsesTextPartTypeForRole(role);
   if (typeof content === 'string') {
     return content
-      ? [{ type: 'input_text', text: content }]
+      ? [{ type: textPartType, text: content }]
       : [];
   }
 
@@ -208,7 +213,7 @@ function normalizeInputMessageContent(content) {
 
     if ((part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') && typeof part.text === 'string') {
       parts.push({
-        type: 'input_text',
+        type: textPartType,
         text: part.text
       });
       continue;
@@ -284,11 +289,12 @@ function convertMessagesToResponseInput(messages) {
       continue;
     }
 
-    const contentParts = normalizeInputMessageContent(normalizedMessage.content);
+    const normalizedRole = normalizeMessageRole(normalizedMessage.role);
+    const contentParts = normalizeInputMessageContent(normalizedMessage.content, normalizedRole);
     if (contentParts.length > 0) {
       items.push({
         type: 'message',
-        role: normalizeMessageRole(normalizedMessage.role),
+        role: normalizedRole,
         content: contentParts
       });
     } else {
@@ -296,8 +302,11 @@ function convertMessagesToResponseInput(messages) {
       if (fallbackText) {
         items.push({
           type: 'message',
-          role: normalizeMessageRole(normalizedMessage.role),
-          content: [{ type: 'input_text', text: fallbackText }]
+          role: normalizedRole,
+          content: [{
+            type: getResponsesTextPartTypeForRole(normalizedRole),
+            text: fallbackText
+          }]
         });
       }
     }
