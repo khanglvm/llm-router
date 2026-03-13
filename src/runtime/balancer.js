@@ -55,6 +55,66 @@ function resolveCandidateWeight(candidate) {
   return Math.floor(parsed);
 }
 
+function resolveCandidateContextWindow(candidate) {
+  const raw = candidate?.contextWindow ?? candidate?.model?.contextWindow;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function shouldApplyContextAwareOrdering(route, estimatedRequiredTokens) {
+  if (!Number.isFinite(estimatedRequiredTokens) || estimatedRequiredTokens <= 0) return false;
+  return Boolean(route?.routeStrategy || route?.routeType === "alias");
+}
+
+function partitionEligibleEntriesByContextWindow(eligibleEntries, estimatedRequiredTokens) {
+  if (!Array.isArray(eligibleEntries) || eligibleEntries.length <= 1) {
+    return {
+      prioritizedEntries: [...(eligibleEntries || [])],
+      deferredEntries: []
+    };
+  }
+
+  const fittingKnown = [];
+  const unknownWindow = [];
+  const tooSmallKnown = [];
+
+  for (const entry of eligibleEntries) {
+    const contextWindow = resolveCandidateContextWindow(entry?.candidate);
+    if (!contextWindow) {
+      unknownWindow.push(entry);
+      continue;
+    }
+
+    if (contextWindow >= estimatedRequiredTokens) {
+      fittingKnown.push(entry);
+      continue;
+    }
+
+    tooSmallKnown.push(entry);
+  }
+
+  const prioritizedEntries = [...fittingKnown, ...unknownWindow];
+  if (prioritizedEntries.length === 0) {
+    return {
+      prioritizedEntries: [...tooSmallKnown].sort((left, right) => {
+        const leftWindow = resolveCandidateContextWindow(left?.candidate) || 0;
+        const rightWindow = resolveCandidateContextWindow(right?.candidate) || 0;
+        if (rightWindow !== leftWindow) {
+          return rightWindow - leftWindow;
+        }
+        return sortEntriesByOriginalOrder(left, right);
+      }),
+      deferredEntries: []
+    };
+  }
+
+  return {
+    prioritizedEntries,
+    deferredEntries: tooSmallKnown
+  };
+}
+
 function resolveHealthState(candidateState, now) {
   const openUntil = Math.max(
     normalizeNonNegativeInteger(candidateState?.openUntil),
@@ -229,6 +289,7 @@ export async function rankRouteCandidates({
   stateStore,
   config,
   rateLimitEvaluations,
+  requestContext,
   now = Date.now()
 }) {
   const normalizedStrategy = normalizeStrategyName(strategy || route?.routeStrategy || route?.strategy);
@@ -254,14 +315,30 @@ export async function rankRouteCandidates({
   const ineligibleEntries = entries
     .filter((entry) => !entry.eligible)
     .sort(sortEntriesByOriginalOrder);
+  const estimatedRequiredTokens = normalizeNonNegativeInteger(
+    requestContext?.estimatedRequiredTokens ??
+    requestContext?.requiredTokens ??
+    requestContext?.totalTokensEstimate
+  );
 
   const routeCursor = stateStore
     ? await stateStore.getRouteCursor(resolvedRouteKey)
     : 0;
-  const ranking = rankEligibleEntries(normalizedStrategy, eligibleEntries, routeCursor);
+  const contextAwareGroups = shouldApplyContextAwareOrdering(route, estimatedRequiredTokens)
+    ? partitionEligibleEntriesByContextWindow(eligibleEntries, estimatedRequiredTokens)
+    : {
+        prioritizedEntries: eligibleEntries,
+        deferredEntries: []
+      };
+  const ranking = rankEligibleEntries(
+    normalizedStrategy,
+    contextAwareGroups.prioritizedEntries,
+    routeCursor
+  );
 
   const rankedEntries = [
     ...ranking.orderedEligible,
+    ...contextAwareGroups.deferredEntries,
     ...ineligibleEntries
   ];
 

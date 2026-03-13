@@ -249,7 +249,7 @@ export function spawnStartProcess({
   env = process.env
 } = {}) {
   const finalCliPath = normalizeCliPath(cliPath || env.LLM_ROUTER_CLI_PATH || process.argv[1] || "");
-  if (!finalCliPath) throw new Error("Cannot spawn llm-router start: CLI path is unknown.");
+  if (!finalCliPath) throw new Error("Cannot spawn LLM Router start: CLI path is unknown.");
 
   const args = [
     finalCliPath,

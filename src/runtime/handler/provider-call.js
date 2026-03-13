@@ -31,6 +31,11 @@ import {
   handleCodexStreamToOpenAI
 } from "../codex-response-transformer.js";
 import { toBoolean } from "./utils.js";
+import {
+  maybeInterceptAmpWebSearch,
+  rewriteProviderBodyForAmpWebSearch,
+  shouldInterceptAmpWebSearch
+} from "./amp-web-search.js";
 
 async function toProviderError(response) {
   const raw = await response.text();
@@ -88,7 +93,8 @@ async function adaptProviderResponse({
   fallbackModel,
   requestKind,
   requestBody,
-  clientType
+  clientType,
+  env
 }) {
   const buildSuccessResponse = async (resultResponse) => ({
     ok: true,
@@ -97,7 +103,8 @@ async function adaptProviderResponse({
     response: await maybeRewriteAmpClientResponse(resultResponse, {
       clientType,
       requestBody,
-      stream
+      stream,
+      env
     })
   });
 
@@ -205,6 +212,228 @@ function extractToolTypes(body) {
   )];
 }
 
+function isOpenAIHostedWebSearchRequest(targetFormat, requestKind) {
+  return targetFormat === FORMATS.OPENAI && requestKind === "responses";
+}
+
+function normalizeOpenAIHostedWebSearchType(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isOpenAIHostedWebSearchToolType(type) {
+  const normalized = normalizeOpenAIHostedWebSearchType(type);
+  return normalized === "web_search" || normalized.startsWith("web_search_preview");
+}
+
+function isOpenAINativeWebSearchToolType(type) {
+  const normalized = normalizeOpenAIHostedWebSearchType(type);
+  return normalized === "web_search"
+    || (normalized.startsWith("web_search_") && !normalized.startsWith("web_search_preview"));
+}
+
+function hasOpenAIHostedWebSearchTool(body) {
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  return tools.some((tool) =>
+    isOpenAIHostedWebSearchToolType(tool?.type) || isOpenAINativeWebSearchToolType(tool?.type)
+  );
+}
+
+function normalizeOpenAIHostedWebSearchToolChoice(toolChoice, toolType) {
+  if (typeof toolChoice === "string") {
+    const normalized = normalizeOpenAIHostedWebSearchType(toolChoice);
+    if (isOpenAIHostedWebSearchToolType(normalized) || isOpenAINativeWebSearchToolType(normalized)) {
+      return "required";
+    }
+    return toolChoice;
+  }
+  if (!toolChoice || typeof toolChoice !== "object" || Array.isArray(toolChoice)) {
+    return toolChoice;
+  }
+
+  const normalizedType = normalizeOpenAIHostedWebSearchType(toolChoice.type);
+  if (normalizedType === "none" || normalizedType === "auto") {
+    return normalizedType;
+  }
+  if (!isOpenAIHostedWebSearchToolType(normalizedType) && !isOpenAINativeWebSearchToolType(normalizedType)) {
+    return toolChoice;
+  }
+
+  void toolType;
+  return "required";
+}
+
+function rewriteProviderBodyForOpenAIHostedWebSearch(providerBody, toolType) {
+  if (!toolType || !isOpenAINativeWebSearchToolType(toolType)) {
+    return {
+      providerBody,
+      rewritten: false
+    };
+  }
+
+  const tools = Array.isArray(providerBody?.tools) ? providerBody.tools : null;
+  let rewritten = false;
+  const nextTools = tools
+    ? tools.map((tool) => {
+      if (!tool || typeof tool !== "object" || !isOpenAIHostedWebSearchToolType(tool.type)) {
+        return tool;
+      }
+      if (normalizeOpenAIHostedWebSearchType(tool.type) === toolType) {
+        return tool;
+      }
+      rewritten = true;
+      return {
+        ...tool,
+        type: toolType
+      };
+    })
+    : tools;
+
+  const nextToolChoice = normalizeOpenAIHostedWebSearchToolChoice(providerBody?.tool_choice, toolType);
+  if (nextToolChoice !== providerBody?.tool_choice) {
+    rewritten = true;
+  }
+
+  if (!rewritten) {
+    return {
+      providerBody,
+      rewritten: false
+    };
+  }
+
+  return {
+    rewritten: true,
+    providerBody: {
+      ...providerBody,
+      ...(nextTools ? { tools: nextTools } : {}),
+      ...(nextToolChoice !== undefined ? { tool_choice: nextToolChoice } : {})
+    }
+  };
+}
+
+function getProviderOpenAIHostedWebSearchToolType(provider, { targetFormat, requestKind } = {}) {
+  if (!isOpenAIHostedWebSearchRequest(targetFormat, requestKind)) return "";
+
+  const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
+  if (subscriptionType === "chatgpt-codex") {
+    return "web_search";
+  }
+
+  const candidates = [
+    provider?.lastProbe?.openaiResponses?.webSearchToolType,
+    provider?.lastProbe?.toolSupport?.openaiResponses?.webSearchToolType,
+    provider?.metadata?.openaiResponses?.webSearchToolType,
+    provider?.metadata?.toolSupport?.openaiResponses?.webSearchToolType
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeOpenAIHostedWebSearchType(candidate);
+    if (isOpenAINativeWebSearchToolType(normalized)) {
+      return normalized;
+    }
+  }
+
+  return "";
+}
+
+async function readProviderErrorHint(response) {
+  if (!(response instanceof Response)) return "";
+  try {
+    const raw = await response.clone().text();
+    if (!raw) return "";
+    const parsed = parseJsonSafely(raw);
+    return [
+      parsed?.error?.code,
+      parsed?.error?.type,
+      parsed?.error?.message,
+      parsed?.error,
+      parsed?.code,
+      parsed?.type,
+      parsed?.message,
+      raw
+    ]
+      .filter((entry) => entry !== undefined && entry !== null)
+      .map((entry) => String(entry).toLowerCase())
+      .join(" ");
+  } catch {
+    return "";
+  }
+}
+
+function isUnsupportedOpenAIHostedWebSearchHint(hint) {
+  const normalized = String(hint || "").toLowerCase();
+  if (!normalized || !normalized.includes("web_search")) return false;
+  return normalized.includes("unsupported tool type")
+    || normalized.includes("tool type is not supported")
+    || normalized.includes("tool is not supported")
+    || normalized.includes("does not support tool")
+    || normalized.includes("unsupported tool");
+}
+
+async function maybeRetryOpenAIHostedWebSearchProviderRequest({
+  response,
+  executeProviderRequest,
+  providerBody,
+  targetFormat,
+  requestKind
+} = {}) {
+  if (!(response instanceof Response) || typeof executeProviderRequest !== "function") {
+    return {
+      response,
+      providerBody,
+      retried: false
+    };
+  }
+  if (!isOpenAIHostedWebSearchRequest(targetFormat, requestKind) || !hasOpenAIHostedWebSearchTool(providerBody)) {
+    return {
+      response,
+      providerBody,
+      retried: false
+    };
+  }
+
+  const rewritten = rewriteProviderBodyForOpenAIHostedWebSearch(providerBody, "web_search");
+  if (!rewritten.rewritten) {
+    return {
+      response,
+      providerBody,
+      retried: false
+    };
+  }
+
+  const errorHint = await readProviderErrorHint(response);
+  if (!errorHint.includes("web_search_preview") || !isUnsupportedOpenAIHostedWebSearchHint(errorHint)) {
+    return {
+      response,
+      providerBody,
+      retried: false
+    };
+  }
+
+  try {
+    const retriedResponse = await executeProviderRequest(rewritten.providerBody);
+    return {
+      response: retriedResponse instanceof Response ? retriedResponse : response,
+      providerBody: rewritten.providerBody,
+      retried: retriedResponse instanceof Response
+    };
+  } catch {
+    return {
+      response,
+      providerBody,
+      retried: false
+    };
+  }
+}
+
+async function resolveHostedWebSearchErrorKind(response, providerBody, { targetFormat, requestKind } = {}) {
+  if (!isOpenAIHostedWebSearchRequest(targetFormat, requestKind) || !hasOpenAIHostedWebSearchTool(providerBody)) {
+    return "";
+  }
+
+  const errorHint = await readProviderErrorHint(response);
+  return isUnsupportedOpenAIHostedWebSearchHint(errorHint) ? "not_supported_error" : "";
+}
+
 function logToolRouting({ env, clientType, candidate, originalBody, providerBody, sourceFormat, targetFormat } = {}) {
   if (!isProviderDebugEnabled(env)) return;
 
@@ -225,11 +454,19 @@ export async function makeProviderCall({
   requestKind,
   requestHeaders,
   env,
-  clientType
+  clientType,
+  runtimeConfig,
+  stateStore
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
   const translate = needsTranslation(sourceFormat, targetFormat);
+  const interceptAmpWebSearch = shouldInterceptAmpWebSearch({
+    clientType,
+    originalBody: body,
+    runtimeConfig,
+    env
+  });
 
   let providerBody = { ...body };
   if (translate) {
@@ -267,6 +504,20 @@ export async function makeProviderCall({
     targetModel: candidate.backend,
     requestHeaders
   });
+  const declaredOpenAIHostedWebSearchToolType = getProviderOpenAIHostedWebSearchToolType(provider, {
+    targetFormat,
+    requestKind
+  });
+  const declaredOpenAIHostedWebSearchRewrite = rewriteProviderBodyForOpenAIHostedWebSearch(
+    providerBody,
+    declaredOpenAIHostedWebSearchToolType
+  );
+  if (declaredOpenAIHostedWebSearchRewrite.rewritten) {
+    providerBody = declaredOpenAIHostedWebSearchRewrite.providerBody;
+  }
+  if (interceptAmpWebSearch) {
+    providerBody = rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat).providerBody;
+  }
   logToolRouting({
     env,
     clientType,
@@ -279,13 +530,14 @@ export async function makeProviderCall({
 
   if (isSubscriptionProvider(provider)) {
     const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
-    const subscriptionResult = await makeSubscriptionProviderCall({
+    const executeSubscriptionRequest = async (requestBody) => makeSubscriptionProviderCall({
       provider,
-      body: providerBody,
+      body: requestBody,
       // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
       stream: subscriptionType === "chatgpt-codex" ? true : Boolean(stream),
       env
     });
+    const subscriptionResult = await executeSubscriptionRequest(providerBody);
 
     if (!subscriptionResult?.ok) {
       return subscriptionResult;
@@ -307,9 +559,27 @@ export async function makeProviderCall({
     }
 
     const fallbackModel = candidate?.backend || providerBody?.model || "unknown";
+    let upstreamResponse = subscriptionResult.response;
+    if (interceptAmpWebSearch) {
+      const intercepted = await maybeInterceptAmpWebSearch({
+        response: upstreamResponse,
+        providerBody,
+        targetFormat,
+        requestKind,
+        stream,
+        runtimeConfig,
+        env,
+        stateStore,
+        executeProviderRequest: async (followUpBody) => {
+          const followUpResult = await executeSubscriptionRequest(followUpBody);
+          return followUpResult?.response instanceof Response ? followUpResult.response : null;
+        }
+      });
+      upstreamResponse = intercepted.response;
+    }
     if (subscriptionType !== "chatgpt-codex") {
       return adaptProviderResponse({
-        response: subscriptionResult.response,
+        response: upstreamResponse,
         stream,
         translate,
         sourceFormat,
@@ -317,7 +587,8 @@ export async function makeProviderCall({
         fallbackModel,
         requestKind,
         requestBody: body,
-        clientType
+        clientType,
+        env
       });
     }
 
@@ -328,7 +599,7 @@ export async function makeProviderCall({
           status: 200,
           retryable: false,
           response: await maybeRewriteAmpClientResponse(
-            passthroughResponseWithCors(subscriptionResult.response, {
+            passthroughResponseWithCors(upstreamResponse, {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
               Connection: "keep-alive"
@@ -336,13 +607,14 @@ export async function makeProviderCall({
             {
               clientType,
               requestBody: body,
-              stream
+              stream,
+              env
             }
           )
         };
       }
 
-      const parsedSubscriptionResponse = await extractCodexFinalResponse(subscriptionResult.response);
+      const parsedSubscriptionResponse = await extractCodexFinalResponse(upstreamResponse);
       if (!parsedSubscriptionResponse) {
         return {
           ok: false,
@@ -365,13 +637,14 @@ export async function makeProviderCall({
         response: await maybeRewriteAmpClientResponse(jsonResponse(parsedSubscriptionResponse), {
           clientType,
           requestBody: body,
-          stream
+          stream,
+          env
         })
       };
     }
 
     if (stream) {
-      const openAIStreamResponse = handleCodexStreamToOpenAI(subscriptionResult.response, {
+      const openAIStreamResponse = handleCodexStreamToOpenAI(upstreamResponse, {
         fallbackModel
       });
       if (sourceFormat === FORMATS.CLAUDE) {
@@ -382,7 +655,8 @@ export async function makeProviderCall({
           response: await maybeRewriteAmpClientResponse(handleOpenAIStreamToClaude(openAIStreamResponse), {
             clientType,
             requestBody: body,
-            stream
+            stream,
+            env
           })
         };
       }
@@ -393,12 +667,13 @@ export async function makeProviderCall({
         response: await maybeRewriteAmpClientResponse(openAIStreamResponse, {
           clientType,
           requestBody: body,
-          stream
+          stream,
+          env
         })
       };
     }
 
-    const parsedSubscriptionResponse = await extractCodexFinalResponse(subscriptionResult.response);
+    const parsedSubscriptionResponse = await extractCodexFinalResponse(upstreamResponse);
     if (!parsedSubscriptionResponse) {
       return {
         ok: false,
@@ -427,7 +702,8 @@ export async function makeProviderCall({
           {
             clientType,
             requestBody: body,
-            stream
+            stream,
+            env
           }
         )
       };
@@ -440,7 +716,8 @@ export async function makeProviderCall({
       response: await maybeRewriteAmpClientResponse(jsonResponse(openAINonStreamResponse), {
         clientType,
         requestBody: body,
-        stream
+        stream,
+        env
       })
     };
   }
@@ -451,6 +728,24 @@ export async function makeProviderCall({
     requestHeaders,
     targetFormat
   );
+  const executeHttpProviderRequest = async (requestBody) => {
+    const timeoutMs = resolveUpstreamTimeoutMs(env);
+    const timeoutControl = buildTimeoutSignal(timeoutMs);
+    try {
+      const init = {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody)
+      };
+      if (timeoutControl.signal) {
+        init.signal = timeoutControl.signal;
+      }
+
+      return await fetch(providerUrl, init);
+    } finally {
+      timeoutControl.cleanup();
+    }
+  };
 
   if (!providerUrl) {
     return {
@@ -469,23 +764,8 @@ export async function makeProviderCall({
   }
 
   let response;
-  let cleanupTimeout = () => {};
   try {
-    const timeoutMs = resolveUpstreamTimeoutMs(env);
-    const timeoutControl = buildTimeoutSignal(timeoutMs);
-    cleanupTimeout = timeoutControl.cleanup;
-    const init = {
-      method: "POST",
-      headers,
-      body: JSON.stringify(providerBody)
-    };
-    if (timeoutControl.signal) {
-      init.signal = timeoutControl.signal;
-    }
-
-    response = await fetch(providerUrl, {
-      ...init
-    });
+    response = await executeHttpProviderRequest(providerBody);
   } catch (error) {
     return {
       ok: false,
@@ -500,18 +780,54 @@ export async function makeProviderCall({
         }
       }, 503)
     };
-  } finally {
-    cleanupTimeout();
   }
 
   if (!response.ok) {
+    const retriedOpenAIHostedWebSearch = await maybeRetryOpenAIHostedWebSearchProviderRequest({
+      response,
+      executeProviderRequest: executeHttpProviderRequest,
+      providerBody,
+      targetFormat,
+      requestKind
+    });
+    response = retriedOpenAIHostedWebSearch.response;
+    providerBody = retriedOpenAIHostedWebSearch.providerBody;
+  }
+
+  if (!response.ok) {
+    const hostedWebSearchErrorKind = await resolveHostedWebSearchErrorKind(response, providerBody, {
+      targetFormat,
+      requestKind
+    });
     return {
       ok: false,
       status: response.status,
       retryable: shouldRetryStatus(response.status),
+      ...(hostedWebSearchErrorKind ? { errorKind: hostedWebSearchErrorKind } : {}),
       upstreamResponse: response,
       translateError: translate
     };
+  }
+
+  if (interceptAmpWebSearch) {
+    const intercepted = await maybeInterceptAmpWebSearch({
+      response,
+      providerBody,
+      targetFormat,
+      requestKind,
+      stream,
+      runtimeConfig,
+      env,
+      stateStore,
+      executeProviderRequest: async (followUpBody) => {
+        try {
+          return await executeHttpProviderRequest(followUpBody);
+        } catch {
+          return null;
+        }
+      }
+    });
+    response = intercepted.response;
   }
 
   return adaptProviderResponse({
@@ -523,6 +839,7 @@ export async function makeProviderCall({
     fallbackModel: candidate.backend,
     requestKind,
     requestBody: body,
-    clientType
+    clientType,
+    env
   });
 }

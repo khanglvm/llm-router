@@ -6,13 +6,14 @@ import { commitRouteSelection, rankRouteCandidates } from "./balancer.js";
 import { normalizeRuntimeConfig, resolveRequestedRoute } from "./config.js";
 import { getApplicableRateLimitBuckets } from "./rate-limits.js";
 
-function candidate(modelId, weight = 1) {
+function candidate(modelId, weight = 1, contextWindow = undefined) {
   return {
     providerId: "openrouter",
     modelId,
     requestModelId: `openrouter/${modelId}`,
     targetFormat: "openai",
-    routeWeight: weight
+    routeWeight: weight,
+    ...(Number.isFinite(contextWindow) ? { model: { contextWindow } } : {})
   };
 }
 
@@ -175,6 +176,61 @@ test("auto strategy de-prioritizes low remaining-capacity candidates", async () 
   assert.ok(high > low);
   assert.ok(high >= 75);
   assert.ok(low <= 25);
+});
+
+test("alias ranking defers known-too-small context windows behind candidates that can fit", async () => {
+  const store = createMemoryStateStore();
+  const small = candidate("small", 1, 128_000);
+  const large = candidate("large", 1, 200_000);
+
+  const ranked = await rankRouteCandidates({
+    route: {
+      routeType: "alias",
+      routeStrategy: "ordered",
+      routeRef: "chat.default"
+    },
+    routeKey: "route:context-aware",
+    strategy: "ordered",
+    candidates: [small, large],
+    stateStore: store,
+    requestContext: {
+      estimatedRequiredTokens: 150_000
+    }
+  });
+
+  assert.deepEqual(
+    ranked.rankedCandidates.map((entry) => entry.requestModelId),
+    ["openrouter/large", "openrouter/small"]
+  );
+  assert.equal(ranked.selectedEntry?.candidate.requestModelId, "openrouter/large");
+});
+
+test("alias ranking prefers the largest undersized context window when no candidate fully fits", async () => {
+  const store = createMemoryStateStore();
+  const smaller = candidate("smaller", 1, 64_000);
+  const small = candidate("small", 1, 128_000);
+  const medium = candidate("medium", 1, 200_000);
+
+  const ranked = await rankRouteCandidates({
+    route: {
+      routeType: "alias",
+      routeStrategy: "ordered",
+      routeRef: "chat.default"
+    },
+    routeKey: "route:context-risk",
+    strategy: "ordered",
+    candidates: [smaller, small, medium],
+    stateStore: store,
+    requestContext: {
+      estimatedRequiredTokens: 1_000_000
+    }
+  });
+
+  assert.deepEqual(
+    ranked.rankedCandidates.map((entry) => entry.requestModelId),
+    ["openrouter/medium", "openrouter/small", "openrouter/smaller"]
+  );
+  assert.equal(ranked.selectedEntry?.candidate.requestModelId, "openrouter/medium");
 });
 
 test("integration: alias route rotates targets with round-robin strategy", async () => {

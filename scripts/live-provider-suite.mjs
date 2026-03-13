@@ -3,10 +3,8 @@
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
-import routerModule from "../src/cli/router-module.js";
 import { writeConfigFile, readConfigFile } from "../src/node/config-store.js";
 import { startLocalRouteServer } from "../src/node/local-server.js";
 import { applyLocalServerSettings } from "../src/node/local-server-settings.js";
@@ -20,7 +18,8 @@ const DEFAULT_MAX_TOKENS = 16;
 const DEFAULT_REQUEST_TEXT = "Reply with exactly: OK";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_WEB_HOST = "127.0.0.1";
-const DEFAULT_SURFACES = ["cli", "tui", "web"];
+const DEFAULT_SURFACES = ["cli", "web"];
+const SUPPORTED_SURFACES = ["cli", "web"];
 const DEFAULT_PROBE_RPM = 30;
 
 function parseArgs(argv) {
@@ -528,63 +527,6 @@ async function runRouteCases(baseUrl, config, options, selectionOptions) {
   return results;
 }
 
-function createQueuedPrompts(entries) {
-  const queue = [...entries];
-  const take = (type) => {
-    assert.ok(queue.length > 0, `No queued answer left for ${type}`);
-    const next = queue.shift();
-    if (next && typeof next === "object" && next.type === "cancel") {
-      throw new Error("Prompt cancelled");
-    }
-    if (next && typeof next === "object" && "type" in next) {
-      assert.equal(next.type, type);
-      return next.value;
-    }
-    if (next === "__cancel__") {
-      throw new Error("Prompt cancelled");
-    }
-    return next;
-  };
-
-  return {
-    select: async () => take("select"),
-    text: async () => take("text"),
-    confirm: async () => take("confirm"),
-    password: async () => take("password"),
-    multiselect: async () => take("multiselect"),
-    remaining: () => [...queue]
-  };
-}
-
-async function withForcedTty(callback) {
-  const stdoutDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  const stdinDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-
-  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
-  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
-
-  try {
-    return await callback();
-  } finally {
-    if (stdoutDescriptor) {
-      Object.defineProperty(process.stdout, "isTTY", stdoutDescriptor);
-    } else {
-      delete process.stdout.isTTY;
-    }
-    if (stdinDescriptor) {
-      Object.defineProperty(process.stdin, "isTTY", stdinDescriptor);
-    } else {
-      delete process.stdin.isTTY;
-    }
-  }
-}
-
-function getConfigAction() {
-  const action = routerModule.actions.find((entry) => entry.actionId === "config");
-  if (!action) throw new Error("Router config action is unavailable.");
-  return action;
-}
-
 async function readJsonResponse(response) {
   const text = await response.text();
   const payload = text ? JSON.parse(text) : null;
@@ -743,93 +685,6 @@ async function runCliSurface(provider, options) {
 
       return {
         surface: "cli",
-        providerId: provider.id,
-        configPath,
-        routeResults
-      };
-    } finally {
-      await closeServer(server);
-    }
-  } finally {
-    await fs.rm(tempDir, { recursive: true, force: true });
-  }
-}
-
-async function runTuiSurface(provider, options) {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-live-tui-"));
-  const configPath = path.join(tempDir, "tui.config.json");
-  const routerPort = await getAvailablePort(options.host);
-  const baseUrl = `http://${options.host}:${routerPort}`;
-  const configAction = getConfigAction();
-  const prompts = createQueuedPrompts([
-    { type: "select", value: "standard" },
-    { type: "text", value: provider.name },
-    { type: "text", value: provider.id },
-    { type: "password", value: provider.apiKey },
-    { type: "text", value: provider.endpoints.join(",") },
-    { type: "text", value: provider.models.join(",") },
-    { type: "text", value: JSON.stringify(provider.headers) },
-    { type: "confirm", value: true },
-    { type: "text", value: String(options.probeRequestsPerMinute) },
-    { type: "confirm", value: false }
-  ]);
-
-  console.log(`\n[tui] provider=${provider.id} endpoints=${provider.endpoints.join(",")} apiKey=${maskSecret(provider.apiKey)}`);
-
-  try {
-    const result = await withForcedTty(async () => configAction.run({
-      args: {
-        operation: "upsert-provider",
-        config: configPath
-      },
-      mode: "commandline",
-      forcePrompt: true,
-      prompts,
-      terminal: {
-        line(message) {
-          if (message) process.stdout.write(`[tui] ${String(message)}\n`);
-        },
-        info(message) {
-          if (message) process.stdout.write(`[tui] ${String(message)}\n`);
-        },
-        warn(message) {
-          if (message) process.stdout.write(`[tui] ${String(message)}\n`);
-        },
-        error(message) {
-          if (message) process.stderr.write(`[tui] ${String(message)}\n`);
-        }
-      }
-    }));
-
-    if (!result?.ok) {
-      throw new Error(result?.errorMessage || "TUI upsert-provider failed.");
-    }
-    if (prompts.remaining().length > 0) {
-      throw new Error(`TUI prompt queue was not fully consumed (${prompts.remaining().length} answers left).`);
-    }
-
-    const savedConfig = await readConfigFile(configPath);
-    const server = await startLocalRouteServer({
-      host: options.host,
-      port: routerPort,
-      configPath,
-      watchConfig: false,
-      requireAuth: false
-    });
-
-    try {
-      const healthy = await waitForHealth(baseUrl, options.timeoutMs);
-      if (!healthy) {
-        throw new Error(`TUI surface router did not become healthy on ${baseUrl} within ${options.timeoutMs} ms.`);
-      }
-
-      const routeResults = await runRouteCases(baseUrl, savedConfig, options, {
-        preferredTypes: ["claude", "openai"],
-        maxCases: 1
-      });
-
-      return {
-        surface: "tui",
         providerId: provider.id,
         configPath,
         routeResults
@@ -1020,13 +875,12 @@ function printUsage() {
     "",
     "Runs real provider coverage across:",
     "  - CLI non-interactive config flow",
-    "  - prompt-driven TUI config flow",
     "  - Web console provider discovery / test / save / router control flow",
     "",
     "Usage:",
     "  node scripts/live-provider-suite.mjs",
     "  node scripts/live-provider-suite.mjs --env-file=.env.test-suite.local",
-    "  node scripts/live-provider-suite.mjs --surfaces=cli,tui,web",
+    "  node scripts/live-provider-suite.mjs --surfaces=cli,web",
     "",
     "Provider sources:",
     "  --providers-json='[...]'",
@@ -1048,7 +902,7 @@ function printUsage() {
     "  --max-tokens=16",
     "  --request-text='Reply with exactly: OK'",
     "  --probe-requests-per-minute=30",
-    "  --surfaces=cli,tui,web"
+    "  --surfaces=cli,web"
   ].join("\n"));
 }
 
@@ -1074,7 +928,7 @@ export async function main(rawArgv = process.argv.slice(2)) {
   }
 
   const surfaces = dedupeStrings(splitCsv(args.surfaces || DEFAULT_SURFACES.join(","))).map((value) => value.toLowerCase());
-  const invalidSurfaces = surfaces.filter((value) => !DEFAULT_SURFACES.includes(value));
+  const invalidSurfaces = surfaces.filter((value) => !SUPPORTED_SURFACES.includes(value));
   if (invalidSurfaces.length > 0) {
     throw new Error(`Unsupported surface(s): ${invalidSurfaces.join(", ")}.`);
   }
@@ -1102,11 +956,6 @@ export async function main(rawArgv = process.argv.slice(2)) {
 
   if (surfaces.includes("cli")) {
     results.push(await runCliSurface(providers[0], options));
-  }
-
-  if (surfaces.includes("tui")) {
-    const provider = providers[Math.min(1, providers.length - 1)];
-    results.push(await runTuiSurface(provider, options));
   }
 
   if (surfaces.includes("web")) {

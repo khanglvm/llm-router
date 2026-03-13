@@ -5,8 +5,19 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { TextDecoder, TextEncoder } from "node:util";
+import { JSDOM, VirtualConsole } from "jsdom";
 import { detectAvailableEditors, startWebConsoleServer } from "./web-console-server.js";
+import { appendActivityLogEntry, resolveActivityLogPath } from "./activity-log.js";
+import { resolveCodingToolBackupFilePath } from "./coding-tool-config.js";
 import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
+import { DEFAULT_MODEL_ALIAS_ID } from "../runtime/config.js";
+import { createFileStateStore } from "../runtime/state-store.file.js";
+import { resolveWindowRange } from "../runtime/rate-limits.js";
+import {
+  CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL,
+  CODEX_CLI_INHERIT_MODEL_VALUE
+} from "../shared/coding-tool-bindings.js";
 
 async function makeTempConfig(contents) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "llm-router-web-"));
@@ -44,6 +55,19 @@ async function makeCodingToolEnv() {
     },
     claudeEnv: {
       CLAUDE_CONFIG_DIR: path.join(dir, ".claude")
+    },
+    async cleanup() {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
+}
+
+async function makeRuntimeEnv() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "llm-router-runtime-"));
+  return {
+    dir,
+    env: {
+      LLM_ROUTER_STATE_FILE_PATH: path.join(dir, "state.json")
     },
     async cleanup() {
       await rm(dir, { recursive: true, force: true });
@@ -117,13 +141,166 @@ function getClaudeSettingsPath(env) {
 }
 
 function getToolBackupPath(filePath) {
-  return `${filePath}.llm_router_backup`;
+  return resolveCodingToolBackupFilePath(filePath);
 }
+
+test("resolveCodingToolBackupFilePath inserts the backup marker before the final extension", () => {
+  assert.equal(
+    resolveCodingToolBackupFilePath("/tmp/config.toml"),
+    "/tmp/config.llm_router_backup.toml"
+  );
+  assert.equal(
+    resolveCodingToolBackupFilePath("/tmp/settings.json"),
+    "/tmp/settings.llm_router_backup.json"
+  );
+  assert.equal(
+    resolveCodingToolBackupFilePath("/tmp/config"),
+    "/tmp/config.llm_router_backup"
+  );
+});
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
   const payload = await response.json();
   return { response, payload };
+}
+
+function createSilentEventSource(window) {
+  return class SilentEventSource extends window.EventTarget {
+    close() {}
+  };
+}
+
+async function loadWebConsoleDom(baseUrl, { fetchImpl = null } = {}) {
+  const errors = [];
+  const virtualConsole = new VirtualConsole();
+
+  virtualConsole.on("jsdomError", (error) => {
+    if (String(error?.message || "").includes("Could not parse CSS stylesheet")) return;
+    errors.push(error?.stack || error?.message || String(error));
+  });
+  virtualConsole.on("error", (...args) => {
+    errors.push(args.map((arg) => arg?.stack || arg?.message || String(arg)).join("\n"));
+  });
+
+  const dom = await JSDOM.fromURL(baseUrl, {
+    resources: "usable",
+    runScripts: "dangerously",
+    pretendToBeVisual: true,
+    virtualConsole,
+    beforeParse(window) {
+      window.fetch = (input, init) => {
+        const resolvedFetch = typeof fetchImpl === "function" ? fetchImpl : globalThis.fetch;
+        if (typeof input === "string" || input instanceof URL) {
+          return resolvedFetch(new URL(String(input), window.location.href), init, window);
+        }
+        if (input instanceof window.Request) {
+          return resolvedFetch(new URL(input.url, window.location.href), init, window);
+        }
+        return resolvedFetch(input, init, window);
+      };
+      window.Headers = globalThis.Headers;
+      window.Request = globalThis.Request;
+      window.Response = globalThis.Response;
+      window.AbortController = globalThis.AbortController;
+      window.AbortSignal = globalThis.AbortSignal;
+      window.TextEncoder = TextEncoder;
+      window.TextDecoder = TextDecoder;
+      window.confirm = () => true;
+      window.matchMedia = () => ({
+        matches: false,
+        media: "",
+        onchange: null,
+        addListener() {},
+        removeListener() {},
+        addEventListener() {},
+        removeEventListener() {},
+        dispatchEvent() { return false; }
+      });
+      window.requestAnimationFrame = (callback) => setTimeout(() => callback(Date.now()), 16);
+      window.cancelAnimationFrame = (handle) => clearTimeout(handle);
+      window.ResizeObserver = class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      };
+      window.PointerEvent = window.MouseEvent;
+      window.HTMLElement.prototype.scrollIntoView = function scrollIntoView() {};
+      window.navigator.clipboard = {
+        async writeText() {}
+      };
+      if (!window.crypto?.getRandomValues) {
+        Object.defineProperty(window, "crypto", {
+          configurable: true,
+          value: globalThis.crypto
+        });
+      }
+      window.EventSource = createSilentEventSource(window);
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for document load.")), 15_000);
+    dom.window.addEventListener("load", () => {
+      clearTimeout(timeout);
+      resolve();
+    }, { once: true });
+  });
+
+  return { dom, errors };
+}
+
+async function waitForDomText(dom, text, timeoutMs = 15_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if ((dom.window.document.body?.textContent || "").includes(text)) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for DOM text: ${text}`);
+}
+
+async function waitForDomCondition(check, timeoutMs = 15_000, failureMessage = "Timed out waiting for DOM condition.") {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(failureMessage);
+}
+
+async function waitForAsyncCondition(check, timeoutMs = 15_000, failureMessage = "Timed out waiting for async condition.") {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(failureMessage);
+}
+
+async function waitForDomTextToDisappear(dom, text, timeoutMs = 15_000) {
+  await waitForDomCondition(
+    () => !(dom.window.document.body?.textContent || "").includes(text),
+    timeoutMs,
+    `Timed out waiting for DOM text to disappear: ${text}`
+  );
+}
+
+function findButtonByText(root, text) {
+  return Array.from(root.querySelectorAll("button")).find((button) => (button.textContent || "").trim().includes(text)) || null;
+}
+
+function setInputValue(window, input, value) {
+  const prototype = input instanceof window.HTMLTextAreaElement
+    ? window.HTMLTextAreaElement.prototype
+    : window.HTMLInputElement.prototype;
+  const valueSetter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  if (typeof valueSetter === "function") {
+    valueSetter.call(input, value);
+  } else {
+    input.value = value;
+  }
+  input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  input.dispatchEvent(new window.Event("change", { bubbles: true }));
 }
 
 async function getAvailablePort() {
@@ -299,8 +476,655 @@ test("web console state exposes config metadata and raw text", async () => {
     assert.equal(payload.config.providerCount, 1);
     assert.match(payload.config.rawText, /"demo"/);
     assert.equal(payload.config.localServer.port, FIXED_LOCAL_ROUTER_PORT);
+    assert.equal(payload.activityLog.enabled, true);
     assert.match(payload.startup.label, /startup|launchagent|systemd/i);
     assert.equal(Array.isArray(payload.logs), true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console state exposes live AMP web search quota state", async () => {
+  const runtime = await makeRuntimeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    amp: {
+      webSearch: {
+        strategy: "ordered",
+        count: 5,
+        providers: [
+          {
+            id: "brave",
+            apiKey: "brave_test_key",
+            limit: 10,
+            remaining: 5
+          }
+        ]
+      }
+    }
+  });
+  const stateStore = await createFileStateStore({
+    filePath: runtime.env.LLM_ROUTER_STATE_FILE_PATH
+  });
+  const monthWindowKey = `${resolveWindowRange({ unit: "month", size: 1 }).key}:sync=5`;
+  await stateStore.incrementBucketUsage("amp-web-search:brave", monthWindowKey, 2, {
+    expiresAt: Date.now() + 60_000
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    runtimeEnv: runtime.env
+  });
+
+  try {
+    const { response, payload } = await fetchJson(`${server.url}/api/state`);
+    assert.equal(response.status, 200);
+    assert.equal(payload.webSearch?.interceptEnabled, true);
+    assert.equal(payload.webSearch?.providers?.[0]?.id, "brave");
+    assert.equal(payload.webSearch?.providers?.[0]?.currentRemaining, 3);
+    assert.equal(payload.webSearch?.providers?.[0]?.usedSinceSync, 2);
+    assert.equal(payload.ampWebSearch?.providers?.[0]?.id, "brave");
+  } finally {
+    await stateStore.close();
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await runtime.cleanup();
+  }
+});
+
+test("web console clearing a web-search credential stops showing Saved immediately", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key",
+          limit: 1000,
+          remaining: 1000
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    await waitForDomText(dom, "OpenAI");
+
+    const webSearchTab = Array.from(dom.window.document.querySelectorAll('[role="tab"]'))
+      .find((button) => (button.textContent || "").trim().includes("Web Search"));
+    assert.ok(webSearchTab);
+    webSearchTab.dispatchEvent(new dom.window.PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    webSearchTab.click();
+
+    await waitForDomCondition(
+      () => Boolean(dom.window.document.querySelector('input[placeholder="brv_..."]')),
+      15_000,
+      "Timed out waiting for the Brave API key input."
+    );
+
+    const braveInput = dom.window.document.querySelector('input[placeholder="brv_..."]');
+    assert.ok(braveInput);
+
+    setInputValue(dom.window, braveInput, "brave_next_key");
+    await waitForDomText(dom, "Last saved");
+
+    setInputValue(dom.window, braveInput, "");
+
+    await waitForDomCondition(() => {
+      const text = dom.window.document.body.textContent || "";
+      return !text.includes("Last saved")
+        && (
+          text.includes("Unsaved changes queued. Auto-save will run shortly.")
+          || text.includes("saving...")
+        );
+    }, 4_000, "Timed out waiting for the web-search autosave status to leave Saved.");
+
+    dom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console web-search shows saving state while autosave is in flight", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key",
+          limit: 1000,
+          remaining: 1000
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  let applyCallCount = 0;
+  let delayedSaveStarted = false;
+  let releaseDelayedSave = () => {};
+  const delayedSaveGate = new Promise((resolve) => {
+    releaseDelayedSave = resolve;
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url, {
+      fetchImpl: async (input, init) => {
+        const url = String(input || "");
+        if (url.endsWith("/api/amp/apply")) {
+          applyCallCount += 1;
+          if (applyCallCount >= 2) {
+            delayedSaveStarted = true;
+            await delayedSaveGate;
+          }
+        }
+        return globalThis.fetch(input, init);
+      }
+    });
+    await waitForDomText(dom, "OpenAI");
+
+    const webSearchTab = Array.from(dom.window.document.querySelectorAll('[role="tab"]'))
+      .find((button) => (button.textContent || "").trim().includes("Web Search"));
+    assert.ok(webSearchTab);
+    webSearchTab.dispatchEvent(new dom.window.PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    webSearchTab.click();
+
+    await waitForDomCondition(
+      () => Boolean(dom.window.document.querySelector('input[placeholder="brv_..."]')),
+      15_000,
+      "Timed out waiting for the Brave API key input."
+    );
+
+    const braveInput = dom.window.document.querySelector('input[placeholder="brv_..."]');
+    assert.ok(braveInput);
+
+    setInputValue(dom.window, braveInput, "brave_next_key");
+    await waitForDomText(dom, "Last saved");
+
+    setInputValue(dom.window, braveInput, "brave_final_key");
+    await waitForAsyncCondition(
+      async () => delayedSaveStarted,
+      5_000,
+      "Timed out waiting for the delayed autosave request."
+    );
+
+    await waitForDomCondition(() => {
+      const text = dom.window.document.body.textContent || "";
+      return text.includes("Saving changes...") && !text.includes("Last saved");
+    }, 5_000, "Timed out waiting for the web-search autosave UI to show saving state.");
+
+    releaseDelayedSave();
+    await waitForDomText(dom, "Last saved");
+
+    dom.window.close();
+  } finally {
+    releaseDelayedSave();
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console web-search credential edits persist across reloads", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop",
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID,
+      webSearch: {
+        strategy: "ordered",
+        count: 5,
+        providers: [
+          {
+            id: "brave",
+            apiKey: "brave_test_key",
+            limit: 1000,
+            remaining: 1000
+          }
+        ]
+      }
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key",
+          limit: 1000,
+          remaining: 1000
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    await waitForDomText(dom, "OpenAI");
+
+    const webSearchTab = Array.from(dom.window.document.querySelectorAll('[role="tab"]'))
+      .find((button) => (button.textContent || "").trim().includes("Web Search"));
+    assert.ok(webSearchTab);
+    webSearchTab.dispatchEvent(new dom.window.PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    webSearchTab.click();
+
+    await waitForDomCondition(
+      () => Boolean(dom.window.document.querySelector('input[placeholder="brv_..."]'))
+        && Boolean(dom.window.document.querySelector('input[placeholder="tvly-..."]')),
+      15_000,
+      "Timed out waiting for the web-search credential inputs."
+    );
+
+    const braveInput = dom.window.document.querySelector('input[placeholder="brv_..."]');
+    const tavilyInput = dom.window.document.querySelector('input[placeholder="tvly-..."]');
+    assert.ok(braveInput);
+    assert.ok(tavilyInput);
+
+    setInputValue(dom.window, tavilyInput, "tavily_test_key");
+    await waitForAsyncCondition(async () => {
+      const persisted = JSON.parse(await readFile(fixture.configPath, "utf8"));
+      const providers = Array.isArray(persisted.webSearch?.providers) ? persisted.webSearch.providers : [];
+      return providers.some((provider) => provider?.id === "tavily" && provider?.apiKey === "tavily_test_key");
+    }, 10_000, "Timed out waiting for the Tavily credential to persist.");
+
+    setInputValue(dom.window, braveInput, "");
+    await waitForAsyncCondition(async () => {
+      const persisted = JSON.parse(await readFile(fixture.configPath, "utf8"));
+      const providers = Array.isArray(persisted.webSearch?.providers) ? persisted.webSearch.providers : [];
+      return !providers.some((provider) => provider?.id === "brave" && provider?.apiKey)
+        && providers.some((provider) => provider?.id === "tavily" && provider?.apiKey === "tavily_test_key")
+        && !Object.prototype.hasOwnProperty.call(persisted.amp || {}, "webSearch");
+    }, 10_000, "Timed out waiting for the Brave credential to clear.");
+
+    dom.window.close();
+
+    const { dom: reloadedDom } = await loadWebConsoleDom(server.url);
+    await waitForDomText(reloadedDom, "OpenAI");
+
+    const reloadedWebSearchTab = Array.from(reloadedDom.window.document.querySelectorAll('[role="tab"]'))
+      .find((button) => (button.textContent || "").trim().includes("Web Search"));
+    assert.ok(reloadedWebSearchTab);
+    reloadedWebSearchTab.dispatchEvent(new reloadedDom.window.PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    reloadedWebSearchTab.dispatchEvent(new reloadedDom.window.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    reloadedWebSearchTab.dispatchEvent(new reloadedDom.window.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    reloadedWebSearchTab.click();
+
+    await waitForDomCondition(
+      () => Boolean(reloadedDom.window.document.querySelector('input[placeholder="brv_..."]'))
+        && Boolean(reloadedDom.window.document.querySelector('input[placeholder="tvly-..."]')),
+      15_000,
+      "Timed out waiting for the reloaded web-search inputs."
+    );
+
+    assert.equal(reloadedDom.window.document.querySelector('input[placeholder="brv_..."]')?.value || "", "");
+    assert.equal(reloadedDom.window.document.querySelector('input[placeholder="tvly-..."]')?.value || "", "tavily_test_key");
+
+    reloadedDom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console can add a hosted GPT web-search endpoint from the modal", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "rc/gpt-5.4" }],
+        fallbackTargets: []
+      }
+    },
+    providers: [
+      {
+        id: "rc",
+        name: "RamClouds",
+        baseUrl: "https://ramclouds.me",
+        format: "openai",
+        formats: ["openai"],
+        apiKey: "rc_test_key",
+        models: [{ id: "gpt-5.4", formats: ["openai"] }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-5.4"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: []
+    }
+  });
+  const hostedSearchTests = [];
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    testHostedWebSearchProvider: async ({ providerId, modelId }) => {
+      hostedSearchTests.push({ providerId, modelId });
+      return {
+        routeId: `${providerId}/${modelId}`,
+        providerId,
+        providerName: "RamClouds",
+        modelId,
+        label: "RamClouds · gpt-5.4",
+        usedWebSearch: true,
+        text: "Sunrise in Paris today is 7:10 AM according to Time and Date."
+      };
+    }
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    await waitForDomText(dom, "RamClouds");
+
+    const webSearchTab = Array.from(dom.window.document.querySelectorAll('[role="tab"]'))
+      .find((button) => (button.textContent || "").trim().includes("Web Search"));
+    assert.ok(webSearchTab);
+    webSearchTab.dispatchEvent(new dom.window.PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    webSearchTab.dispatchEvent(new dom.window.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    webSearchTab.click();
+
+    await waitForDomCondition(() => {
+      return Array.from(dom.window.document.querySelectorAll("button"))
+        .some((button) => (button.textContent || "").trim() === "Endpoint");
+    }, 15_000, "Timed out waiting for the hosted search endpoint button.");
+
+    const addButton = Array.from(dom.window.document.querySelectorAll("button"))
+      .find((button) => (button.textContent || "").trim() === "Endpoint");
+    assert.ok(addButton);
+    addButton.click();
+
+    await waitForDomText(dom, "Saved route id");
+    await waitForDomText(dom, "rc/gpt-5.4");
+
+    const testButton = Array.from(dom.window.document.querySelectorAll("button"))
+      .find((button) => (button.textContent || "").trim() === "Test connection");
+    assert.ok(testButton);
+    testButton.click();
+
+    await waitForAsyncCondition(async () => {
+      const persisted = JSON.parse(await readFile(fixture.configPath, "utf8"));
+      const providers = Array.isArray(persisted.webSearch?.providers) ? persisted.webSearch.providers : [];
+      return providers.some((provider) => provider?.id === "rc/gpt-5.4" && provider?.providerId === "rc" && provider?.model === "gpt-5.4");
+    }, 10_000, "Timed out waiting for the hosted GPT web-search route to persist.");
+
+    assert.deepEqual(hostedSearchTests, [
+      {
+        providerId: "rc",
+        modelId: "gpt-5.4"
+      }
+    ]);
+
+    dom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console amp apply persists a cleared web-search provider", async () => {
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key",
+          limit: 1000,
+          remaining: 1000
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const nextConfig = structuredClone(initial.payload.config.document);
+    nextConfig.webSearch.providers = [];
+
+    const saved = await fetchJson(`${server.url}/api/amp/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: JSON.stringify(nextConfig),
+        source: "autosave"
+      })
+    });
+
+    assert.equal(saved.response.status, 200);
+    assert.deepEqual(saved.payload.config.document.webSearch.providers, []);
+    assert.equal(Object.prototype.hasOwnProperty.call(saved.payload.config.document.amp || {}, "webSearch"), false);
+
+    const persisted = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.deepEqual(persisted.webSearch?.providers, []);
+    assert.equal(Object.prototype.hasOwnProperty.call(persisted.amp || {}, "webSearch"), false);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console can toggle activity logging and clear the shared log file", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const activityLogPath = resolveActivityLogPath(fixture.configPath);
+  await appendActivityLogEntry(activityLogPath, {
+    level: "warn",
+    message: "Seeded runtime activity",
+    detail: "Fallback moved to backup model.",
+    source: "runtime"
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    assert.equal(initial.response.status, 200);
+    assert.equal(initial.payload.activityLog.enabled, true);
+    assert.equal(initial.payload.logs.some((entry) => entry.message === "Seeded runtime activity"), true);
+    assert.equal(initial.payload.logs.find((entry) => entry.message === "Seeded runtime activity")?.category, "usage");
+
+    const disabled = await fetchJson(`${server.url}/api/activity-log/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: false })
+    });
+    assert.equal(disabled.response.status, 200);
+    assert.equal(disabled.payload.activityLog.enabled, false);
+
+    const disabledConfig = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(disabledConfig.metadata.activityLog.enabled, false);
+
+    const enabled = await fetchJson(`${server.url}/api/activity-log/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true })
+    });
+    assert.equal(enabled.response.status, 200);
+    assert.equal(enabled.payload.activityLog.enabled, true);
+
+    const enabledConfig = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(Object.prototype.hasOwnProperty.call(enabledConfig.metadata || {}, "activityLog"), false);
+
+    const cleared = await fetchJson(`${server.url}/api/activity-log/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(cleared.response.status, 200);
+    assert.deepEqual(cleared.payload.logs, []);
+    assert.equal(await readTextFileOrNull(activityLogPath), null);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console broadcasts shared activity log updates", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const activityLogPath = resolveActivityLogPath(fixture.configPath);
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const logsEventPromise = waitForSseEvent(`${server.url}/api/events`, "logs", 4000, (payload) =>
+      Array.isArray(payload?.logs) && payload.logs.some((entry) => entry.message === "Request fallback triggered for chat.default.")
+    );
+
+    await appendActivityLogEntry(activityLogPath, {
+      level: "warn",
+      message: "Request fallback triggered for chat.default.",
+      detail: "demo/gpt-4o-mini failed (status 429 · rate limited). Trying demo/gpt-4o next.",
+      source: "runtime"
+    });
+
+    const logsEvent = await logsEventPromise;
+    assert.equal(logsEvent.activityLog.enabled, true);
+    assert.equal(logsEvent.logs[0].message, "Request fallback triggered for chat.default.");
+    assert.equal(logsEvent.logs[0].source, "runtime");
+    assert.equal(logsEvent.logs[0].category, "usage");
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -410,6 +1234,417 @@ test("web console serves the React shell assets", async () => {
     const appResponse = await fetch(`${server.url}/app.js`);
     assert.equal(appResponse.status, 200);
     assert.match(appResponse.headers.get("content-type") || "", /application\/javascript/);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console edit-provider modal opens without triggering a render loop", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        baseUrl: "https://api.openai.com/v1",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ]
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom, errors } = await loadWebConsoleDom(server.url);
+    await waitForDomText(dom, "OpenAI");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const editButton = dom.window.document.querySelector('button[aria-label="Edit provider OpenAI"]');
+    assert.ok(editButton);
+
+    editButton.click();
+
+    await waitForDomText(dom, "Edit · openai");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(
+      errors.some((entry) => entry.includes("Maximum update depth exceeded")),
+      false
+    );
+    assert.match(dom.window.document.body.textContent || "", /Switch between provider settings and model list/);
+
+    dom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console save-provider closes the edit-provider modal", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        baseUrl: "https://api.openai.com/v1",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ]
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    if (typeof dom.window.structuredClone !== "function" && typeof globalThis.structuredClone === "function") {
+      dom.window.structuredClone = globalThis.structuredClone;
+    }
+    await waitForDomText(dom, "OpenAI");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const editButton = dom.window.document.querySelector('button[aria-label="Edit provider OpenAI"]');
+    assert.ok(editButton);
+    editButton.click();
+
+    await waitForDomText(dom, "Edit · openai");
+
+    const getModalRoot = () => dom.window.document.body.lastElementChild;
+    const modalRoot = getModalRoot();
+    assert.ok(modalRoot);
+
+    const providerIdInput = Array.from(modalRoot.querySelectorAll("input")).find((input) => input.value === "openai");
+    assert.ok(providerIdInput);
+    setInputValue(dom.window, providerIdInput, "openai-updated");
+    providerIdInput.dispatchEvent(new dom.window.FocusEvent("blur", { bubbles: true }));
+
+    await waitForDomCondition(
+      () => Boolean(findButtonByText(getModalRoot(), "Save provider")),
+      15_000,
+      "Timed out waiting for Save provider button."
+    );
+
+    const saveButton = findButtonByText(getModalRoot(), "Save provider");
+    assert.ok(saveButton);
+    saveButton.click();
+
+    await waitForDomTextToDisappear(dom, "Edit · openai");
+
+    const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(saved.providers[0]?.id, "openai-updated");
+
+    dom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console save-models closes the edit-provider modal", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ]
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    await waitForDomText(dom, "OpenAI");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const editButton = dom.window.document.querySelector('button[aria-label="Edit provider OpenAI"]');
+    assert.ok(editButton);
+    editButton.click();
+
+    await waitForDomText(dom, "Edit · openai");
+
+    const modelsTab = findButtonByText(dom.window.document.body, "Model list");
+    assert.ok(modelsTab);
+    modelsTab.click();
+
+    await waitForDomCondition(
+      () => Boolean(dom.window.document.querySelector('input[aria-label="Context window for gpt-4o-mini"]')),
+      15_000,
+      "Timed out waiting for provider model inputs."
+    );
+
+    const contextInput = dom.window.document.querySelector('input[aria-label="Context window for gpt-4o-mini"]');
+    assert.ok(contextInput);
+    contextInput.focus();
+    setInputValue(dom.window, contextInput, "128000");
+    contextInput.dispatchEvent(new dom.window.FocusEvent("blur", { bubbles: true }));
+
+    await waitForDomCondition(
+      () => Boolean(findButtonByText(dom.window.document.body, "Save models")),
+      15_000,
+      "Timed out waiting for Save models button."
+    );
+
+    const saveButton = findButtonByText(dom.window.document.body, "Save models");
+    assert.ok(saveButton);
+    saveButton.click();
+
+    await waitForDomTextToDisappear(dom, "Edit · openai");
+
+    const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    const savedModel = (saved.providers?.[0]?.models || []).find((model) => model.id === "gpt-4o-mini");
+    assert.equal(savedModel?.contextWindow, 128000);
+
+    dom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console keeps the provider model draft row and new models at the top", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ]
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    await waitForDomText(dom, "OpenAI");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const editButton = dom.window.document.querySelector('button[aria-label="Edit provider OpenAI"]');
+    assert.ok(editButton);
+    editButton.click();
+
+    await waitForDomText(dom, "Edit · openai");
+
+    const modelsTab = findButtonByText(dom.window.document.body, "Model list");
+    assert.ok(modelsTab);
+    modelsTab.click();
+
+    const getModelInputs = () => Array.from(
+      dom.window.document.querySelectorAll('input[placeholder="Add a new model id"], input[placeholder="Model id"]')
+    );
+
+    await waitForDomCondition(
+      () => getModelInputs().length >= 3,
+      15_000,
+      "Timed out waiting for provider model inputs."
+    );
+
+    let modelInputs = getModelInputs();
+    assert.equal(modelInputs[0]?.getAttribute("placeholder"), "Add a new model id");
+    assert.deepEqual(
+      modelInputs.slice(1).map((input) => input.value),
+      ["gpt-4o-mini", "gpt-4o"]
+    );
+
+    setInputValue(dom.window, modelInputs[0], "gpt-4.1-mini");
+
+    await waitForDomCondition(
+      () => {
+        const currentInputs = getModelInputs();
+        return currentInputs.length >= 4
+          && currentInputs[0]?.getAttribute("placeholder") === "Add a new model id"
+          && currentInputs[0]?.value === ""
+          && currentInputs[1]?.value === "gpt-4.1-mini"
+          && currentInputs[2]?.value === "gpt-4o-mini"
+          && currentInputs[3]?.value === "gpt-4o";
+      },
+      15_000,
+      "Timed out waiting for provider models to keep the draft row and new model at the top."
+    );
+
+    dom.window.close();
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console add-alias modal shows placeholder guidance and no header close button", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    defaultModel: DEFAULT_MODEL_ALIAS_ID,
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID
+    },
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "openai/gpt-4o-mini" }],
+        fallbackTargets: [{ ref: "openai/gpt-4o" }]
+      }
+    },
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        format: "openai",
+        baseUrl: "https://api.openai.com/v1",
+        endpoints: ["https://api.openai.com/v1"],
+        apiKeyEnv: "OPENAI_API_KEY",
+        models: [{ id: "gpt-4o-mini" }, { id: "gpt-4o" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["gpt-4o-mini"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ]
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { dom } = await loadWebConsoleDom(server.url);
+    await waitForDomCondition(
+      () => Boolean(findButtonByText(dom.window.document.body, "Add alias")),
+      30_000,
+      "Timed out waiting for Add alias button."
+    );
+
+    const addAliasButton = findButtonByText(dom.window.document.body, "Add alias");
+    assert.ok(addAliasButton);
+    addAliasButton.click();
+
+    await waitForDomCondition(
+      () => Boolean(dom.window.document.body.lastElementChild?.textContent?.includes("Create alias")),
+      15_000,
+      "Timed out waiting for add-alias modal."
+    );
+
+    const modalRoot = dom.window.document.body.lastElementChild;
+    assert.ok(modalRoot);
+
+    const aliasNameInput = modalRoot.querySelector('input[placeholder="Enter alias name. Example: claude-opus"]');
+    assert.ok(aliasNameInput);
+    assert.equal(findButtonByText(modalRoot, "Close"), null);
+
+    dom.window.close();
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -1240,6 +2475,61 @@ test("web console can discover provider models via injected helper", async () =>
   }
 });
 
+test("web console can look up model context windows via injected LiteLLM helper", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const calls = [];
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+  }, {
+    lookupLiteLlmContextWindow: async (input) => {
+      calls.push(input);
+      return [{
+        query: "gpt-4o-mini",
+        exactMatch: {
+          model: "gpt-4o-mini",
+          contextWindow: 128000,
+          provider: "openai"
+        },
+        suggestions: [],
+        medianContextWindow: 128000
+      }];
+    }
+  });
+
+  try {
+    const lookup = await fetchJson(`${server.url}/api/config/litellm-context-lookup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        models: ["gpt-4o-mini"],
+        limit: 3
+      })
+    });
+
+    assert.equal(lookup.response.status, 200);
+    assert.deepEqual(lookup.payload.result, [{
+      query: "gpt-4o-mini",
+      exactMatch: {
+        model: "gpt-4o-mini",
+        contextWindow: 128000,
+        provider: "openai"
+      },
+      suggestions: [],
+      medianContextWindow: 128000
+    }]);
+    assert.equal(lookup.payload.source.provider, "litellm");
+    assert.deepEqual(calls, [{
+      models: ["gpt-4o-mini"],
+      limit: 3
+    }]);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
 test("exit endpoint shuts down the web console process loop", async () => {
   const fixture = await makeTempConfig(createBaseConfig());
   const server = await startTestWebConsoleServer({
@@ -1371,6 +2661,57 @@ test("web console can open AMP config in detected editor", async () => {
   } finally {
     await server.close("test-cleanup");
     await ampClient.cleanup();
+    await fixture.cleanup();
+  }
+});
+
+test("web console can open managed file chips by path", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const opened = [];
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    openFileInEditor: async (editorId, filePath) => {
+      opened.push({ editorId, filePath });
+    }
+  });
+
+  const textFilePath = path.join(fixture.dir, "tooling", "config.toml");
+  const jsonFilePath = path.join(fixture.dir, "tooling", "backup.json");
+
+  try {
+    const textResponse = await fetchJson(`${server.url}/api/file/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        editorId: "default",
+        filePath: textFilePath,
+        ensureMode: "text"
+      })
+    });
+
+    const jsonResponse = await fetchJson(`${server.url}/api/file/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        editorId: "default",
+        filePath: jsonFilePath,
+        ensureMode: "jsonObject"
+      })
+    });
+
+    assert.equal(textResponse.response.status, 200);
+    assert.equal(jsonResponse.response.status, 200);
+    assert.equal(await readTextFileOrNull(textFilePath), "");
+    assert.deepEqual(await readJsonFileOrNull(jsonFilePath), {});
+    assert.deepEqual(opened, [
+      { editorId: "default", filePath: textFilePath },
+      { editorId: "default", filePath: jsonFilePath }
+    ]);
+  } finally {
+    await server.close("test-cleanup");
     await fixture.cleanup();
   }
 });
@@ -1685,6 +3026,64 @@ test("web console writes Codex CLI model catalog metadata for direct route bindi
   }
 });
 
+test("web console supports Codex CLI inherit mode without writing router model mappings", async () => {
+  const codexCli = await makeCodexCliEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop",
+    modelAliases: {
+      "gpt-5.4": {
+        id: "gpt-5.4",
+        strategy: "ordered",
+        targets: [{ ref: "demo/gpt-4o-mini" }],
+        fallbackTargets: []
+      }
+    }
+  });
+  await mkdir(path.dirname(getCodexConfigPath(codexCli.env)), { recursive: true });
+  await writeFile(getCodexConfigPath(codexCli.env), 'model = "gpt-5.4"\n', "utf8");
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    codexCliEnv: codexCli.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const enabled = await fetchJson(`${server.url}/api/codex-cli/global-route`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        rawText: initial.payload.config.rawText,
+        bindings: {
+          defaultModel: CODEX_CLI_INHERIT_MODEL_VALUE
+        }
+      })
+    });
+    assert.equal(enabled.response.status, 200);
+    assert.equal(enabled.payload.codingTools.codexCli.bindings.defaultModel, CODEX_CLI_INHERIT_MODEL_VALUE);
+
+    const codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
+    assert.match(codexConfigText || "", /model_provider = "llm-router"/);
+    assert.match(codexConfigText || "", /model = "gpt-5\.4"/);
+    assert.doesNotMatch(codexConfigText || "", /model_catalog_json = /);
+    assert.equal(await readTextFileOrNull(getCodexModelCatalogPath(codexCli.env)), null);
+
+    const refreshed = await fetchJson(`${server.url}/api/state`);
+    assert.equal(refreshed.response.status, 200);
+    assert.equal(refreshed.payload.codingTools.codexCli.bindings.defaultModel, CODEX_CLI_INHERIT_MODEL_VALUE);
+    assert.equal(refreshed.payload.codingTools.codexCli.inheritCliModel, true);
+    assert.equal(refreshed.payload.codingTools.codexCli.configuredModel, "gpt-5.4");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await codexCli.cleanup();
+  }
+});
+
 test("web console treats Codex CLI as connected when the endpoint matches and still reflects live config file changes", async () => {
   const codexCli = await makeCodexCliEnv();
   const fixture = await makeTempConfig({
@@ -1723,7 +3122,10 @@ test("web console treats Codex CLI as connected when the endpoint matches and st
     const originalText = await readTextFileOrNull(configPath);
     const updatedText = String(originalText || "")
       .replace("gw_test_master_key_1234567890abcdefghijklmnop", "gw_replaced_secret_value")
-      .replace('model = "demo/gpt-4o-mini"', 'model = "coding.default"');
+      .replace(
+        'model = "demo/gpt-4o-mini"',
+        'model = "coding.default"\nmodel_reasoning_effort = "minimal"'
+      );
     await writeFile(configPath, updatedText, "utf8");
 
     const refreshed = await fetchJson(`${server.url}/api/state`);
@@ -1775,17 +3177,117 @@ test("web console updates Codex CLI model bindings while routed through llm-rout
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         bindings: {
-          defaultModel: "coding.default"
+          defaultModel: "coding.default",
+          thinkingLevel: "high"
         }
       })
     });
     assert.equal(updated.response.status, 200);
     assert.equal(updated.payload.codingTools.codexCli.bindings.defaultModel, "coding.default");
+    assert.equal(updated.payload.codingTools.codexCli.bindings.thinkingLevel, "high");
 
     const codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
     assert.match(codexConfigText || "", /model = "coding.default"/);
+    assert.match(codexConfigText || "", /model_reasoning_effort = "high"/);
     const catalog = await readJsonFileOrNull(getCodexModelCatalogPath(codexCli.env));
     assert.equal(catalog?.models?.some((entry) => entry?.slug === "coding.default"), true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await codexCli.cleanup();
+  }
+});
+
+test("web console restores Codex CLI built-in model control when switching to inherit mode and preserves later CLI model edits", async () => {
+  const codexCli = await makeCodexCliEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop",
+    modelAliases: {
+      "coding.default": {
+        id: "coding.default",
+        strategy: "ordered",
+        targets: [{ ref: "demo/gpt-4o-mini" }],
+        fallbackTargets: []
+      },
+      "gpt-5.4": {
+        id: "gpt-5.4",
+        strategy: "ordered",
+        targets: [{ ref: "demo/gpt-4o-mini" }],
+        fallbackTargets: []
+      },
+      "gpt-5.1-codex-mini": {
+        id: "gpt-5.1-codex-mini",
+        strategy: "ordered",
+        targets: [{ ref: "demo/gpt-4o-mini" }],
+        fallbackTargets: []
+      }
+    }
+  });
+  await mkdir(path.dirname(getCodexConfigPath(codexCli.env)), { recursive: true });
+  await writeFile(getCodexConfigPath(codexCli.env), 'model = "gpt-5.4"\n', "utf8");
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    codexCliEnv: codexCli.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    await fetchJson(`${server.url}/api/codex-cli/global-route`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        rawText: initial.payload.config.rawText,
+        bindings: {
+          defaultModel: "coding.default"
+        }
+      })
+    });
+
+    let codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
+    assert.match(codexConfigText || "", /model = "coding\.default"/);
+    assert.match(codexConfigText || "", /model_catalog_json = /);
+
+    const inheritMode = await fetchJson(`${server.url}/api/codex-cli/model-bindings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        bindings: {
+          defaultModel: CODEX_CLI_INHERIT_MODEL_VALUE
+        }
+      })
+    });
+    assert.equal(inheritMode.response.status, 200);
+    assert.equal(inheritMode.payload.codingTools.codexCli.bindings.defaultModel, CODEX_CLI_INHERIT_MODEL_VALUE);
+
+    codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
+    assert.match(codexConfigText || "", /model = "gpt-5\.4"/);
+    assert.doesNotMatch(codexConfigText || "", /model_catalog_json = /);
+    assert.equal(await readTextFileOrNull(getCodexModelCatalogPath(codexCli.env)), null);
+
+    const liveUpdatedText = String(codexConfigText || "").replace('model = "gpt-5.4"', 'model = "gpt-5.1-codex-mini"');
+    await writeFile(getCodexConfigPath(codexCli.env), liveUpdatedText, "utf8");
+
+    const nextConfig = JSON.parse(initial.payload.config.rawText);
+    nextConfig.providers[0].name = "Demo Updated";
+    const saved = await fetchJson(`${server.url}/api/config/save`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ rawText: `${JSON.stringify(nextConfig, null, 2)}\n` })
+    });
+    assert.equal(saved.response.status, 200);
+
+    codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
+    assert.match(codexConfigText || "", /model = "gpt-5\.1-codex-mini"/);
+    assert.doesNotMatch(codexConfigText || "", /model_catalog_json = /);
+
+    const refreshed = await fetchJson(`${server.url}/api/state`);
+    assert.equal(refreshed.payload.codingTools.codexCli.bindings.defaultModel, CODEX_CLI_INHERIT_MODEL_VALUE);
+    assert.equal(refreshed.payload.codingTools.codexCli.configuredModel, "gpt-5.1-codex-mini");
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -2058,12 +3560,14 @@ test("web console treats Claude Code as connected when the endpoint matches and 
     const settings = await readJsonFileOrNull(settingsPath);
     settings.env.ANTHROPIC_AUTH_TOKEN = "gw_replaced_secret_value";
     settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "coding.default";
+    settings.env.MAX_THINKING_TOKENS = String(CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high);
     await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
 
     const refreshed = await fetchJson(`${server.url}/api/state`);
     assert.equal(refreshed.response.status, 200);
     assert.equal(refreshed.payload.codingTools.claudeCode.routedViaRouter, true);
     assert.equal(refreshed.payload.codingTools.claudeCode.bindings.defaultOpusModel, "coding.default");
+    assert.equal(refreshed.payload.codingTools.claudeCode.bindings.thinkingLevel, "high");
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -2084,7 +3588,8 @@ test("web console restores deprecated Claude Code small/fast bindings from backu
       ANTHROPIC_API_KEY: "old_api_key",
       ANTHROPIC_MODEL: "old/primary",
       ANTHROPIC_SMALL_FAST_MODEL: "old/small-fast",
-      CLAUDE_CODE_SUBAGENT_MODEL: "old/subagent"
+      CLAUDE_CODE_SUBAGENT_MODEL: "old/subagent",
+      MAX_THINKING_TOKENS: "4096"
     }
   };
   await mkdir(path.dirname(getClaudeSettingsPath(claudeCode.env)), { recursive: true });
@@ -2113,6 +3618,7 @@ test("web console restores deprecated Claude Code small/fast bindings from backu
 
     const routedSettings = await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env));
     assert.equal(routedSettings.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
+    assert.equal(routedSettings.env.MAX_THINKING_TOKENS, undefined);
 
     const disabled = await fetchJson(`${server.url}/api/claude-code/global-route`, {
       method: "POST",
@@ -2171,7 +3677,8 @@ test("web console updates Claude Code model bindings while routed through llm-ro
           defaultOpusModel: "demo/gpt-4o-mini",
           defaultSonnetModel: "coding.default",
           defaultHaikuModel: "demo/gpt-4o-mini",
-          subagentModel: "coding.default"
+          subagentModel: "coding.default",
+          thinkingLevel: "high"
         }
       })
     });
@@ -2181,6 +3688,7 @@ test("web console updates Claude Code model bindings while routed through llm-ro
     assert.equal(updated.payload.codingTools.claudeCode.bindings.defaultSonnetModel, "coding.default");
     assert.equal(updated.payload.codingTools.claudeCode.bindings.defaultHaikuModel, "demo/gpt-4o-mini");
     assert.equal(updated.payload.codingTools.claudeCode.bindings.subagentModel, "coding.default");
+    assert.equal(updated.payload.codingTools.claudeCode.bindings.thinkingLevel, "high");
 
     const settings = await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env));
     assert.equal(settings.env.ANTHROPIC_MODEL, "coding.default");
@@ -2189,6 +3697,7 @@ test("web console updates Claude Code model bindings while routed through llm-ro
     assert.equal(settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "demo/gpt-4o-mini");
     assert.equal(settings.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
     assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, "coding.default");
+    assert.equal(settings.env.MAX_THINKING_TOKENS, String(CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high));
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();

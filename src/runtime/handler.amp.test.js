@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { createFetchHandler } from "./handler.js";
 import { normalizeRuntimeConfig } from "./config.js";
-import { isAmpManagementPath, resolveApiRoute } from "./handler/request.js";
+import { inferAmpContextRequirement, isAmpManagementPath, resolveApiRoute } from "./handler/request.js";
 
 function buildConfig(overrides = {}) {
   return normalizeRuntimeConfig({
@@ -1451,6 +1451,138 @@ test("createFetchHandler maps AMP Gemini googleSearch tools onto Claude web sear
   }
 });
 
+test("createFetchHandler intercepts AMP web search locally when alternate search providers are configured", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ],
+    amp: {
+      upstreamUrl: "https://ampcode.com",
+      upstreamApiKey: "amp_upstream_key",
+      proxyWebSearchToUpstream: true,
+      webSearch: {
+        strategy: "ordered",
+        count: 3,
+        providers: [
+          { id: "brave", apiKey: "brave_search_key", limit: 1000, remaining: 5 }
+        ]
+      }
+    }
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const normalizedUrl = String(url);
+    const body = init?.body ? await readInitJsonBody(init) : {};
+    captured.push({
+      url: normalizedUrl,
+      headers: getHeaderMap(init.headers),
+      body
+    });
+
+    if (normalizedUrl === "https://api.anthropic.com/v1/messages" && captured.filter((entry) => entry.url === normalizedUrl).length === 1) {
+      return jsonResponse({
+        id: "msg_amp_intercept_1",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_1",
+            name: "web_search",
+            input: {
+              query: "llm-router release notes"
+            }
+          }
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 6, output_tokens: 2 }
+      });
+    }
+
+    if (normalizedUrl.startsWith("https://api.search.brave.com/")) {
+      return jsonResponse({
+        web: {
+          results: [
+            {
+              title: "LLM Router release notes",
+              url: "https://example.com/releases",
+              description: "Release notes from the project website."
+            }
+          ]
+        }
+      });
+    }
+
+    if (normalizedUrl === "https://api.anthropic.com/v1/messages" && captured.filter((entry) => entry.url === normalizedUrl).length === 2) {
+      return jsonResponse({
+        id: "msg_amp_intercept_2",
+        type: "message",
+        role: "assistant",
+        model: "claude-3-5-haiku",
+        content: [
+          { type: "text", text: "Here is the final answer after local search." }
+        ],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 14, output_tokens: 5 }
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${normalizedUrl}`);
+  };
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/openai/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "anthropic/claude-3-5-haiku",
+        input: "Search online for llm-router release notes.",
+        tools: [
+          { type: "web_search" }
+        ],
+        tool_choice: "required"
+      })
+    }), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(captured[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured[1]?.url.startsWith("https://api.search.brave.com/"), true);
+    assert.equal(captured[2]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(captured.some((entry) => entry.url.startsWith("https://ampcode.com/")), false);
+    assert.equal(captured[0]?.body?.tools?.[0]?.name, "web_search");
+    assert.equal(captured[2]?.body?.tools, undefined);
+    assert.match(String(captured[2]?.body?.system || ""), /You just performed web searches/);
+    assert.match(JSON.stringify(captured[2]?.body?.messages || []), /LLM Router release notes/);
+    assert.notEqual(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:proxy-upstream");
+
+    const payload = await readJson(response);
+    assert.match(JSON.stringify(payload), /Here is the final answer after local search/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
 test("createFetchHandler can proxy AMP web search requests upstream when enabled", { concurrency: false }, async () => {
   const config = buildConfig({
     defaultModel: "anthropic/claude-3-5-haiku",
@@ -1792,6 +1924,122 @@ test("createFetchHandler rewrites AMP Claude mapped responses back to the reques
       await fetchHandler.close();
     }
   }
+});
+
+test("createFetchHandler can override the visible AMP response model for debugging", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "anthropic/claude-3-5-haiku",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku" }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({
+    id: "msg_amp_debug_override",
+    type: "message",
+    role: "assistant",
+    model: "claude-3-5-haiku",
+    content: [{ type: "text", text: "OK" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 3, output_tokens: 1 }
+  });
+
+  try {
+    const response = await fetchHandler(new Request("http://router.local/api/provider/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-6",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "Say OK." }]
+      })
+    }), {
+      LLM_ROUTER_DEBUG_AMP_VISIBLE_MODEL_OVERRIDE: "gpt-5.3-codex"
+    });
+
+    assert.equal(response.status, 200);
+    const payload = await readJson(response);
+    assert.equal(payload.model, "gpt-5.3-codex");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("inferAmpContextRequirement maps current AMP modes and observed resolved model ids", () => {
+  const baseRequest = new Request("http://router.local/api/provider/anthropic/v1/messages", {
+    method: "POST",
+    headers: {
+      "anthropic-version": "2023-06-01"
+    }
+  });
+
+  assert.deepEqual(
+    inferAmpContextRequirement(baseRequest, { model: "smart" }, { clientType: "amp", providerHint: "anthropic", requestKind: "messages" }),
+    { minimumContextTokens: 168000, source: "amp:model:smart" }
+  );
+  assert.deepEqual(
+    inferAmpContextRequirement(baseRequest, { model: "rush" }, { clientType: "amp", providerHint: "anthropic", requestKind: "messages" }),
+    { minimumContextTokens: 136000, source: "amp:model:rush" }
+  );
+  assert.deepEqual(
+    inferAmpContextRequirement(baseRequest, { model: "free" }, { clientType: "amp", providerHint: "anthropic", requestKind: "messages" }),
+    { minimumContextTokens: 136000, source: "amp:model:free" }
+  );
+  assert.deepEqual(
+    inferAmpContextRequirement(
+      new Request("http://router.local/api/provider/openai/v1/responses", { method: "POST" }),
+      { model: "deep" },
+      { clientType: "amp", providerHint: "openai", requestKind: "responses" }
+    ),
+    { minimumContextTokens: 272000, source: "amp:model:deep" }
+  );
+  assert.deepEqual(
+    inferAmpContextRequirement(baseRequest, { model: "large" }, { clientType: "amp", providerHint: "anthropic", requestKind: "messages" }),
+    { minimumContextTokens: 936000, source: "amp:model:large" }
+  );
+  assert.deepEqual(
+    inferAmpContextRequirement(
+      new Request("http://router.local/api/provider/openai/v1/responses", { method: "POST" }),
+      { model: "openai/gpt-5.3-codex" },
+      { clientType: "amp", providerHint: "openai", requestKind: "responses" }
+    ),
+    { minimumContextTokens: 272000, source: "amp:model:openai/gpt-5.3-codex" }
+  );
+  assert.deepEqual(
+    inferAmpContextRequirement(baseRequest, { model: "gpt-5.3-codex" }, { clientType: "amp", providerHint: "anthropic", requestKind: "messages" }),
+    { minimumContextTokens: 968000, source: "amp:model:gpt-5.3-codex" }
+  );
+});
+
+test("inferAmpContextRequirement lets the AMP 1M beta override mode-specific floors", () => {
+  const request = new Request("http://router.local/api/provider/anthropic/v1/messages", {
+    method: "POST",
+    headers: {
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "context-1m-2025-08-07"
+    }
+  });
+
+  assert.deepEqual(
+    inferAmpContextRequirement(request, { model: "large" }, { clientType: "amp", providerHint: "anthropic", requestKind: "messages" }),
+    { minimumContextTokens: 1000000, source: "amp:anthropic-beta:context-1m-2025-08-07" }
+  );
 });
 
 test("createFetchHandler rewrites AMP Claude stream model names back to the requested model", { concurrency: false }, async () => {

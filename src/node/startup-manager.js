@@ -1,5 +1,5 @@
 /**
- * OS startup integration for llm-router.
+ * OS startup integration for LLM Router.
  * Supports macOS LaunchAgent and Linux systemd --user service.
  */
 
@@ -58,14 +58,14 @@ export function resolveStartupCliEntryPath({
   }
 
   const nodeBinDir = path.dirname(execPath);
-  for (const binName of ["llm-router", "llm-router-route"]) {
+  for (const binName of ["llr", "llm-router", "llm-router-route"]) {
     const candidate = path.join(nodeBinDir, binName);
     if (exists(candidate)) return candidate;
   }
 
   if (envCliPath) return envCliPath;
   if (argvCliPath) return path.resolve(argvCliPath);
-  throw new Error("Unable to resolve llm-router CLI entry path.");
+  throw new Error("Unable to resolve the LLM Router CLI entry path.");
 }
 
 function makeExecArgs({ configPath }) {

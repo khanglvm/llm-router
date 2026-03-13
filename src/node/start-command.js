@@ -286,11 +286,11 @@ async function handoffToStartupManagedWithLatest({
     if (!stopped?.ok) {
       return {
         ok: false,
-        errorMessage: stopped?.reason || `Failed to stop existing llm-router pid ${activeRuntime.pid}.`
+        errorMessage: stopped?.reason || `Failed to stop existing LLM Router pid ${activeRuntime.pid}.`
       };
     }
     await clearRuntimeStateFn({ pid: activeRuntime.pid });
-    line(`Stopped manual llm-router on http://${activeRuntime.host}:${activeRuntime.port} so the startup service can own the router.`);
+    line(`Stopped manual LLM Router on http://${activeRuntime.host}:${activeRuntime.port} so the startup service can own the router.`);
   }
 
   const reclaimed = await reclaimPortFn({ port: startArgs.port, line, error });
@@ -319,7 +319,7 @@ async function handoffToStartupManagedWithLatest({
     if (!runtime) {
       return {
         ok: false,
-        errorMessage: `Startup-managed llm-router did not become ready on http://${startArgs.host}:${startArgs.port}.`
+        errorMessage: `Startup-managed LLM Router did not become ready on http://${startArgs.host}:${startArgs.port}.`
       };
     }
     return {
@@ -333,7 +333,7 @@ async function handoffToStartupManagedWithLatest({
     error(`Failed restarting startup-managed service: ${message}`);
     return {
       ok: false,
-      errorMessage: `Failed to restart startup-managed llm-router with latest installed version: ${message}`
+      errorMessage: `Failed to restart the startup-managed LLM Router instance with the latest installed version: ${message}`
     };
   }
 }
@@ -394,7 +394,7 @@ export async function runStartCommand(options = {}) {
       exitCode: 2,
       errorMessage: [
         `Config file not found: ${configPath}`,
-        "Run 'llm-router config' to create provider config or 'llm-router -h' for help."
+        "Run 'llr config' to create provider config or 'llr -h' for help."
       ].join("\n")
     };
   }
@@ -439,7 +439,7 @@ export async function runStartCommand(options = {}) {
       exitCode: 2,
       errorMessage: [
         `No providers configured in ${configPath}`,
-        "Run 'llm-router config' to add a provider or 'llm-router -h' for help."
+        "Run 'llr config' to add a provider or 'llr -h' for help."
       ].join("\n")
     };
   }
@@ -450,7 +450,7 @@ export async function runStartCommand(options = {}) {
       exitCode: 2,
       errorMessage: [
         `Local auth requires masterKey in ${configPath}.`,
-        "Run 'llm-router config --operation=set-master-key --master-key=...' or start without --require-auth."
+        "Run 'llr config --operation=set-master-key --master-key=...' or start without --require-auth."
       ].join("\n")
     };
   }
@@ -494,7 +494,7 @@ export async function runStartCommand(options = {}) {
       ok: true,
       exitCode: 0,
       data: [
-        `Startup-managed llm-router is active on http://${handoff.runtime.host}:${handoff.runtime.port}.`,
+        `Startup-managed LLM Router is active on http://${handoff.runtime.host}:${handoff.runtime.port}.`,
         `manager=${handoff.detail?.manager || startup.manager || "unknown"}`,
         `service=${handoff.detail?.serviceId || startup.serviceId || "unknown"}`
       ].join("\n")
@@ -538,7 +538,7 @@ export async function runStartCommand(options = {}) {
             startArgs: buildStartArgs({ configPath, ...nextLocalServer })
           });
           if (!launch.ok) {
-            error(`Failed to relaunch llm-router after config runtime change: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
+            error(`Failed to relaunch LLM Router after the config runtime change: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
             process.exit(1);
             return;
           }
@@ -562,7 +562,7 @@ export async function runStartCommand(options = {}) {
     return {
       ok: false,
       exitCode: 1,
-      errorMessage: `Another llm-router instance is already running at http://${activeRuntime.host}:${activeRuntime.port}. Stop it before starting a new one.`
+      errorMessage: `Another LLM Router instance is already running at http://${activeRuntime.host}:${activeRuntime.port}. Stop it before starting a new one.`
     };
   }
 
@@ -574,7 +574,7 @@ export async function runStartCommand(options = {}) {
       return {
         ok: false,
         exitCode: 1,
-        errorMessage: `Failed to start llm-router on http://${host}:${port}: ${startError instanceof Error ? startError.message : String(startError)}`
+        errorMessage: `Failed to start LLM Router on http://${host}:${port}: ${startError instanceof Error ? startError.message : String(startError)}`
       };
     }
 
@@ -622,7 +622,7 @@ export async function runStartCommand(options = {}) {
             ok: true,
             exitCode: 0,
             data: [
-              "Restarted startup-managed llm-router instance with latest installed version.",
+              "Restarted the startup-managed LLM Router instance with the latest installed version.",
               `manager=${restarted.detail?.manager || "unknown"}`,
               `service=${restarted.detail?.serviceId || "unknown"}`
             ].join("\n")
@@ -633,7 +633,7 @@ export async function runStartCommand(options = {}) {
           return {
             ok: true,
             exitCode: 0,
-            data: `Startup-managed llm-router is still running on port ${port}. Exiting without changes.`
+            data: `Startup-managed LLM Router is still running on port ${port}. Exiting without changes.`
           };
         }
 
@@ -647,7 +647,7 @@ export async function runStartCommand(options = {}) {
             };
           }
 
-          line("Startup-managed instance stopped. Starting llm-router in this terminal...");
+          line("Startup-managed instance stopped. Starting LLM Router in this terminal...");
           const takeoverStart = await attemptServerStartAfterStartupStop(buildLocalServerOptions, { startLocalRouteServer: startLocalRouteServerFn });
           if (takeoverStart.ok) {
             server = takeoverStart.server;
@@ -656,7 +656,7 @@ export async function runStartCommand(options = {}) {
             return {
               ok: false,
               exitCode: 1,
-              errorMessage: `Failed to start llm-router on http://${host}:${port}: ${takeoverStart.error instanceof Error ? takeoverStart.error.message : String(takeoverStart.error)}`
+              errorMessage: `Failed to start LLM Router on http://${host}:${port}: ${takeoverStart.error instanceof Error ? takeoverStart.error.message : String(takeoverStart.error)}`
             };
           }
         }
@@ -682,7 +682,7 @@ export async function runStartCommand(options = {}) {
         return {
           ok: false,
           exitCode: 1,
-          errorMessage: `Failed to start llm-router after reclaiming port ${port}: ${retryError instanceof Error ? retryError.message : String(retryError)}`
+          errorMessage: `Failed to start LLM Router after reclaiming port ${port}: ${retryError instanceof Error ? retryError.message : String(retryError)}`
         };
       }
     }
@@ -763,7 +763,7 @@ export async function runStartCommand(options = {}) {
       binaryState = nextState;
 
       if (managedByStartup) {
-        line(`Detected llm-router update (${from} -> ${to}). Exiting for startup manager to relaunch latest version.`);
+        line(`Detected LLM Router update (${from} -> ${to}). Exiting for the startup manager to relaunch the latest version.`);
         void shutdown().then(() => {
           process.exit(0);
         });
@@ -774,7 +774,7 @@ export async function runStartCommand(options = {}) {
       if (!cliPath) {
         if (!binaryNoticeSent) {
           binaryNoticeSent = true;
-          line(`Detected llm-router update (${from} -> ${to}). Restart this process to run the new version.`);
+          line(`Detected LLM Router update (${from} -> ${to}). Restart this process to run the new version.`);
         }
         return;
       }
@@ -782,22 +782,22 @@ export async function runStartCommand(options = {}) {
       binaryRelaunching = true;
       void (async () => {
         try {
-          line(`Detected llm-router update (${from} -> ${to}). Relaunching latest version...`);
+          line(`Detected LLM Router update (${from} -> ${to}). Relaunching the latest version...`);
           await shutdown();
           const launch = await spawnReplacementCli({
             cliPath,
             startArgs: buildStartArgs({ configPath, host, port, watchConfig, watchBinary, requireAuth })
           });
           if (!launch.ok) {
-            error(`Failed to relaunch updated llm-router: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
+            error(`Failed to relaunch the updated LLM Router process: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
             process.exit(1);
             return;
           }
 
-          line(`Started updated llm-router process (pid ${launch.pid || "unknown"}).`);
+          line(`Started the updated LLM Router process (pid ${launch.pid || "unknown"}).`);
           process.exit(0);
         } catch (relaunchError) {
-          error(`Failed during llm-router auto-relaunch: ${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`);
+          error(`Failed during LLM Router auto-relaunch: ${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`);
           process.exit(1);
         }
       })();

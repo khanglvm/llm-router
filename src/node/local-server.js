@@ -9,6 +9,8 @@ import { Readable } from "node:stream";
 import { createFetchHandler } from "../runtime/handler.js";
 import { readConfigFile, getDefaultConfigPath } from "./config-store.js";
 import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
+import { readActivityLogSettings } from "../shared/local-router-defaults.js";
+import { appendActivityLogEntry, resolveActivityLogPath } from "./activity-log.js";
 
 const DEFAULT_CONFIG_RELOAD_DEBOUNCE_MS = 300;
 const MAX_CONFIG_RELOAD_DEBOUNCE_MS = 5000;
@@ -237,6 +239,7 @@ export async function startLocalRouteServer({
   port = FIXED_LOCAL_ROUTER_PORT,
   host = FIXED_LOCAL_ROUTER_HOST,
   configPath = getDefaultConfigPath(),
+  activityLogPath = "",
   watchConfig = true,
   configReloadDebounceMs = process.env.LLM_ROUTER_CONFIG_RELOAD_DEBOUNCE_MS,
   validateConfig,
@@ -245,20 +248,37 @@ export async function startLocalRouteServer({
   requireAuth = false
 } = {}) {
   const reloadDebounceMs = resolveReloadDebounceMs(configReloadDebounceMs);
+  const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
+  let activityLogEnabled = true;
   const configStore = createLiveConfigStore({
     configPath,
     watchConfig,
     reloadDebounceMs,
     validateConfig,
-    onReload: onConfigReload,
+    onReload: (nextConfig, reason) => {
+      activityLogEnabled = readActivityLogSettings(nextConfig).enabled;
+      if (typeof onConfigReload === "function") {
+        onConfigReload(nextConfig, reason);
+      }
+    },
     onReloadError: onConfigReloadError
   });
-  await configStore.getConfig();
+  const initialConfig = await configStore.getConfig();
+  activityLogEnabled = readActivityLogSettings(initialConfig).enabled;
 
   const fetchHandler = createFetchHandler({
     ignoreAuth: !requireAuth,
     getConfig: () => configStore.getConfig(),
-    defaultStateStoreBackend: "file"
+    defaultStateStoreBackend: "file",
+    onActivityLog: (entry) => {
+      if (!activityLogEnabled) return;
+      void appendActivityLogEntry(resolvedActivityLogPath, {
+        ...entry,
+        source: entry?.source || "runtime"
+      }).catch((error) => {
+        console.warn(`[llm-router] Failed writing activity log: ${formatError(error)}`);
+      });
+    }
   });
 
   const fallbackHost = formatHostForUrl(host, port);

@@ -829,6 +829,238 @@ test("normalizeRuntimeConfig preserves new AMP schema fields", () => {
   });
 });
 
+test("normalizeRuntimeConfig preserves anchored AMP raw model routes without explicit targets", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {
+      defaultRoute: "openrouter/gpt-4o-mini",
+      rawModelRoutes: [
+        { from: "gpt-*-codex*", sourceRouteKey: "Smart" }
+      ]
+    }
+  }));
+
+  assert.deepEqual(normalized.amp.rawModelRoutes, [
+    { from: "gpt-*-codex*", sourceRouteKey: "smart" }
+  ]);
+});
+
+test("normalizeRuntimeConfig normalizes shared web search providers and strategy", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      strategy: "quota-aware-weighted-rr",
+      count: 30,
+      providers: {
+        tavily: {
+          apiKey: "tavily_test_key",
+          limit: 1000,
+          remaining: 875
+        },
+        brave: {
+          apiKey: "brave_test_key"
+        }
+      }
+    }
+  }));
+
+  const expected = {
+    strategy: "quota-balance",
+    count: 20,
+    providers: [
+      {
+        id: "tavily",
+        apiKey: "tavily_test_key",
+        count: 20,
+        limit: 1000,
+        remaining: 875
+      },
+      {
+        id: "brave",
+        apiKey: "brave_test_key",
+        count: 20,
+        limit: 1000,
+        remaining: 1000
+      }
+    ]
+  };
+
+  assert.deepEqual(normalized.webSearch, expected);
+  assert.equal(Object.prototype.hasOwnProperty.call(normalized.amp || {}, "webSearch"), false);
+});
+
+test("normalizeRuntimeConfig preserves hosted GPT web search routes", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    providers: [
+      {
+        id: "rc",
+        name: "RamClouds",
+        baseUrl: "https://ramclouds.me",
+        format: "openai",
+        formats: ["openai"],
+        models: [{ id: "gpt-5.4", formats: ["openai"] }]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "rc/gpt-5.4",
+          providerId: "rc",
+          model: "gpt-5.4"
+        }
+      ]
+    }
+  }));
+
+  assert.deepEqual(normalized.webSearch, {
+    strategy: "ordered",
+    count: 5,
+    providers: [
+      {
+        id: "rc/gpt-5.4",
+        providerId: "rc",
+        model: "gpt-5.4"
+      }
+    ]
+  });
+});
+
+test("normalizeRuntimeConfig lets top-level webSearch override legacy amp.webSearch", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      strategy: "ordered",
+      count: 4,
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_root_key",
+          limit: 1000,
+          remaining: 700
+        }
+      ]
+    },
+    amp: {
+      webSearch: {
+        strategy: "quota-balance",
+        count: 9,
+        providers: [
+          {
+            id: "tavily",
+            apiKey: "tavily_legacy_key",
+            limit: 1000,
+            remaining: 100
+          }
+        ]
+      }
+    }
+  }));
+
+  assert.deepEqual(normalized.webSearch, {
+    strategy: "ordered",
+    count: 4,
+    providers: [
+      {
+        id: "brave",
+        apiKey: "brave_root_key",
+        count: 4,
+        limit: 1000,
+        remaining: 700
+      }
+    ]
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(normalized.amp || {}, "webSearch"), false);
+});
+
+test("validateRuntimeConfig rejects invalid per-provider web search counts", () => {
+  const config = createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {},
+    webSearch: {
+      strategy: "ordered",
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key",
+          count: 21
+        }
+      ]
+    }
+  });
+
+  const errors = validateRuntimeConfig(config);
+  assert.deepEqual(errors, [
+    "webSearch provider 'brave' has invalid count '21'."
+  ]);
+});
+
+test("validateRuntimeConfig rejects web search remaining values above the configured limit", () => {
+  const config = createBaseRawConfig({
+    version: CONFIG_VERSION,
+    amp: {},
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key",
+          limit: 100,
+          remaining: 101
+        }
+      ]
+    }
+  });
+
+  const errors = validateRuntimeConfig(config);
+  assert.deepEqual(errors, [
+    "webSearch provider 'brave' remaining cannot exceed limit."
+  ]);
+});
+
+test("validateRuntimeConfig rejects hosted GPT web search routes that are not OpenAI-compatible", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    modelAliases: {
+      [DEFAULT_MODEL_ALIAS_ID]: {
+        id: DEFAULT_MODEL_ALIAS_ID,
+        strategy: "ordered",
+        targets: [{ ref: "anthropic/gpt-5.4" }],
+        fallbackTargets: []
+      }
+    },
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        formats: ["claude"],
+        models: [{ id: "gpt-5.4", formats: ["claude"] }]
+      }
+    ],
+    webSearch: {
+      strategy: "ordered",
+      count: 5,
+      providers: [
+        {
+          id: "anthropic/gpt-5.4",
+          providerId: "anthropic",
+          model: "gpt-5.4"
+        }
+      ]
+    }
+  }));
+
+  const errors = validateRuntimeConfig(config);
+  assert.deepEqual(errors, [
+    "webSearch provider 'anthropic/gpt-5.4' must reference an OpenAI-compatible provider/model route."
+  ]);
+});
+
 test("DEFAULT_AMP_ENTITY_DEFINITIONS and DEFAULT_AMP_SIGNATURE_DEFINITIONS preserve builtin AMP catalog", () => {
   assert.ok(DEFAULT_AMP_ENTITY_DEFINITIONS.some((entry) => entry.id === "smart"));
   assert.ok(DEFAULT_AMP_ENTITY_DEFINITIONS.some((entry) => entry.id === "title"));
@@ -986,6 +1218,27 @@ test("resolveRequestModel prefers amp.defaultRoute over global defaultModel for 
 
   assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
   assert.equal(resolved.routeType, "amp-default-route");
+});
+
+test("resolveRequestModel uses anchored AMP raw model routes with the AMP default route", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    defaultModel: "anthropic/claude-3-5-haiku",
+    amp: {
+      defaultRoute: "openrouter/gpt-4o-mini",
+      rawModelRoutes: [
+        { from: "gpt-*-codex*", sourceRouteKey: "smart" }
+      ]
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "gpt-5.3-codex", FORMATS.OPENAI, {
+    clientType: "amp",
+    providerHint: "openai"
+  });
+
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+  assert.equal(resolved.routeType, "amp-raw-model-route");
 });
 
 test("validateRuntimeConfig rejects invalid refs in new AMP schema routes", () => {

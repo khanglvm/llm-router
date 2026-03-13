@@ -23,6 +23,8 @@ import {
 import { corsResponse, jsonResponse } from "./handler/http.js";
 import {
   detectUserRequestFormat,
+  estimateRequestContextTokens,
+  inferAmpContextRequirement,
   isAmpManagementPath,
   isJsonRequest,
   isStreamingEnabled,
@@ -43,6 +45,7 @@ import {
   convertAmpGeminiRequestToOpenAI,
   hasGeminiWebSearchTool
 } from "./handler/amp-gemini.js";
+import { shouldInterceptAmpWebSearch } from "./handler/amp-web-search.js";
 import {
   isRequestFromAllowedIp,
   resolveAllowedOrigin,
@@ -55,7 +58,7 @@ import {
   resolveFallbackCircuitPolicy,
   resolveRetryPolicy
 } from "./handler/fallback.js";
-import { sleep } from "./handler/utils.js";
+import { parseJsonSafely, sleep } from "./handler/utils.js";
 import {
   applyCandidateFailureState,
   applyRuntimeRetryPolicyGuards,
@@ -68,6 +71,7 @@ import {
   isRoutingDebugEnabled,
   recordRouteAttempt,
   recordRouteSkip,
+  setRouteContextDebug,
   setRouteSelectedCandidate,
   setRouteToolDebug,
   withRouteDebugHeaders
@@ -94,13 +98,6 @@ function filterCandidatesByFormat(candidates) {
   }
 
   return { eligible, skipped };
-}
-
-function hasNextEligibleCandidate(entries, startIndex) {
-  for (let index = startIndex + 1; index < (entries || []).length; index += 1) {
-    if (entries[index]?.eligible) return true;
-  }
-  return false;
 }
 
 function extractBuiltInToolTypes(body) {
@@ -161,11 +158,111 @@ function isChatGPTCodexCandidate(candidate) {
   return subscriptionType === "chatgpt-codex";
 }
 
+function resolveCandidateContextWindow(candidate) {
+  const raw = candidate?.contextWindow ?? candidate?.model?.contextWindow;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function resolveSelectedContextRisk(candidate, estimatedRequiredTokens) {
+  const requiredTokens = Number(estimatedRequiredTokens);
+  if (!candidate || !Number.isFinite(requiredTokens) || requiredTokens <= 0) return "";
+
+  const contextWindow = resolveCandidateContextWindow(candidate);
+  if (!contextWindow) {
+    return "selected-context-window-unknown";
+  }
+  if (contextWindow < requiredTokens) {
+    return `selected-context-window-below-required:${contextWindow}<${requiredTokens}`;
+  }
+  return "";
+}
+
 const WEB_SEARCH_UNAVAILABLE_HINTS = [
   "web search credits are unavailable in this session",
   "web access unavailable (out of credits)",
   "web access unavailable"
 ];
+const ACTIVITY_LOG_ERROR_DETAIL_MAX_CHARS = 240;
+
+function queueActivityEvent(onActivityLog, payload) {
+  if (typeof onActivityLog !== "function") return;
+  try {
+    const result = onActivityLog(payload);
+    if (result && typeof result.then === "function") {
+      result.catch(() => {});
+    }
+  } catch {
+  }
+}
+
+function getNextEligibleCandidateEntry(entries, startIndex) {
+  for (let index = startIndex + 1; index < (entries || []).length; index += 1) {
+    if (entries[index]?.eligible) return entries[index];
+  }
+  return null;
+}
+
+function formatActivityCandidateLabel(candidate) {
+  const providerId = String(candidate?.providerId || "unknown").trim() || "unknown";
+  const modelId = String(candidate?.modelId || candidate?.backend || "unknown").trim() || "unknown";
+  return `${providerId}/${modelId}`;
+}
+
+function formatActivityRouteLabel(requestedModel, resolved) {
+  const requested = String(requestedModel || "").trim() || "smart";
+  const routeRef = String(resolved?.routeRef || "").trim();
+  return routeRef && routeRef !== requested ? `${requested} -> ${routeRef}` : (routeRef || requested);
+}
+
+function formatFailureCategory(category) {
+  return String(category || "")
+    .trim()
+    .replace(/_/g, " ");
+}
+
+function buildFailureSummary(result, classification) {
+  const parts = [];
+  const status = Number.isFinite(result?.status) ? Number(result.status) : 0;
+  if (status > 0) parts.push(`status ${status}`);
+  const category = formatFailureCategory(classification?.category);
+  if (category) parts.push(category);
+  return parts.join(" · ") || "request failed";
+}
+
+function buildActivityDetail(baseMessage, providerMessage = "") {
+  const detail = String(providerMessage || "").trim();
+  if (!detail) return baseMessage;
+  return `${baseMessage} Provider said: ${detail}`;
+}
+
+async function readActivityErrorDetail(result) {
+  const response = result?.upstreamResponse instanceof Response
+    ? result.upstreamResponse
+    : (result?.response instanceof Response ? result.response : null);
+  if (!(response instanceof Response)) return "";
+
+  try {
+    const raw = (await response.clone().text()).trim();
+    if (!raw) return "";
+    const parsed = parseJsonSafely(raw, null);
+    const message = parsed?.error?.message
+      || parsed?.error?.code
+      || parsed?.error?.type
+      || parsed?.error
+      || parsed?.code
+      || parsed?.type
+      || parsed?.message
+      || raw;
+    const compact = String(message || "").replace(/\s+/g, " ").trim();
+    if (!compact) return "";
+    if (compact.length <= ACTIVITY_LOG_ERROR_DETAIL_MAX_CHARS) return compact;
+    return `${compact.slice(0, ACTIVITY_LOG_ERROR_DETAIL_MAX_CHARS - 1)}…`;
+  } catch {
+    return "";
+  }
+}
 
 function extractAssistantTextFragments(payload) {
   const fragments = [];
@@ -359,7 +456,14 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
   const requestedModel = body?.model || "smart";
   const stream = isStreamingEnabled(sourceFormat, body);
 
-  if (shouldProxyAmpWebSearchRequest(options.clientType, builtInToolTypes, config)) {
+  const interceptAmpWebSearch = shouldInterceptAmpWebSearch({
+    clientType: options.clientType,
+    originalBody: body,
+    runtimeConfig: config,
+    env
+  });
+
+  if (!interceptAmpWebSearch && shouldProxyAmpWebSearchRequest(options.clientType, builtInToolTypes, config)) {
     const routeDebug = buildAmpWebSearchProxyDebugState(env, requestedModel, builtInToolTypes);
     if (routeDebug.enabled) {
       console.warn(
@@ -415,6 +519,30 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     ...resolved,
     sourceFormat
   };
+  const routeLabel = formatActivityRouteLabel(requestedModel, resolved);
+  const requestContext = estimateRequestContextTokens(body);
+  const ampContextRequirement = inferAmpContextRequirement(request, body, options);
+  const effectiveRequiredTokens = Math.max(
+    Number(requestContext?.estimatedRequiredTokens) || 0,
+    Number(ampContextRequirement?.minimumContextTokens) || 0
+  );
+  const effectiveRequestContext = {
+    ...requestContext,
+    ampMinimumContextTokens: Number(ampContextRequirement?.minimumContextTokens) || 0,
+    ampContextSource: String(ampContextRequirement?.source || "").trim(),
+    estimatedRequiredTokens: effectiveRequiredTokens
+  };
+  setRouteContextDebug(routeDebug, {
+    requiredTokens: effectiveRequiredTokens,
+    hintSource: effectiveRequiredTokens > (Number(requestContext?.estimatedRequiredTokens) || 0)
+      ? ampContextRequirement?.source || "request-context-hint"
+      : (effectiveRequiredTokens > 0 ? "request-body-estimate" : "")
+  });
+  if (routeDebug.enabled && effectiveRequestContext.ampContextSource) {
+    console.warn(
+      `[llm-router] context hint request=${requestedModel} source=${effectiveRequestContext.ampContextSource} required=${effectiveRequiredTokens}`
+    );
+  }
   const routeCandidates = [resolved.primary, ...resolved.fallbacks];
   const formatFiltered = filterCandidatesByFormat(routeCandidates);
   for (const skipped of formatFiltered.skipped) {
@@ -449,6 +577,7 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
       candidates: prioritizedCandidates.candidates,
       stateStore,
       config,
+      requestContext: effectiveRequestContext,
       now
     });
   } catch (error) {
@@ -463,6 +592,12 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
 
   routeDebug.strategy = ranking.strategy;
   setRouteSelectedCandidate(routeDebug, ranking.selectedEntry?.candidate);
+  setRouteContextDebug(routeDebug, {
+    risk: resolveSelectedContextRisk(
+      ranking.selectedEntry?.candidate,
+      effectiveRequestContext.estimatedRequiredTokens
+    )
+  });
   for (const skippedEntry of (ranking.skippedEntries || [])) {
     recordRouteSkip(routeDebug, skippedEntry.candidate, skippedEntry.skipReasons);
   }
@@ -480,6 +615,7 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
   let lastErrorResult = null;
   let lastErrorMessage = "Unknown error";
   let routeSelectionCommitted = false;
+  let pendingFallbackContext = null;
 
   for (let index = 0; index < ranking.entries.length; index += 1) {
     const entry = ranking.entries[index];
@@ -505,14 +641,16 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     while (attempt < maxAttempts) {
       attempt += 1;
       result = await makeProviderCall({
-      body,
-      sourceFormat,
-      stream,
-      requestKind: options.requestKind,
-      candidate,
-      requestHeaders: request.headers,
-      env,
-      clientType: options.clientType
+        body,
+        sourceFormat,
+        stream,
+        requestKind: options.requestKind,
+        candidate,
+        requestHeaders: request.headers,
+        env,
+        clientType: options.clientType,
+        runtimeConfig: config,
+        stateStore
       });
 
       if (!quotaConsumed && shouldConsumeQuotaFromResult(result)) {
@@ -538,7 +676,22 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
         }
         await clearCandidateRoutingState(stateStore, entry.candidateKey);
         setRouteSelectedCandidate(routeDebug, candidate, { overwrite: true });
+        setRouteContextDebug(routeDebug, {
+          risk: resolveSelectedContextRisk(candidate, effectiveRequestContext.estimatedRequiredTokens)
+        });
         recordRouteAttempt(routeDebug, candidate, result.status, null, attempt);
+        if (pendingFallbackContext) {
+          queueActivityEvent(options.onActivityLog, {
+            level: "success",
+            message: `Fallback request succeeded for ${routeLabel}.`,
+            detail: `${formatActivityCandidateLabel(candidate)} completed the request after ${pendingFallbackContext.failedCandidate} failed (${pendingFallbackContext.failureSummary}).`,
+            source: "runtime",
+            category: "usage",
+            kind: "fallback-succeeded",
+            route: routeLabel
+          });
+          pendingFallbackContext = null;
+        }
         return withRouteDebugHeaders(result.response, routeDebug);
       }
 
@@ -571,8 +724,41 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
       isFallbackAttempt
     );
 
-    const hasNextCandidate = hasNextEligibleCandidate(ranking.entries, index);
+    const nextCandidateEntry = getNextEligibleCandidateEntry(ranking.entries, index);
+    const hasNextCandidate = Boolean(nextCandidateEntry);
+    const failureSummary = buildFailureSummary(result, classification);
+    const providerMessage = await readActivityErrorDetail(result);
+    if (hasNextCandidate && classification?.allowFallback !== false) {
+      queueActivityEvent(options.onActivityLog, {
+        level: "warn",
+        message: `Request fallback triggered for ${routeLabel}.`,
+        detail: buildActivityDetail(
+          `${formatActivityCandidateLabel(candidate)} failed (${failureSummary}). Trying ${formatActivityCandidateLabel(nextCandidateEntry?.candidate)} next.`,
+          providerMessage
+        ),
+        source: "runtime",
+        category: "usage",
+        kind: "fallback-triggered",
+        route: routeLabel
+      });
+      pendingFallbackContext = {
+        failedCandidate: formatActivityCandidateLabel(candidate),
+        failureSummary
+      };
+    }
     if (!hasNextCandidate || classification?.allowFallback === false) {
+      queueActivityEvent(options.onActivityLog, {
+        level: "error",
+        message: `Request failed for ${routeLabel}.`,
+        detail: buildActivityDetail(
+          `${formatActivityCandidateLabel(candidate)} failed (${failureSummary})${classification?.allowFallback === false ? ". Fallback stopped for this error." : ". No more fallbacks are available."}`,
+          providerMessage
+        ),
+        source: "runtime",
+        category: "usage",
+        kind: "request-failed",
+        route: routeLabel
+      });
       return withRouteDebugHeaders(await buildFailureResponse(result), routeDebug);
     }
   }

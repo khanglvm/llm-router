@@ -50,6 +50,10 @@ function getAiHelpAction() {
   return routerModule.actions.find((entry) => entry.actionId === "ai-help");
 }
 
+function getReclaimAction() {
+  return routerModule.actions.find((entry) => entry.actionId === "reclaim");
+}
+
 function getSubscriptionAction() {
   return routerModule.actions.find((entry) => entry.actionId === "subscription");
 }
@@ -818,185 +822,6 @@ test("interactive set-amp-config edits existing AMP routes with inbound and outb
   assert.ok(lineLogs.some((message) => message.includes("https://ampcode.com/models")));
 });
 
-test("interactive config shows the new root menu sections", async (t) => {
-  const configAction = getConfigAction();
-  const configPath = await createTempConfigFile(t, {
-    ...baseConfigFixture(),
-    masterKey: "gw_local_master"
-  });
-
-  const seenLabels = [];
-  const prompts = {
-    select: async ({ options }) => {
-      seenLabels.push((options || []).map((option) => option.label));
-      throw new Error("Prompt cancelled");
-    },
-    text: async () => { throw new Error("Prompt cancelled"); },
-    confirm: async () => { throw new Error("Prompt cancelled"); }
-  };
-
-  const result = await configAction.run(createConfigContext({
-    config: configPath
-  }, {
-    forcePrompt: true,
-    prompts
-  }));
-
-  assert.equal(result.ok, true);
-  assert.equal(String(result.data || ""), "No changes made.");
-  assert.deepEqual(seenLabels[0], [
-    "Providers",
-    "Models",
-    "Model Alias",
-    "AMP",
-    "Startup",
-    "Other setting"
-  ]);
-});
-
-test("interactive config root menu lets users go back and pick another section", async (t) => {
-  const configAction = getConfigAction();
-  const configPath = await createTempConfigFile(t, {
-    ...baseConfigFixture(),
-    masterKey: "gw_local_master"
-  });
-  const prompts = createQueuedPrompts([
-    { type: "select", value: "startup" },
-    { type: "select", value: "__back__" },
-    { type: "select", value: "other-settings" },
-    { type: "select", value: "list-routing" },
-    { type: "cancel" }
-  ]);
-
-  const result = await configAction.run(createConfigContext({
-    config: configPath
-  }, {
-    forcePrompt: true,
-    prompts
-  }));
-
-  assert.equal(result.ok, true);
-  assert.match(String(result.data || ""), /Providers/);
-  assert.deepEqual(prompts.remaining(), []);
-});
-
-test("interactive providers menu edits one field and returns to the detail screen", async (t) => {
-  const configAction = getConfigAction();
-  const configPath = await createTempConfigFile(t, baseConfigFixture());
-  const prompts = createQueuedPrompts([
-    { type: "select", value: "providers" },
-    { type: "select", value: "openrouter" },
-    { type: "select", value: "edit-name" },
-    { type: "text", value: "OpenRouter Prime" },
-    { type: "cancel" },
-    { type: "cancel" },
-    { type: "cancel" }
-  ]);
-
-  const result = await configAction.run(createConfigContext({
-    config: configPath
-  }, {
-    forcePrompt: true,
-    prompts
-  }));
-
-  assert.equal(result.ok, true);
-  const next = await readConfigFile(configPath);
-  assert.equal(next.providers.find((entry) => entry.id === "openrouter")?.name, "OpenRouter Prime");
-  assert.match(String(result.data || ""), /Provider Name Updated/);
-  assert.deepEqual(prompts.remaining(), []);
-});
-
-test("interactive models menu only probes new models and lets users rename undetected entries", async (t) => {
-  const configAction = getConfigAction();
-  const configPath = await createTempConfigFile(t, baseConfigFixture());
-  const calls = installFetchMock(t, ({ url, method, body }) => {
-    if (method === "GET" && url.endsWith("/models")) {
-      return jsonResponse({ object: "list", data: [] });
-    }
-
-    if (method === "POST" && url.endsWith("/chat/completions") && body?.model === "__llm_router_probe__") {
-      return jsonResponse({ error: { message: "model not found" } }, { status: 400 });
-    }
-
-    if (method === "POST" && url.endsWith("/chat/completions") && body?.model === "gpt-5-codx") {
-      return jsonResponse({ error: { message: "model not found" } }, { status: 404 });
-    }
-
-    if (method === "POST" && url.endsWith("/chat/completions") && body?.model === "gpt-5-codex") {
-      return jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "ok" } }] });
-    }
-
-    return jsonResponse({ error: { message: `unhandled ${method} ${url}` } }, { status: 500 });
-  });
-
-  const prompts = createQueuedPrompts([
-    { type: "select", value: "models" },
-    { type: "select", value: "openrouter" },
-    { type: "text", value: "gpt-4o-mini,gpt-5-codx" },
-    { type: "text", value: "gpt-5-codex" },
-    { type: "cancel" },
-    { type: "cancel" }
-  ]);
-
-  const result = await configAction.run(createConfigContext({
-    config: configPath
-  }, {
-    forcePrompt: true,
-    prompts
-  }));
-
-  assert.equal(result.ok, true);
-  const next = await readConfigFile(configPath);
-  assert.deepEqual(next.providers.find((entry) => entry.id === "openrouter")?.models.map((model) => model.id), [
-    "gpt-4o-mini",
-    "gpt-5-codex"
-  ]);
-  const probedModels = calls
-    .filter((entry) => entry.method === "POST" && entry.url.endsWith("/chat/completions") && entry.body?.model && entry.body.model !== "__llm_router_probe__")
-    .map((entry) => entry.body.model);
-  assert.deepEqual(probedModels, ["gpt-5-codx", "gpt-5-codex"]);
-  assert.match(String(result.data || ""), /Provider Models Updated/);
-  assert.deepEqual(prompts.remaining(), []);
-});
-
-test("interactive model alias menu edits an existing alias directly", async (t) => {
-  const configAction = getConfigAction();
-  const configPath = await createTempConfigFile(t, {
-    ...baseConfigFixture(),
-    modelAliases: {
-      "chat.default": {
-        strategy: "auto",
-        targets: [{ ref: "openrouter/gpt-4o-mini" }]
-      }
-    }
-  });
-  const prompts = createQueuedPrompts([
-    { type: "select", value: "model-alias" },
-    { type: "select", value: "chat.default" },
-    { type: "select", value: "edit-targets" },
-    { type: "text", value: "anthropic/claude-3-5-haiku@2" },
-    { type: "cancel" },
-    { type: "cancel" },
-    { type: "cancel" }
-  ]);
-
-  const result = await configAction.run(createConfigContext({
-    config: configPath
-  }, {
-    forcePrompt: true,
-    prompts
-  }));
-
-  assert.equal(result.ok, true);
-  const next = await readConfigFile(configPath);
-  assert.deepEqual(next.modelAliases["chat.default"].targets, [
-    { ref: "anthropic/claude-3-5-haiku", weight: 2 }
-  ]);
-  assert.match(String(result.data || ""), /Model Alias Saved/);
-  assert.deepEqual(prompts.remaining(), []);
-});
-
 test("non-interactive set-amp-config can patch AMP client files with local gateway key", async (t) => {
   const configAction = getConfigAction();
   const configPath = await createTempConfigFile(t, {
@@ -1501,6 +1326,69 @@ test("non-interactive upsert-provider subscription auto-generates unique gpt-sub
   assert.deepEqual(probedRequests.map((body) => body.model), CODEX_SUBSCRIPTION_MODELS);
 });
 
+test("non-interactive upsert-provider can fill model context windows from LiteLLM", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, baseConfigFixture());
+  const lookupCalls = [];
+  const terminalLines = [];
+
+  const result = await configAction.run(createConfigContext({
+    operation: "upsert-provider",
+    config: configPath,
+    "provider-id": "demo",
+    name: "Demo",
+    "base-url": "https://example.com/v1",
+    "api-key": "sk-demo",
+    models: "gpt-4o-mini,gpt-4o",
+    "skip-probe": "true",
+    "fill-model-context-windows": "true"
+  }, {
+    terminal: {
+      line(message) {
+        terminalLines.push(message);
+      },
+      info() {},
+      warn() {},
+      error() {}
+    },
+    lookupLiteLlmContextWindow: async ({ models }) => {
+      lookupCalls.push(models);
+      return [
+        {
+          query: "gpt-4o-mini",
+          exactMatch: {
+            model: "gpt-4o-mini",
+            contextWindow: 128000
+          },
+          suggestions: []
+        },
+        {
+          query: "gpt-4o",
+          exactMatch: {
+            model: "gpt-4o",
+            contextWindow: 128000
+          },
+          suggestions: []
+        }
+      ];
+    }
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(lookupCalls, [["gpt-4o-mini", "gpt-4o"]]);
+  const next = await readConfigFile(configPath);
+  const provider = next.providers.find((entry) => entry.id === "demo");
+  assert.ok(provider);
+  assert.deepEqual(provider.models.map((model) => ({
+    id: model.id,
+    contextWindow: model.contextWindow
+  })), [
+    { id: "gpt-4o-mini", contextWindow: 128000 },
+    { id: "gpt-4o", contextWindow: 128000 }
+  ]);
+  assert.match(terminalLines.join("\n"), /LiteLLM filled 2 model context windows/i);
+});
+
 test("non-interactive upsert-model-alias accepts auto model routing strategy", async (t) => {
   const configAction = getConfigAction();
   const configPath = await createTempConfigFile(t, baseConfigFixture());
@@ -1728,6 +1616,238 @@ test("list-routing stays stable after mixed edits", async (t) => {
   assert.equal(normalized.modelAliases["chat.default"].targets.length, 2);
 });
 
+test("set-codex-cli-routing patches Codex CLI config and tool-status reports it", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-codex-tool-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const codexConfigPath = path.join(tempDir, "config.toml");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-codex-cli-routing",
+    config: configPath,
+    "codex-config-file": codexConfigPath,
+    "default-model": "openrouter/gpt-4o-mini",
+    "thinking-level": "high"
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const codexConfigText = await fs.readFile(codexConfigPath, "utf8");
+  assert.match(codexConfigText, /model_provider = "llm-router"/);
+  assert.match(codexConfigText, /model = "openrouter\/gpt-4o-mini"/);
+
+  const statusResult = await configAction.run(createConfigContext({
+    operation: "tool-status",
+    config: configPath,
+    "codex-config-file": codexConfigPath
+  }));
+
+  assert.equal(statusResult.ok, true);
+  assert.match(String(statusResult.data || ""), /Codex CLI/);
+  assert.match(String(statusResult.data || ""), /Routed Via Router\s+\|\s+Yes/);
+  assert.match(String(statusResult.data || ""), /openrouter\/gpt-4o-mini/);
+});
+
+test("set-claude-code-routing patches Claude Code settings and tool-status reports it", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-claude-tool-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const claudeSettingsPath = path.join(tempDir, "settings.json");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-claude-code-routing",
+    config: configPath,
+    "claude-code-settings-file": claudeSettingsPath,
+    "primary-model": "openrouter/gpt-4o-mini",
+    "default-haiku-model": "anthropic/claude-3-5-haiku",
+    "thinking-level": "high"
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const claudeSettings = JSON.parse(await fs.readFile(claudeSettingsPath, "utf8"));
+  assert.equal(claudeSettings.env.ANTHROPIC_MODEL, "openrouter/gpt-4o-mini");
+  assert.equal(claudeSettings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "anthropic/claude-3-5-haiku");
+
+  const statusResult = await configAction.run(createConfigContext({
+    operation: "tool-status",
+    config: configPath,
+    "claude-code-settings-file": claudeSettingsPath
+  }));
+
+  assert.equal(statusResult.ok, true);
+  assert.match(String(statusResult.data || ""), /Claude Code/);
+  assert.match(String(statusResult.data || ""), /Routed Via Router\s+\|\s+Yes/);
+  assert.match(String(statusResult.data || ""), /anthropic\/claude-3-5-haiku/);
+});
+
+test("set-amp-client-routing bootstraps config and can unpatch AMP client files", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-amp-tool-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const settingsFilePath = path.join(tempDir, "settings.json");
+  const secretsFilePath = path.join(tempDir, "secrets.json");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-amp-client-routing",
+    config: configPath,
+    "amp-client-settings-scope": "global",
+    "amp-client-settings-file": settingsFilePath,
+    "amp-client-secrets-file": secretsFilePath
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const updatedConfig = await readConfigFile(configPath);
+  assert.equal(updatedConfig.amp.defaultRoute, "openrouter/gpt-4o-mini");
+
+  const settingsAfterPatch = JSON.parse(await fs.readFile(settingsFilePath, "utf8"));
+  assert.equal(settingsAfterPatch["amp.url"], LOCAL_ROUTER_ORIGIN);
+
+  const unpatchResult = await configAction.run(createConfigContext({
+    operation: "set-amp-client-routing",
+    config: configPath,
+    enabled: "false",
+    "amp-client-settings-scope": "global",
+    "amp-client-settings-file": settingsFilePath,
+    "amp-client-secrets-file": secretsFilePath
+  }));
+
+  assert.equal(unpatchResult.ok, true);
+  const settingsAfterUnpatch = JSON.parse(await fs.readFile(settingsFilePath, "utf8"));
+  assert.equal(Object.prototype.hasOwnProperty.call(settingsAfterUnpatch, "amp.url"), false);
+});
+
+test("snapshot includes runtime and coding tool sections", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+
+  const result = await configAction.run(createConfigContext({
+    operation: "snapshot",
+    config: configPath
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Router Snapshot/);
+  assert.match(String(result.data || ""), /Runtime/);
+  assert.match(String(result.data || ""), /Codex CLI/);
+  assert.match(String(result.data || ""), /Claude Code/);
+  assert.match(String(result.data || ""), /AMP Client/);
+});
+
+test("validate reports success for a valid config", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+
+  const result = await configAction.run(createConfigContext({
+    operation: "validate",
+    config: configPath
+  }));
+
+  assert.equal(result.ok, true);
+  assert.match(String(result.data || ""), /Config Validation/);
+  assert.match(String(result.data || ""), /JSON Parse\s+\|\s+Passed/);
+  assert.match(String(result.data || ""), /Validation\s+\|\s+Passed/);
+});
+
+test("validate reports parse errors for invalid JSON", async (t) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-validate-bad-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const configPath = path.join(tempDir, "config.json");
+  await fs.writeFile(configPath, "{ invalid json\n", "utf8");
+  const configAction = getConfigAction();
+
+  const result = await configAction.run(createConfigContext({
+    operation: "validate",
+    config: configPath
+  }));
+
+  assert.equal(result.ok, false);
+  assert.equal(result.exitCode, 2);
+  assert.match(String(result.errorMessage || ""), /Config Validation/);
+  assert.match(String(result.errorMessage || ""), /JSON parse error/i);
+});
+
+test("reclaim action reports when the fixed port is already free", async () => {
+  const reclaimAction = getReclaimAction();
+  assert.ok(reclaimAction);
+  let reclaimCalls = 0;
+
+  const result = await reclaimAction.run({
+    args: {},
+    mode: "commandline",
+    terminal: {
+      line() {},
+      error() {}
+    },
+    listListeningPids: () => ({ ok: true, pids: [] }),
+    reclaimPort: async () => {
+      reclaimCalls += 1;
+      return { ok: true };
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(reclaimCalls, 0);
+  assert.match(String(result.data || ""), /Router Port Reclaim/);
+  assert.match(String(result.data || ""), /Busy Before\s+\|\s+No/);
+  assert.match(String(result.data || ""), /Reclaimed\s+\|\s+No/);
+});
+
+test("reclaim action frees a busy fixed port", async () => {
+  const reclaimAction = getReclaimAction();
+  assert.ok(reclaimAction);
+  const probes = [
+    { ok: true, pids: [43210] },
+    { ok: true, pids: [] }
+  ];
+  let probeIndex = 0;
+  let reclaimCalls = 0;
+
+  const result = await reclaimAction.run({
+    args: {},
+    mode: "commandline",
+    terminal: {
+      line() {},
+      error() {}
+    },
+    listListeningPids: () => probes[Math.min(probeIndex++, probes.length - 1)],
+    reclaimPort: async () => {
+      reclaimCalls += 1;
+      return { ok: true };
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(reclaimCalls, 1);
+  assert.match(String(result.data || ""), /Router Port Reclaim/);
+  assert.match(String(result.data || ""), /Reclaimed\s+\|\s+Yes/);
+  assert.match(String(result.data || ""), /43210/);
+});
+
 test("migrate-config creates backup and upgrades legacy config version", async (t) => {
   const configAction = getConfigAction();
   const legacy = baseConfigFixture();
@@ -1764,8 +1884,12 @@ test("ai-help action exists and includes discovery commands", async (t) => {
 
   assert.equal(result.ok, true);
   assert.match(String(result.data || ""), /# AI-HELP/);
-  assert.match(String(result.data || ""), /llm-router -h/);
-  assert.match(String(result.data || ""), /llm-router config -h/);
+  assert.match(String(result.data || ""), /llr -h/);
+  assert.match(String(result.data || ""), /llr config -h/);
+  assert.match(String(result.data || ""), /llr reclaim/);
+  assert.match(String(result.data || ""), /llr config --operation=validate/);
+  assert.match(String(result.data || ""), /llr config --operation=snapshot/);
+  assert.match(String(result.data || ""), /set-codex-cli-routing/);
   assert.match(String(result.data || ""), /## PRE-PATCH API GATE/);
   assert.match(String(result.data || ""), /## CODING TOOL PATCH PLAYBOOK/);
   assert.match(String(result.data || ""), /patch_gate_codex_cli=/);

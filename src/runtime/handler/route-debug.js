@@ -41,6 +41,9 @@ export function buildRouteDebugState(enabled, resolved) {
     selectedCandidate: "",
     skippedCandidates: [],
     attempts: [],
+    contextRequiredTokens: "",
+    contextHintSource: "",
+    contextRisk: "",
     toolTypes: "",
     toolRouting: ""
   };
@@ -81,6 +84,24 @@ export function setRouteToolDebug(debugState, toolTypes, toolRouting = "") {
   debugState.toolRouting = String(toolRouting || "").trim();
 }
 
+export function setRouteContextDebug(debugState, { requiredTokens, hintSource, risk } = {}) {
+  if (!debugState?.enabled) return;
+
+  const normalizedRequiredTokens = Number(requiredTokens);
+  if (Number.isFinite(normalizedRequiredTokens) && normalizedRequiredTokens > 0) {
+    debugState.contextRequiredTokens = String(Math.floor(normalizedRequiredTokens));
+  }
+
+  const normalizedHintSource = String(hintSource || "").trim();
+  if (normalizedHintSource) {
+    debugState.contextHintSource = normalizedHintSource;
+  }
+
+  if (risk !== undefined) {
+    debugState.contextRisk = String(risk || "").trim();
+  }
+}
+
 export function withRouteDebugHeaders(response, debugState) {
   if (!debugState?.enabled || !(response instanceof Response)) {
     return response;
@@ -105,6 +126,21 @@ export function withRouteDebugHeaders(response, debugState) {
   const attempts = toSafeHeaderValue(debugState.attempts.join(","));
   if (attempts) {
     headers.set("x-llm-router-attempts", attempts);
+  }
+
+  const contextRequiredTokens = toSafeHeaderValue(debugState.contextRequiredTokens);
+  if (contextRequiredTokens) {
+    headers.set("x-llm-router-context-required", contextRequiredTokens);
+  }
+
+  const contextHintSource = toSafeHeaderValue(debugState.contextHintSource);
+  if (contextHintSource) {
+    headers.set("x-llm-router-context-hint-source", contextHintSource);
+  }
+
+  const contextRisk = toSafeHeaderValue(debugState.contextRisk);
+  if (contextRisk) {
+    headers.set("x-llm-router-context-risk", contextRisk);
   }
 
   const toolTypes = toSafeHeaderValue(debugState.toolTypes);

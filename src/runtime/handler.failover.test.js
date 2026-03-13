@@ -227,6 +227,98 @@ test("auth failure can fall through to next provider", { concurrency: false }, a
   }
 });
 
+test("fallback recovery emits activity log entries", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const store = createMemoryStateStore();
+  const activityEvents = [];
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store,
+    onActivityLog: (entry) => {
+      activityEvents.push(entry);
+    }
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    let requestCount = 0;
+    globalThis.fetch = async (_url, init) => {
+      requestCount += 1;
+      const payload = JSON.parse(String(init?.body || "{}"));
+      if (requestCount === 1) {
+        return jsonPayloadResponse({
+          error: { message: "rate limit reached" }
+        }, 429);
+      }
+      return claudeSuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+      LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS: "1"
+    });
+    assert.equal(response.status, 200);
+    assert.equal(activityEvents.length, 2);
+    assert.equal(activityEvents[0].level, "warn");
+    assert.equal(activityEvents[0].category, "usage");
+    assert.match(activityEvents[0].message, /Request fallback triggered for chat\.default/);
+    assert.match(activityEvents[0].detail, /openrouter\/gpt-4o-mini failed \(status 429 · rate limited\)/);
+    assert.match(activityEvents[0].detail, /Trying anthropic\/claude-3-5-haiku next/);
+    assert.equal(activityEvents[1].level, "success");
+    assert.match(activityEvents[1].message, /Fallback request succeeded for chat\.default/);
+    assert.match(activityEvents[1].detail, /anthropic\/claude-3-5-haiku completed the request after openrouter\/gpt-4o-mini failed/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("terminal request failure emits an activity log entry", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  });
+  const store = createMemoryStateStore();
+  const activityEvents = [];
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store,
+    onActivityLog: (entry) => {
+      activityEvents.push(entry);
+    }
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => jsonPayloadResponse({
+      error: { message: "bad request" }
+    }, 400);
+
+    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+      LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS: "1"
+    });
+    assert.equal(response.status, 400);
+    assert.equal(activityEvents.length, 1);
+    assert.equal(activityEvents[0].level, "error");
+    assert.equal(activityEvents[0].category, "usage");
+    assert.match(activityEvents[0].message, /Request failed for chat\.default/);
+    assert.match(activityEvents[0].detail, /openrouter\/gpt-4o-mini failed \(status 400 · invalid request\)/);
+    assert.match(activityEvents[0].detail, /Fallback stopped for this error/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
 test("invalid request short-circuits without fallback fan-out", { concurrency: false }, async () => {
   const config = buildConfig();
   const store = createMemoryStateStore();
@@ -251,6 +343,64 @@ test("invalid request short-circuits without fallback fan-out", { concurrency: f
     });
     assert.equal(response.status, 400);
     assert.equal(callCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("context window overflow can fall through to the next alias target", { concurrency: false }, async () => {
+  const config = buildConfig({
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini", contextWindow: 128000 }]
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku", contextWindow: 200000 }]
+      }
+    ]
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      calls.push(payload.model);
+      if (calls.length === 1) {
+        return jsonPayloadResponse({
+          error: {
+            message: "This model's maximum context length is 128000 tokens. However, your request exceeded the context window."
+          }
+        }, 400);
+      }
+      return claudeSuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeOpenAIRequest("chat.default"), {
+      LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS: "1"
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, [
+      "gpt-4o-mini",
+      "claude-3-5-haiku"
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
     if (typeof fetchHandler.close === "function") {

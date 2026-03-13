@@ -130,7 +130,7 @@ export async function stopStartupManagedListener({ port, line, error }, deps = {
 
   if (!shouldStopStartup) return { ok: true, attempted: false };
 
-  line(`Detected startup-managed llm-router on port ${port}. Stopping startup service before reclaim.`);
+  line(`Detected a startup-managed LLM Router instance on port ${port}. Stopping the startup service before reclaim.`);
   try {
     await stopStartupFn();
     await clearRuntimeStateFn();
@@ -140,7 +140,7 @@ export async function stopStartupManagedListener({ port, line, error }, deps = {
     return {
       ok: false,
       attempted: true,
-      errorMessage: `Port ${port} is occupied by a startup-managed llm-router service and could not be stopped automatically. Stop it with 'llm-router stop' or 'llm-router config --operation=startup-uninstall' and retry.`
+      errorMessage: `Port ${port} is occupied by a startup-managed LLM Router service and could not be stopped automatically. Stop it with 'llr stop' or 'llr config --operation=startup-uninstall' and retry.`
     };
   }
 }

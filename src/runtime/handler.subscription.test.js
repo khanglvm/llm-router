@@ -607,6 +607,82 @@ test("makeProviderCall reconstructs Codex Responses JSON for non-stream OpenAI r
   assert.equal(payload.output?.[0]?.arguments, "{\"query\":\"llm-router\"}");
 });
 
+test("makeProviderCall normalizes web_search_preview to web_search for subscription Codex responses requests", { concurrency: false }, async (t) => {
+  const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpHome;
+  t.after(() => restoreHomeValue(originalHome));
+  t.after(async () => {
+    await fs.rm(tmpHome, { recursive: true, force: true });
+  });
+
+  await saveTokens("personal", {
+    accessToken: "token-abc",
+    refreshToken: "refresh-abc",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    tokenType: "Bearer",
+    scope: "openid"
+  });
+
+  const responseSse = [
+    "event: response.created",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_preview\",\"created_at\":1730000006,\"model\":\"gpt-5.3-codex\"}}",
+    "",
+    "event: response.completed",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_preview\",\"object\":\"response\",\"created_at\":1730000006,\"model\":\"gpt-5.3-codex\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_item_3\",\"call_id\":\"call_web_2\",\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"llm-router\\\"}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":4,\"total_tokens\":6},\"incomplete_details\":null}}",
+    "",
+    ""
+  ].join("\n");
+
+  const originalFetch = globalThis.fetch;
+  let capturedRequest = null;
+  globalThis.fetch = async (url, init = {}) => {
+    capturedRequest = {
+      url: String(url),
+      headers: init.headers || {},
+      body: JSON.parse(String(init.body || "{}"))
+    };
+    return new Response(responseSse, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await makeProviderCall({
+    body: {
+      model: "chatgpt/gpt-5.3-codex",
+      tools: [{ type: "web_search_preview" }],
+      tool_choice: {
+        type: "web_search_preview"
+      },
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Search the web for llm-router" }]
+        }
+      ]
+    },
+    sourceFormat: FORMATS.OPENAI,
+    stream: false,
+    candidate: buildSubscriptionCandidate(),
+    requestKind: "responses",
+    requestHeaders: new Headers(),
+    env: {}
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(capturedRequest?.body?.tools?.[0]?.type, "web_search");
+  assert.equal(capturedRequest?.body?.tool_choice, "required");
+
+  const payload = await result.response.json();
+  assert.equal(payload.output?.[0]?.type, "function_call");
+  assert.equal(payload.output?.[0]?.name, "web_search");
+});
+
 test("makeProviderCall sends Claude OAuth subscription requests with Anthropic headers", { concurrency: false }, async (t) => {
   const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-subscription-test-"));
   const originalHome = process.env.HOME;

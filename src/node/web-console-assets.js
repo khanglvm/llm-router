@@ -3,7 +3,7 @@ import { WEB_CONSOLE_CSS } from "./web-console-styles.generated.js";
 export { WEB_CONSOLE_CSS };
 
 export function renderWebConsoleHtml({
-  title = "LLM Router Web",
+  title = "LLM Router Web Console",
   headHtml = "",
   bodyHtml = ""
 } = {}) {

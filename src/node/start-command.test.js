@@ -91,7 +91,7 @@ test("stopStartupManagedListener stops startup-managed runtime before reclaim", 
 
   assert.deepEqual(result, { ok: true, attempted: true });
   assert.equal(lines.length, 1);
-  assert.match(lines[0], /Stopping startup service before reclaim/);
+  assert.match(lines[0], /Stopping the startup service before reclaim/);
 });
 
 test("reclaimPort short-circuits when startup-managed stop fails", async () => {
@@ -188,7 +188,7 @@ test("runStartCommand reports a missing config file with setup guidance", async 
     assert.equal(result.ok, false);
     assert.equal(result.exitCode, 2);
     assert.match(result.errorMessage || "", /Config file not found/);
-    assert.match(result.errorMessage || "", /Run 'llm-router config'/);
+    assert.match(result.errorMessage || "", /Run 'llr config'/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -290,13 +290,13 @@ test("runStartCommand hands off to installed startup service instead of starting
 
     assert.equal(result.ok, true);
     assert.equal(result.exitCode, 0);
-    assert.match(result.data || "", /Startup-managed llm-router is active/);
+    assert.match(result.data || "", /Startup-managed LLM Router is active/);
     assert.deepEqual(stopCalls, [4321]);
     assert.equal(installCalls.length, 1);
     assert.equal(installCalls[0].configPath, fixture.configPath);
     assert.equal(installCalls[0].port, LOCAL_ROUTER_PORT);
     assert.deepEqual(errors, []);
-    assert.equal(lines.some((message) => /Stopped manual llm-router/.test(message)), true);
+    assert.equal(lines.some((message) => /Stopped manual LLM Router/.test(message)), true);
   } finally {
     await fixture.cleanup();
   }

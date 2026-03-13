@@ -8,6 +8,22 @@ const MAX_MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 60_000;
 const MIN_UPSTREAM_TIMEOUT_MS = 1_000;
 const MAX_UPSTREAM_TIMEOUT_MS = 300_000;
+const DEFAULT_OUTPUT_TOKEN_RESERVE = 1_024;
+const AMP_ANTHROPIC_CONTEXT_BASELINE_TOKENS = 200_000;
+const AMP_ANTHROPIC_CONTEXT_1M_TOKENS = 1_000_000;
+const AMP_ANTHROPIC_CONTEXT_1M_BETA = "context-1m-2025-08-07";
+const AMP_CONTEXT_HINTS_BY_MODEL = new Map([
+  ["free", { minimumContextTokens: 136_000, source: "amp:model:free" }],
+  ["rush", { minimumContextTokens: 136_000, source: "amp:model:rush" }],
+  ["smart", { minimumContextTokens: 168_000, source: "amp:model:smart" }],
+  ["deep", { minimumContextTokens: 272_000, source: "amp:model:deep" }],
+  ["large", { minimumContextTokens: 936_000, source: "amp:model:large" }],
+  ["claude-haiku-4-5-20251001", { minimumContextTokens: 136_000, source: "amp:model:claude-haiku-4-5-20251001" }],
+  ["claude-opus-4-6", { minimumContextTokens: 168_000, source: "amp:model:claude-opus-4-6" }],
+  ["openai/gpt-5.3-codex", { minimumContextTokens: 272_000, source: "amp:model:openai/gpt-5.3-codex" }],
+  ["claude-sonnet-4-6", { minimumContextTokens: 936_000, source: "amp:model:claude-sonnet-4-6" }],
+  ["gpt-5.3-codex", { minimumContextTokens: 968_000, source: "amp:model:gpt-5.3-codex" }]
+]);
 const AMP_API_PROVIDER_PREFIX = "/api/provider/";
 const AMP_MANAGEMENT_ROOT_PREFIXES = [
   "/auth",
@@ -162,6 +178,26 @@ function parseContentLength(value) {
   return parsed;
 }
 
+function parseNonNegativeNumber(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+function parseHeaderTokenList(value) {
+  if (!value) return [];
+  return String(value)
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function lookupAmpContextHint(model) {
+  const key = String(model || "").trim().toLowerCase();
+  if (!key) return null;
+  return AMP_CONTEXT_HINTS_BY_MODEL.get(key) || null;
+}
+
 function createRequestBodyTooLargeError(maxBytes) {
   const error = new Error(`Request body exceeds ${maxBytes} bytes.`);
   error.code = "REQUEST_BODY_TOO_LARGE";
@@ -208,6 +244,91 @@ export async function parseJsonBodyWithLimit(request, maxBytes) {
   const raw = await readRequestBodyWithLimit(request, maxBytes);
   if (!raw || !raw.trim()) return {};
   return JSON.parse(raw);
+}
+
+export function estimateRequestContextTokens(body = {}) {
+  if (!body || typeof body !== "object") {
+    return {
+      estimatedInputTokens: 0,
+      requestedOutputTokens: 0,
+      safetyPaddingTokens: 0,
+      estimatedRequiredTokens: 0
+    };
+  }
+
+  let serialized = "";
+  try {
+    serialized = JSON.stringify(body) || "";
+  } catch {
+    serialized = "";
+  }
+
+  const charLength = serialized.length;
+  const byteLength = serialized
+    ? new TextEncoder().encode(serialized).byteLength
+    : 0;
+  const estimatedInputTokens = Math.max(
+    Math.ceil(charLength / 4),
+    Math.ceil(byteLength / 3)
+  );
+
+  const explicitOutputTokens = Math.max(
+    parseNonNegativeNumber(body?.max_output_tokens),
+    parseNonNegativeNumber(body?.max_completion_tokens),
+    parseNonNegativeNumber(body?.max_tokens)
+  );
+  const requestedOutputTokens = explicitOutputTokens > 0
+    ? explicitOutputTokens
+    : DEFAULT_OUTPUT_TOKEN_RESERVE;
+  const safetyPaddingTokens = estimatedInputTokens > 0
+    ? Math.max(256, Math.ceil(estimatedInputTokens * 0.1))
+    : 0;
+
+  return {
+    estimatedInputTokens,
+    requestedOutputTokens,
+    safetyPaddingTokens,
+    estimatedRequiredTokens: estimatedInputTokens + requestedOutputTokens + safetyPaddingTokens
+  };
+}
+
+export function inferAmpContextRequirement(request, body = {}, options = {}) {
+  if (String(options?.clientType || "").trim().toLowerCase() !== "amp") {
+    return {
+      minimumContextTokens: 0,
+      source: ""
+    };
+  }
+
+  const providerHint = String(options?.providerHint || "").trim().toLowerCase();
+  const requestKind = String(options?.requestKind || "").trim().toLowerCase();
+  const requestedModelHint = lookupAmpContextHint(body?.model);
+  const anthropicBetaFlags = parseHeaderTokenList(
+    request?.headers?.get("anthropic-beta") || request?.headers?.get("Anthropic-Beta")
+  );
+
+  if (anthropicBetaFlags.includes(AMP_ANTHROPIC_CONTEXT_1M_BETA)) {
+    return {
+      minimumContextTokens: AMP_ANTHROPIC_CONTEXT_1M_TOKENS,
+      source: `amp:anthropic-beta:${AMP_ANTHROPIC_CONTEXT_1M_BETA}`
+    };
+  }
+
+  if (requestedModelHint) {
+    return requestedModelHint;
+  }
+
+  if (providerHint === "anthropic" || requestKind === "messages") {
+    return {
+      minimumContextTokens: AMP_ANTHROPIC_CONTEXT_BASELINE_TOKENS,
+      source: "amp:anthropic-route:200k-baseline"
+    };
+  }
+
+  return {
+    minimumContextTokens: 0,
+    source: ""
+  };
 }
 
 export function isJsonRequest(request) {

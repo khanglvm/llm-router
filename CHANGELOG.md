@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0-beta.2] - 2026-03-13
+
+### Changed
+- Rebranded the user-facing CLI/docs name to `LLM Router` with `llr` as the primary command while keeping the published package scope as `@khanglvm/llm-router`.
+- Updated README and CLI help/examples to use the new branding and command.
+- Expanded the CLI management surface so agents can validate config state, inspect runtime/tool state (`validate`, `snapshot`, `tool-status`), reclaim the fixed local router port, run standalone provider diagnostics, and patch Codex CLI / Claude Code / AMP client routing without depending on the web console.
+- Updated `llr ai-help` and local agent instructions to prefer first-party CLI commands for validation, router recovery, coding-tool routing, and router inspection.
+
+### Removed
+- Removed the deprecated TUI entry flow from the supported operator surface and from the real-provider live suite coverage.
+
 ## [2.0.0-beta.1] - 2026-03-11
 
 ### Fixed

@@ -142,7 +142,7 @@ export async function makeSubscriptionProviderCall({ provider, body, stream }) {
         type: 'error',
         error: {
           type: 'authentication_error',
-          message: `Not authenticated for subscription profile '${profileId}'. Run 'llm-router subscription login --profile=${profileId}' first.`
+          message: `Not authenticated for subscription profile '${profileId}'. Run 'llr subscription login --profile=${profileId}' first.`
         }
       }), {
         status: 401,

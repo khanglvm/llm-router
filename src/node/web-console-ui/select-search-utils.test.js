@@ -4,13 +4,30 @@ import {
   filterSelectOptions,
   getSelectSearchKey,
   hasSelectSearchQuery,
-  optionMatchesSelectQuery
+  optionMatchesSelectQuery,
+  shouldShowSelectSearchInput
 } from "./select-search-utils.js";
 
 test("hasSelectSearchQuery ignores empty and whitespace-only values", () => {
   assert.equal(hasSelectSearchQuery(""), false);
   assert.equal(hasSelectSearchQuery("   "), false);
   assert.equal(hasSelectSearchQuery("route"), true);
+});
+
+test("shouldShowSelectSearchInput stays visible by default for searchable selects", () => {
+  assert.equal(
+    shouldShowSelectSearchInput({
+      searchEnabled: true
+    }),
+    true
+  );
+
+  assert.equal(
+    shouldShowSelectSearchInput({
+      searchEnabled: false
+    }),
+    false
+  );
 });
 
 test("filterSelectOptions matches route label, value, and hint", () => {

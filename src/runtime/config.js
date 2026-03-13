@@ -181,12 +181,18 @@ function normalizeAmpModelMappingEntry(entry) {
     entry.ref ??
     ""
   ).trim();
+  const sourceRouteKey = normalizeAmpRouteKey(
+    entry.sourceRouteKey ??
+    entry["source-route-key"] ??
+    ""
+  );
 
-  if (!from || !to) return null;
+  if (!from || (!to && !sourceRouteKey)) return null;
 
   return {
     from,
-    to
+    ...(to ? { to } : {}),
+    ...(sourceRouteKey ? { sourceRouteKey } : {})
   };
 }
 
@@ -473,6 +479,289 @@ function normalizeAmpSubagentDefinitions(rawDefinitions) {
   return out;
 }
 
+const AMP_WEB_SEARCH_PROVIDER_IDS = Object.freeze([
+  "brave",
+  "tavily",
+  "exa",
+  "searxng"
+]);
+
+const AMP_WEB_SEARCH_PROVIDER_DEFAULT_LIMITS = Object.freeze({
+  brave: 1000,
+  tavily: 1000,
+  exa: 1000,
+  searxng: 0
+});
+const AMP_WEB_SEARCH_DEFAULT_COUNT = 5;
+const AMP_WEB_SEARCH_MIN_COUNT = 1;
+const AMP_WEB_SEARCH_MAX_COUNT = 20;
+
+function looksLikeHostedWebSearchRouteId(value) {
+  const text = String(value || "").trim();
+  return text.includes("/") && parseRouteReference(text).type === "direct";
+}
+
+function buildHostedWebSearchRouteId(providerId, modelId) {
+  const normalizedProviderId = String(providerId || "").trim();
+  const normalizedModelId = String(modelId || "").trim();
+  if (!normalizedProviderId || !normalizedModelId) return "";
+  return `${normalizedProviderId}/${normalizedModelId}`;
+}
+
+function normalizeHostedWebSearchProviderRoute(entry, explicitId = "") {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const explicitRouteId = String(explicitId || "").trim();
+  const providerId = String(
+    entry.providerId
+    ?? entry.provider
+    ?? entry.routeProviderId
+    ?? entry["provider-id"]
+    ?? ""
+  ).trim();
+  const modelId = String(
+    entry.model
+    ?? entry.modelId
+    ?? entry.routeModelId
+    ?? entry["model-id"]
+    ?? ""
+  ).trim();
+  const routeId = String(
+    explicitRouteId
+    || entry.id
+    || buildHostedWebSearchRouteId(providerId, modelId)
+  ).trim();
+  if (!looksLikeHostedWebSearchRouteId(routeId)) return null;
+
+  const parsed = parseRouteReference(routeId);
+  if (parsed.type !== "direct") return null;
+  const normalizedProviderId = providerId || parsed.providerId;
+  const normalizedModelId = modelId || parsed.modelId;
+  const normalizedRouteId = buildHostedWebSearchRouteId(normalizedProviderId, normalizedModelId);
+  if (!normalizedRouteId || normalizedRouteId !== routeId) return null;
+
+  return {
+    id: normalizedRouteId,
+    providerId: normalizedProviderId,
+    model: normalizedModelId
+  };
+}
+
+function normalizeAmpWebSearchProviderId(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return AMP_WEB_SEARCH_PROVIDER_IDS.includes(normalized) ? normalized : "";
+}
+
+function normalizeAmpWebSearchStrategy(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "ordered";
+  if (normalized === "quota-balance" || normalized === "quota-balanced") return "quota-balance";
+  if (normalized === "quota-aware-weighted-rr") return "quota-balance";
+  return "ordered";
+}
+
+function parseNonNegativeInteger(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function parseAmpWebSearchCount(value, fallback = AMP_WEB_SEARCH_DEFAULT_COUNT) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(AMP_WEB_SEARCH_MAX_COUNT, Math.max(AMP_WEB_SEARCH_MIN_COUNT, Math.floor(parsed)));
+}
+
+function hasOwnWebSearchProviderField(entry, keys = []) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  return keys.some((key) => Object.prototype.hasOwnProperty.call(entry, key) && entry[key] !== undefined && entry[key] !== null && String(entry[key]).trim() !== "");
+}
+
+function normalizeAmpWebSearchProviderEntry(entry, explicitId = "", { preserveUnconfigured = true, inheritedCount = AMP_WEB_SEARCH_DEFAULT_COUNT } = {}) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+
+  const hostedRoute = normalizeHostedWebSearchProviderRoute(entry, explicitId);
+  if (hostedRoute) return hostedRoute;
+
+  const id = normalizeAmpWebSearchProviderId(
+    explicitId
+    || entry.id
+    || entry.provider
+    || entry.backend
+    || entry.name
+  );
+  if (!id) return null;
+
+  const apiKey = String(
+    entry.apiKey
+    ?? entry["api-key"]
+    ?? entry.key
+    ?? ""
+  ).trim();
+  const url = sanitizeEndpointUrl(
+    entry.url
+    ?? entry.baseUrl
+    ?? entry["base-url"]
+    ?? entry.searxngUrl
+    ?? entry["searxng-url"]
+    ?? ""
+  ).replace(/\/+$/, "");
+  const hasExplicitCount = hasOwnWebSearchProviderField(entry, ["count", "resultCount", "result-count", "resultsPerCall", "results-per-call"]);
+  const hasExplicitLimit = hasOwnWebSearchProviderField(entry, ["limit", "monthlyLimit", "monthly-limit", "quota"]);
+  const hasExplicitRemaining = hasOwnWebSearchProviderField(entry, ["remaining", "remainingQuota", "remaining-quota", "remainingQueries", "remaining-queries"]);
+  const hasCredential = id === "searxng" ? Boolean(url) : Boolean(apiKey);
+  if (!preserveUnconfigured && !hasCredential && !hasExplicitCount && !hasExplicitLimit && !hasExplicitRemaining) {
+    return null;
+  }
+
+  const count = parseAmpWebSearchCount(
+    entry.count
+    ?? entry.resultCount
+    ?? entry["result-count"]
+    ?? entry.resultsPerCall
+    ?? entry["results-per-call"],
+    inheritedCount
+  );
+  const includeQuotaDefaults = hasCredential || hasExplicitLimit || hasExplicitRemaining;
+  const limitFallback = includeQuotaDefaults ? (AMP_WEB_SEARCH_PROVIDER_DEFAULT_LIMITS[id] || 0) : 0;
+  const limit = parseNonNegativeInteger(
+    entry.limit
+    ?? entry.monthlyLimit
+    ?? entry["monthly-limit"]
+    ?? entry.quota
+    ?? limitFallback,
+    limitFallback
+  );
+  const remainingFallback = limit > 0 ? limit : 0;
+  const remaining = parseNonNegativeInteger(
+    entry.remaining
+    ?? entry.remainingQuota
+    ?? entry["remaining-quota"]
+    ?? entry.remainingQueries
+    ?? entry["remaining-queries"]
+    ?? remainingFallback,
+    remainingFallback
+  );
+
+  const normalizedEntry = {
+    id,
+    ...(id === "searxng"
+      ? (url ? { url } : {})
+      : (apiKey ? { apiKey } : {})),
+    ...(count !== AMP_WEB_SEARCH_DEFAULT_COUNT ? { count } : {}),
+    ...(hasExplicitLimit || (includeQuotaDefaults && limit > 0) ? { limit } : {}),
+    ...(hasExplicitRemaining || (includeQuotaDefaults && (limit > 0 || remaining > 0))
+      ? { remaining: limit > 0 ? Math.min(remaining, limit) : remaining }
+      : {})
+  };
+
+  return normalizedEntry;
+}
+
+function normalizeAmpWebSearchProviders(rawProviders, rawWebSearch = {}) {
+  const inheritedCount = parseAmpWebSearchCount(rawWebSearch.count, AMP_WEB_SEARCH_DEFAULT_COUNT);
+  if (Array.isArray(rawProviders)) {
+    const ordered = [];
+    const seen = new Set();
+    for (const entry of rawProviders) {
+      const normalized = normalizeAmpWebSearchProviderEntry(entry, "", {
+        preserveUnconfigured: true,
+        inheritedCount
+      });
+      if (!normalized || seen.has(normalized.id)) continue;
+      seen.add(normalized.id);
+      ordered.push(normalized);
+    }
+    return ordered;
+  }
+
+  if (rawProviders && typeof rawProviders === "object") {
+    const ordered = [];
+    const seen = new Set();
+    for (const [providerId, entry] of Object.entries(rawProviders)) {
+      const normalized = normalizeAmpWebSearchProviderEntry(entry, providerId, {
+        preserveUnconfigured: true,
+        inheritedCount
+      });
+      if (!normalized || seen.has(normalized.id)) continue;
+      seen.add(normalized.id);
+      ordered.push(normalized);
+    }
+    return ordered;
+  }
+
+  const legacyPreferredBackend = normalizeAmpWebSearchProviderId(
+    rawWebSearch.preferredBackend ?? rawWebSearch["preferred-backend"]
+  );
+  const legacyEntries = [
+    normalizeAmpWebSearchProviderEntry({
+      apiKey: rawWebSearch.braveApiKey ?? rawWebSearch["brave-api-key"],
+      count: rawWebSearch.count,
+      limit: rawWebSearch.braveMonthlyLimit ?? rawWebSearch["brave-monthly-limit"],
+      remaining: rawWebSearch.braveRemaining ?? rawWebSearch["brave-remaining"]
+    }, "brave", { preserveUnconfigured: false, inheritedCount }),
+    normalizeAmpWebSearchProviderEntry({
+      apiKey: rawWebSearch.tavilyApiKey ?? rawWebSearch["tavily-api-key"],
+      count: rawWebSearch.count,
+      limit: rawWebSearch.tavilyMonthlyLimit ?? rawWebSearch["tavily-monthly-limit"],
+      remaining: rawWebSearch.tavilyRemaining ?? rawWebSearch["tavily-remaining"]
+    }, "tavily", { preserveUnconfigured: false, inheritedCount }),
+    normalizeAmpWebSearchProviderEntry({
+      apiKey: rawWebSearch.exaApiKey ?? rawWebSearch["exa-api-key"],
+      count: rawWebSearch.count,
+      limit: rawWebSearch.exaMonthlyLimit ?? rawWebSearch["exa-monthly-limit"],
+      remaining: rawWebSearch.exaRemaining ?? rawWebSearch["exa-remaining"]
+    }, "exa", { preserveUnconfigured: false, inheritedCount }),
+    normalizeAmpWebSearchProviderEntry({
+      count: rawWebSearch.count,
+      url: rawWebSearch.searxngUrl ?? rawWebSearch["searxng-url"] ?? rawWebSearch.url
+    }, "searxng", { preserveUnconfigured: false, inheritedCount })
+  ].filter(Boolean);
+
+  if (!legacyPreferredBackend) return legacyEntries;
+
+  return [
+    ...legacyEntries.filter((entry) => entry.id === legacyPreferredBackend),
+    ...legacyEntries.filter((entry) => entry.id !== legacyPreferredBackend)
+  ];
+}
+
+function normalizeAmpWebSearchConfig(rawWebSearch) {
+  if (!rawWebSearch || typeof rawWebSearch !== "object" || Array.isArray(rawWebSearch)) return undefined;
+
+  const providers = normalizeAmpWebSearchProviders(rawWebSearch.providers, rawWebSearch);
+  const count = parseAmpWebSearchCount(rawWebSearch.count, AMP_WEB_SEARCH_DEFAULT_COUNT);
+
+  return {
+    strategy: normalizeAmpWebSearchStrategy(rawWebSearch.strategy),
+    count,
+    providers
+  };
+}
+
+function supportsOpenAIHostedWebSearchRoute(provider, model) {
+  const providerFormats = dedupeStrings([...(provider?.formats || []), provider?.format]);
+  if (!providerFormats.includes(FORMATS.OPENAI)) return false;
+
+  const modelId = String(model?.id || "").trim();
+  const preferredFormat = modelId
+    ? String(provider?.lastProbe?.modelPreferredFormat?.[modelId] || "").trim()
+    : "";
+  if (preferredFormat) {
+    return preferredFormat === FORMATS.OPENAI;
+  }
+
+  const probedFormats = modelId
+    ? dedupeStrings(provider?.lastProbe?.modelSupport?.[modelId] || [])
+    : [];
+  if (probedFormats.length > 0) {
+    return probedFormats.includes(FORMATS.OPENAI);
+  }
+
+  const modelFormats = dedupeStrings([...(model?.formats || []), model?.format]);
+  return modelFormats.length === 0 || modelFormats.includes(FORMATS.OPENAI);
+}
+
 function normalizeAmpConfig(rawAmp) {
   const source = rawAmp && typeof rawAmp === "object" && !Array.isArray(rawAmp)
     ? rawAmp
@@ -484,6 +773,33 @@ function normalizeAmpConfig(rawAmp) {
   const hasRawModelRoutes = hasOwn(source, "rawModelRoutes") || hasOwn(source, "raw-model-routes");
   const hasOverrides = hasOwn(source, "overrides");
   const hasFallback = hasOwn(source, "fallback");
+  const hasWebSearch = hasOwn(source, "webSearch")
+    || hasOwn(source, "web-search")
+    || [
+      "preferredBackend",
+      "preferred-backend",
+      "count",
+      "braveApiKey",
+      "brave-api-key",
+      "tavilyApiKey",
+      "tavily-api-key",
+      "exaApiKey",
+      "exa-api-key",
+      "searxngUrl",
+      "searxng-url",
+      "braveMonthlyLimit",
+      "brave-monthly-limit",
+      "tavilyMonthlyLimit",
+      "tavily-monthly-limit",
+      "exaMonthlyLimit",
+      "exa-monthly-limit",
+      "braveRemaining",
+      "brave-remaining",
+      "tavilyRemaining",
+      "tavily-remaining",
+      "exaRemaining",
+      "exa-remaining"
+    ].some((key) => hasOwn(source, key));
   const normalizedSubagentDefinitions = normalizeAmpSubagentDefinitions(
     source.subagentDefinitions ?? source["subagent-definitions"]
   );
@@ -497,6 +813,7 @@ function normalizeAmpConfig(rawAmp) {
     .filter(Boolean);
   const normalizedOverrides = normalizeAmpOverrides(source.overrides);
   const normalizedFallback = normalizeAmpFallback(source.fallback);
+  const normalizedWebSearch = normalizeAmpWebSearchConfig(source.webSearch ?? source["web-search"] ?? source);
 
   return {
     upstreamUrl: sanitizeEndpointUrl(
@@ -563,6 +880,11 @@ function normalizeAmpConfig(rawAmp) {
     ...(hasFallback && normalizedFallback !== undefined
       ? {
           fallback: normalizedFallback
+        }
+      : {}),
+    ...(hasWebSearch && normalizedWebSearch !== undefined
+      ? {
+          webSearch: normalizedWebSearch
         }
       : {}),
     ...(normalizedSubagentDefinitions !== undefined
@@ -1352,7 +1674,21 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     : (typeof raw["master-key"] === "string" ? raw["master-key"] : undefined);
 
   const defaultModel = rawDefaultModel;
-  const amp = normalizeAmpConfig(raw.amp ?? raw.ampcode ?? raw["amp-code"]);
+  const rawAmp = raw.amp ?? raw.ampcode ?? raw["amp-code"];
+  const rawAmpObject = rawAmp && typeof rawAmp === "object" && !Array.isArray(rawAmp)
+    ? rawAmp
+    : {};
+  const rawWebSearch = raw.webSearch ?? raw["web-search"];
+  const amp = normalizeAmpConfig(rawAmp);
+  const webSearch = normalizeAmpWebSearchConfig(rawWebSearch)
+    ?? (amp?.webSearch && typeof amp.webSearch === "object" && !Array.isArray(amp.webSearch)
+      ? amp.webSearch
+      : undefined);
+  const normalizedAmp = webSearch && amp?.webSearch && typeof amp.webSearch === "object" && !Array.isArray(amp.webSearch)
+    ? Object.fromEntries(
+        Object.entries(amp).filter(([key]) => key !== "webSearch")
+      )
+    : amp;
 
   const normalized = {
     version: inferNormalizedConfigVersion(raw, providers, modelAliases),
@@ -1360,7 +1696,8 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     defaultModel,
     providers,
     modelAliases,
-    amp,
+    amp: normalizedAmp,
+    ...(webSearch ? { webSearch } : {}),
     metadata: sanitizeRuntimeMetadata(raw.metadata)
   };
   Object.defineProperty(normalized, NORMALIZATION_ISSUES_SYMBOL, {
@@ -1601,6 +1938,70 @@ function validateAmpConfig(config, routingIndex, errors) {
     if (!entry?.route) continue;
     validateAmpRouteReference(String(entry.route), routingIndex, errors, `AMP override signature '${entry.id || "(unknown)"}'`);
   }
+
+  const webSearch = config?.webSearch ?? amp?.webSearch;
+  if (webSearch && typeof webSearch === "object" && !Array.isArray(webSearch)) {
+    if (!["ordered", "quota-balance"].includes(String(webSearch.strategy || "ordered").trim())) {
+      errors.push(`webSearch has unsupported strategy '${webSearch.strategy}'.`);
+    }
+
+    const providers = Array.isArray(webSearch.providers) ? webSearch.providers : [];
+    const seenProviderIds = new Set();
+    for (const provider of providers) {
+      const providerId = String(provider?.id || "").trim();
+      if (!providerId) {
+        errors.push("webSearch provider is missing id.");
+        continue;
+      }
+      if (seenProviderIds.has(providerId)) {
+        errors.push(`webSearch provider '${providerId}' is duplicated.`);
+      } else {
+        seenProviderIds.add(providerId);
+      }
+
+      if (AMP_WEB_SEARCH_PROVIDER_IDS.includes(providerId)) {
+        const count = provider?.count;
+        if (count !== undefined && (!Number.isFinite(Number(count)) || Number(count) < AMP_WEB_SEARCH_MIN_COUNT || Number(count) > AMP_WEB_SEARCH_MAX_COUNT)) {
+          errors.push(`webSearch provider '${providerId}' has invalid count '${count}'.`);
+        }
+
+        const limit = provider?.limit;
+        if (limit !== undefined && (!Number.isFinite(Number(limit)) || Number(limit) < 0)) {
+          errors.push(`webSearch provider '${providerId}' has invalid limit '${limit}'.`);
+        }
+
+        const remaining = provider?.remaining;
+        if (remaining !== undefined && (!Number.isFinite(Number(remaining)) || Number(remaining) < 0)) {
+          errors.push(`webSearch provider '${providerId}' has invalid remaining '${remaining}'.`);
+        }
+        if (
+          remaining !== undefined
+          && Number.isFinite(Number(limit))
+          && Number(limit) > 0
+          && Number(remaining) > Number(limit)
+        ) {
+          errors.push(`webSearch provider '${providerId}' remaining cannot exceed limit.`);
+        }
+        continue;
+      }
+
+      const hostedRoute = normalizeHostedWebSearchProviderRoute(provider, providerId);
+      if (!hostedRoute) {
+        errors.push(`webSearch provider '${providerId}' is unsupported.`);
+        continue;
+      }
+
+      const resolvedRoute = resolveRouteReference(config, hostedRoute.id);
+      if (!resolvedRoute?.provider || !resolvedRoute?.model) {
+        errors.push(`webSearch provider '${providerId}' does not reference a configured provider/model route.`);
+        continue;
+      }
+
+      if (!supportsOpenAIHostedWebSearchRoute(resolvedRoute.provider, resolvedRoute.model)) {
+        errors.push(`webSearch provider '${providerId}' must reference an OpenAI-compatible provider/model route.`);
+      }
+    }
+  }
 }
 
 export function validateRuntimeConfig(config, { requireMasterKey = false, requireProvider = false } = {}) {
@@ -1810,15 +2211,38 @@ export function maskSecret(value) {
 }
 
 export function sanitizeConfigForDisplay(config) {
+  const sanitizedWebSearch = config.webSearch && typeof config.webSearch === "object" && !Array.isArray(config.webSearch)
+    ? {
+        ...config.webSearch,
+        providers: (Array.isArray(config.webSearch.providers) ? config.webSearch.providers : []).map((provider) => ({
+          ...provider,
+          apiKey: provider?.apiKey ? maskSecret(provider.apiKey) : undefined
+        }))
+      }
+    : undefined;
+  const sanitizedAmp = config.amp
+    ? {
+        ...config.amp,
+        upstreamApiKey: config.amp.upstreamApiKey ? maskSecret(config.amp.upstreamApiKey) : undefined,
+        ...(config.amp.webSearch && typeof config.amp.webSearch === "object" && !Array.isArray(config.amp.webSearch)
+          ? {
+              webSearch: {
+                ...config.amp.webSearch,
+                providers: (Array.isArray(config.amp.webSearch.providers) ? config.amp.webSearch.providers : []).map((provider) => ({
+                  ...provider,
+                  apiKey: provider?.apiKey ? maskSecret(provider.apiKey) : undefined
+                }))
+              }
+            }
+          : {})
+      }
+    : undefined;
+
   return {
     ...config,
     masterKey: config.masterKey ? maskSecret(config.masterKey) : undefined,
-    amp: config.amp
-      ? {
-          ...config.amp,
-          upstreamApiKey: config.amp.upstreamApiKey ? maskSecret(config.amp.upstreamApiKey) : undefined
-        }
-      : undefined,
+    ...(sanitizedWebSearch ? { webSearch: sanitizedWebSearch } : {}),
+    amp: sanitizedAmp,
     providers: (config.providers || []).map((provider) => ({
       ...provider,
       apiKey: provider.apiKey ? maskSecret(provider.apiKey) : undefined
@@ -2528,7 +2952,7 @@ function resolveAmpConfiguredDefinitionTarget(definitions, routes, propertyName 
   };
 }
 
-function resolveAmpRawModelMappedTarget(config, requestedModel) {
+function resolveAmpRawModelMappedTarget(config, requestedModel, routingIndex) {
   const mappings = Array.isArray(config?.amp?.rawModelRoutes)
     ? config.amp.rawModelRoutes
     : [];
@@ -2538,6 +2962,18 @@ function resolveAmpRawModelMappedTarget(config, requestedModel) {
     if (!matchAmpModelPattern(mapping.from, requestedModel)) continue;
     const target = String(mapping.to || "").trim();
     if (target) return target;
+
+    const sourceRouteKey = String(mapping.sourceRouteKey || "").trim();
+    if (!sourceRouteKey) continue;
+
+    const routeTarget = String(config?.amp?.routes?.[sourceRouteKey] || "").trim();
+    if (routeTarget) return routeTarget;
+
+    const ampDefaultTarget = String(config?.amp?.defaultRoute || "").trim();
+    if (ampDefaultTarget) return ampDefaultTarget;
+
+    const globalDefaultTarget = getDefaultRouteReference(config, routingIndex);
+    if (globalDefaultTarget) return globalDefaultTarget;
   }
 
   return "";
@@ -2660,7 +3096,7 @@ function resolveAmpRequestedRoute(config, effectiveRequested, normalizedRequeste
       : {};
     const entityTarget = resolveAmpConfiguredDefinitionTarget(matchingEntities, routes);
     const signatureTarget = resolveAmpConfiguredDefinitionTarget(matchingSignatures, routes);
-    const rawMappedTarget = resolveAmpRawModelMappedTarget(config, effectiveRequested);
+    const rawMappedTarget = resolveAmpRawModelMappedTarget(config, effectiveRequested, routingIndex);
 
     const entityRoute = entityTarget.target
       ? resolveLocalRoute(entityTarget.target, {

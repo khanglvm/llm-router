@@ -6,6 +6,12 @@ export function hasSelectSearchQuery(value) {
   return normalizeSelectSearchText(value).length > 0;
 }
 
+export function shouldShowSelectSearchInput({
+  searchEnabled = true,
+} = {}) {
+  return Boolean(searchEnabled);
+}
+
 export function getSelectSearchKey(event) {
   const key = String(event?.key || "");
   if (!key || key.length !== 1) return "";

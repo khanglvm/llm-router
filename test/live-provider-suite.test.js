@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { TextDecoder, TextEncoder } from "node:util";
 import test from "node:test";
 import { JSDOM, VirtualConsole } from "jsdom";
-import routerModule from "../src/cli/router-module.js";
 import { readConfigFile, writeConfigFile } from "../src/node/config-store.js";
 import { buildProviderFromConfigInput, applyConfigChanges } from "../src/node/config-workflows.js";
 import { startLocalRouteServer } from "../src/node/local-server.js";
@@ -18,48 +17,7 @@ import {
 } from "./helpers/live-suite.js";
 
 const liveSuite = await loadLiveSuiteSettings();
-const configAction = routerModule.actions.find((entry) => entry.actionId === "config");
 const DEFAULT_REQUEST_HEADERS = { "content-type": "application/json" };
-
-function createConfigContext(args, overrides = {}) {
-  return {
-    args,
-    mode: "commandline",
-    terminal: {
-      line() {},
-      info() {},
-      warn() {},
-      error() {}
-    },
-    prompts: {},
-    ...overrides
-  };
-}
-
-function createQueuedPrompts(entries) {
-  const queue = [...entries];
-  const take = (type) => {
-    assert.ok(queue.length > 0, `No queued answer left for ${type}`);
-    const next = queue.shift();
-    if (next && typeof next === "object" && next.type === "cancel") {
-      throw new Error("Prompt cancelled");
-    }
-    if (next && typeof next === "object" && "type" in next) {
-      assert.equal(next.type, type);
-      return next.value;
-    }
-    return next;
-  };
-
-  return {
-    select: async () => take("select"),
-    text: async () => take("text"),
-    confirm: async () => take("confirm"),
-    password: async () => take("password"),
-    multiselect: async () => take("multiselect"),
-    remaining: () => [...queue]
-  };
-}
 
 async function parseJsonResponse(response) {
   const text = await response.text();
@@ -101,10 +59,6 @@ async function runQualifiedModelRequest(baseUrl, provider, modelId, requestOptio
   return format === "claude"
     ? callClaude(baseUrl, qualifiedModel, requestOptions)
     : callOpenAI(baseUrl, qualifiedModel, requestOptions);
-}
-
-function pickTuiProvider(providers) {
-  return providers.find((provider) => provider.openaiBaseUrl && provider.claudeBaseUrl) || providers[0];
 }
 
 function pickWebProvider(providers, excludeId = "") {
@@ -301,15 +255,13 @@ async function loadWebConsoleDom(baseUrl) {
   return dom;
 }
 
-test("real-provider flows cover CLI, TUI, and Web UI", {
+test("real-provider flows cover CLI and Web UI", {
   timeout: Math.max(liveSuite.timeoutMs * 4, 360_000)
 }, async (t) => {
   if (!liveSuite.enabled) {
     t.skip(liveSuite.reason);
     return;
   }
-
-  assert.ok(configAction, "config action should exist");
 
   await t.test("CLI flow configures real providers and routes live requests", {
     timeout: Math.max(liveSuite.timeoutMs * 2, 180_000)
@@ -385,81 +337,6 @@ test("real-provider flows cover CLI, TUI, and Web UI", {
       }
 
       assert.equal(successCount > 0, true, "CLI flow should return at least one successful routed response.");
-    } finally {
-      await localServer?.close();
-      await workspace.cleanup();
-    }
-  });
-
-  await t.test("TUI flow probes a real provider and saves a working config", {
-    timeout: Math.max(liveSuite.timeoutMs * 2, 180_000)
-  }, async () => {
-    const provider = pickTuiProvider(liveSuite.providers);
-    const interactiveModels = pickInteractiveModels(provider);
-    const workspace = await createIsolatedWorkspace("llm-router-live-tui-");
-    const configPath = workspace.configPath;
-    const port = await getAvailablePort();
-    const baseUrl = `http://${liveSuite.host}:${port}`;
-    const prompts = createQueuedPrompts([
-      { type: "select", value: "models" },
-      { type: "select", value: provider.id },
-      { type: "text", value: interactiveModels.join(",") },
-      { type: "cancel" },
-      { type: "cancel" }
-    ]);
-    let localServer = null;
-
-    try {
-      await writeConfigFile({
-        version: 2,
-        providers: [{
-          id: provider.id,
-          name: `${provider.name} TUI`,
-          apiKey: provider.apiKey,
-          baseUrl: provider.openaiBaseUrl || provider.claudeBaseUrl,
-          baseUrlByFormat: {
-            ...(provider.openaiBaseUrl ? { openai: provider.openaiBaseUrl } : {}),
-            ...(provider.claudeBaseUrl ? { claude: provider.claudeBaseUrl } : {})
-          },
-          format: provider.openaiBaseUrl ? "openai" : "claude",
-          formats: [provider.openaiBaseUrl ? "openai" : "", provider.claudeBaseUrl ? "claude" : ""].filter(Boolean),
-          headers: provider.headers,
-          models: []
-        }],
-        modelAliases: {}
-      }, configPath);
-
-      const result = await configAction.run(createConfigContext({
-        config: configPath
-      }, {
-        forcePrompt: true,
-        prompts
-      }));
-
-      assert.equal(result.ok, true, String(result.errorMessage || result.data || ""));
-      assert.deepEqual(prompts.remaining(), []);
-
-      const savedConfig = await readConfigFile(configPath);
-      const savedProvider = savedConfig.providers.find((entry) => entry.id === provider.id);
-      assert.ok(savedProvider, "TUI should persist the provider");
-      assert.equal(savedProvider.models.length > 0, true);
-
-      localServer = await startLocalRouteServer({
-        host: liveSuite.host,
-        port,
-        configPath,
-        watchConfig: false
-      });
-
-      const response = await runQualifiedModelRequest(baseUrl, savedProvider, savedProvider.models[0].id, {
-        requestText: liveSuite.requestText,
-        maxTokens: liveSuite.maxTokens,
-        timeoutMs: liveSuite.timeoutMs
-      });
-      assertLiveRouteResponse(
-        response,
-        `TUI-configured route request failed for ${savedProvider.id}/${savedProvider.models[0].id}`
-      );
     } finally {
       await localServer?.close();
       await workspace.cleanup();

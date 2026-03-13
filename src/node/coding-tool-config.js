@@ -1,6 +1,14 @@
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import {
+  CODEX_CLI_INHERIT_MODEL_VALUE,
+  isCodexCliInheritModelBinding,
+  mapClaudeCodeThinkingLevelToTokens,
+  mapClaudeCodeThinkingTokensToLevel,
+  normalizeClaudeCodeThinkingLevel,
+  normalizeCodexCliReasoningEffort
+} from "../shared/coding-tool-bindings.js";
 
 const BACKUP_SUFFIX = ".llm_router_backup";
 const CODEX_PROVIDER_ID = "llm-router";
@@ -12,7 +20,8 @@ const CLAUDE_MANAGED_ENV_KEYS = Object.freeze([
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-  "CLAUDE_CODE_SUBAGENT_MODEL"
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "MAX_THINKING_TOKENS"
 ]);
 const CLAUDE_BACKUP_ENV_KEYS = Object.freeze([
   ...CLAUDE_MANAGED_ENV_KEYS,
@@ -64,6 +73,13 @@ function normalizeHttpUrl(value) {
 
 function normalizeModelBinding(value) {
   return String(value || "").trim();
+}
+
+function areResolvedFilePathsEqual(left, right) {
+  const leftText = String(left || "").trim();
+  const rightText = String(right || "").trim();
+  if (!leftText || !rightText) return false;
+  return path.resolve(leftText) === path.resolve(rightText);
 }
 
 function backupHasData(backup) {
@@ -321,14 +337,19 @@ function normalizeClaudeBindings(bindings = {}) {
     defaultOpusModel: normalizeModelBinding(source.defaultOpusModel),
     defaultSonnetModel: normalizeModelBinding(source.defaultSonnetModel),
     defaultHaikuModel: normalizeModelBinding(source.defaultHaikuModel),
-    subagentModel: normalizeModelBinding(source.subagentModel)
+    subagentModel: normalizeModelBinding(source.subagentModel),
+    thinkingLevel: normalizeClaudeCodeThinkingLevel(source.thinkingLevel)
   };
 }
 
 function normalizeCodexBindings(bindings = {}) {
   const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+  const defaultModel = normalizeModelBinding(source.defaultModel);
   return {
-    defaultModel: normalizeModelBinding(source.defaultModel)
+    defaultModel: isCodexCliInheritModelBinding(defaultModel)
+      ? CODEX_CLI_INHERIT_MODEL_VALUE
+      : defaultModel,
+    thinkingLevel: normalizeCodexCliReasoningEffort(source.thinkingLevel)
   };
 }
 
@@ -339,6 +360,7 @@ function captureCodexBackup(document) {
     version: 1,
     modelProvider: getTopLevelTomlStringField(document, "model_provider"),
     model: getTopLevelTomlStringField(document, "model"),
+    modelReasoningEffort: getTopLevelTomlStringField(document, "model_reasoning_effort"),
     modelCatalogJson: getTopLevelTomlStringField(document, "model_catalog_json"),
     providerSection: {
       exists: Boolean(providerSection),
@@ -353,6 +375,9 @@ function applyCodexBackup(document, backup = {}) {
 
   if (backup?.model?.exists) setTopLevelTomlStringField(document, "model", backup.model.value);
   else deleteTopLevelTomlField(document, "model");
+
+  if (backup?.modelReasoningEffort?.exists) setTopLevelTomlStringField(document, "model_reasoning_effort", backup.modelReasoningEffort.value);
+  else deleteTopLevelTomlField(document, "model_reasoning_effort");
 
   if (backup?.modelCatalogJson?.exists) setTopLevelTomlStringField(document, "model_catalog_json", backup.modelCatalogJson.value);
   else deleteTopLevelTomlField(document, "model_catalog_json");
@@ -415,7 +440,10 @@ function sanitizeBackup(backup, tool) {
 }
 
 export function resolveCodingToolBackupFilePath(configFilePath = "") {
-  return `${path.resolve(String(configFilePath || "").trim())}${BACKUP_SUFFIX}`;
+  const resolvedPath = path.resolve(String(configFilePath || "").trim());
+  const parsed = path.parse(resolvedPath);
+  if (!parsed.ext) return `${resolvedPath}${BACKUP_SUFFIX}`;
+  return path.join(parsed.dir, `${parsed.name}${BACKUP_SUFFIX}${parsed.ext}`);
 }
 
 export function resolveCodexCliConfigFilePath({
@@ -504,6 +532,8 @@ export async function readCodexCliRoutingState({
   const document = splitTomlDocument(configState.text);
   const modelProvider = getTopLevelTomlStringField(document, "model_provider");
   const model = getTopLevelTomlStringField(document, "model");
+  const modelReasoningEffort = getTopLevelTomlStringField(document, "model_reasoning_effort");
+  const modelCatalogJson = getTopLevelTomlStringField(document, "model_catalog_json");
   const providerSection = parseTomlSectionKeyValues(getTomlSection(document, `model_providers.${CODEX_PROVIDER_ID}`));
   const configuredBaseUrl = String(providerSection.base_url || "").trim();
   const configuredBearerToken = String(providerSection.experimental_bearer_token || "").trim();
@@ -512,6 +542,12 @@ export async function readCodexCliRoutingState({
       && modelProvider.value === CODEX_PROVIDER_ID
       && configuredBaseUrl === expectedBaseUrl
   );
+  const routerCatalogPath = resolveCodexCliModelCatalogFilePath({
+    configFilePath: resolvedConfigPath,
+    env,
+    homeDir
+  });
+  const usingRouterManagedCatalog = areResolvedFilePathsEqual(modelCatalogJson.value, routerCatalogPath);
 
   return {
     tool: "codex-cli",
@@ -522,8 +558,15 @@ export async function readCodexCliRoutingState({
     routedViaRouter,
     configuredBaseUrl,
     modelProvider: modelProvider.value,
+    configuredModel: model.value,
+    configuredThinkingLevel: modelReasoningEffort.value,
+    configuredModelCatalogJson: modelCatalogJson.value,
+    inheritCliModel: routedViaRouter && !usingRouterManagedCatalog,
     bindings: {
-      defaultModel: model.value
+      defaultModel: routedViaRouter && !usingRouterManagedCatalog
+        ? CODEX_CLI_INHERIT_MODEL_VALUE
+        : model.value,
+      thinkingLevel: modelReasoningEffort.value
     }
   };
 }
@@ -563,6 +606,8 @@ export async function patchCodexCliConfigFile({
   const document = splitTomlDocument(configState.text);
   const backupState = await ensureToolBackupFileExists(resolvedBackupPath);
   const existingBackup = sanitizeBackup(backupState.data, "codex-cli");
+  const currentModelCatalogJson = getTopLevelTomlStringField(document, "model_catalog_json");
+  const currentlyUsingRouterManagedCatalog = areResolvedFilePathsEqual(currentModelCatalogJson.value, resolvedCatalogPath);
 
   if (captureBackup && !backupHasData(existingBackup)) {
     const backup = configState.existed ? captureCodexBackup(document) : {};
@@ -570,26 +615,50 @@ export async function patchCodexCliConfigFile({
   }
 
   setTopLevelTomlStringField(document, "model_provider", CODEX_PROVIDER_ID);
-  if (normalizedBindings.defaultModel) setTopLevelTomlStringField(document, "model", normalizedBindings.defaultModel);
+  if (isCodexCliInheritModelBinding(normalizedBindings.defaultModel)) {
+    if (currentlyUsingRouterManagedCatalog) {
+      if (existingBackup?.model?.exists) setTopLevelTomlStringField(document, "model", existingBackup.model.value);
+      else deleteTopLevelTomlField(document, "model");
+
+      if (existingBackup?.modelCatalogJson?.exists) {
+        setTopLevelTomlStringField(document, "model_catalog_json", existingBackup.modelCatalogJson.value);
+      } else {
+        deleteTopLevelTomlField(document, "model_catalog_json");
+      }
+    }
+  } else if (normalizedBindings.defaultModel) {
+    setTopLevelTomlStringField(document, "model", normalizedBindings.defaultModel);
+  } else {
+    deleteTopLevelTomlField(document, "model");
+  }
+  if (normalizedBindings.thinkingLevel) {
+    setTopLevelTomlStringField(document, "model_reasoning_effort", normalizedBindings.thinkingLevel);
+  } else {
+    deleteTopLevelTomlField(document, "model_reasoning_effort");
+  }
   setTomlSection(document, `model_providers.${CODEX_PROVIDER_ID}`, createCodexProviderSection({
     baseUrl,
     apiKey: normalizedApiKey
   }));
-  if (normalizedModelCatalog) {
-    if (normalizedModelCatalog.models.length > 0) {
+  if (!isCodexCliInheritModelBinding(normalizedBindings.defaultModel)) {
+    if (normalizedModelCatalog?.models?.length > 0) {
       await writeJsonObjectFile(resolvedCatalogPath, normalizedModelCatalog);
       setTopLevelTomlStringField(document, "model_catalog_json", resolvedCatalogPath);
     } else {
       deleteTopLevelTomlField(document, "model_catalog_json");
-      await fs.rm(resolvedCatalogPath, { force: true });
     }
   }
 
   await writeTextFile(resolvedConfigPath, serializeTomlDocument(document));
+  const finalModelCatalogJson = getTopLevelTomlStringField(document, "model_catalog_json");
+  const usingRouterManagedCatalog = areResolvedFilePathsEqual(finalModelCatalogJson.value, resolvedCatalogPath);
+  if (!usingRouterManagedCatalog) {
+    await fs.rm(resolvedCatalogPath, { force: true });
+  }
   return {
     configFilePath: resolvedConfigPath,
     backupFilePath: resolvedBackupPath,
-    modelCatalogFilePath: normalizedModelCatalog?.models?.length > 0 ? resolvedCatalogPath : "",
+    modelCatalogFilePath: usingRouterManagedCatalog ? resolvedCatalogPath : "",
     configCreated: !configState.existed,
     baseUrl,
     bindings: normalizedBindings
@@ -663,7 +732,8 @@ export async function readClaudeCodeRoutingState({
       defaultOpusModel: envConfig.ANTHROPIC_DEFAULT_OPUS_MODEL,
       defaultSonnetModel: envConfig.ANTHROPIC_DEFAULT_SONNET_MODEL,
       defaultHaikuModel: envConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL,
-      subagentModel: envConfig.CLAUDE_CODE_SUBAGENT_MODEL
+      subagentModel: envConfig.CLAUDE_CODE_SUBAGENT_MODEL,
+      thinkingLevel: mapClaudeCodeThinkingTokensToLevel(envConfig.MAX_THINKING_TOKENS)
     })
   };
 }
@@ -727,6 +797,10 @@ export async function patchClaudeCodeSettingsFile({
 
   if (normalizedBindings.subagentModel) nextSettings.env.CLAUDE_CODE_SUBAGENT_MODEL = normalizedBindings.subagentModel;
   else delete nextSettings.env.CLAUDE_CODE_SUBAGENT_MODEL;
+
+  const maxThinkingTokens = mapClaudeCodeThinkingLevelToTokens(normalizedBindings.thinkingLevel);
+  if (maxThinkingTokens) nextSettings.env.MAX_THINKING_TOKENS = maxThinkingTokens;
+  else delete nextSettings.env.MAX_THINKING_TOKENS;
 
   await writeJsonObjectFile(resolvedSettingsPath, nextSettings);
   return {

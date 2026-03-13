@@ -62,7 +62,18 @@ function createBaseConfig(overrides = {}) {
 }
 
 test("applyProviderModelEdits rewrites provider refs while preserving fixed default route", () => {
-  const config = createBaseConfig();
+  const config = createBaseConfig({
+    amp: {
+      defaultRoute: DEFAULT_MODEL_ALIAS_ID,
+      routes: {
+        chat: "openai/gpt-4o-mini"
+      },
+      rawModelRoutes: [
+        { from: "gpt-4o-mini", to: "openai/gpt-4o-mini" },
+        { from: "gpt-4o", sourceRouteKey: "chat" }
+      ]
+    }
+  });
 
   const next = applyProviderModelEdits(config, "openai", [
     { sourceId: "gpt-4o", id: "gpt-4o" },
@@ -75,6 +86,9 @@ test("applyProviderModelEdits rewrites provider refs while preserving fixed defa
   );
   assert.equal(next.defaultModel, DEFAULT_MODEL_ALIAS_ID);
   assert.equal(next.amp.defaultRoute, DEFAULT_MODEL_ALIAS_ID);
+  assert.equal(next.amp.routes.chat, "openai/gpt-4.1-mini");
+  assert.equal(next.amp.rawModelRoutes[0].to, "openai/gpt-4.1-mini");
+  assert.equal(next.amp.rawModelRoutes[1].sourceRouteKey, "chat");
   assert.deepEqual(
     next.modelAliases[DEFAULT_MODEL_ALIAS_ID].targets.map((target) => target.ref),
     ["openai/gpt-4.1-mini"]
@@ -115,9 +129,41 @@ test("applyProviderModelEdits preserves empty aliases when their targets disappe
   assert.equal(next.amp.defaultRoute, DEFAULT_MODEL_ALIAS_ID);
 });
 
+test("applyProviderModelEdits persists context windows on renamed and new models", () => {
+  const config = createBaseConfig();
+
+  const next = applyProviderModelEdits(config, "openai", [
+    { sourceId: "gpt-4o-mini", id: "gpt-4.1-mini", contextWindow: "128000" },
+    { id: "gpt-4o", contextWindow: "256000" }
+  ]);
+
+  assert.deepEqual(next.providers[0].models, [
+    {
+      id: "gpt-4.1-mini",
+      fallbackModels: ["openai/gpt-4o", "anthropic/claude-3-5-haiku"],
+      contextWindow: 128000
+    },
+    {
+      id: "gpt-4o",
+      contextWindow: 256000
+    }
+  ]);
+});
+
 test("applyModelAliasEdits renames non-default aliases and preserves target metadata", () => {
   const config = createBaseConfig({
-    amp: { defaultRoute: "alias:coding" },
+    amp: {
+      defaultRoute: "alias:coding",
+      routes: {
+        chat: "coding",
+        analysis: "alias:coding"
+      },
+      rawModelRoutes: [
+        { from: "gpt-4o-mini", to: "coding" },
+        { from: "claude*", to: "alias:coding" },
+        { from: "look-at", sourceRouteKey: "look-at" }
+      ]
+    },
     modelAliases: {
       [DEFAULT_MODEL_ALIAS_ID]: {
         id: DEFAULT_MODEL_ALIAS_ID,
@@ -155,11 +201,28 @@ test("applyModelAliasEdits renames non-default aliases and preserves target meta
   assert.equal(next.modelAliases.chained.targets[0].ref, "coding.primary");
   assert.equal(next.defaultModel, DEFAULT_MODEL_ALIAS_ID);
   assert.equal(next.amp.defaultRoute, "alias:coding.primary");
+  assert.equal(next.amp.routes.chat, "coding.primary");
+  assert.equal(next.amp.routes.analysis, "alias:coding.primary");
+  assert.equal(next.amp.rawModelRoutes[0].to, "coding.primary");
+  assert.equal(next.amp.rawModelRoutes[1].to, "alias:coding.primary");
+  assert.equal(next.amp.rawModelRoutes[2].sourceRouteKey, "look-at");
 });
 
 test("removeModelAlias clears dependent refs and preserves empty aliases", () => {
   const config = createBaseConfig({
-    amp: { defaultRoute: "alias:coding" },
+    amp: {
+      defaultRoute: "alias:coding",
+      routes: {
+        chat: "coding",
+        analysis: "alias:coding",
+        safe: "openai/gpt-4o-mini"
+      },
+      rawModelRoutes: [
+        { from: "gpt-4o-mini", to: "coding" },
+        { from: "claude*", to: "alias:coding" },
+        { from: "safe", to: "openai/gpt-4o-mini" }
+      ]
+    },
     modelAliases: {
       [DEFAULT_MODEL_ALIAS_ID]: {
         id: DEFAULT_MODEL_ALIAS_ID,
@@ -189,6 +252,12 @@ test("removeModelAlias clears dependent refs and preserves empty aliases", () =>
   assert.deepEqual(next.modelAliases.chained.fallbackTargets, []);
   assert.equal(next.defaultModel, DEFAULT_MODEL_ALIAS_ID);
   assert.equal(next.amp.defaultRoute, DEFAULT_MODEL_ALIAS_ID);
+  assert.deepEqual(next.amp.routes, {
+    safe: "openai/gpt-4o-mini"
+  });
+  assert.deepEqual(next.amp.rawModelRoutes, [
+    { from: "safe", to: "openai/gpt-4o-mini" }
+  ]);
 });
 
 test("removeModelAlias clears the fixed default alias instead of deleting it", () => {

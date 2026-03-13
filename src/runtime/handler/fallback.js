@@ -44,6 +44,18 @@ const POLICY_HINTS = [
   "unsafe",
   "flagged"
 ];
+const CONTEXT_WINDOW_HINTS = [
+  "context window",
+  "maximum context length",
+  "maximum context size",
+  "context length exceeded",
+  "context_length_exceeded",
+  "prompt is too long",
+  "input is too long",
+  "request is too long",
+  "too many tokens",
+  "ran out of room in the model's context window"
+];
 const fallbackCircuitState = new Map();
 
 export function shouldRetryStatus(status) {
@@ -235,9 +247,12 @@ export function setCandidateCooldown(candidate, cooldownMs, policy, status, now 
 }
 
 async function readProviderErrorHint(result) {
-  if (!(result?.upstreamResponse instanceof Response)) return "";
+  const response = result?.upstreamResponse instanceof Response
+    ? result.upstreamResponse
+    : (result?.response instanceof Response ? result.response : null);
+  if (!(response instanceof Response)) return "";
   try {
-    const raw = await result.upstreamResponse.clone().text();
+    const raw = await response.clone().text();
     if (!raw) return "";
     const limitedRaw = raw.slice(0, ERROR_TEXT_SCAN_LIMIT);
     const parsed = parseJsonSafely(limitedRaw);
@@ -384,6 +399,19 @@ export async function classifyFailureResult(result, retryPolicy) {
       allowFallback: true,
       originCooldownMs: retryPolicy.originFallbackCooldownMs
     };
+  }
+
+  if ([400, 413, 422].includes(status)) {
+    const hintText = await readProviderErrorHint(result);
+    if (hasAnyHint(hintText, CONTEXT_WINDOW_HINTS)) {
+      return {
+        category: "context_window_exceeded",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: 0
+      };
+    }
   }
 
   if (status === 408 || status === 409 || status >= 500) {

@@ -1,5 +1,6 @@
 import {
   Children,
+  useCallback,
   cloneElement,
   createContext,
   forwardRef,
@@ -13,10 +14,18 @@ import {
 import * as SelectPrimitive from "@radix-ui/react-select";
 import { Input } from "./input.jsx";
 import { cn } from "../../lib/utils.js";
-import { getSelectSearchKey, hasSelectSearchQuery, optionMatchesSelectQuery } from "../../select-search-utils.js";
+import {
+  getSelectSearchKey,
+  hasSelectSearchQuery,
+  optionMatchesSelectQuery,
+  shouldShowSelectSearchInput
+} from "../../select-search-utils.js";
+import { useDropdownPlacement } from "../../dropdown-placement.js";
 
 const SelectSearchContext = createContext(null);
 const DEFAULT_SELECT_SEARCH_PLACEHOLDER = "Enter character to filter";
+const SELECT_SEARCH_HEADER_HEIGHT = 41;
+const SELECT_SEARCH_INPUT_DATA_ATTR = "data-llm-router-select-search-input";
 
 function extractTextFromNode(node) {
   if (node === null || node === undefined || typeof node === "boolean") return "";
@@ -66,6 +75,7 @@ function filterSelectChildren(children, query = "") {
     const nested = filterSelectChildren(child.props.children, query);
     totalItems += nested.totalItems;
     matchedItems += nested.matchedItems;
+    if (child.type?.__LLM_ROUTER_SELECT_GROUP === true && nested.matchedItems === 0) return null;
     return cloneElement(child, undefined, nested.children);
   });
 
@@ -76,23 +86,59 @@ function filterSelectChildren(children, query = "") {
   };
 }
 
-export function Select({ open: openProp, defaultOpen = false, onOpenChange, searchEnabled = true, children, ...props }) {
+export function Select({
+  open: openProp,
+  defaultOpen = false,
+  onOpenChange,
+  searchEnabled = true,
+  openSearchRequest = 0,
+  children,
+  ...props
+}) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(Boolean(defaultOpen));
   const [filterValue, setFilterValue] = useState("");
+  const [searchSessionActive, setSearchSessionActive] = useState(false);
+  const triggerRef = useRef(null);
+  const handledOpenSearchRequestRef = useRef(0);
   const open = openProp !== undefined ? openProp : uncontrolledOpen;
+
+  useEffect(() => {
+    if (open) return;
+    setFilterValue("");
+    setSearchSessionActive(false);
+  }, [open]);
 
   function handleOpenChange(nextOpen) {
     if (openProp === undefined) setUncontrolledOpen(nextOpen);
     onOpenChange?.(nextOpen);
-    if (!nextOpen) setFilterValue("");
+    if (!nextOpen) {
+      setFilterValue("");
+      setSearchSessionActive(false);
+    }
   }
+
+  useEffect(() => {
+    if (!openSearchRequest || openSearchRequest === handledOpenSearchRequestRef.current) return;
+    handledOpenSearchRequestRef.current = openSearchRequest;
+    setFilterValue("");
+    if (searchEnabled) setSearchSessionActive(true);
+    if (open) return;
+    if (openProp === undefined) {
+      setUncontrolledOpen(true);
+    }
+    onOpenChange?.(true);
+  }, [openSearchRequest, searchEnabled, open, openProp, onOpenChange]);
 
   const contextValue = {
     open,
     searchEnabled,
     filterValue,
     setFilterValue,
-    setOpen: handleOpenChange
+    searchSessionActive,
+    setSearchSessionActive,
+    setOpen: handleOpenChange,
+    triggerRef,
+    openSearchRequest
   };
 
   return (
@@ -106,6 +152,18 @@ export function Select({ open: openProp, defaultOpen = false, onOpenChange, sear
 
 export const SelectTrigger = forwardRef(function SelectTrigger({ className, children, onKeyDown, ...props }, ref) {
   const searchContext = useContext(SelectSearchContext);
+  const triggerRef = searchContext?.triggerRef || null;
+
+  const setTriggerNode = useCallback((node) => {
+    if (triggerRef) {
+      triggerRef.current = node;
+    }
+    if (typeof ref === "function") {
+      ref(node);
+      return;
+    }
+    if (ref) ref.current = node;
+  }, [triggerRef, ref]);
 
   function handleKeyDown(event) {
     onKeyDown?.(event);
@@ -113,22 +171,25 @@ export const SelectTrigger = forwardRef(function SelectTrigger({ className, chil
     const searchKey = getSelectSearchKey(event);
     if (!searchKey) return;
     event.preventDefault();
+    searchContext.setSearchSessionActive?.(true);
     searchContext.setOpen(true);
     searchContext.setFilterValue((current) => `${current}${searchKey}`);
   }
 
   return (
     <SelectPrimitive.Trigger
-      ref={ref}
+      ref={setTriggerNode}
       className={cn(
-        "inline-flex h-9 w-full items-center justify-between gap-2 rounded-lg border border-input bg-background/80 px-3 text-sm text-foreground shadow-sm outline-none transition focus:border-ring focus:ring-2 focus:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50",
+        "relative inline-flex h-9 w-full items-center gap-2 rounded-lg border border-input bg-background/80 pl-3 pr-9 text-sm text-foreground shadow-sm outline-none transition focus:border-ring focus:ring-2 focus:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50",
         className
       )}
       onKeyDown={handleKeyDown}
       {...props}
     >
-      {children}
-      <SelectPrimitive.Icon className="text-muted-foreground">▾</SelectPrimitive.Icon>
+      <span className="min-w-0 flex-1 truncate text-left">
+        {children}
+      </span>
+      <SelectPrimitive.Icon className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">▾</SelectPrimitive.Icon>
     </SelectPrimitive.Trigger>
   );
 });
@@ -149,14 +210,33 @@ export const SelectContent = forwardRef(function SelectContent({
   const searchContext = useContext(SelectSearchContext);
   const contentRef = useRef(null);
   const searchInputRef = useRef(null);
-  const searchVisible = Boolean(searchContext?.searchEnabled) && hasSelectSearchQuery(searchContext?.filterValue);
+  const placement = useDropdownPlacement({
+    open: Boolean(searchContext?.open),
+    anchorRef: searchContext?.triggerRef,
+    preferredSide: "bottom",
+    desiredHeight: 288,
+    offset: 4
+  });
+  const searchVisible = shouldShowSelectSearchInput({
+    searchEnabled: searchContext?.searchEnabled,
+    filterValue: searchContext?.filterValue,
+    sessionActive: searchContext?.searchSessionActive
+  });
   const filteredChildren = useMemo(
-    () => searchVisible ? filterSelectChildren(children, searchContext?.filterValue) : { children, totalItems: 0, matchedItems: 0 },
-    [children, searchContext?.filterValue, searchVisible]
+    () => hasSelectSearchQuery(searchContext?.filterValue)
+      ? filterSelectChildren(children, searchContext?.filterValue)
+      : { children, totalItems: 0, matchedItems: 0 },
+    [children, searchContext?.filterValue]
   );
-  const showEmptySearchState = searchVisible
+  const showEmptySearchState = hasSelectSearchQuery(searchContext?.filterValue)
     && filteredChildren.totalItems > 0
     && filteredChildren.matchedItems === 0;
+  const viewportMaxHeight = Math.max(
+    0,
+    Math.floor(
+      (placement.maxHeight || 288) - (searchVisible ? SELECT_SEARCH_HEADER_HEIGHT : 0)
+    )
+  );
 
   useEffect(() => {
     if (!searchContext?.open || !searchVisible || typeof window === "undefined") return undefined;
@@ -168,16 +248,16 @@ export const SelectContent = forwardRef(function SelectContent({
       input.setSelectionRange(length, length);
     });
     return () => window.cancelAnimationFrame(frameId);
-  }, [searchContext?.open, searchVisible]);
+  }, [searchContext?.open, searchVisible, searchContext?.openSearchRequest]);
 
-  function setContentNode(node) {
+  const setContentNode = useCallback((node) => {
     contentRef.current = node;
     if (typeof ref === "function") {
       ref(node);
       return;
     }
     if (ref) ref.current = node;
-  }
+  }, [ref]);
 
   function handleContentKeyDownCapture(event) {
     onKeyDownCapture?.(event);
@@ -186,15 +266,14 @@ export const SelectContent = forwardRef(function SelectContent({
     if (!searchKey) return;
     event.preventDefault();
     event.stopPropagation();
+    searchContext.setSearchSessionActive?.(true);
     searchContext.setFilterValue((current) => `${current}${searchKey}`);
   }
 
   function handleSearchChange(event) {
     const nextValue = event.target.value;
+    searchContext?.setSearchSessionActive?.(true);
     searchContext?.setFilterValue(nextValue);
-    if (!hasSelectSearchQuery(nextValue) && typeof window !== "undefined") {
-      window.requestAnimationFrame(() => focusSelectOption(contentRef.current));
-    }
   }
 
   return (
@@ -202,6 +281,7 @@ export const SelectContent = forwardRef(function SelectContent({
       <SelectPrimitive.Content
         ref={setContentNode}
         position={position}
+        side={position === "popper" ? placement.side : undefined}
         className={cn(
           "z-50 min-w-[8rem] overflow-hidden rounded-xl border border-border/70 bg-popover text-popover-foreground shadow-lg",
           position === "popper" && "data-[side=bottom]:translate-y-1 data-[side=top]:-translate-y-1",
@@ -214,6 +294,7 @@ export const SelectContent = forwardRef(function SelectContent({
           <div className="border-b border-border/70 p-1">
             <Input
               ref={searchInputRef}
+              data-llm-router-select-search-input="true"
               value={searchContext?.filterValue || ""}
               autoComplete="off"
               autoCorrect="off"
@@ -238,6 +319,7 @@ export const SelectContent = forwardRef(function SelectContent({
                 }
                 if (event.key === "Escape") {
                   event.preventDefault();
+                  searchContext?.setSearchSessionActive?.(false);
                   searchContext?.setFilterValue("");
                   if (typeof window !== "undefined") {
                     window.requestAnimationFrame(() => focusSelectOption(contentRef.current));
@@ -247,8 +329,13 @@ export const SelectContent = forwardRef(function SelectContent({
             />
           </div>
         ) : null}
-        <SelectPrimitive.Viewport className="max-h-[18rem] p-1">
-          {searchVisible ? filteredChildren.children : children}
+        <SelectPrimitive.Viewport
+          className="px-1 pb-1"
+          style={{
+            maxHeight: `${viewportMaxHeight}px`
+          }}
+        >
+          {hasSelectSearchQuery(searchContext?.filterValue) ? filteredChildren.children : children}
           {showEmptySearchState ? (
             <div className="px-3 py-2 text-sm text-muted-foreground">{emptySearchMessage}</div>
           ) : null}
@@ -258,16 +345,35 @@ export const SelectContent = forwardRef(function SelectContent({
   );
 });
 
-export const SelectItem = forwardRef(function SelectItem({ className, children, searchText = "", textValue, ...props }, ref) {
+export const SelectItem = forwardRef(function SelectItem({
+  className,
+  children,
+  searchText = "",
+  textValue,
+  onPointerMove,
+  ...props
+}, ref) {
+  const searchContext = useContext(SelectSearchContext);
   const resolvedTextValue = String(textValue || extractTextFromNode(children) || "").trim();
+
+  function handlePointerMove(event) {
+    onPointerMove?.(event);
+    if (event.defaultPrevented || !searchContext?.searchEnabled || typeof document === "undefined") return;
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement && activeElement.getAttribute(SELECT_SEARCH_INPUT_DATA_ATTR) === "true") {
+      event.preventDefault();
+    }
+  }
+
   return (
     <SelectPrimitive.Item
       ref={ref}
       className={cn(
-        "relative flex w-full cursor-default select-none items-center rounded-lg py-2 pl-3 pr-8 text-sm text-foreground outline-none transition focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+        "relative flex w-full cursor-default select-none items-center rounded-lg py-2 pl-3 pr-8 text-sm text-foreground outline-none transition-colors hover:bg-accent/60 focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
         className
       )}
       textValue={resolvedTextValue}
+      onPointerMove={handlePointerMove}
       {...props}
     >
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
@@ -279,3 +385,24 @@ export const SelectItem = forwardRef(function SelectItem({ className, children, 
 });
 
 SelectItem.__LLM_ROUTER_SELECT_ITEM = true;
+
+export function SelectGroup(props) {
+  return <SelectPrimitive.Group {...props} />;
+}
+
+SelectGroup.__LLM_ROUTER_SELECT_GROUP = true;
+
+export const SelectLabel = forwardRef(function SelectLabel({ className, children, ...props }, ref) {
+  return (
+    <SelectPrimitive.Label
+      ref={ref}
+      className={cn(
+        "-mt-1 sticky top-0 z-10 -mx-1 mb-1 block border-b border-border/55 bg-background/96 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-foreground/80 backdrop-blur-sm",
+        className
+      )}
+      {...props}
+    >
+      {children}
+    </SelectPrimitive.Label>
+  );
+});

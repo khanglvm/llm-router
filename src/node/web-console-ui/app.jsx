@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Badge } from "./components/ui/badge.jsx";
 import { Button } from "./components/ui/button.jsx";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card.jsx";
@@ -6,8 +7,18 @@ import { Input } from "./components/ui/input.jsx";
 import { Switch } from "./components/ui/switch.jsx";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs.jsx";
 import { Textarea } from "./components/ui/textarea.jsx";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select.jsx";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue
+} from "./components/ui/select.jsx";
+import { getClippingAncestors, useDropdownPlacement } from "./dropdown-placement.js";
 import { cn } from "./lib/utils.js";
+import { BufferedTextInput } from "./buffered-text-input.js";
 import {
   applyModelAliasEdits,
   applyProviderInlineEdits,
@@ -29,6 +40,13 @@ import {
 import { CODEX_SUBSCRIPTION_MODELS, CLAUDE_CODE_SUBSCRIPTION_MODELS } from "../../runtime/subscription-constants.js";
 import { DEFAULT_AMP_ENTITY_DEFINITIONS, DEFAULT_AMP_SIGNATURE_DEFINITIONS, DEFAULT_MODEL_ALIAS_ID } from "../../runtime/config.js";
 import { LOCAL_ROUTER_ORIGIN, LOCAL_ROUTER_PORT } from "../../shared/local-router-defaults.js";
+import {
+  CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL,
+  CODEX_CLI_INHERIT_MODEL_VALUE,
+  normalizeClaudeCodeThinkingLevel,
+  isCodexCliInheritModelBinding
+} from "../../shared/coding-tool-bindings.js";
+import { classifyTransientIntegerInput } from "./transient-integer-input-utils.js";
 
 const JSON_HEADERS = { "content-type": "application/json" };
 const LOG_LEVEL_STYLES = {
@@ -37,17 +55,37 @@ const LOG_LEVEL_STYLES = {
   warn: "bg-amber-50 text-amber-700 ring-amber-100",
   error: "bg-rose-50 text-rose-700 ring-rose-100"
 };
+const ACTIVITY_FILTER_OPTIONS = [
+  { value: "usage", label: "Request / response" },
+  { value: "router", label: "LLM Router" },
+  { value: "all", label: "All categories" }
+];
+const ACTIVITY_CATEGORY_META = {
+  usage: {
+    label: "Request / response",
+    badgeVariant: "info",
+    emptyLabel: "request/response"
+  },
+  router: {
+    label: "LLM Router",
+    badgeVariant: "outline",
+    emptyLabel: "LLM Router"
+  }
+};
+const GITHUB_REPO_URL = "https://github.com/khanglvm/llm-router";
+const GITHUB_SPONSORS_URL = "https://github.com/sponsors/khanglvm";
 
 const QUICK_START_FALLBACK_USER_AGENT = "AICodeClient/1.0.0";
 const LIVE_UPDATES_RETRY_MS = 3000;
-const TOAST_DURATION_MS = 5000;
+const TOAST_DURATION_MS = 4000;
 const TOAST_STATUS_TICK_MS = 100;
+const CONTEXT_LOOKUP_SUGGESTION_LIMIT = 6;
 const QUICK_START_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const QUICK_START_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const QUICK_START_CONNECTION_OPTIONS = [
   {
     value: "api",
-    label: "API-based",
+    label: "API Key",
     description: "Test endpoint + model candidates with an API key env before saving."
   },
   {
@@ -69,6 +107,19 @@ const MODEL_ALIAS_STRATEGY_OPTIONS = [
   { value: "quota-aware-weighted-rr", label: "Quota-aware weighted RR" }
 ];
 const MODEL_ALIAS_STRATEGY_LABELS = Object.fromEntries(MODEL_ALIAS_STRATEGY_OPTIONS.map((option) => [option.value, option.label]));
+const CODEX_THINKING_LEVEL_OPTIONS = Object.freeze([
+  { value: "minimal", label: "Minimal", hint: "Fastest supported reasoning" },
+  { value: "low", label: "Low", hint: "Lighter reasoning" },
+  { value: "medium", label: "Medium", hint: "Balanced depth" },
+  { value: "high", label: "High", hint: "Deeper reasoning" },
+  { value: "xhigh", label: "XHigh", hint: "Model-dependent extra depth" }
+]);
+const CLAUDE_THINKING_LEVEL_OPTIONS = Object.freeze([
+  { value: "low", label: "Low", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.low}` },
+  { value: "medium", label: "Medium", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.medium}` },
+  { value: "high", label: "High", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high}` },
+  { value: "max", label: "Max", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.max}` }
+]);
 const QUICK_START_WINDOW_OPTIONS = RATE_LIMIT_WINDOW_OPTIONS;
 const QUICK_START_API_ENV_BY_CONNECTION = {
   openai: "OPENAI_API_KEY",
@@ -115,6 +166,50 @@ const QUICK_START_CONNECTION_PRESETS = Object.freeze({
     subscriptionProfile: ""
   })
 });
+const AMP_WEB_SEARCH_STRATEGY_OPTIONS = Object.freeze([
+  { value: "ordered", label: "Ordered" },
+  { value: "quota-balance", label: "Quota balance" }
+]);
+const AMP_WEB_SEARCH_PROVIDER_OPTIONS = Object.freeze([
+  Object.freeze({
+    id: "brave",
+    label: "Brave",
+    credentialField: "apiKey",
+    credentialLabel: "API key",
+    credentialPlaceholder: "brv_...",
+    defaultLimit: 1000
+  }),
+  Object.freeze({
+    id: "tavily",
+    label: "Tavily",
+    credentialField: "apiKey",
+    credentialLabel: "API key",
+    credentialPlaceholder: "tvly-...",
+    defaultLimit: 1000
+  }),
+  Object.freeze({
+    id: "exa",
+    label: "Exa",
+    credentialField: "apiKey",
+    credentialLabel: "API key",
+    credentialPlaceholder: "exa_...",
+    defaultLimit: 1000
+  }),
+  Object.freeze({
+    id: "searxng",
+    label: "SearXNG",
+    credentialField: "url",
+    credentialLabel: "Base URL",
+    credentialPlaceholder: "https://searx.example.com",
+    defaultLimit: 0
+  })
+]);
+const AMP_WEB_SEARCH_PROVIDER_META = Object.fromEntries(
+  AMP_WEB_SEARCH_PROVIDER_OPTIONS.map((provider) => [provider.id, provider])
+);
+const AMP_WEB_SEARCH_DEFAULT_COUNT = 5;
+const AMP_WEB_SEARCH_MIN_COUNT = 1;
+const AMP_WEB_SEARCH_MAX_COUNT = 20;
 
 function splitListValues(value) {
   return Array.from(new Set(String(value || "")
@@ -170,6 +265,48 @@ function moveItemDown(items = [], itemKey, getKey = (item) => item?.key) {
   const [movedItem] = nextItems.splice(currentIndex, 1);
   nextItems.splice(currentIndex + 1, 0, movedItem);
   return nextItems;
+}
+
+function captureScrollSettleSnapshot(node, scrollContainers = []) {
+  const rect = node?.getBoundingClientRect?.();
+  return {
+    top: Number.isFinite(rect?.top) ? Number(rect.top) : Number.NaN,
+    left: Number.isFinite(rect?.left) ? Number(rect.left) : Number.NaN,
+    windowX: typeof window === "undefined" ? 0 : Number(window.scrollX || window.pageXOffset || 0),
+    windowY: typeof window === "undefined" ? 0 : Number(window.scrollY || window.pageYOffset || 0),
+    containers: scrollContainers.map((container) => ({
+      top: Number(container?.scrollTop || 0),
+      left: Number(container?.scrollLeft || 0)
+    }))
+  };
+}
+
+function isScrollSettleSnapshotStable(previousSnapshot, nextSnapshot, threshold = 0.5) {
+  if (!previousSnapshot || !nextSnapshot) return false;
+  if (!Number.isFinite(nextSnapshot.top) || !Number.isFinite(nextSnapshot.left)) return false;
+  if (Math.abs(nextSnapshot.top - previousSnapshot.top) > threshold) return false;
+  if (Math.abs(nextSnapshot.left - previousSnapshot.left) > threshold) return false;
+  if (Math.abs(nextSnapshot.windowX - previousSnapshot.windowX) > threshold) return false;
+  if (Math.abs(nextSnapshot.windowY - previousSnapshot.windowY) > threshold) return false;
+  if ((previousSnapshot.containers?.length || 0) !== (nextSnapshot.containers?.length || 0)) return false;
+
+  return nextSnapshot.containers.every((position, index) => {
+    const previousPosition = previousSnapshot.containers[index];
+    if (!previousPosition) return false;
+    return Math.abs(position.top - previousPosition.top) <= threshold
+      && Math.abs(position.left - previousPosition.left) <= threshold;
+  });
+}
+
+function getActivityEntryCategory(entry) {
+  const category = String(entry?.category || "").trim().toLowerCase();
+  if (category === "usage" || category === "router") return category;
+  const source = String(entry?.source || "").trim().toLowerCase();
+  const kind = String(entry?.kind || "").trim().toLowerCase();
+  if (source === "runtime" || kind.startsWith("request") || kind.startsWith("fallback")) {
+    return "usage";
+  }
+  return "router";
 }
 
 const DRAGGING_ROW_CLASSES = ["border-primary/45", "bg-primary/5"];
@@ -281,20 +418,79 @@ function ArrowDownIcon({ className = "" }) {
   );
 }
 
+function PlusIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className={className}>
+      <path d="M8 3.5v9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M3.5 8h9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function GitHubIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+      <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.2-.02-2.18-3.2.69-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.74.4-1.25.72-1.54-2.56-.29-5.25-1.28-5.25-5.71 0-1.26.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.17 1.18a10.9 10.9 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.62 1.59.23 2.76.11 3.05.74.8 1.18 1.82 1.18 3.08 0 4.44-2.69 5.41-5.26 5.69.41.35.78 1.05.78 2.11 0 1.52-.01 2.75-.01 3.12 0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z" />
+    </svg>
+  );
+}
+
+function HeartIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
+      <path d="M12 21.3 10.9 20.3C5.4 15.3 2 12.3 2 8.5 2 5.4 4.4 3 7.5 3c1.8 0 3.5.8 4.5 2.1C13 3.8 14.7 3 16.5 3 19.6 3 22 5.4 22 8.5c0 3.8-3.4 6.8-8.9 11.8L12 21.3Z" />
+    </svg>
+  );
+}
+
+function PlayIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
+      <path d="M6.25 4.7a.75.75 0 0 1 1.14-.64l8.1 5.05a1.05 1.05 0 0 1 0 1.78l-8.1 5.05a.75.75 0 0 1-1.14-.64V4.7Z" />
+    </svg>
+  );
+}
+
+function PauseIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
+      <path d="M6.25 4.5A1.25 1.25 0 0 1 7.5 3.25h.5a1.25 1.25 0 0 1 1.25 1.25v11A1.25 1.25 0 0 1 8 16.75h-.5a1.25 1.25 0 0 1-1.25-1.25v-11Zm4.5 0A1.25 1.25 0 0 1 12 3.25h.5a1.25 1.25 0 0 1 1.25 1.25v11A1.25 1.25 0 0 1 12.5 16.75H12a1.25 1.25 0 0 1-1.25-1.25v-11Z" />
+    </svg>
+  );
+}
+
+function FolderIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={className}>
+      <path d="M2.75 6.5A1.75 1.75 0 0 1 4.5 4.75h3L9.4 6.4h6.1a1.75 1.75 0 0 1 1.75 1.75v6.35a1.75 1.75 0 0 1-1.75 1.75h-11A1.75 1.75 0 0 1 2.75 14.5v-8Z" />
+      <path d="M2.75 8h14.5" />
+    </svg>
+  );
+}
+
+function PowerIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={className}>
+      <path d="M10 3.25v5" />
+      <path d="M6.1 5.15a6.25 6.25 0 1 0 7.8 0" />
+    </svg>
+  );
+}
+
 function MoveUpButton({ disabled = false, label = "Move up", onClick }) {
   return (
     <Button
       type="button"
       variant="ghost"
       size="sm"
-      className="h-8 w-8 rounded-full p-0"
+      className="h-7 w-7 rounded-full p-0"
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
       disabled={disabled}
       aria-label={label}
       title={label}
     >
-      <ArrowUpIcon className="h-4 w-4" />
+      <ArrowUpIcon className="h-3.5 w-3.5" />
     </Button>
   );
 }
@@ -305,17 +501,24 @@ function MoveDownButton({ disabled = false, label = "Move down", onClick }) {
       type="button"
       variant="ghost"
       size="sm"
-      className="h-8 w-8 rounded-full p-0"
+      className="h-7 w-7 rounded-full p-0"
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
       disabled={disabled}
       aria-label={label}
       title={label}
     >
-      <ArrowDownIcon className="h-4 w-4" />
+      <ArrowDownIcon className="h-3.5 w-3.5" />
     </Button>
   );
 }
+
+function ProviderStatusDot({ active = false }) {
+  if (!active) return null;
+  return <span aria-hidden="true" className="inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />;
+}
+
+const ROW_REMOVE_BUTTON_CLASS = "w-[5.5rem] justify-self-end";
 
 function normalizeModelAliasStrategyValue(strategy) {
   const normalized = String(strategy || "").trim().toLowerCase();
@@ -641,6 +844,466 @@ function ensureAmpDraftConfigShape(config = {}) {
   return next;
 }
 
+function parseAmpWebSearchInteger(value, fallback = 0, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function ensureWebSearchConfigShape(config = {}) {
+  const next = config && typeof config === "object" && !Array.isArray(config)
+    ? config
+    : {};
+  const legacyWebSearch = next.amp?.webSearch && typeof next.amp.webSearch === "object" && !Array.isArray(next.amp.webSearch)
+    ? safeClone(next.amp.webSearch)
+    : null;
+
+  if (!next.webSearch || typeof next.webSearch !== "object" || Array.isArray(next.webSearch)) {
+    next.webSearch = legacyWebSearch || {};
+  }
+
+  if (next.amp && typeof next.amp === "object" && !Array.isArray(next.amp) && Object.prototype.hasOwnProperty.call(next.amp, "webSearch")) {
+    delete next.amp.webSearch;
+  }
+
+  const strategy = String(next.webSearch.strategy || "").trim();
+  next.webSearch.strategy = strategy === "quota-balance" ? "quota-balance" : "ordered";
+  if (next.webSearch.count !== undefined && next.webSearch.count !== null && String(next.webSearch.count).trim() !== "") {
+    next.webSearch.count = parseAmpWebSearchInteger(next.webSearch.count, AMP_WEB_SEARCH_DEFAULT_COUNT, {
+      min: AMP_WEB_SEARCH_MIN_COUNT,
+      max: AMP_WEB_SEARCH_MAX_COUNT
+    });
+  } else {
+    delete next.webSearch.count;
+  }
+  if (!Array.isArray(next.webSearch.providers)) {
+    next.webSearch.providers = [];
+  }
+  return next.webSearch;
+}
+
+function isHostedWebSearchProviderId(value = "") {
+  const text = String(value || "").trim();
+  return text.includes("/");
+}
+
+function normalizeWebSearchProviderKey(value = "") {
+  const text = String(value || "").trim();
+  return isHostedWebSearchProviderId(text) ? text : text.toLowerCase();
+}
+
+function buildHostedWebSearchProviderId(providerId = "", modelId = "") {
+  const normalizedProviderId = String(providerId || "").trim();
+  const normalizedModelId = String(modelId || "").trim();
+  if (!normalizedProviderId || !normalizedModelId) return "";
+  return `${normalizedProviderId}/${normalizedModelId}`;
+}
+
+function getWebSearchProviderFormats(provider = {}) {
+  return [...new Set(
+    [provider?.format, ...(Array.isArray(provider?.formats) ? provider.formats : [])]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => value === "openai" || value === "claude")
+  )];
+}
+
+function getWebSearchModelFormats(provider = {}, model = {}) {
+  const modelId = String(model?.id || "").trim();
+  const preferredFormat = modelId ? String(provider?.lastProbe?.modelPreferredFormat?.[modelId] || "").trim().toLowerCase() : "";
+  if (preferredFormat === "openai" || preferredFormat === "claude") {
+    return [preferredFormat];
+  }
+
+  const probedFormats = modelId
+    ? [...new Set(
+      (Array.isArray(provider?.lastProbe?.modelSupport?.[modelId]) ? provider.lastProbe.modelSupport[modelId] : [])
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter((value) => value === "openai" || value === "claude")
+    )]
+    : [];
+  if (probedFormats.length > 0) return probedFormats;
+
+  return [...new Set(
+    [model?.format, ...(Array.isArray(model?.formats) ? model.formats : [])]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => value === "openai" || value === "claude")
+  )];
+}
+
+function providerHasHostedWebSearchConnection(provider = {}) {
+  const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
+  if (String(provider?.type || "").trim().toLowerCase() === "subscription") {
+    return subscriptionType === "chatgpt-codex";
+  }
+
+  const providerFormats = getWebSearchProviderFormats(provider);
+  if (!providerFormats.includes("openai")) return false;
+  return Boolean(String(provider?.baseUrlByFormat?.openai || provider?.baseUrl || "").trim());
+}
+
+function providerHasHostedWebSearchAuth(provider = {}) {
+  if (String(provider?.type || "").trim().toLowerCase() === "subscription") {
+    return String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase() === "chatgpt-codex";
+  }
+  if (String(provider?.apiKey || "").trim() || String(provider?.apiKeyEnv || "").trim()) return true;
+  if (String(provider?.auth?.type || "").trim().toLowerCase() === "none") return true;
+
+  return Object.keys(provider?.headers && typeof provider.headers === "object" ? provider.headers : {})
+    .some((key) => {
+      const normalized = String(key || "").trim().toLowerCase();
+      return normalized === "authorization" || normalized === "x-api-key";
+    });
+}
+
+function modelSupportsHostedWebSearch(provider = {}, model = {}) {
+  if (!providerHasHostedWebSearchConnection(provider)) return false;
+  const modelFormats = getWebSearchModelFormats(provider, model);
+  return modelFormats.length === 0 || modelFormats.includes("openai");
+}
+
+function hasWebSearchDraftField(entry = {}, keys = []) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  return keys.some((key) => Object.prototype.hasOwnProperty.call(entry, key) && entry[key] !== undefined && entry[key] !== null && String(entry[key]).trim() !== "");
+}
+
+function normalizeBuiltinWebSearchProviderDraft(entry = {}, explicitId = "") {
+  const providerId = String(explicitId || entry?.id || "").trim().toLowerCase();
+  const providerMeta = AMP_WEB_SEARCH_PROVIDER_META[providerId];
+  if (!providerMeta) return null;
+
+  const credentialField = providerMeta.credentialField;
+  const credentialValue = String(entry?.[credentialField] || "").trim();
+  const hasExplicitCount = hasWebSearchDraftField(entry, ["count", "resultCount", "result-count", "resultsPerCall", "results-per-call"]);
+  const hasExplicitLimit = hasWebSearchDraftField(entry, ["limit", "monthlyLimit", "monthly-limit", "quota"]);
+  const hasExplicitRemaining = hasWebSearchDraftField(entry, ["remaining", "remainingQuota", "remaining-quota", "remainingQueries", "remaining-queries"]);
+  const includeQuotaDefaults = Boolean(credentialValue) || hasExplicitLimit || hasExplicitRemaining;
+  const defaultLimit = includeQuotaDefaults ? (Number(providerMeta.defaultLimit) || 0) : 0;
+  const count = parseAmpWebSearchInteger(
+    entry?.count ?? entry?.resultCount ?? entry?.["result-count"] ?? entry?.resultsPerCall ?? entry?.["results-per-call"],
+    AMP_WEB_SEARCH_DEFAULT_COUNT,
+    { min: AMP_WEB_SEARCH_MIN_COUNT, max: AMP_WEB_SEARCH_MAX_COUNT }
+  );
+  const limit = parseAmpWebSearchInteger(entry?.limit, defaultLimit, { min: 0 });
+  const remainingFallback = limit > 0 ? limit : 0;
+  const remaining = parseAmpWebSearchInteger(entry?.remaining, remainingFallback, { min: 0 });
+
+  return {
+    kind: "builtin",
+    id: providerId,
+    [credentialField]: credentialValue,
+    ...(hasExplicitCount && count !== AMP_WEB_SEARCH_DEFAULT_COUNT ? { count } : {}),
+    ...(hasExplicitLimit || (includeQuotaDefaults && limit > 0) ? { limit } : {}),
+    ...(hasExplicitRemaining || (includeQuotaDefaults && (limit > 0 || remaining > 0))
+      ? { remaining: limit > 0 ? Math.min(remaining, limit) : remaining }
+      : {})
+  };
+}
+
+function normalizeHostedWebSearchProviderDraft(entry = {}, explicitId = "") {
+  const routeId = String(
+    explicitId
+    || entry?.id
+    || buildHostedWebSearchProviderId(entry?.providerId ?? entry?.provider, entry?.model ?? entry?.modelId)
+  ).trim();
+  if (!isHostedWebSearchProviderId(routeId)) return null;
+  const providerId = String(entry?.providerId ?? entry?.provider ?? routeId.slice(0, routeId.indexOf("/"))).trim();
+  const modelId = String(entry?.model ?? entry?.modelId ?? routeId.slice(routeId.indexOf("/") + 1)).trim();
+  const normalizedRouteId = buildHostedWebSearchProviderId(providerId, modelId);
+  if (!normalizedRouteId || normalizedRouteId !== routeId) return null;
+
+  return {
+    kind: "hosted",
+    id: normalizedRouteId,
+    providerId,
+    model: modelId
+  };
+}
+
+function normalizeWebSearchProviderDraft(entry = {}, explicitId = "") {
+  return normalizeHostedWebSearchProviderDraft(entry, explicitId)
+    || normalizeBuiltinWebSearchProviderDraft(entry, explicitId);
+}
+
+function buildHostedWebSearchCandidateGroups(config = {}, existingIds = new Set()) {
+  const providers = Array.isArray(config?.providers) ? config.providers : [];
+  return providers
+    .map((provider) => {
+      const providerId = String(provider?.id || "").trim();
+      if (!providerId || provider?.enabled === false || !providerHasHostedWebSearchConnection(provider) || !providerHasHostedWebSearchAuth(provider)) {
+        return null;
+      }
+      const models = (Array.isArray(provider?.models) ? provider.models : [])
+        .map((model) => {
+          const modelId = String(model?.id || "").trim();
+          const routeId = buildHostedWebSearchProviderId(providerId, modelId);
+          if (!modelId || !routeId || existingIds.has(routeId)) return null;
+          if (!modelSupportsHostedWebSearch(provider, model)) return null;
+          if (!modelId.toLowerCase().includes("gpt")) return null;
+          return {
+            value: modelId,
+            label: modelId,
+            routeId
+          };
+        })
+        .filter(Boolean);
+      if (models.length === 0) return null;
+      return {
+        providerId,
+        providerLabel: String(provider?.name || providerId).trim() || providerId,
+        providerHint: String(provider?.subscriptionType || "").trim().toLowerCase() === "chatgpt-codex"
+          ? "ChatGPT subscription"
+          : (String(provider?.baseUrlByFormat?.openai || provider?.baseUrl || "").trim() || "OpenAI-compatible endpoint"),
+        models
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildWebSearchProviderRows(config = {}, snapshot = null) {
+  const nextConfig = ensureAmpDraftConfigShape(config);
+  const webSearch = ensureWebSearchConfigShape(nextConfig);
+  const configuredProviders = Array.isArray(webSearch.providers)
+    ? webSearch.providers
+        .map((provider) => normalizeWebSearchProviderDraft(provider, provider?.id))
+        .filter(Boolean)
+    : [];
+  const configuredIds = new Set(configuredProviders.map((provider) => normalizeWebSearchProviderKey(provider.id)));
+  const orderedProviders = [
+    ...configuredProviders,
+    ...AMP_WEB_SEARCH_PROVIDER_OPTIONS
+      .filter((provider) => !configuredIds.has(provider.id))
+      .map((provider) => normalizeBuiltinWebSearchProviderDraft({ id: provider.id }, provider.id))
+      .filter(Boolean)
+  ];
+  const snapshotProviders = Array.isArray(snapshot?.providers) ? snapshot.providers : [];
+  const snapshotById = new Map(
+    snapshotProviders
+      .map((provider) => [normalizeWebSearchProviderKey(provider?.id), provider])
+      .filter(([providerId]) => Boolean(providerId))
+  );
+  const providerConfigById = new Map(
+    (Array.isArray(config?.providers) ? config.providers : [])
+      .map((provider) => [String(provider?.id || "").trim(), provider])
+      .filter(([providerId]) => Boolean(providerId))
+  );
+  const fallbackCount = parseAmpWebSearchInteger(webSearch?.count, AMP_WEB_SEARCH_DEFAULT_COUNT, {
+    min: AMP_WEB_SEARCH_MIN_COUNT,
+    max: AMP_WEB_SEARCH_MAX_COUNT
+  });
+
+  return orderedProviders.map((provider) => {
+    const normalizedId = normalizeWebSearchProviderKey(provider.id);
+    const runtimeState = snapshotById.get(normalizedId) || null;
+    const configuredIndex = configuredProviders.findIndex((entry) => normalizeWebSearchProviderKey(entry.id) === normalizedId);
+    const displayIndex = orderedProviders.findIndex((entry) => normalizeWebSearchProviderKey(entry.id) === normalizedId);
+    const isReady = provider.kind === "hosted"
+      ? runtimeState?.ready !== false
+      : Boolean(provider?.[AMP_WEB_SEARCH_PROVIDER_META[provider.id]?.credentialField || "apiKey"]);
+
+    if (provider.kind === "hosted") {
+      const sourceProvider = providerConfigById.get(provider.providerId) || null;
+      return {
+        id: provider.id,
+        key: provider.id,
+        kind: "hosted",
+        label: String(sourceProvider?.name || provider.providerId).trim() || provider.providerId,
+        providerId: provider.providerId,
+        modelId: provider.model,
+        routeId: provider.id,
+        configured: true,
+        configuredIndex,
+        configuredCount: configuredProviders.length,
+        displayIndex,
+        displayCount: orderedProviders.length,
+        active: isReady,
+        runtimeState
+      };
+    }
+
+    const providerMeta = AMP_WEB_SEARCH_PROVIDER_META[provider.id];
+    const credentialField = providerMeta?.credentialField || "apiKey";
+    const credentialValue = String(provider?.[credentialField] || "").trim();
+    const hasExplicitCount = hasWebSearchDraftField(provider, ["count"]);
+    const resultPerCall = parseAmpWebSearchInteger(provider?.count, fallbackCount, {
+      min: AMP_WEB_SEARCH_MIN_COUNT,
+      max: AMP_WEB_SEARCH_MAX_COUNT
+    });
+    return {
+      id: provider.id,
+      key: provider.id,
+      kind: "builtin",
+      label: providerMeta?.label || provider.id,
+      credentialField,
+      credentialLabel: providerMeta?.credentialLabel || "Credential",
+      credentialPlaceholder: providerMeta?.credentialPlaceholder || "",
+      credentialValue,
+      resultPerCall,
+      resultPerCallInput: hasExplicitCount
+        ? String(resultPerCall)
+        : (fallbackCount !== AMP_WEB_SEARCH_DEFAULT_COUNT ? String(fallbackCount) : ""),
+      limit: parseAmpWebSearchInteger(provider?.limit, providerMeta?.defaultLimit || 0, { min: 0 }),
+      remaining: parseAmpWebSearchInteger(provider?.remaining, providerMeta?.defaultLimit || 0, { min: 0 }),
+      configured: Boolean(credentialValue),
+      configuredIndex,
+      configuredCount: configuredProviders.length,
+      displayIndex,
+      displayCount: orderedProviders.length,
+      active: isReady,
+      runtimeState
+    };
+  });
+}
+
+function updateWebSearchConfig(config = {}, updates = {}) {
+  const next = ensureAmpDraftConfigShape(config);
+  const webSearch = ensureWebSearchConfigShape(next);
+  if (updates.strategy !== undefined) {
+    webSearch.strategy = String(updates.strategy || "").trim() === "quota-balance" ? "quota-balance" : "ordered";
+  }
+  if (updates.count !== undefined) {
+    webSearch.count = parseAmpWebSearchInteger(updates.count, webSearch.count, { min: 1, max: 20 });
+  }
+  return next;
+}
+
+function updateWebSearchProviderConfig(config = {}, providerId, updates = {}) {
+  const normalizedProviderId = String(providerId || "").trim().toLowerCase();
+  if (!AMP_WEB_SEARCH_PROVIDER_META[normalizedProviderId]) return ensureAmpDraftConfigShape(config);
+
+  const next = ensureAmpDraftConfigShape(config);
+  const webSearch = ensureWebSearchConfigShape(next);
+  const existingProviders = Array.isArray(webSearch.providers) ? webSearch.providers.slice() : [];
+  const existingIndex = existingProviders.findIndex((provider) => normalizeWebSearchProviderKey(provider?.id) === normalizedProviderId);
+  const existingProvider = existingIndex >= 0 ? existingProviders[existingIndex] : null;
+  const baseProvider = normalizeBuiltinWebSearchProviderDraft(
+    existingProvider || { id: normalizedProviderId },
+    normalizedProviderId
+  ) || normalizeBuiltinWebSearchProviderDraft({ id: normalizedProviderId }, normalizedProviderId);
+  const providerMeta = AMP_WEB_SEARCH_PROVIDER_META[normalizedProviderId];
+  const credentialField = providerMeta.credentialField;
+  const mergedProvider = normalizeBuiltinWebSearchProviderDraft({
+    ...(existingProvider && typeof existingProvider === "object" && !Array.isArray(existingProvider) ? existingProvider : {}),
+    ...baseProvider,
+    ...updates,
+    id: normalizedProviderId,
+    [credentialField]: updates[credentialField] !== undefined ? String(updates[credentialField] || "").trim() : baseProvider?.[credentialField]
+  }, normalizedProviderId);
+  const hasCredential = Boolean(String(mergedProvider?.[credentialField] || "").trim());
+  const shouldPersistCount = hasWebSearchDraftField(updates, ["count"])
+    ? Boolean(String(updates?.count || "").trim()) && Number(mergedProvider?.count) !== AMP_WEB_SEARCH_DEFAULT_COUNT
+    : hasWebSearchDraftField(existingProvider, ["count"]) && Number(mergedProvider?.count) !== AMP_WEB_SEARCH_DEFAULT_COUNT;
+  const shouldPersistLimit = hasCredential
+    || hasWebSearchDraftField(updates, ["limit"])
+    || hasWebSearchDraftField(existingProvider, ["limit"]);
+  const shouldPersistRemaining = hasCredential
+    || hasWebSearchDraftField(updates, ["remaining"])
+    || hasWebSearchDraftField(existingProvider, ["remaining"]);
+
+  const persistedProvider = {
+    id: normalizedProviderId,
+    ...(hasCredential ? { [credentialField]: String(mergedProvider?.[credentialField] || "").trim() } : {}),
+    ...(shouldPersistCount ? { count: Number(mergedProvider.count) } : {}),
+    ...(shouldPersistLimit && Number(mergedProvider?.limit) > 0 ? { limit: Number(mergedProvider.limit) } : {}),
+    ...(shouldPersistRemaining && (Number(mergedProvider?.limit) > 0 || Number(mergedProvider?.remaining) > 0)
+      ? { remaining: Number(mergedProvider.remaining) }
+      : {})
+  };
+
+  if (existingIndex >= 0) {
+    existingProviders[existingIndex] = persistedProvider;
+  } else {
+    existingProviders.push(persistedProvider);
+  }
+  webSearch.providers = existingProviders;
+  return next;
+}
+
+function addHostedWebSearchProviderConfig(config = {}, providerId, modelId) {
+  const routeId = buildHostedWebSearchProviderId(providerId, modelId);
+  if (!routeId) return ensureAmpDraftConfigShape(config);
+
+  const next = ensureAmpDraftConfigShape(config);
+  const webSearch = ensureWebSearchConfigShape(next);
+  const providers = Array.isArray(webSearch.providers) ? webSearch.providers.slice() : [];
+  const routeKey = normalizeWebSearchProviderKey(routeId);
+  if (providers.some((provider) => normalizeWebSearchProviderKey(provider?.id) === routeKey)) {
+    return next;
+  }
+  providers.push({
+    id: routeId,
+    providerId: String(providerId || "").trim(),
+    model: String(modelId || "").trim()
+  });
+  webSearch.providers = providers;
+  return next;
+}
+
+function removeWebSearchProviderConfig(config = {}, providerId) {
+  const normalizedProviderId = normalizeWebSearchProviderKey(providerId);
+  const next = ensureAmpDraftConfigShape(config);
+  const webSearch = ensureWebSearchConfigShape(next);
+  const providers = Array.isArray(webSearch.providers) ? webSearch.providers.slice() : [];
+  const filteredProviders = providers.filter((provider) => normalizeWebSearchProviderKey(provider?.id) !== normalizedProviderId);
+  if (filteredProviders.length === providers.length) return next;
+  webSearch.providers = filteredProviders;
+  return next;
+}
+
+function moveWebSearchProviderConfig(config = {}, providerId, direction = "up") {
+  const normalizedProviderId = normalizeWebSearchProviderKey(providerId);
+  const next = ensureAmpDraftConfigShape(config);
+  const webSearch = ensureWebSearchConfigShape(next);
+  const providers = Array.isArray(webSearch.providers) ? webSearch.providers.slice() : [];
+  const providerById = new Map(
+    providers.map((provider) => [normalizeWebSearchProviderKey(provider?.id), provider]).filter(([id]) => Boolean(id))
+  );
+  const currentIndex = providers.findIndex((provider) => normalizeWebSearchProviderKey(provider?.id) === normalizedProviderId);
+
+  if (currentIndex !== -1) {
+    const targetIndex = direction === "down" ? currentIndex + 1 : currentIndex - 1;
+    if (targetIndex < 0 || targetIndex >= providers.length) return next;
+    const [movedProvider] = providers.splice(currentIndex, 1);
+    providers.splice(targetIndex, 0, movedProvider);
+    webSearch.providers = providers;
+    return next;
+  }
+
+  if (!AMP_WEB_SEARCH_PROVIDER_META[normalizedProviderId]) return next;
+
+  const displayOrder = [
+    ...providers.map((provider) => normalizeWebSearchProviderKey(provider?.id)).filter(Boolean),
+    ...AMP_WEB_SEARCH_PROVIDER_OPTIONS
+      .map((provider) => provider.id)
+      .filter((id) => !providerById.has(id))
+  ];
+  const displayIndex = displayOrder.indexOf(normalizedProviderId);
+  if (displayIndex === -1) return next;
+  const targetIndex = direction === "down" ? displayIndex + 1 : displayIndex - 1;
+  if (targetIndex < 0 || targetIndex >= displayOrder.length) return next;
+  const reordered = displayOrder.slice();
+  const [movedProviderId] = reordered.splice(displayIndex, 1);
+  reordered.splice(targetIndex, 0, movedProviderId);
+
+  const persistedIds = new Set(providerById.keys());
+  persistedIds.add(normalizedProviderId);
+  for (const id of reordered.slice(0, targetIndex + 1)) {
+    if (AMP_WEB_SEARCH_PROVIDER_META[id]) persistedIds.add(id);
+  }
+
+  webSearch.providers = reordered
+    .filter((id) => persistedIds.has(id))
+    .map((id) => providerById.get(id) || { id });
+  return next;
+}
+
+function shouldImmediateAutosaveWebSearchProviderChange(providerId, field, value) {
+  const normalizedProviderId = String(providerId || "").trim().toLowerCase();
+  const providerMeta = AMP_WEB_SEARCH_PROVIDER_META[normalizedProviderId];
+  if (!providerMeta) return false;
+  if (String(field || "").trim() !== providerMeta.credentialField) return false;
+  return !String(value || "").trim();
+}
+
 function buildManagedRouteOptions(config = {}) {
   const options = [];
   const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
@@ -651,19 +1314,28 @@ function buildManagedRouteOptions(config = {}) {
     options.push({
       value: aliasId,
       label: aliasId,
-      hint: `Alias · ${(aliases[aliasId]?.targets || []).length || 0} target(s)`
+      hint: `Alias · ${(aliases[aliasId]?.targets || []).length || 0} target(s)`,
+      kind: "alias",
+      groupKey: "aliases",
+      groupLabel: "Aliases"
     });
   }
 
   for (const provider of (Array.isArray(config?.providers) ? config.providers : [])) {
-    const providerLabel = provider?.name || provider?.id || "provider";
+    const providerId = String(provider?.id || "").trim();
+    const providerLabel = String(provider?.name || providerId || "provider").trim() || "provider";
     for (const model of (Array.isArray(provider?.models) ? provider.models : [])) {
       const modelId = String(model?.id || "").trim();
-      if (!provider?.id || !modelId) continue;
+      if (!providerId || !modelId) continue;
+      const contextWindow = Number.isFinite(model?.contextWindow) ? Number(model.contextWindow) : null;
       options.push({
-        value: `${provider.id}/${modelId}`,
-        label: `${provider.id}/${modelId}`,
-        hint: providerLabel
+        value: `${providerId}/${modelId}`,
+        label: `${providerId}/${modelId}`,
+        hint: contextWindow ? `${providerLabel} · ${formatContextWindow(contextWindow)}` : providerLabel,
+        kind: "model",
+        providerId,
+        groupKey: `provider:${providerId}`,
+        groupLabel: providerLabel
       });
     }
   }
@@ -676,6 +1348,154 @@ function buildManagedRouteOptions(config = {}) {
   });
 }
 
+function inferManagedRouteOptionMetadata(value = "") {
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedValue) return {};
+
+  const normalizedAliasValue = normalizedValue.startsWith("alias:")
+    ? normalizedValue.slice("alias:".length).trim()
+    : normalizedValue;
+  if (!normalizedAliasValue.includes("/")) {
+    return {
+      kind: "alias",
+      groupKey: "aliases",
+      groupLabel: "Aliases"
+    };
+  }
+
+  const separatorIndex = normalizedAliasValue.indexOf("/");
+  const providerId = normalizedAliasValue.slice(0, separatorIndex).trim();
+  if (!providerId) return {};
+  return {
+    kind: "model",
+    providerId,
+    groupKey: `provider:${providerId}`,
+    groupLabel: providerId
+  };
+}
+
+function formatContextWindow(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized <= 0) return "Unknown";
+  if (normalized >= 1000) {
+    const roundedK = normalized / 1000;
+    const rendered = Number.isInteger(roundedK) ? String(roundedK) : roundedK.toFixed(1).replace(/\.0$/, "");
+    return `${rendered}K`;
+  }
+  return String(normalized);
+}
+
+function formatCompactContextWindowInput(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized <= 0) return "";
+
+  const units = [
+    { suffix: "M", divisor: 1000 * 1000 },
+    { suffix: "K", divisor: 1000 }
+  ];
+
+  for (const unit of units) {
+    if (normalized < unit.divisor) continue;
+    const scaledValue = normalized / unit.divisor;
+    const renderedValue = scaledValue >= 10
+      ? String(Math.round(scaledValue))
+      : scaledValue.toFixed(1).replace(/\.0$/, "");
+    return `${renderedValue}${unit.suffix}`;
+  }
+
+  return String(normalized);
+}
+
+function formatEditableContextWindowInput(value) {
+  const normalizedValue = normalizeContextWindowInput(value);
+  const normalized = Number(normalizedValue);
+  if (!Number.isFinite(normalized) || normalized <= 0) return String(value || "");
+  return new Intl.NumberFormat().format(normalized);
+}
+
+function buildProviderModelContextWindowMap(config = {}) {
+  const map = new Map();
+  for (const provider of (Array.isArray(config?.providers) ? config.providers : [])) {
+    const providerId = String(provider?.id || "").trim();
+    if (!providerId) continue;
+    for (const model of (Array.isArray(provider?.models) ? provider.models : [])) {
+      const modelId = String(model?.id || "").trim();
+      if (!modelId) continue;
+      map.set(`${providerId}/${modelId}`, {
+        ref: `${providerId}/${modelId}`,
+        providerId,
+        providerName: String(provider?.name || providerId).trim() || providerId,
+        modelId,
+        contextWindow: Number.isFinite(model?.contextWindow) ? Number(model.contextWindow) : null
+      });
+    }
+  }
+  return map;
+}
+
+function buildAliasContextWindowSummary(aliasId = "", config = {}) {
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+  const modelContextMap = buildProviderModelContextWindowMap(config);
+  const seenAliases = new Set();
+  const seenModelRefs = new Set();
+  const models = [];
+  const unknownRefs = [];
+
+  function visitRouteRef(ref) {
+    const normalizedRef = String(ref || "").trim();
+    if (!normalizedRef) return;
+
+    if (modelContextMap.has(normalizedRef)) {
+      if (seenModelRefs.has(normalizedRef)) return;
+      seenModelRefs.add(normalizedRef);
+      models.push(modelContextMap.get(normalizedRef));
+      return;
+    }
+
+    const normalizedAliasRef = normalizedRef.startsWith("alias:") ? normalizedRef.slice("alias:".length).trim() : normalizedRef;
+    if (!normalizedAliasRef || !Object.prototype.hasOwnProperty.call(aliases, normalizedAliasRef)) {
+      if (!unknownRefs.includes(normalizedRef)) unknownRefs.push(normalizedRef);
+      return;
+    }
+
+    if (seenAliases.has(normalizedAliasRef)) return;
+    seenAliases.add(normalizedAliasRef);
+    const nestedAlias = aliases[normalizedAliasRef];
+    for (const target of [...(nestedAlias?.targets || []), ...(nestedAlias?.fallbackTargets || [])]) {
+      visitRouteRef(target?.ref);
+    }
+  }
+
+  visitRouteRef(aliasId);
+
+  const knownModels = models.filter((model) => Number.isFinite(model?.contextWindow));
+  const uniqueWindows = [...new Set(knownModels.map((model) => model.contextWindow))].sort((left, right) => left - right);
+  const smallestContextWindow = uniqueWindows[0] ?? null;
+  const largestContextWindow = uniqueWindows[uniqueWindows.length - 1] ?? null;
+
+  return {
+    aliasId,
+    models,
+    unknownRefs,
+    smallestContextWindow,
+    largestContextWindow,
+    hasMixedContextWindows: uniqueWindows.length > 1
+  };
+}
+
+function buildAliasGuideContextNotes(config = {}) {
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+
+  return Object.keys(aliases)
+    .map((aliasId) => buildAliasContextWindowSummary(aliasId, config))
+    .filter((summary) => summary.hasMixedContextWindows)
+    .sort((left, right) => String(left.aliasId || "").localeCompare(String(right.aliasId || "")));
+}
+
 function withCurrentManagedRouteOptions(options = [], values = []) {
   const nextOptions = [...(Array.isArray(options) ? options : [])];
   const seen = new Set(nextOptions.map((option) => String(option?.value || "").trim()).filter(Boolean));
@@ -686,11 +1506,361 @@ function withCurrentManagedRouteOptions(options = [], values = []) {
     nextOptions.push({
       value,
       label: value,
-      hint: "Current config"
+      hint: "Current config",
+      ...inferManagedRouteOptionMetadata(value)
     });
   }
 
   return nextOptions;
+}
+
+function buildGroupedSelectOptions(options = []) {
+  const groups = [];
+  const groupsByKey = new Map();
+  let ungroupedGroup = null;
+
+  for (const option of (Array.isArray(options) ? options : []).filter(Boolean)) {
+    const groupKey = String(option?.groupKey || option?.groupLabel || "").trim();
+    const groupLabel = String(option?.groupLabel || "").trim();
+
+    if (!groupKey) {
+      if (!ungroupedGroup) {
+        ungroupedGroup = { key: "__ungrouped__", label: "", options: [] };
+        groups.push(ungroupedGroup);
+      }
+      ungroupedGroup.options.push(option);
+      continue;
+    }
+
+    let group = groupsByKey.get(groupKey);
+    if (!group) {
+      group = {
+        key: groupKey,
+        label: groupLabel || groupKey,
+        options: []
+      };
+      groupsByKey.set(groupKey, group);
+      groups.push(group);
+    }
+    group.options.push(option);
+  }
+
+  return groups;
+}
+
+function formatRouteOptionSelectLabel(option = {}, { includeHint = false } = {}) {
+  const label = String(option?.label || option?.value || "").trim() || String(option?.value || "").trim();
+  const hint = String(option?.hint || "").trim();
+  return includeHint && hint ? `${label} · ${hint}` : label;
+}
+
+function renderSelectOptionNodes(options = [], {
+  keyPrefix = "select-option",
+  includeHint = false
+} = {}) {
+  return buildGroupedSelectOptions(options).map((group, groupIndex) => {
+    const items = group.options.map((option) => (
+      <SelectItem
+        key={`${keyPrefix}-${option.value}`}
+        value={option.value}
+        searchText={`${option.label || ""} ${option.value || ""} ${option.hint || ""} ${group.label || ""}`}
+      >
+        {formatRouteOptionSelectLabel(option, { includeHint })}
+      </SelectItem>
+    ));
+
+    if (!group.label) return items;
+    return (
+      <SelectGroup key={`${keyPrefix}-group-${group.key || groupIndex}`}>
+        <SelectLabel>{group.label}</SelectLabel>
+        {items}
+      </SelectGroup>
+    );
+  });
+}
+
+function buildCodexCliGuideContent({
+  bindingValue = "",
+  thinkingLevel = "",
+  configFilePath = "",
+  endpointUrl = ""
+} = {}) {
+  const normalizedBindingValue = String(bindingValue || "").trim();
+  const normalizedThinkingLevel = String(thinkingLevel || "").trim();
+  const normalizedConfigFilePath = String(configFilePath || "").trim();
+  const normalizedEndpointUrl = String(endpointUrl || "").trim();
+  const inheritMode = isCodexCliInheritModelBinding(normalizedBindingValue);
+
+  const modeBadgeLabel = inheritMode
+    ? "Mode: Inherit Codex model"
+    : normalizedBindingValue
+      ? `Mode: Pinned to ${normalizedBindingValue}`
+      : "Mode: Choose a route";
+  const callout = inheritMode
+    ? {
+        variant: "success",
+        title: "Inherit mode keeps Codex-native model picks intact.",
+        body: (
+          <>
+            Codex CLI still chooses its own model name. Create a same-name alias in the <span className="font-medium">Alias &amp; Fallback</span> tab so LLM Router can resolve that name to the real upstream target you want.
+          </>
+        )
+      }
+    : normalizedBindingValue
+      ? {
+          variant: "info",
+          title: "Pinned mode forces one router target.",
+          body: (
+            <>
+              LLM Router writes <code>model={normalizedBindingValue}</code> into Codex CLI config. That is the simplest setup when every Codex session should use one managed route or alias.
+            </>
+          )
+        }
+      : {
+          variant: "warning",
+          title: "Choose your model strategy before you connect.",
+          body: (
+            <>
+              Pick <span className="font-medium">Inherit Codex CLI model</span> if Codex should keep using its built-in model names, or pick one managed route/alias if you want a single fixed target.
+            </>
+          )
+        };
+
+  return {
+    title: "Codex CLI guide",
+    description: "Quick setup for routing Codex CLI through LLM Router while keeping model routing easy to inspect and change later.",
+    badges: [
+      { label: modeBadgeLabel, variant: inheritMode ? "success" : normalizedBindingValue ? "info" : "outline" },
+      { label: normalizedThinkingLevel ? `Thinking: ${normalizedThinkingLevel}` : "Thinking: Codex default", variant: "outline" },
+      { label: normalizedConfigFilePath ? "Config file detected" : "User config: ~/.codex/config.toml", variant: "outline" }
+    ],
+    callout,
+    highlights: [
+      {
+        eyebrow: "1. Connect",
+        title: "Point Codex CLI at LLM Router",
+        body: normalizedEndpointUrl
+          ? (
+              <>
+                When connected, Codex sends requests to <code>{normalizedEndpointUrl}</code>. LLM Router then handles upstream auth, alias resolution, and failover.
+              </>
+            )
+          : (
+              <>
+                Click <span className="font-medium">Connect</span> to patch Codex CLI so it talks to LLM Router instead of a provider directly.
+              </>
+            )
+      },
+      {
+        eyebrow: "2. Route",
+        title: "Choose between inherit and pinned mode",
+        body: inheritMode
+          ? (
+              <>
+                Keep Codex model names such as <code>gpt-5.4</code>, then create matching aliases in LLM Router, for example <code>gpt-5.4</code> -&gt; <code>demo/gpt-4o-mini</code>.
+              </>
+            )
+          : (
+              <>
+                Select one managed route or alias in <span className="font-medium">Default model</span> when you want every Codex request to land on the same router target.
+              </>
+            )
+      },
+      {
+        eyebrow: "3. Tune",
+        title: "Optional reasoning control",
+        body: (
+          <>
+            <span className="font-medium">Thinking level</span> writes Codex CLI <code>model_reasoning_effort</code> with the official values <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, or <code>xhigh</code>.
+          </>
+        )
+      }
+    ],
+    sections: [
+      {
+        title: "Quick start",
+        items: [
+          <>Set a <code>masterKey</code> in LLM Router first. The <span className="font-medium">Connect</span> button stays disabled until gateway auth is ready.</>,
+          <>Click <span className="font-medium">Connect</span> to patch the Codex CLI config file and router base URL.</>,
+          inheritMode
+            ? <>Leave <span className="font-medium">Default model</span> on <span className="font-medium">Inherit Codex CLI model</span>, then create aliases that match the Codex model names you actually use.</>
+            : normalizedBindingValue
+              ? <>Your current default is pinned to <code>{normalizedBindingValue}</code>. Change it only when you want Codex to use a different managed route or alias.</>
+              : <>Choose either <span className="font-medium">Inherit Codex CLI model</span> or one managed route/alias in <span className="font-medium">Default model</span> before you start using Codex through the router.</>,
+          <>Set <span className="font-medium">Thinking level</span> only when you want LLM Router to write <code>model_reasoning_effort</code>; leave it unset to keep Codex CLI defaults.</>
+        ]
+      },
+      {
+        title: "Choose the right model strategy",
+        items: [
+          <>Use <span className="font-medium">Inherit Codex CLI model</span> when you want Codex-native model names and model-specific UI/options to remain visible.</>,
+          <>Use a fixed route or alias when your team wants one centrally managed target regardless of what Codex would otherwise choose.</>,
+          <>If Codex-specific options disappear after pinning a route, switch back to inherit mode and route those same model names through aliases instead.</>
+        ]
+      },
+      {
+        title: "Where these settings land",
+        items: [
+          normalizedConfigFilePath
+            ? <>This page is currently managing <code>{normalizedConfigFilePath}</code>.</>
+            : <>Codex CLI usually stores user settings in <code>~/.codex/config.toml</code>. Trusted projects can also add overrides in <code>.codex/config.toml</code>.</>,
+          <>The router-managed bindings in this panel map to Codex CLI <code>model</code> and <code>model_reasoning_effort</code>.</>,
+          <>Use <span className="font-medium">Open Codex CLI Config File</span> whenever you want to inspect the exact generated config.</>
+        ]
+      },
+      {
+        title: "Quick verify",
+        items: [
+          <>Open the config file from this page and confirm the values match the mode you intended.</>,
+          <>Start Codex CLI and run a small prompt. If inherit mode is on, make sure the Codex model you selected has a same-name alias in LLM Router.</>,
+          <>If requests fail after switching models, check the <span className="font-medium">Alias &amp; Fallback</span> tab first because the alias behind that model name may be missing or pointed at the wrong target.</>
+        ]
+      }
+    ]
+  };
+}
+
+function buildClaudeCodeGuideContent({
+  bindings = {},
+  settingsFilePath = "",
+  endpointUrl = ""
+} = {}) {
+  const primaryModel = String(bindings?.primaryModel || "").trim();
+  const defaultOpusModel = String(bindings?.defaultOpusModel || "").trim();
+  const defaultSonnetModel = String(bindings?.defaultSonnetModel || "").trim();
+  const defaultHaikuModel = String(bindings?.defaultHaikuModel || "").trim();
+  const subagentModel = String(bindings?.subagentModel || "").trim();
+  const normalizedLevel = normalizeClaudeCodeThinkingLevel(bindings?.thinkingLevel);
+  const selectedBudget = normalizedLevel
+    ? CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL[normalizedLevel]
+    : "";
+  const normalizedSettingsFilePath = String(settingsFilePath || "").trim();
+  const normalizedEndpointUrl = String(endpointUrl || "").trim();
+  const activeOverrideCount = [
+    primaryModel,
+    defaultOpusModel,
+    defaultSonnetModel,
+    defaultHaikuModel,
+    subagentModel,
+    normalizedLevel
+  ].filter(Boolean).length;
+
+  const callout = primaryModel
+    ? {
+        variant: "info",
+        title: "Primary model override is active.",
+        body: (
+          <>
+            LLM Router is currently writing <code>ANTHROPIC_MODEL={primaryModel}</code>. Leave that field blank if you want Claude Code to keep choosing its own primary model.
+          </>
+        )
+      }
+    : activeOverrideCount > 0
+      ? {
+          variant: "info",
+          title: "Only filled fields are overridden.",
+          body: (
+            <>
+              Claude Code continues to inherit its normal defaults for every blank field. This is useful when you only want to steer alias models, subagents, or thinking budget through LLM Router.
+            </>
+          )
+        }
+      : {
+          variant: "success",
+          title: "Blank fields are a valid setup.",
+          body: (
+            <>
+              You do not need to fill every binding. Leave fields empty unless you want LLM Router to override that specific Claude Code setting.
+            </>
+          )
+        };
+
+  return {
+    title: "Claude Code guide",
+    description: "Quick setup for routing Claude Code through LLM Router while keeping only the model and thinking overrides you actually want.",
+    badges: [
+      { label: activeOverrideCount > 0 ? `${activeOverrideCount} override${activeOverrideCount === 1 ? "" : "s"} active` : "No router overrides", variant: activeOverrideCount > 0 ? "info" : "outline" },
+      { label: normalizedLevel ? `Thinking: ${normalizedLevel} (${selectedBudget})` : "Thinking: Claude adaptive default", variant: "outline" },
+      { label: normalizedSettingsFilePath ? "Settings file detected" : "Settings scope: local/project/user", variant: "outline" }
+    ],
+    callout,
+    highlights: [
+      {
+        eyebrow: "1. Connect",
+        title: "Point Claude Code at the router",
+        body: normalizedEndpointUrl
+          ? (
+              <>
+                When connected, Claude Code sends requests to <code>{normalizedEndpointUrl}</code>. LLM Router then handles upstream auth, route selection, and failover.
+              </>
+            )
+          : (
+              <>
+                Click <span className="font-medium">Connect</span> to patch Claude Code so it uses the router Anthropic endpoint instead of a provider directly.
+              </>
+            )
+      },
+      {
+        eyebrow: "2. Override",
+        title: "Set only the bindings you need",
+        body: (
+          <>
+            Leave fields blank to inherit Claude Code defaults. Fill <code>ANTHROPIC_MODEL</code>, the Opus/Sonnet/Haiku defaults, or <code>CLAUDE_CODE_SUBAGENT_MODEL</code> only when you want LLM Router to manage those values.
+          </>
+        )
+      },
+      {
+        eyebrow: "3. Think",
+        title: "Use a stable thinking selector",
+        body: (
+          <>
+            The <span className="font-medium">Thinking level</span> dropdown is an LLM Router convenience layer that writes <code>MAX_THINKING_TOKENS</code> using stable budgets instead of making you remember raw numbers.
+          </>
+        )
+      }
+    ],
+    sections: [
+      {
+        title: "Quick start",
+        items: [
+          <>Click <span className="font-medium">Connect</span> to patch Claude Code toward the router and keep provider credentials centralized inside LLM Router.</>,
+          <>Leave <span className="font-medium">Current model override</span> empty unless you explicitly want to replace Claude Code&apos;s own main model selection.</>,
+          <>Use <span className="font-medium">Default Opus</span>, <span className="font-medium">Default Sonnet</span>, and <span className="font-medium">Default Haiku</span> when you want Claude Code&apos;s built-in alias names to resolve to managed routes or aliases.</>,
+          <>Use <span className="font-medium">Sub-agent model</span> when background workers or helper agents should run on a different route than the main session.</>,
+          <>Use <span className="font-medium">Thinking level</span> only when you want a fixed <code>MAX_THINKING_TOKENS</code> budget; leave it unset to keep Claude Code&apos;s adaptive/default behavior.</>
+        ]
+      },
+      {
+        title: "What each binding controls",
+        items: [
+          <><code>ANTHROPIC_MODEL</code>: overrides the main model for the active Claude Code session.</>,
+          <><code>ANTHROPIC_DEFAULT_OPUS_MODEL</code>, <code>ANTHROPIC_DEFAULT_SONNET_MODEL</code>, and <code>ANTHROPIC_DEFAULT_HAIKU_MODEL</code>: remap Claude Code&apos;s built-in alias names to managed routes or aliases.</>,
+          <><code>CLAUDE_CODE_SUBAGENT_MODEL</code>: routes subagents and background workers to a specific managed model.</>,
+          normalizedLevel
+            ? <><code>MAX_THINKING_TOKENS</code>: currently mapped from <span className="font-medium">{normalizedLevel}</span> to <code>{selectedBudget}</code>.</>
+            : <><code>MAX_THINKING_TOKENS</code>: stays unset here unless you choose a thinking level.</>
+        ]
+      },
+      {
+        title: "Settings scope and precedence",
+        items: [
+          <>Claude Code settings apply in this order: <code>managed-settings.json</code>, CLI arguments, <code>.claude/settings.local.json</code>, <code>.claude/settings.json</code>, then <code>~/.claude/settings.json</code>.</>,
+          normalizedSettingsFilePath
+            ? <>This page is currently managing <code>{normalizedSettingsFilePath}</code>.</>
+            : <>Claude Code can read from project-local, project-shared, or user settings files depending on what exists in your environment.</>,
+          <>If a value seems ignored, check whether a higher-precedence file or command-line flag is overriding it.</>
+        ]
+      },
+      {
+        title: "Quick verify",
+        items: [
+          <>Open the settings file from this page and confirm the <code>env</code> block contains only the overrides you meant to set.</>,
+          <>Launch Claude Code and test both the main session and any subagents if you changed <code>CLAUDE_CODE_SUBAGENT_MODEL</code>.</>,
+          <>If thinking behavior is not what you expected, remember this UI maps levels to <code>MAX_THINKING_TOKENS</code>; clearing the field returns control to Claude Code&apos;s own default behavior.</>
+        ]
+      }
+    ]
+  };
 }
 
 function buildAmpKnownRouteKeySet() {
@@ -715,20 +1885,49 @@ function ensureAmpRouteCollections(amp) {
   }
 }
 
+function getAmpAnchoredRouteKey(mapping = {}) {
+  return String(mapping?.sourceRouteKey || "").trim();
+}
+
 function buildAmpEntityRows(config = {}) {
   const nextConfig = ensureAmpDraftConfigShape(config);
   const amp = nextConfig.amp;
   ensureAmpRouteCollections(amp);
 
+  const anchoredRawRoutes = new Map();
+  const rawRouteEntries = [];
+  for (const [index, mapping] of (amp.rawModelRoutes || []).entries()) {
+    const sourceRouteKey = getAmpAnchoredRouteKey(mapping);
+    if (sourceRouteKey && isKnownAmpRouteKey(sourceRouteKey)) {
+      anchoredRawRoutes.set(sourceRouteKey, { mapping, index });
+      continue;
+    }
+
+    rawRouteEntries.push({
+      id: `raw:${index}`,
+      source: "raw",
+      index,
+      routeKey: "",
+      inbound: String(mapping?.from || "").trim(),
+      outbound: String(mapping?.to || "").trim(),
+      label: "Custom mapping",
+      description: `Wildcard/raw match: ${String(mapping?.from || "").trim() || "(empty)"}`,
+      defaultMatch: "",
+      isCustom: true,
+      removable: true
+    });
+  }
+
   const builtInRouteEntries = DEFAULT_AMP_ENTITY_DEFINITIONS.map((entry) => {
     const routeKey = String(entry.id || "").trim();
     const defaultMatch = getAmpDefaultMatchForRouteKey(routeKey);
+    const anchoredRawRoute = anchoredRawRoutes.get(routeKey)?.mapping || null;
     return {
       id: `route:${routeKey}`,
       source: "route",
       routeKey,
-      inbound: defaultMatch || routeKey,
-      outbound: String(amp.routes?.[routeKey] || "").trim(),
+      inbound: String(anchoredRawRoute?.from || defaultMatch || routeKey).trim(),
+      outbound: String(anchoredRawRoute?.to || amp.routes?.[routeKey] || "").trim(),
       label: formatAmpEntityLabel(routeKey),
       description: entry.description || "",
       defaultMatch,
@@ -757,20 +1956,6 @@ function buildAmpEntityRows(config = {}) {
       };
     });
 
-  const rawRouteEntries = (amp.rawModelRoutes || []).map((mapping, index) => ({
-    id: `raw:${index}`,
-    source: "raw",
-    index,
-    routeKey: "",
-    inbound: String(mapping?.from || "").trim(),
-    outbound: String(mapping?.to || "").trim(),
-    label: "Custom mapping",
-    description: `Wildcard/raw match: ${String(mapping?.from || "").trim() || "(empty)"}`,
-    defaultMatch: "",
-    isCustom: true,
-    removable: true
-  }));
-
   return [...builtInRouteEntries, ...configuredRouteEntries, ...rawRouteEntries];
 }
 
@@ -797,6 +1982,10 @@ function updateAmpEditableRouteConfig(config = {}, entryId, {
   const preferredDefaultMatch = preferredRouteKey
     ? String(currentEntry.defaultMatch || "").trim()
     : "";
+  const anchoredRawRouteIndex = preferredRouteKey
+    ? amp.rawModelRoutes.findIndex((mapping) => getAmpAnchoredRouteKey(mapping) === preferredRouteKey)
+    : -1;
+  const usesAnchoredBuiltInRoute = preferredRouteKey && isKnownAmpRouteKey(preferredRouteKey);
   const nextKnownRouteKey = isKnownAmpRouteKey(nextInbound)
     ? nextInbound
     : (preferredRouteKey && preferredDefaultMatch && nextInbound === preferredDefaultMatch ? preferredRouteKey : "");
@@ -807,10 +1996,27 @@ function updateAmpEditableRouteConfig(config = {}, entryId, {
   if (currentEntry.source === "raw" && Number.isInteger(currentEntry.index)) {
     amp.rawModelRoutes.splice(currentEntry.index, 1);
   }
+  if (anchoredRawRouteIndex >= 0) {
+    amp.rawModelRoutes.splice(anchoredRawRouteIndex, 1);
+  }
 
   if (nextKnownRouteKey) {
     if (nextOutbound) {
       amp.routes[nextKnownRouteKey] = nextOutbound;
+    }
+    return next;
+  }
+
+  if (usesAnchoredBuiltInRoute) {
+    const defaultInbound = preferredDefaultMatch || preferredRouteKey;
+    if (nextOutbound) {
+      amp.routes[preferredRouteKey] = nextOutbound;
+    }
+    if (nextInbound && nextInbound !== defaultInbound) {
+      amp.rawModelRoutes.push({
+        from: nextInbound,
+        sourceRouteKey: preferredRouteKey
+      });
     }
     return next;
   }
@@ -948,7 +2154,7 @@ function createProviderInlineDraftState(provider = {}) {
 }
 
 function getQuickStartConnectionLabel(connectionType) {
-  return QUICK_START_CONNECTION_OPTIONS.find((option) => option.value === connectionType)?.label || "API-based";
+  return QUICK_START_CONNECTION_OPTIONS.find((option) => option.value === connectionType)?.label || "API Key";
 }
 
 function getQuickStartSuggestedModelIds(connectionType, protocol = "openai") {
@@ -1108,6 +2314,16 @@ function createQuickStartState(baseConfig = {}, { seedMode = "blank", targetProv
     ? findQuickStartAliasEntry(baseConfig, resolvedProviderId, { aliasId: DEFAULT_MODEL_ALIAS_ID })
     : null;
   const resolvedModelIds = providerModels.length > 0 ? providerModels : [...defaults.modelIds];
+  const modelContextWindows = Object.fromEntries(
+    (Array.isArray(provider?.models) ? provider.models : [])
+      .map((model) => {
+        const modelId = String(model?.id || "").trim();
+        const contextWindow = Number(model?.contextWindow);
+        if (!modelId || !Number.isFinite(contextWindow) || contextWindow <= 0) return null;
+        return [modelId, Math.floor(contextWindow)];
+      })
+      .filter(Boolean)
+  );
   const headerRows = connectionType === "api"
     ? headerObjectToRows(provider?.headers, defaultProviderUserAgent)
     : [];
@@ -1121,6 +2337,7 @@ function createQuickStartState(baseConfig = {}, { seedMode = "blank", targetProv
     apiKeyEnv: String(provider?.apiKeyEnv || provider?.apiKey || defaults.apiKeyEnv),
     subscriptionProfile: String(provider?.subscriptionProfile || defaults.subscriptionProfile),
     modelIds: resolvedModelIds,
+    modelContextWindows,
     modelDraft: "",
     aliasModelIds: getQuickStartAliasTargetModelIds(aliasEntry, resolvedProviderId, resolvedModelIds),
     headerRows,
@@ -1138,10 +2355,15 @@ function createQuickStartState(baseConfig = {}, { seedMode = "blank", targetProv
   };
 }
 
-function buildQuickStartModelEntries(modelIds, modelPreferredFormat = {}) {
+function buildQuickStartModelEntries(modelIds, modelPreferredFormat = {}, modelContextWindows = {}) {
   return (modelIds || []).map((id) => {
     const preferred = modelPreferredFormat[id];
-    return preferred ? { id, formats: [preferred] } : { id };
+    const contextWindow = Number(modelContextWindows?.[id]);
+    return {
+      id,
+      ...(preferred ? { formats: [preferred] } : {}),
+      ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow: Math.floor(contextWindow) } : {})
+    };
   });
 }
 
@@ -1208,7 +2430,11 @@ function buildQuickStartConfig(baseConfig = {}, quickStart, testedProviderConfig
       ...(Object.keys(customHeaders).length > 0 ? { headers: customHeaders } : {}),
       format: preferredFormat,
       formats: workingFormats.length > 0 ? workingFormats : [preferredFormat],
-      models: buildQuickStartModelEntries(effectiveModelIds, testedProviderConfig?.modelPreferredFormat || {}),
+      models: buildQuickStartModelEntries(
+        effectiveModelIds,
+        testedProviderConfig?.modelPreferredFormat || {},
+        quickStart?.modelContextWindows || {}
+      ),
       ...(providerMetadata ? { metadata: providerMetadata } : {})
     };
   } else {
@@ -1223,7 +2449,7 @@ function buildQuickStartConfig(baseConfig = {}, quickStart, testedProviderConfig
       subscriptionProfile: resolveQuickStartSubscriptionProfile(quickStart),
       format: providerFormat,
       formats: [providerFormat],
-      models: buildQuickStartModelEntries(orderedModelIds)
+      models: buildQuickStartModelEntries(orderedModelIds, {}, quickStart?.modelContextWindows || {})
     };
   }
 
@@ -1416,6 +2642,21 @@ function describeConfigStatus(summary) {
   return { variant: "success", label: "Config: valid" };
 }
 
+function measureAliasSwitcherWidth(aliasLabel = "") {
+  const label = String(aliasLabel || "Select alias").trim() || "Select alias";
+  const fallbackWidth = Math.min(Math.max(Math.ceil(label.length * 8.5 + 62), 160), 520);
+
+  if (typeof document === "undefined") return fallbackWidth;
+
+  const canvas = measureAliasSwitcherWidth.canvas
+    || (measureAliasSwitcherWidth.canvas = document.createElement("canvas"));
+  const context = canvas.getContext("2d");
+  if (!context) return fallbackWidth;
+
+  context.font = '500 14px "Inter", "SF Pro Display", ui-sans-serif, system-ui, sans-serif';
+  return Math.min(Math.max(Math.ceil(context.measureText(label).width + 62), 160), 520);
+}
+
 async function copyTextToClipboard(value) {
   const text = String(value || "");
   if (!text) return;
@@ -1509,6 +2750,145 @@ async function fetchJsonLineStream(url, options = {}, { onMessage } = {}) {
   return finalResult;
 }
 
+function buildLiteLlmContextSuggestionKey(result = {}) {
+  return `${String(result?.model || "").trim()}::${String(result?.contextWindow || "").trim()}`;
+}
+
+function stripContextWindowFormatting(value) {
+  return String(value || "").trim().replace(/[.,\s_'`]/g, "");
+}
+
+function normalizeContextWindowInput(value) {
+  const text = stripContextWindowFormatting(value);
+  if (!text) return "";
+  const parsed = Number.parseInt(text, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? String(parsed) : text;
+}
+
+async function lookupLiteLlmContextWindow(models = []) {
+  const normalizedModels = [...new Set((Array.isArray(models) ? models : [])
+    .map((model) => String(model || "").trim())
+    .filter(Boolean))];
+  if (normalizedModels.length === 0) return [];
+  const payload = await fetchJson("/api/config/litellm-context-lookup", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      models: normalizedModels,
+      limit: CONTEXT_LOOKUP_SUGGESTION_LIMIT
+    })
+  });
+  return Array.isArray(payload?.result) ? payload.result : [];
+}
+
+function normalizeLiteLlmContextCandidate(candidate = {}) {
+  const model = String(candidate?.model || "").trim();
+  const provider = String(candidate?.provider || "").trim();
+  const mode = String(candidate?.mode || "").trim();
+  const contextWindow = Number(candidate?.contextWindow);
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) return null;
+  return {
+    model,
+    provider,
+    mode,
+    contextWindow: Math.floor(contextWindow)
+  };
+}
+
+function simplifyLiteLlmContextLabel(model = "", provider = "") {
+  const normalizedModel = String(model || "").trim();
+  const normalizedProvider = String(provider || "").trim();
+  if (!normalizedModel || !normalizedProvider) return normalizedModel;
+
+  const lowercaseModel = normalizedModel.toLowerCase();
+  const lowercaseProvider = normalizedProvider.toLowerCase();
+  const knownPrefixes = [`${lowercaseProvider}/`, `${lowercaseProvider}:`];
+
+  for (const prefix of knownPrefixes) {
+    if (!lowercaseModel.startsWith(prefix)) continue;
+    const simplifiedLabel = normalizedModel.slice(prefix.length).trim();
+    return simplifiedLabel || normalizedModel;
+  }
+
+  return normalizedModel;
+}
+
+function buildLiteLlmContextLookupState(result = {}, { fallbackQuery = "" } = {}) {
+  const query = String(result?.query || fallbackQuery || "").trim();
+  const exactMatch = normalizeLiteLlmContextCandidate(result?.exactMatch);
+  const suggestions = (Array.isArray(result?.suggestions) ? result.suggestions : [])
+    .map((candidate) => normalizeLiteLlmContextCandidate(candidate))
+    .filter(Boolean);
+  const medianContextWindow = Number(result?.medianContextWindow);
+  const normalizedMedianContextWindow = Number.isFinite(medianContextWindow) && medianContextWindow > 0
+    ? Math.floor(medianContextWindow)
+    : (exactMatch?.contextWindow || null);
+
+  const options = [];
+  const seenKeys = new Set();
+
+  function addOption(option) {
+    if (!option?.key || seenKeys.has(option.key)) return;
+    seenKeys.add(option.key);
+    options.push(option);
+  }
+
+  if (exactMatch) {
+    addOption({
+      key: `exact::${buildLiteLlmContextSuggestionKey(exactMatch)}`,
+      label: simplifyLiteLlmContextLabel(exactMatch.model, exactMatch.provider) || "Exact match",
+      detail: exactMatch.provider ? `Exact · ${exactMatch.provider}` : "Exact",
+      contextWindow: exactMatch.contextWindow
+    });
+  }
+
+  for (const suggestion of suggestions) {
+    addOption({
+      key: buildLiteLlmContextSuggestionKey(suggestion),
+      label: simplifyLiteLlmContextLabel(suggestion.model, suggestion.provider) || "Suggestion",
+      detail: suggestion.provider || "Known model",
+      contextWindow: suggestion.contextWindow
+    });
+  }
+
+  return {
+    query,
+    exactMatch,
+    suggestions,
+    medianContextWindow: normalizedMedianContextWindow,
+    options,
+    status: options.length > 0 ? "ready" : "miss"
+  };
+}
+
+function resolveLiteLlmPrefillContextWindow(result = {}) {
+  const state = buildLiteLlmContextLookupState(result);
+  if (state.exactMatch?.contextWindow) return String(state.exactMatch.contextWindow);
+  if (state.medianContextWindow) return String(state.medianContextWindow);
+  return "";
+}
+
+function buildLiteLlmContextLookupMap(results = []) {
+  const lookupMap = new Map();
+  for (const result of (Array.isArray(results) ? results : [])) {
+    const state = buildLiteLlmContextLookupState(result);
+    if (!state.query) continue;
+    lookupMap.set(state.query, state);
+  }
+  return lookupMap;
+}
+
+function buildLiteLlmModelContextWindowMap(results = []) {
+  const next = {};
+  for (const result of (Array.isArray(results) ? results : [])) {
+    const query = String(result?.query || "").trim();
+    const prefill = resolveLiteLlmPrefillContextWindow(result);
+    if (!query || !prefill) continue;
+    next[query] = Number(prefill);
+  }
+  return next;
+}
+
 function Field({ label, hint, className, children, stacked = false, headerClassName, hintClassName, headerAction = null }) {
   return (
     <div className={cn("flex flex-col gap-2 text-sm", className)}>
@@ -1531,6 +2911,44 @@ function Field({ label, hint, className, children, stacked = false, headerClassN
       </div>
       {children}
     </div>
+  );
+}
+
+function TransientIntegerInput({ value, onValueChange, disabled = false, allowEmptyCommit = false, ...props }) {
+  const canonicalValue = String(value ?? "");
+  const [draftValue, setDraftValue] = useState(canonicalValue);
+
+  useEffect(() => {
+    setDraftValue(canonicalValue);
+  }, [canonicalValue]);
+
+  return (
+    <Input
+      {...props}
+      value={draftValue}
+      inputMode="numeric"
+      disabled={disabled}
+      onChange={(event) => {
+        const change = classifyTransientIntegerInput(event.target.value);
+        if (!change.accepted) return;
+        setDraftValue(change.draftValue);
+        if (change.shouldCommit) {
+          onValueChange(change.commitValue);
+        } else if (allowEmptyCommit && change.draftValue === "") {
+          onValueChange("");
+        }
+      }}
+      onBlur={() => {
+        setDraftValue((current) => {
+          if (current !== "") return current;
+          if (allowEmptyCommit) {
+            onValueChange("");
+            return "";
+          }
+          return canonicalValue;
+        });
+      }}
+    />
   );
 }
 
@@ -1559,6 +2977,7 @@ function Modal({
   children,
   variant = "dialog",
   headerActions = null,
+  showCloseButton = true,
   footer = null,
   contentClassName = "",
   bodyClassName = "",
@@ -1577,8 +2996,7 @@ function Modal({
 
   if (!open) return null;
   const isPage = variant === "page";
-
-  return (
+  const modalContent = (
     <div
       className={cn(
         "fixed inset-0 z-50 bg-slate-950/55 backdrop-blur-sm",
@@ -1605,9 +3023,11 @@ function Modal({
           </div>
           <div className="flex shrink-0 items-center gap-2">
             {headerActions}
-            <Button type="button" variant="ghost" size="sm" onClick={onClose}>
-              Close
-            </Button>
+            {showCloseButton ? (
+              <Button type="button" variant="ghost" size="sm" onClick={onClose}>
+                Close
+              </Button>
+            ) : null}
           </div>
         </div>
         <div className={cn(
@@ -1629,6 +3049,93 @@ function Modal({
       </div>
     </div>
   );
+
+  if (typeof document === "undefined" || !document.body) return modalContent;
+  return createPortal(modalContent, document.body);
+}
+
+function AdaptiveDropdownPanel({
+  open = false,
+  anchorRef,
+  preferredSide = "bottom",
+  desiredHeight = 288,
+  offset = 4,
+  className = "",
+  children,
+  ...props
+}) {
+  const placement = useDropdownPlacement({
+    open,
+    anchorRef,
+    preferredSide,
+    desiredHeight,
+    offset
+  });
+
+  if (!open) return null;
+
+  return (
+    <div
+      className={cn(
+        "absolute left-0 right-0 z-30 overflow-y-auto rounded-xl border border-border/70 bg-popover shadow-lg",
+        placement.side === "top" ? "bottom-full mb-1" : "top-full mt-1",
+        className
+      )}
+      style={{
+        maxHeight: `${Math.max(0, Math.floor(placement.maxHeight || desiredHeight))}px`
+      }}
+      {...props}
+    >
+      {children}
+    </div>
+  );
+}
+
+function UnsavedChangesModal({
+  open = false,
+  onKeepEditing = () => {},
+  onDiscardAndClose = () => {},
+  onSaveAndClose = () => {},
+  saveDisabled = false,
+  dirtyLabels = [],
+  details = ""
+}) {
+  const sectionLabel = dirtyLabels.length > 1
+    ? `${dirtyLabels.slice(0, -1).join(", ")} and ${dirtyLabels[dirtyLabels.length - 1]}`
+    : dirtyLabels[0] || "this form";
+
+  return (
+    <Modal
+      open={open}
+      onClose={onKeepEditing}
+      title="Unsaved changes"
+      description={`You have unsaved edits in ${sectionLabel}.`}
+      contentClassName="max-w-lg rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
+      showCloseButton={false}
+      footer={(
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={onKeepEditing}>
+            Keep editing
+          </Button>
+          <Button type="button" variant="outline" onClick={onDiscardAndClose}>
+            Cancel + Close
+          </Button>
+          <Button type="button" onClick={() => void onSaveAndClose()} disabled={saveDisabled}>
+            Save + Close
+          </Button>
+        </div>
+      )}
+    >
+      <div className="space-y-3 text-sm leading-6 text-muted-foreground">
+        <div>Choose whether to save these edits before closing the modal.</div>
+        {details ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900">
+            {details}
+          </div>
+        ) : null}
+      </div>
+    </Modal>
+  );
 }
 
 function EditIcon({ className = "" }) {
@@ -1636,6 +3143,14 @@ function EditIcon({ className = "" }) {
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
       <path d="M12 20h9" />
       <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" />
+    </svg>
+  );
+}
+
+function CheckIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="m5 12 4.25 4.25L19 6.5" />
     </svg>
   );
 }
@@ -1648,6 +3163,15 @@ function TrashIcon({ className = "" }) {
       <path d="M18 6v12.25A1.75 1.75 0 0 1 16.25 20h-8.5A1.75 1.75 0 0 1 6 18.25V6" />
       <path d="M10 10.5v5" />
       <path d="M14 10.5v5" />
+    </svg>
+  );
+}
+
+function CopyIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15V6a2 2 0 0 1 2-2h9" />
     </svg>
   );
 }
@@ -1683,6 +3207,38 @@ function RotateIcon({ className = "" }) {
   );
 }
 
+function FileIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M6 3.5h5.25L15 7.25V16A1.5 1.5 0 0 1 13.5 17.5h-7A1.5 1.5 0 0 1 5 16V5A1.5 1.5 0 0 1 6.5 3.5H6Z" />
+      <path d="M11 3.5V7.5H15" />
+      <path d="M7.75 11h4.5" />
+      <path d="M7.75 14h4.5" />
+    </svg>
+  );
+}
+
+function BackupFileIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M6 3.5h5.25L15 7.25V16A1.5 1.5 0 0 1 13.5 17.5h-7A1.5 1.5 0 0 1 5 16V5A1.5 1.5 0 0 1 6.5 3.5H6Z" />
+      <path d="M11 3.5V7.5H15" />
+      <path d="M7 12.25a3 3 0 1 1 2.85 2.99" />
+      <path d="M8.5 10.25h1.5v1.5" />
+    </svg>
+  );
+}
+
+function SecretFileIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M10 2.75 4.75 5v4.12c0 3.42 2.1 6.58 5.25 7.88 3.15-1.3 5.25-4.46 5.25-7.88V5L10 2.75Z" />
+      <circle cx="10" cy="9" r="1.4" />
+      <path d="M10 10.4v2.1" />
+    </svg>
+  );
+}
+
 function HeaderAccessChip({
   label,
   value,
@@ -1694,11 +3250,11 @@ function HeaderAccessChip({
   return (
     <button
       type="button"
-      className="inline-flex h-9 min-w-0 max-w-full items-center gap-2 rounded-full border border-border/70 bg-background/90 px-3 text-left transition hover:border-accent hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70 sm:max-w-[15rem]"
+      className="inline-flex h-9 min-w-0 max-w-full items-center gap-2 rounded-full border border-border/70 bg-background/90 px-3 text-left transition hover:border-accent hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70 sm:max-w-[18rem]"
       onClick={onClick}
       disabled={disabled}
       aria-label={actionLabel}
-      title={actionLabel}
+      title={disabled ? actionLabel : value}
     >
       <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-secondary text-muted-foreground">
         {icon}
@@ -1780,55 +3336,89 @@ function HeaderAccessGroup({
   );
 }
 
-function SummaryChipGroup({ label, items = [], emptyLabel = "None yet", onCopy, compact = false }) {
+function CompactHeaderChip({
+  label,
+  value,
+  icon,
+  disabled = false,
+  onClick,
+  actionLabel = "",
+  emptyLabel = "Not resolved"
+}) {
+  const displayValue = String(value || "").trim() || emptyLabel;
+
   return (
-    <div className="min-w-0">
-      <div className={cn("text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground", compact ? "mb-2" : "mb-3")}>{label}</div>
-      {items.length > 0 ? (
-        <div className={cn("overflow-y-auto", compact ? "max-h-20" : "max-h-28")}>
-          <div className={cn("flex flex-wrap", compact ? "gap-2" : "gap-3")}>
-            {items.map((item) => (
-              <button
-                key={`${label}-${item.value}`}
-                type="button"
-                className={cn(
-                  "inline-flex max-w-full items-center rounded-full border border-border/70 bg-background text-foreground transition hover:border-accent hover:bg-accent",
-                  compact ? "px-3 py-1.5 text-xs font-medium" : "px-3.5 py-2 text-sm font-medium"
-                )}
-                onClick={() => onCopy(item)}
-                title={item.value}
-              >
-                <span className="truncate">{item.label}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : (
-        <div className={cn(
-          "rounded-xl border border-dashed border-border text-muted-foreground",
-          compact ? "px-3 py-1.5 text-xs" : "px-3 py-2 text-sm"
-        )}>{emptyLabel}</div>
-      )}
-    </div>
+    <button
+      type="button"
+      className="inline-flex min-w-0 max-w-full items-start gap-2 rounded-2xl border border-border/70 bg-background/90 px-3 py-2 text-left transition hover:border-accent hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={actionLabel}
+      title={disabled ? actionLabel : displayValue}
+    >
+      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-secondary text-muted-foreground">
+        {icon}
+      </span>
+      <span className="min-w-0">
+        <span className="block text-[9px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">{label}</span>
+        <span className="mt-1 block break-all text-[11px] font-medium leading-4 text-foreground">{displayValue}</span>
+      </span>
+    </button>
   );
 }
 
-function ConsoleSummarySection({
-  aliasItems = [],
-  onCopyAlias
+function ConnectedIndicatorDot({
+  connected = false,
+  className,
+  srLabel = "Connected",
+  size = "sm"
 }) {
+  if (!connected) return null;
+
+  const outerSizeClassName = size === "md" ? "h-3.5 w-3.5" : "h-2.5 w-2.5";
+  const innerSizeClassName = size === "md" ? "h-2 w-2" : "h-1.5 w-1.5";
+
   return (
-    <section aria-label="Model aliases">
-      <div className="rounded-2xl border border-border/70 bg-card p-3">
-        <SummaryChipGroup
-          label="Model aliases"
-          items={aliasItems}
-          emptyLabel="No aliases yet."
-          onCopy={onCopyAlias}
-          compact
-        />
-      </div>
-    </section>
+    <span className={cn("relative inline-flex shrink-0 items-center justify-center", outerSizeClassName, className)}>
+      <span aria-hidden="true" className="absolute inset-0 rounded-full bg-emerald-400/45 animate-ping motion-reduce:animate-none" />
+      <span aria-hidden="true" className={cn("relative rounded-full bg-emerald-500 ring-2 ring-emerald-500/15", innerSizeClassName)} />
+      <span className="sr-only">{srLabel}</span>
+    </span>
+  );
+}
+
+function ConnectionStatusChipRow({
+  primaryLabel = "Config file",
+  primaryValue = "",
+  primaryIcon = <FileIcon className="h-3 w-3" />,
+  onOpenPrimary,
+  secondaryLabel = "Backup file",
+  secondaryValue = "",
+  secondaryIcon = <BackupFileIcon className="h-3 w-3" />,
+  onOpenSecondary
+}) {
+  const resolvedPrimaryValue = String(primaryValue || "").trim();
+  const resolvedSecondaryValue = String(secondaryValue || "").trim();
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <CompactHeaderChip
+        label={primaryLabel}
+        value={resolvedPrimaryValue}
+        icon={primaryIcon}
+        disabled={!resolvedPrimaryValue || typeof onOpenPrimary !== "function"}
+        onClick={onOpenPrimary}
+        actionLabel={resolvedPrimaryValue ? `Open ${primaryLabel.toLowerCase()}` : `${primaryLabel} path is not resolved yet`}
+      />
+      <CompactHeaderChip
+        label={secondaryLabel}
+        value={resolvedSecondaryValue}
+        icon={secondaryIcon}
+        disabled={!resolvedSecondaryValue || typeof onOpenSecondary !== "function"}
+        onClick={onOpenSecondary}
+        actionLabel={resolvedSecondaryValue ? `Open ${secondaryLabel.toLowerCase()}` : `${secondaryLabel} path is not resolved yet`}
+      />
+    </div>
   );
 }
 
@@ -2032,15 +3622,35 @@ function ValidationPanel({ summary, validationMessages, isDirty }) {
   );
 }
 
-function ProviderModelsEditor({ provider, disabled = false, disabledReason = "", busy = false, onApply, framed = true, focusRequest = 0 }) {
+function ProviderModelsEditor({
+  provider,
+  disabled = false,
+  disabledReason = "",
+  busy = false,
+  onApply,
+  framed = true,
+  focusRequest = 0,
+  onStateChange = null
+}) {
   const initialRows = useMemo(() => createProviderModelDraftRows(provider), [provider]);
   const [rows, setRows] = useState([]);
   const [submitState, setSubmitState] = useState("");
+  const [contextLookupBusy, setContextLookupBusy] = useState(false);
+  const [contextLookupPendingByRowKey, setContextLookupPendingByRowKey] = useState({});
+  const [contextLookupStateByRowKey, setContextLookupStateByRowKey] = useState({});
+  const [contextLookupStatus, setContextLookupStatus] = useState(null);
+  const [activeContextLookupRowKey, setActiveContextLookupRowKey] = useState("");
+  const [editingContextRowKey, setEditingContextRowKey] = useState("");
+  const [editingContextDraftByRowKey, setEditingContextDraftByRowKey] = useState({});
   const rowCounterRef = useRef(0);
+  const rowsRef = useRef([]);
   const inputRefs = useRef(new Map());
+  const contextInputShellRefs = useRef(new Map());
   const pendingFocusRowKeyRef = useRef("");
   const draggingKeyRef = useRef("");
   const draggingNodeRef = useRef(null);
+  const contextLookupCacheRef = useRef(new Map());
+  const contextLookupRequestRef = useRef(new Map());
 
   function createDraftRow(overrides = {}) {
     rowCounterRef.current += 1;
@@ -2048,6 +3658,7 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
       key: `model-${provider.id}-draft-${rowCounterRef.current}`,
       id: "",
       sourceId: "",
+      contextWindow: "",
       ...overrides
     };
   }
@@ -2056,20 +3667,24 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
     pendingFocusRowKeyRef.current = rowKey;
   }
 
-  function ensureTrailingDraftRow(nextRows = [], { preserveFocus = false } = {}) {
+  function ensureDraftRow(nextRows = [], { preserveFocus = false } = {}) {
     const filledRows = [];
     let draftRow = null;
 
     for (const row of (Array.isArray(nextRows) ? nextRows : [])) {
       const value = String(row?.id || "");
+      const contextWindow = row?.contextWindow === undefined || row?.contextWindow === null
+        ? ""
+        : String(row.contextWindow);
       if (String(value).trim()) {
-        filledRows.push({ ...row, id: value });
+        filledRows.push({ ...row, id: value, contextWindow });
         continue;
       }
       if (!draftRow) {
         draftRow = {
           ...row,
-          id: ""
+          id: "",
+          contextWindow
         };
       }
     }
@@ -2079,11 +3694,62 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
       if (preserveFocus) focusRow(draftRow.key);
     }
 
-    return [...filledRows, draftRow];
+    return [draftRow, ...filledRows];
+  }
+
+  function clearContextLookupState(rowKey) {
+    setContextLookupStateByRowKey((current) => {
+      if (!current[rowKey]) return current;
+      const next = { ...current };
+      delete next[rowKey];
+      return next;
+    });
+  }
+
+  function setRowLookupPending(rowKey, pending) {
+    setContextLookupPendingByRowKey((current) => {
+      if (pending) {
+        if (current[rowKey]) return current;
+        return {
+          ...current,
+          [rowKey]: true
+        };
+      }
+      if (!current[rowKey]) return current;
+      const next = { ...current };
+      delete next[rowKey];
+      return next;
+    });
+  }
+
+  function updateRow(rowKey, patch = {}, { clearLookupState = false, clearStatus = true, closeLookupMenu = false } = {}) {
+    if (clearLookupState) clearContextLookupState(rowKey);
+    if (clearStatus) setContextLookupStatus(null);
+    if (closeLookupMenu && activeContextLookupRowKey === rowKey) {
+      setActiveContextLookupRowKey("");
+    }
+    setRows((current) => ensureDraftRow(
+      current.map((row) => (row.key === rowKey ? { ...row, ...patch } : row)),
+      { preserveFocus: false }
+    ));
   }
 
   useEffect(() => {
-    setRows(ensureTrailingDraftRow(initialRows, { preserveFocus: true }));
+    rowsRef.current = rows;
+  }, [rows]);
+
+  useEffect(() => {
+    const nextRows = ensureDraftRow(initialRows, { preserveFocus: true });
+    setRows(nextRows);
+    rowsRef.current = nextRows;
+    contextLookupCacheRef.current.clear();
+    contextLookupRequestRef.current.clear();
+    setContextLookupPendingByRowKey({});
+    setContextLookupStateByRowKey({});
+    setContextLookupStatus(null);
+    setActiveContextLookupRowKey("");
+    setEditingContextRowKey("");
+    setEditingContextDraftByRowKey({});
   }, [initialRows]);
 
   useEffect(() => {
@@ -2101,44 +3767,148 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
   useEffect(() => {
     if (!focusRequest) return;
     setRows((current) => {
-      const nextRows = ensureTrailingDraftRow(current, { preserveFocus: false });
+      const nextRows = ensureDraftRow(current, { preserveFocus: false });
       const draftRow = nextRows.find((row) => !String(row?.id || "").trim()) || nextRows[nextRows.length - 1];
       if (draftRow) focusRow(draftRow.key);
       return nextRows;
     });
   }, [focusRequest]);
 
-  const filledRows = rows.filter((row) => String(row?.id || "").trim());
-  const filledModelIds = filledRows.map((row) => String(row?.id || "").trim());
-  const initialModelIds = initialRows.map((row) => String(row?.id || "").trim()).filter(Boolean);
+  useEffect(() => {
+    if (!activeContextLookupRowKey) return;
+    if (rows.some((row) => row.key === activeContextLookupRowKey)) return;
+    setActiveContextLookupRowKey("");
+  }, [rows, activeContextLookupRowKey]);
+
+  useEffect(() => {
+    if (!editingContextRowKey) return;
+    if (rows.some((row) => row.key === editingContextRowKey)) return;
+    setEditingContextRowKey("");
+  }, [rows, editingContextRowKey]);
+
+  useEffect(() => {
+    setEditingContextDraftByRowKey((current) => {
+      const activeRowKeys = new Set(rows.map((row) => row.key));
+      let changed = false;
+      const next = {};
+      for (const [rowKey, value] of Object.entries(current)) {
+        if (!activeRowKeys.has(rowKey)) {
+          changed = true;
+          continue;
+        }
+        next[rowKey] = value;
+      }
+      return changed ? next : current;
+    });
+  }, [rows]);
+
+  useEffect(() => {
+    if (!activeContextLookupRowKey || typeof document === "undefined") return undefined;
+
+    function handlePointerDown(event) {
+      const activeShell = contextInputShellRefs.current.get(activeContextLookupRowKey);
+      if (activeShell?.contains(event.target)) return;
+      setActiveContextLookupRowKey("");
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [activeContextLookupRowKey]);
+
+  const filledRows = useMemo(
+    () => rows.filter((row) => String(row?.id || "").trim()),
+    [rows]
+  );
+  const normalizedInitialRows = useMemo(
+    () => initialRows
+      .map((row) => ({
+        id: String(row?.id || "").trim(),
+        contextWindow: normalizeContextWindowInput(row?.contextWindow || "")
+      }))
+      .filter((row) => row.id),
+    [initialRows]
+  );
+  const normalizedFilledRows = useMemo(
+    () => filledRows.map((row) => ({
+      ...row,
+      id: String(row?.id || "").trim(),
+      contextWindow: normalizeContextWindowInput(row?.contextWindow || "")
+    })),
+    [filledRows]
+  );
+  const filledModelIds = normalizedFilledRows.map((row) => row.id);
+  const initialModelIds = normalizedInitialRows.map((row) => row.id);
   const newModelIds = filledModelIds.filter((modelId) => !initialModelIds.includes(modelId));
   const hasDuplicates = hasDuplicateTrimmedValues(filledModelIds);
   const hasModels = filledModelIds.length > 0;
-  const isDirty = JSON.stringify(initialModelIds) !== JSON.stringify(filledModelIds);
+  const invalidContextWindowRowKeys = new Set(
+    normalizedFilledRows
+      .filter((row) => {
+        const rawValue = String(row?.contextWindow || "").trim();
+        if (!rawValue) return false;
+        const parsed = Number.parseInt(rawValue, 10);
+        return !Number.isFinite(parsed) || parsed <= 0 || String(parsed) !== rawValue;
+      })
+      .map((row) => row.key)
+  );
+  const rowsMissingContextWindow = normalizedFilledRows.filter((row) => !String(row?.contextWindow || "").trim());
+  const isDirty = JSON.stringify(normalizedInitialRows) !== JSON.stringify(normalizedFilledRows.map((row) => ({
+    id: row.id,
+    contextWindow: row.contextWindow
+  })));
   const actionBusy = submitState !== "";
-  const locked = disabled || busy || actionBusy;
+  const locked = disabled || busy || actionBusy || contextLookupBusy;
+  const lastFilledRowIndex = useMemo(() => {
+    let lastIndex = -1;
+    rows.forEach((row, index) => {
+      if (String(row?.id || "").trim()) lastIndex = index;
+    });
+    return lastIndex;
+  }, [rows]);
   const issue = disabled
     ? disabledReason
     : !hasModels
       ? "Keep at least one model id on the provider."
       : hasDuplicates
         ? "Model ids must be unique for each provider."
-        : "";
+        : invalidContextWindowRowKeys.size > 0
+          ? "Context windows must be positive integers when set."
+          : "";
   const setAnimatedRowRef = useReorderLayoutAnimation(rows.map((row) => row.key));
 
-  function updateRow(rowKey, value) {
-    setRows((current) => ensureTrailingDraftRow(
-      current.map((row) => (row.key === rowKey ? { ...row, id: value } : row)),
-      { preserveFocus: false }
-    ));
-  }
+  useEffect(() => {
+    onStateChange?.({
+      isDirty,
+      issue,
+      locked,
+      rows: normalizedFilledRows.map((row) => ({
+        ...row,
+        contextWindow: normalizeContextWindowInput(row.contextWindow)
+      }))
+    });
+  }, [onStateChange, isDirty, issue, locked, normalizedFilledRows]);
 
   function removeRow(rowKey) {
-    setRows((current) => ensureTrailingDraftRow(current.filter((row) => row.key !== rowKey)));
+    clearContextLookupState(rowKey);
+    setRowLookupPending(rowKey, false);
+    setContextLookupStatus(null);
+    if (activeContextLookupRowKey === rowKey) setActiveContextLookupRowKey("");
+    if (editingContextRowKey === rowKey) setEditingContextRowKey("");
+    setEditingContextDraftByRowKey((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, rowKey)) return current;
+      const next = { ...current };
+      delete next[rowKey];
+      return next;
+    });
+    setRows((current) => ensureDraftRow(current.filter((row) => row.key !== rowKey)));
   }
 
   function moveRowUp(rowKey) {
-    setRows((current) => ensureTrailingDraftRow(moveItemUp(current, rowKey, (row) => row?.key)));
+    setRows((current) => ensureDraftRow(moveItemUp(current, rowKey, (row) => row?.key)));
+  }
+
+  function moveRowDown(rowKey) {
+    setRows((current) => ensureDraftRow(moveItemDown(current, rowKey, (row) => row?.key)));
   }
 
   function clearDraggingState() {
@@ -2147,12 +3917,164 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
     draggingNodeRef.current = null;
   }
 
+  async function getContextLookupState(modelId, { force = false } = {}) {
+    const normalizedModelId = String(modelId || "").trim();
+    if (!normalizedModelId) {
+      return buildLiteLlmContextLookupState({ query: normalizedModelId });
+    }
+    if (!force && contextLookupCacheRef.current.has(normalizedModelId)) {
+      return contextLookupCacheRef.current.get(normalizedModelId);
+    }
+    if (!force && contextLookupRequestRef.current.has(normalizedModelId)) {
+      return contextLookupRequestRef.current.get(normalizedModelId);
+    }
+
+    const request = (async () => {
+      const results = await lookupLiteLlmContextWindow([normalizedModelId]);
+      const rawLookupResult = (Array.isArray(results) ? results : [])
+        .find((entry) => String(entry?.query || "").trim() === normalizedModelId) || { query: normalizedModelId };
+      const lookupState = buildLiteLlmContextLookupState(rawLookupResult, { fallbackQuery: normalizedModelId });
+      contextLookupCacheRef.current.set(normalizedModelId, lookupState);
+      return lookupState;
+    })();
+
+    contextLookupRequestRef.current.set(normalizedModelId, request);
+    try {
+      return await request;
+    } finally {
+      contextLookupRequestRef.current.delete(normalizedModelId);
+    }
+  }
+
+  async function ensureContextLookupForRow(rowKey, { openMenu = false, prefill = false, modelId: nextModelId = "" } = {}) {
+    const currentRow = rowsRef.current.find((row) => row.key === rowKey);
+    const modelId = String(nextModelId || currentRow?.id || "").trim();
+    if (!modelId) return null;
+
+    if (openMenu) setActiveContextLookupRowKey(rowKey);
+    setRowLookupPending(rowKey, true);
+
+    try {
+      const lookupState = await getContextLookupState(modelId);
+      setContextLookupStateByRowKey((current) => ({
+        ...current,
+        [rowKey]: lookupState
+      }));
+
+      if (prefill) {
+        const prefillValue = resolveLiteLlmPrefillContextWindow(lookupState);
+        if (prefillValue) {
+          setRows((current) => ensureDraftRow(current.map((row) => {
+            if (row.key !== rowKey) return row;
+            const currentId = String(row?.id || "").trim();
+            const currentContextWindow = String(row?.contextWindow || "").trim();
+            if (!currentId || currentId !== modelId || currentContextWindow) return row;
+            return {
+              ...row,
+              contextWindow: prefillValue
+            };
+          }), { preserveFocus: false }));
+        }
+      }
+
+      return lookupState;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failureState = {
+        query: modelId,
+        status: "error",
+        error: message,
+        options: []
+      };
+      setContextLookupStateByRowKey((current) => ({
+        ...current,
+        [rowKey]: failureState
+      }));
+      return failureState;
+    } finally {
+      setRowLookupPending(rowKey, false);
+    }
+  }
+
+  async function handleLookupEmptyContextWindows(rowKeys = []) {
+    const lookupKeySet = new Set(Array.isArray(rowKeys) ? rowKeys : []);
+    const lookupTargets = normalizedFilledRows
+      .filter((row) => {
+        if (!row.id) return false;
+        if (String(row?.contextWindow || "").trim()) return false;
+        if (lookupKeySet.size === 0) return true;
+        return lookupKeySet.has(row.key);
+      })
+      .map((row) => ({
+        key: row.key,
+        id: row.id
+      }));
+
+    if (lookupTargets.length === 0) return;
+
+    setContextLookupBusy(true);
+    setContextLookupStatus(null);
+
+    try {
+      const results = await lookupLiteLlmContextWindow(lookupTargets.map((row) => row.id));
+      const lookupByQuery = buildLiteLlmContextLookupMap(results);
+      const targetByKey = new Map(lookupTargets.map((row) => [row.key, row]));
+
+      for (const lookupState of lookupByQuery.values()) {
+        if (!lookupState?.query) continue;
+        contextLookupCacheRef.current.set(lookupState.query, lookupState);
+      }
+
+      const currentRows = Array.isArray(rowsRef.current) ? rowsRef.current : [];
+      let filledCount = 0;
+      let missCount = 0;
+      const nextRows = currentRows.map((row) => {
+        const target = targetByKey.get(row.key);
+        if (!target) return row;
+
+        const currentId = String(row?.id || "").trim();
+        const currentContextWindow = String(row?.contextWindow || "").trim();
+        if (!currentId || currentId !== target.id || currentContextWindow) return row;
+
+        const lookupState = lookupByQuery.get(currentId) || buildLiteLlmContextLookupState({ query: currentId });
+        const prefillValue = resolveLiteLlmPrefillContextWindow(lookupState);
+        if (prefillValue) {
+          filledCount += 1;
+          return {
+            ...row,
+            contextWindow: prefillValue
+          };
+        }
+        missCount += 1;
+        return row;
+      });
+
+      setRows(ensureDraftRow(nextRows, { preserveFocus: false }));
+      setContextLookupStatus({
+        tone: filledCount > 0 ? "success" : "warning",
+        message: filledCount > 0
+          ? `Filled ${filledCount} context size${filledCount === 1 ? "" : "s"}${missCount > 0 ? `; ${missCount} still need a manual value` : ""}.`
+          : `Could not fill ${missCount} model${missCount === 1 ? "" : "s"}.`
+      });
+    } catch (error) {
+      setContextLookupStatus({
+        tone: "error",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      setContextLookupBusy(false);
+    }
+  }
+
   async function handleApply() {
     if (locked || issue || !isDirty) return false;
     const willTestNewModels = inferQuickStartConnectionType(provider) === "api" && newModelIds.length > 0;
     setSubmitState(willTestNewModels ? "testing" : "saving");
     try {
-      return await onApply(filledRows);
+      return await onApply(normalizedFilledRows.map((row) => ({
+        ...row,
+        contextWindow: normalizeContextWindowInput(row.contextWindow)
+      })));
     } finally {
       setSubmitState("");
     }
@@ -2161,13 +4083,22 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
   return (
     <div className={cn(framed ? "space-y-3 rounded-2xl border border-border/70 bg-background/60 p-4" : "space-y-3")}>
       <div className="rounded-2xl border border-border/70 bg-secondary/35 px-4 py-3 text-sm leading-6 text-muted-foreground">
-        Direct routes follow this top-to-bottom order. A fresh empty row stays at the bottom so you can add models without switching context.
+        Direct routes follow this top-to-bottom order. Focus a context field to load suggested sizes, or use Fill missing context size to fill each empty row with a median size.
       </div>
 
       <div className="space-y-2">
         {rows.map((row, index) => {
           const trimmedValue = String(row?.id || "").trim();
-          const showRemoveButton = Boolean(trimmedValue);
+          const normalizedContextWindow = String(row?.contextWindow || "").trim();
+          const isFilledRow = Boolean(trimmedValue);
+          const filledRowIndex = isFilledRow
+            ? filledRows.findIndex((candidate) => candidate.key === row.key)
+            : -1;
+          const rowLookupState = contextLookupStateByRowKey[row.key] || null;
+          const rowLookupPending = Boolean(contextLookupPendingByRowKey[row.key]);
+          const showContextLookupMenu = activeContextLookupRowKey === row.key && Boolean(trimmedValue);
+          const hasInvalidContextWindow = invalidContextWindowRowKeys.has(row.key);
+
           return (
             <div
               key={row.key}
@@ -2184,85 +4115,295 @@ function ProviderModelsEditor({ provider, disabled = false, disabledReason = "",
                 event.preventDefault();
                 const fromKey = event.dataTransfer.getData("text/plain") || draggingKeyRef.current;
                 clearDraggingState();
-                setRows((current) => ensureTrailingDraftRow(moveItemsByKey(current, fromKey, row.key)));
+                setRows((current) => ensureDraftRow(moveItemsByKey(current, fromKey, row.key)));
               }}
               className={cn(
-                "grid grid-cols-[auto_auto_minmax(0,1fr)_auto] items-center gap-2 rounded-xl border border-border/70 bg-card/90 p-3",
-                !showRemoveButton ? "border-dashed bg-background/85" : null
+                "space-y-2 rounded-xl border border-border/70 bg-card/90 p-3",
+                !isFilledRow ? "border-dashed bg-background/85" : null,
+                hasInvalidContextWindow ? "border-amber-200 bg-amber-50/70" : null
               )}
             >
-              <span className={cn(
-                "flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground",
-                showRemoveButton && !locked ? "cursor-grab" : "opacity-45"
-              )}
-                draggable={!locked && showRemoveButton}
-                onDragStart={(event) => {
-                  if (locked || !showRemoveButton) return;
-                  const rowNode = getReorderRowNode(event.currentTarget);
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData("text/plain", row.key);
-                  if (rowNode && typeof event.dataTransfer?.setDragImage === "function") {
-                    event.dataTransfer.setDragImage(rowNode, 20, 20);
-                  }
-                  clearDraggingState();
-                  draggingKeyRef.current = row.key;
-                  draggingNodeRef.current = rowNode;
-                  setDraggingRowClasses(rowNode, true);
-                }}
-                onDragEnd={clearDraggingState}
-                title={showRemoveButton ? "Drag to reorder" : "New model draft row"}
-              >
-                <DragGripIcon className="h-4 w-4" />
-              </span>
-              <MoveUpButton
-                disabled={locked || index === 0 || !showRemoveButton}
-                label={index === 0 ? "Already first" : `Move ${row.id || `model ${index + 1}`} up`}
-                onClick={() => moveRowUp(row.key)}
-              />
-              <Input
-                ref={(node) => {
-                  if (node) {
-                    inputRefs.current.set(row.key, node);
-                  } else {
-                    inputRefs.current.delete(row.key);
-                  }
-                }}
-                value={row.id}
-                onChange={(event) => updateRow(row.key, event.target.value)}
-                placeholder={showRemoveButton ? "Model id" : "Add a new model id"}
-                disabled={locked}
-              />
-              {showRemoveButton ? (
-                <Button type="button" variant="ghost" onMouseDown={(event) => event.preventDefault()} onClick={() => removeRow(row.key)} disabled={locked}>
-                  Remove
-                </Button>
-              ) : (
-                <div className="h-9 w-[5.5rem]" aria-hidden="true" />
-              )}
+              <div className="grid grid-cols-[auto_auto_auto_minmax(0,1fr)_minmax(12rem,14rem)_5.5rem] items-center gap-2">
+                <span className={cn(
+                  "flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground",
+                  isFilledRow && !locked ? "cursor-grab" : "opacity-45"
+                )}
+                  draggable={!locked && isFilledRow}
+                  onDragStart={(event) => {
+                    if (locked || !isFilledRow) return;
+                    const rowNode = getReorderRowNode(event.currentTarget);
+                    event.dataTransfer.effectAllowed = "move";
+                    event.dataTransfer.setData("text/plain", row.key);
+                    if (rowNode && typeof event.dataTransfer?.setDragImage === "function") {
+                      event.dataTransfer.setDragImage(rowNode, 20, 20);
+                    }
+                    clearDraggingState();
+                    draggingKeyRef.current = row.key;
+                    draggingNodeRef.current = rowNode;
+                    setDraggingRowClasses(rowNode, true);
+                  }}
+                  onDragEnd={clearDraggingState}
+                  title={isFilledRow ? "Drag to reorder" : "New model draft row"}
+                >
+                  <DragGripIcon className="h-4 w-4" />
+                </span>
+                <MoveUpButton
+                  disabled={locked || !isFilledRow || filledRowIndex <= 0}
+                  label={!isFilledRow || filledRowIndex <= 0 ? "Already first" : `Move ${row.id || `model ${filledRowIndex + 1}`} up`}
+                  onClick={() => moveRowUp(row.key)}
+                />
+                <MoveDownButton
+                  disabled={locked || !isFilledRow || index >= lastFilledRowIndex}
+                  label={!isFilledRow || index >= lastFilledRowIndex ? "Already last" : `Move ${row.id || `model ${filledRowIndex + 1}`} down`}
+                  onClick={() => moveRowDown(row.key)}
+                />
+                <Input
+                  ref={(node) => {
+                    if (node) {
+                      inputRefs.current.set(row.key, node);
+                    } else {
+                      inputRefs.current.delete(row.key);
+                    }
+                  }}
+                  value={row.id}
+                  onChange={(event) => updateRow(
+                    row.key,
+                    { id: event.target.value },
+                    { clearLookupState: true, closeLookupMenu: true }
+                  )}
+                  placeholder={isFilledRow ? "Model id" : "Add a new model id"}
+                  disabled={locked}
+                />
+                <div
+                  ref={(node) => {
+                    if (node) {
+                      contextInputShellRefs.current.set(row.key, node);
+                    } else {
+                      contextInputShellRefs.current.delete(row.key);
+                    }
+                  }}
+                  className="relative min-w-0"
+                >
+                  <Input
+                    value={editingContextRowKey === row.key
+                      ? (editingContextDraftByRowKey[row.key] ?? formatEditableContextWindowInput(row.contextWindow))
+                      : formatCompactContextWindowInput(row.contextWindow)}
+                    onChange={(event) => {
+                      const nextDisplayValue = event.target.value;
+                      const normalizedContextWindow = normalizeContextWindowInput(nextDisplayValue);
+                      setEditingContextDraftByRowKey((current) => ({
+                        ...current,
+                        [row.key]: formatEditableContextWindowInput(normalizedContextWindow)
+                      }));
+                      updateRow(row.key, { contextWindow: normalizedContextWindow }, { clearStatus: false });
+                    }}
+                    onBlur={(event) => {
+                      setEditingContextRowKey((current) => (current === row.key ? "" : current));
+                      setEditingContextDraftByRowKey((current) => {
+                        if (!Object.prototype.hasOwnProperty.call(current, row.key)) return current;
+                        const next = { ...current };
+                        delete next[row.key];
+                        return next;
+                      });
+                      updateRow(row.key, { contextWindow: normalizeContextWindowInput(event.target.value) }, { clearStatus: false });
+                    }}
+                    onFocus={() => {
+                      if (!trimmedValue) return;
+                      setEditingContextRowKey(row.key);
+                      setEditingContextDraftByRowKey((current) => ({
+                        ...current,
+                        [row.key]: formatEditableContextWindowInput(row.contextWindow)
+                      }));
+                      void ensureContextLookupForRow(row.key, { openMenu: true });
+                    }}
+                    onClick={() => {
+                      if (!trimmedValue) return;
+                      void ensureContextLookupForRow(row.key, { openMenu: true });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "ArrowDown" && trimmedValue) {
+                        event.preventDefault();
+                        void ensureContextLookupForRow(row.key, { openMenu: true });
+                        return;
+                      }
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        setActiveContextLookupRowKey("");
+                      }
+                    }}
+                    placeholder="Context window"
+                    inputMode="numeric"
+                    disabled={locked || !trimmedValue}
+                    className="font-medium tabular-nums"
+                    aria-label={trimmedValue ? `Context window for ${trimmedValue}` : "Context window"}
+                  />
+                  {showContextLookupMenu ? (
+                    <AdaptiveDropdownPanel
+                      open={showContextLookupMenu}
+                      anchorRef={{ current: contextInputShellRefs.current.get(row.key) || null }}
+                      preferredSide="top"
+                      desiredHeight={224}
+                      className="z-20 rounded-lg bg-background/98 p-2"
+                      onMouseDown={(event) => event.preventDefault()}
+                    >
+                      {rowLookupPending ? (
+                        <div className="inline-flex items-center gap-2 px-1 py-2 text-sm text-muted-foreground">
+                          <InlineSpinner />
+                          Fetching size options for <code>{trimmedValue}</code>.
+                        </div>
+                      ) : rowLookupState?.status === "error" ? (
+                        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900">
+                          {rowLookupState.error || "Could not load suggested sizes."}
+                        </div>
+                      ) : rowLookupState?.options?.length > 0 ? (
+                        <div className="space-y-1">
+                          {rowLookupState.options.map((option) => (
+                            <button
+                              key={option.key}
+                              type="button"
+                              className="flex w-full flex-col gap-2 rounded-lg border border-border/70 bg-background px-3 py-2 text-left text-sm text-foreground transition hover:border-accent hover:bg-accent disabled:cursor-not-allowed disabled:opacity-70"
+                              disabled={locked}
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => {
+                                setEditingContextDraftByRowKey((current) => ({
+                                  ...current,
+                                  [row.key]: formatEditableContextWindowInput(option.contextWindow)
+                                }));
+                                updateRow(
+                                  row.key,
+                                  { contextWindow: String(option.contextWindow) },
+                                  { clearStatus: false }
+                                );
+                                setActiveContextLookupRowKey("");
+                              }}
+                              title={`Use ${option.label}`}
+                            >
+                              <div className="min-w-0 space-y-1">
+                                <div className="break-words font-medium leading-5">{option.label}</div>
+                                <div className="break-words text-xs leading-4 text-muted-foreground">{option.detail}</div>
+                              </div>
+                              <div className="w-full rounded-md border border-border/70 bg-secondary/70 px-3 py-2">
+                                <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Context size</div>
+                                <div className="mt-1 text-lg font-semibold leading-none tabular-nums text-foreground">
+                                  {formatContextWindow(option.contextWindow)}
+                                </div>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border border-dashed border-border/70 bg-background/80 px-3 py-2 text-xs text-muted-foreground">
+                          No suggested size was found for <code>{rowLookupState?.query || trimmedValue}</code>.
+                        </div>
+                      )}
+                    </AdaptiveDropdownPanel>
+                  ) : null}
+                </div>
+                {isFilledRow ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className={ROW_REMOVE_BUTTON_CLASS}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => removeRow(row.key)}
+                    disabled={locked}
+                  >
+                    Remove
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className={cn(ROW_REMOVE_BUTTON_CLASS, "pointer-events-none invisible")}
+                    tabIndex={-1}
+                    disabled
+                    aria-hidden="true"
+                  >
+                    Remove
+                  </Button>
+                )}
+              </div>
+
+              {rowLookupPending ? (
+                <div className="flex justify-end text-xs">
+                  <div className="inline-flex items-center gap-1.5 text-sky-700">
+                    <InlineSpinner />
+                    Looking up sizes
+                  </div>
+                </div>
+              ) : null}
+
+              {hasInvalidContextWindow ? (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                  Enter a positive integer like <code>128000</code>, or leave the field blank.
+                </div>
+              ) : null}
             </div>
           );
         })}
       </div>
 
       {issue ? <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{issue}</div> : null}
-
-      <div className="flex min-h-9 items-center justify-between gap-3">
-        <div className="text-xs text-muted-foreground">
-          {newModelIds.length > 0 && inferQuickStartConnectionType(provider) === "api"
-            ? `${newModelIds.length} new model${newModelIds.length === 1 ? "" : "s"} will be tested before save.`
-            : "Existing models keep their current configuration metadata."}
+      {contextLookupStatus ? (
+        <div className={cn(
+          "rounded-xl px-3 py-2 text-sm",
+          contextLookupStatus.tone === "error"
+            ? "border border-rose-200 bg-rose-50 text-rose-900"
+            : contextLookupStatus.tone === "warning"
+              ? "border border-amber-200 bg-amber-50 text-amber-900"
+              : "border border-emerald-200 bg-emerald-50 text-emerald-900"
+        )}>
+          {contextLookupStatus.message}
         </div>
-        <div className="flex items-center justify-end gap-2">
-          {!disabled && !locked && isDirty ? <Button type="button" variant="ghost" onClick={() => setRows(ensureTrailingDraftRow(initialRows, { preserveFocus: true }))}>Reset</Button> : null}
-          {!disabled && !locked && isDirty && !issue ? (
-            <Button type="button" onClick={() => void handleApply()}>
-              {submitState === "testing"
-                ? "Testing…"
-                : submitState === "saving" || busy
-                  ? "Saving…"
-                  : "Save models"}
-            </Button>
-          ) : null}
+      ) : null}
+
+      <div
+        className={cn(
+          "sticky z-10 border-t border-border/70 bg-background/95 pt-3 backdrop-blur",
+          framed
+            ? "bottom-0"
+            : "bottom-0 -mx-5 rounded-b-[1rem] px-5 pb-4"
+        )}
+      >
+        <div className="flex min-h-9 items-center justify-between gap-3">
+          <div className="text-xs text-muted-foreground">
+            {newModelIds.length > 0 && inferQuickStartConnectionType(provider) === "api"
+              ? `${newModelIds.length} new model${newModelIds.length === 1 ? "" : "s"} will be tested before save.`
+              : "Existing models keep their current configuration metadata."}
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            {!disabled && !locked && rowsMissingContextWindow.length > 0 ? (
+              <Button type="button" variant="outline" onClick={() => void handleLookupEmptyContextWindows()}>
+                {contextLookupBusy ? "Filling…" : "Fill missing context size"}
+              </Button>
+            ) : null}
+            {!disabled && !locked && isDirty ? (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  setContextLookupPendingByRowKey({});
+                  setContextLookupStateByRowKey({});
+                  setContextLookupStatus(null);
+                  setActiveContextLookupRowKey("");
+                  contextLookupCacheRef.current.clear();
+                  contextLookupRequestRef.current.clear();
+                  setRows(ensureDraftRow(initialRows, { preserveFocus: true }));
+                }}
+              >
+                Reset
+              </Button>
+            ) : null}
+            {!disabled && !locked && isDirty && !issue ? (
+              <Button type="button" onClick={() => void handleApply()}>
+                {submitState === "testing"
+                  ? "Testing…"
+                  : submitState === "saving" || busy
+                    ? "Saving…"
+                    : "Save models"}
+              </Button>
+            ) : null}
+          </div>
         </div>
       </div>
     </div>
@@ -2281,7 +4422,8 @@ function RouteTargetListEditor({
   helperAction = null,
   placeholder = "provider/model or alias",
   draftPlaceholder = "Add a new route",
-  trailingDraftRow = false,
+  showDraftRow = false,
+  showDraftFocusButton = false,
   showWeightInput = false,
   filterOtherSelectedValues = false,
   excludedValues = []
@@ -2289,6 +4431,10 @@ function RouteTargetListEditor({
   const rowCounterRef = useRef(0);
   const draggingKeyRef = useRef("");
   const draggingNodeRef = useRef(null);
+  const rowNodeRefs = useRef(new Map());
+  const draftRowScrollFrameRef = useRef(0);
+  const draftRowScrollRequestRef = useRef(0);
+  const [draftRowOpenSearchRequest, setDraftRowOpenSearchRequest] = useState(0);
   const rowKeyPrefix = useMemo(
     () => String(title || "targets").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "targets",
     [title]
@@ -2296,9 +4442,9 @@ function RouteTargetListEditor({
   const draftRowKey = `${rowKeyPrefix}-draft-row`;
   const displayRows = useMemo(() => {
     const filledRows = (rows || []).filter((row) => String(row?.ref || "").trim());
-    if (!trailingDraftRow) return filledRows;
-    return [...filledRows, { key: draftRowKey, ref: "", sourceRef: "" }];
-  }, [rows, trailingDraftRow, draftRowKey]);
+    if (!showDraftRow) return filledRows;
+    return [{ key: draftRowKey, ref: "", sourceRef: "" }, ...filledRows];
+  }, [rows, showDraftRow, draftRowKey]);
   const setAnimatedRowRef = useReorderLayoutAnimation(displayRows.map((row) => row.key));
   const normalizedExcludedValues = useMemo(
     () => normalizeUniqueTrimmedValues(excludedValues),
@@ -2309,18 +4455,24 @@ function RouteTargetListEditor({
     [options, displayRows, normalizedExcludedValues]
   );
 
+  useEffect(() => () => {
+    if (typeof window !== "undefined" && draftRowScrollFrameRef.current) {
+      window.cancelAnimationFrame(draftRowScrollFrameRef.current);
+    }
+  }, []);
+
   function updateRow(rowKey, value) {
-    if (trailingDraftRow && rowKey === draftRowKey) {
+    if (showDraftRow && rowKey === draftRowKey) {
       if (!String(value || "").trim()) return;
       rowCounterRef.current += 1;
       onChange([
-        ...(rows || []).filter((row) => String(row?.ref || "").trim()),
         {
           key: `${rowKeyPrefix}-draft-${rowCounterRef.current}`,
           ref: value,
           sourceRef: "",
           ...(showWeightInput ? { weight: "1" } : {})
-        }
+        },
+        ...(rows || []).filter((row) => String(row?.ref || "").trim())
       ]);
       return;
     }
@@ -2367,17 +4519,99 @@ function RouteTargetListEditor({
     ]);
   }
 
+  function handleDraftFocusButtonClick() {
+    if (!showDraftRow || disabled) return;
+    const rowNode = rowNodeRefs.current.get(draftRowKey);
+    if (!rowNode || typeof window === "undefined") {
+      setDraftRowOpenSearchRequest((current) => current + 1);
+      return;
+    }
+
+    draftRowScrollRequestRef.current += 1;
+    const scrollRequestId = draftRowScrollRequestRef.current;
+    if (draftRowScrollFrameRef.current) {
+      window.cancelAnimationFrame(draftRowScrollFrameRef.current);
+      draftRowScrollFrameRef.current = 0;
+    }
+
+    rowNode.scrollIntoView({ block: "start", behavior: "smooth" });
+
+    const scrollContainers = getClippingAncestors(rowNode);
+    let lastSnapshot = captureScrollSettleSnapshot(rowNode, scrollContainers);
+    let stableFrames = 0;
+    let frameCount = 0;
+    const maxFrames = 90;
+    const minFrames = 8;
+    const stableFramesRequired = 6;
+    const settleThreshold = 0.5;
+
+    const waitForScrollSettle = () => {
+      if (draftRowScrollRequestRef.current !== scrollRequestId) return;
+      const currentRowNode = rowNodeRefs.current.get(draftRowKey) || rowNode;
+      const currentSnapshot = captureScrollSettleSnapshot(currentRowNode, scrollContainers);
+      if (!Number.isFinite(currentSnapshot.top) || !Number.isFinite(currentSnapshot.left)) {
+        draftRowScrollFrameRef.current = 0;
+        setDraftRowOpenSearchRequest((current) => current + 1);
+        return;
+      }
+
+      if (isScrollSettleSnapshotStable(lastSnapshot, currentSnapshot, settleThreshold)) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+      }
+
+      lastSnapshot = currentSnapshot;
+      frameCount += 1;
+
+      if ((frameCount >= minFrames && stableFrames >= stableFramesRequired) || frameCount >= maxFrames) {
+        draftRowScrollFrameRef.current = 0;
+        setDraftRowOpenSearchRequest((current) => current + 1);
+        return;
+      }
+
+      draftRowScrollFrameRef.current = window.requestAnimationFrame(waitForScrollSettle);
+    };
+
+    draftRowScrollFrameRef.current = window.requestAnimationFrame(waitForScrollSettle);
+  }
+
   return (
     <div className="space-y-2 rounded-2xl border border-border/70 bg-background/55 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">{title}</div>
-        {!trailingDraftRow ? <Button type="button" variant="ghost" onClick={addRow} disabled={disabled}>{addLabel}</Button> : null}
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">{title}</div>
+          {showDraftFocusButton && showDraftRow ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 rounded-md p-0 text-muted-foreground hover:text-foreground"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={handleDraftFocusButtonClick}
+              disabled={disabled}
+              aria-label={addLabel}
+              title={addLabel}
+            >
+              <PlusIcon className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
+        </div>
+        <div className="ml-auto flex max-w-full flex-wrap items-start justify-end gap-x-3 gap-y-2">
+          {helperText ? (
+            <div className="max-w-[34rem] text-right text-[11px] leading-4 text-muted-foreground">{helperText}</div>
+          ) : null}
+          {!showDraftRow ? <Button type="button" variant="ghost" onClick={addRow} disabled={disabled}>{addLabel}</Button> : null}
+        </div>
       </div>
 
       {displayRows.length > 0 ? (
         <div className="space-y-2">
           {displayRows.map((row, index) => {
-            const isDraftRow = trailingDraftRow && row.key === draftRowKey;
+            const isDraftRow = showDraftRow && row.key === draftRowKey;
+            const filledRowIndex = isDraftRow
+              ? -1
+              : (rows || []).findIndex((candidate) => candidate?.key === row.key);
             const rowOptions = filterOtherSelectedValues
               ? resolvedOptions.filter((option) => {
                 const optionValue = String(option?.value || "").trim();
@@ -2390,7 +4624,14 @@ function RouteTargetListEditor({
             return (
               <div
                 key={row.key}
-                ref={setAnimatedRowRef(row.key)}
+                ref={(node) => {
+                  setAnimatedRowRef(row.key)(node);
+                  if (node) {
+                    rowNodeRefs.current.set(row.key, node);
+                    return;
+                  }
+                  rowNodeRefs.current.delete(row.key);
+                }}
                 data-reorder-row="true"
                 onDragOver={(event) => {
                   if (!disabled && draggingKeyRef.current && draggingKeyRef.current !== row.key) {
@@ -2407,8 +4648,8 @@ function RouteTargetListEditor({
                 }}
                 className={cn(
                   showWeightInput
-                    ? "grid grid-cols-[auto_auto_auto_minmax(0,1fr)_10rem_auto] items-center gap-2 rounded-xl border border-border/70 bg-card/90 p-3"
-                    : "grid grid-cols-[auto_auto_auto_minmax(0,1fr)_auto] items-center gap-2 rounded-xl border border-border/70 bg-card/90 p-3",
+                    ? "grid grid-cols-[auto_auto_auto_minmax(0,1fr)_10rem_5.5rem] items-center gap-2 rounded-xl border border-border/70 bg-card/90 p-3"
+                    : "grid grid-cols-[auto_auto_auto_minmax(0,1fr)_5.5rem] items-center gap-2 rounded-xl border border-border/70 bg-card/90 p-3",
                   isDraftRow ? "border-dashed bg-background/85" : null
                 )}
               >
@@ -2436,33 +4677,32 @@ function RouteTargetListEditor({
                   <DragGripIcon className="h-4 w-4" />
                 </span>
                 <MoveUpButton
-                  disabled={disabled || index === 0 || isDraftRow}
-                  label={index === 0 ? "Already first" : `Move ${row.ref || `target ${index + 1}`} up`}
+                  disabled={disabled || isDraftRow || filledRowIndex <= 0}
+                  label={isDraftRow || filledRowIndex <= 0 ? "Already first" : `Move ${row.ref || `target ${filledRowIndex + 1}`} up`}
                   onClick={() => moveRowUp(row.key)}
                 />
                 <MoveDownButton
-                  disabled={disabled || isDraftRow || index === (rows || []).length - 1}
-                  label={isDraftRow || index === (rows || []).length - 1 ? "Already last" : `Move ${row.ref || `target ${index + 1}`} down`}
+                  disabled={disabled || isDraftRow || filledRowIndex === -1 || filledRowIndex >= (rows || []).length - 1}
+                  label={isDraftRow || filledRowIndex === -1 || filledRowIndex >= (rows || []).length - 1 ? "Already last" : `Move ${row.ref || `target ${filledRowIndex + 1}`} down`}
                   onClick={() => moveRowDown(row.key)}
                 />
                 <div className="flex h-9 min-w-0 overflow-hidden rounded-lg border border-input bg-background/80 shadow-sm transition focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/40">
                   <div className="flex shrink-0 items-center border-r border-border/70 bg-secondary/55 px-2.5 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
                     Model
                   </div>
-                  <Select value={row.ref || undefined} onValueChange={(value) => updateRow(row.key, value)} disabled={disabled}>
+                  <Select
+                    value={row.ref || undefined}
+                    onValueChange={(value) => updateRow(row.key, value)}
+                    disabled={disabled}
+                    openSearchRequest={isDraftRow ? draftRowOpenSearchRequest : 0}
+                  >
                     <SelectTrigger className="h-full min-w-0 flex-1 rounded-none border-0 bg-transparent px-3 shadow-none focus:border-transparent focus:ring-0">
                       <SelectValue placeholder={isDraftRow ? draftPlaceholder : placeholder} />
                     </SelectTrigger>
                     <SelectContent>
-                      {rowOptions.length > 0 ? rowOptions.map((option) => (
-                        <SelectItem
-                          key={option.value}
-                          value={option.value}
-                          searchText={`${option.label || ""} ${option.value || ""} ${option.hint || ""}`}
-                        >
-                          {option.label}
-                        </SelectItem>
-                      )) : (
+                      {rowOptions.length > 0 ? renderSelectOptionNodes(rowOptions, {
+                        keyPrefix: `${title}-row-${row.key}`
+                      }) : (
                         <SelectItem value="__no-route-options" disabled>No routes available</SelectItem>
                       )}
                     </SelectContent>
@@ -2488,9 +4728,27 @@ function RouteTargetListEditor({
                   </div>
                 ) : null}
                 {!isDraftRow ? (
-                  <Button type="button" variant="ghost" onMouseDown={(event) => event.preventDefault()} onClick={() => removeRow(row.key)} disabled={disabled}>Remove</Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className={ROW_REMOVE_BUTTON_CLASS}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => removeRow(row.key)}
+                    disabled={disabled}
+                  >
+                    Remove
+                  </Button>
                 ) : (
-                  <div className="h-9 w-[5.5rem]" aria-hidden="true" />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className={cn(ROW_REMOVE_BUTTON_CLASS, "pointer-events-none invisible")}
+                    tabIndex={-1}
+                    disabled
+                    aria-hidden="true"
+                  >
+                    Remove
+                  </Button>
                 )}
               </div>
             );
@@ -2500,10 +4758,7 @@ function RouteTargetListEditor({
         <div className="rounded-xl border border-dashed border-border px-4 py-5 text-sm text-muted-foreground">{emptyLabel}</div>
       )}
 
-      <div className="flex min-h-8 flex-wrap items-center justify-between gap-2">
-        <div className="text-xs text-muted-foreground">{helperText}</div>
-        {helperAction ? <div className="flex shrink-0 items-center">{helperAction}</div> : null}
-      </div>
+      {helperAction ? <div className="flex min-h-8 items-center justify-end">{helperAction}</div> : null}
     </div>
   );
 }
@@ -2661,11 +4916,24 @@ function ModelAliasStrategyModal({
 }) {
   const normalizedInitialStrategy = normalizeModelAliasStrategyValue(initialStrategy);
   const [selectedStrategy, setSelectedStrategy] = useState(normalizedInitialStrategy);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setSelectedStrategy(normalizedInitialStrategy);
+    setSaving(false);
   }, [open, normalizedInitialStrategy, aliasLabel]);
+
+  async function handleSaveClick() {
+    if (disabled || saving) return;
+    setSaving(true);
+    try {
+      const result = await onSave(selectedStrategy);
+      if (result !== false) onClose();
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <Modal
@@ -2673,20 +4941,18 @@ function ModelAliasStrategyModal({
       onClose={onClose}
       title={aliasLabel ? `Choose strategy · ${aliasLabel}` : "Choose strategy"}
       description="Review each routing strategy in its own tab. Save applies the currently selected tab to this alias."
+      showCloseButton={false}
       footer={(
         <div className="flex flex-wrap items-center justify-end gap-2">
-          <Button type="button" variant="ghost" onClick={onClose}>
+          <Button type="button" variant="ghost" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
           <Button
             type="button"
-            onClick={() => {
-              onSave(selectedStrategy);
-              onClose();
-            }}
-            disabled={disabled}
+            onClick={() => void handleSaveClick()}
+            disabled={disabled || saving}
           >
-            Save strategy
+            {saving ? "Saving…" : "Save strategy"}
           </Button>
         </div>
       )}
@@ -2772,6 +5038,100 @@ function ModelAliasStrategyModal({
   );
 }
 
+function AliasGuideModal({
+  open = false,
+  onClose = () => {},
+  config = {}
+}) {
+  const mixedContextAliases = useMemo(
+    () => buildAliasGuideContextNotes(config),
+    [config]
+  );
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Alias guide"
+      description="Aliases give clients one stable route while letting LLM Router swap, balance, and fail over across provider/model targets behind that route."
+      contentClassName="max-h-[92vh] max-w-4xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
+      bodyClassName="max-h-[calc(92vh-5.5rem)]"
+    >
+      <div className="space-y-4">
+        <div className="grid gap-4 md:grid-cols-3">
+          <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+            <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Stable route</div>
+            <div className="mt-2 text-sm leading-6 text-foreground">Expose one alias like <code>coding</code> or <code>gpt-5.4</code> to clients, then retarget the alias later without touching client config.</div>
+          </div>
+          <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+            <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Selection strategy</div>
+            <div className="mt-2 text-sm leading-6 text-foreground">The alias strategy controls how LLM Router picks from the configured targets. Ordered is strict preference; the other strategies distribute traffic when multiple targets are healthy.</div>
+          </div>
+          <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+            <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Fallback behavior</div>
+            <div className="mt-2 text-sm leading-6 text-foreground">If one target is unavailable or rate limited, LLM Router can continue to later candidates in the same alias instead of failing the whole request immediately.</div>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="warning">Important</Badge>
+            <div className="text-sm font-medium text-amber-950">Mixed context windows inside one alias can change behavior.</div>
+          </div>
+          <div className="mt-3 text-sm leading-6 text-amber-900">
+            If an alias mixes models with different context windows, requests that fit the larger model may still fail on the smaller model.
+            For example, an alias that includes both a <code>258K</code> model and a <code>128K</code> model can still fail when routing lands on the smaller target.
+            Keep aliases aligned by context size when you expect long histories or large prompts.
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Current config check</div>
+              <div className="mt-1 text-sm text-muted-foreground">Aliases below currently mix different configured model context windows.</div>
+            </div>
+            <Badge variant={mixedContextAliases.length > 0 ? "warning" : "success"}>
+              {mixedContextAliases.length > 0 ? `${mixedContextAliases.length} alias${mixedContextAliases.length === 1 ? "" : "es"} need review` : "No mixed context windows detected"}
+            </Badge>
+          </div>
+
+          {mixedContextAliases.length > 0 ? (
+            <div className="mt-4 space-y-3">
+              {mixedContextAliases.map((summary) => (
+                <div key={summary.aliasId} className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline">{summary.aliasId}</Badge>
+                    <div className="text-sm font-medium text-amber-950">
+                      Smallest target: {formatContextWindow(summary.smallestContextWindow)}. Largest target: {formatContextWindow(summary.largestContextWindow)}.
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {summary.models.map((model) => (
+                      <div key={model.ref} className="rounded-full border border-amber-200 bg-background/90 px-3 py-1.5 text-sm text-foreground">
+                        {model.ref} · {formatContextWindow(model.contextWindow)}
+                      </div>
+                    ))}
+                    {summary.unknownRefs.map((ref) => (
+                      <div key={ref} className="rounded-full border border-dashed border-amber-300 bg-background/70 px-3 py-1.5 text-sm text-muted-foreground">
+                        {ref} · context unknown
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-4 rounded-xl border border-dashed border-border px-4 py-5 text-sm text-muted-foreground">
+              No alias currently mixes known context-window sizes across its configured targets.
+            </div>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function ModelAliasCard({
   aliasId,
   alias,
@@ -2784,9 +5144,14 @@ function ModelAliasCard({
   busy = false,
   onApply,
   onRemove,
+  onCopyAliasId = () => {},
   isNew = false,
+  alwaysShowAliasIdInput = false,
+  showIssueOnSubmitOnly = false,
   onDiscard = () => {},
   onOpenStrategyModal = () => {},
+  titleAccessory = null,
+  aliasSwitcher = null,
   framed = true
 }) {
   const initialDraftResetKey = buildAliasDraftResetKey(aliasId, alias, { isNew });
@@ -2796,15 +5161,20 @@ function ModelAliasCard({
   );
   const [draft, setDraft] = useState(initialDraft);
   const [aliasIdEditing, setAliasIdEditing] = useState(isNew);
+  const [submitAttempted, setSubmitAttempted] = useState(false);
   const aliasIdInputRef = useRef(null);
 
   useEffect(() => {
     setDraft(initialDraft);
     setAliasIdEditing(isNew);
+    setSubmitAttempted(false);
   }, [initialDraft, isNew]);
 
+  const hasAliasSwitcher = !isNew && Array.isArray(aliasSwitcher?.entries) && aliasSwitcher.entries.length > 1;
+  const showAliasIdInput = alwaysShowAliasIdInput || aliasIdEditing;
+
   useEffect(() => {
-    if (!aliasIdEditing) return undefined;
+    if (!showAliasIdInput) return undefined;
     const frameId = typeof window !== "undefined"
       ? window.requestAnimationFrame(() => {
         aliasIdInputRef.current?.focus();
@@ -2814,13 +5184,20 @@ function ModelAliasCard({
     return () => {
       if (typeof window !== "undefined") window.cancelAnimationFrame(frameId);
     };
-  }, [aliasIdEditing]);
+  }, [showAliasIdInput]);
 
   const normalizedAliasId = String(draft?.id || "").trim();
   const isFixedDefault = aliasId === DEFAULT_MODEL_ALIAS_ID || normalizedAliasId === DEFAULT_MODEL_ALIAS_ID;
   const filteredRouteOptions = useMemo(
-    () => (routeOptions || []).filter((option) => option.value !== normalizedAliasId && option.value !== `alias:${normalizedAliasId}`),
-    [routeOptions, normalizedAliasId]
+    () => withCurrentManagedRouteOptions(
+      (routeOptions || []).filter((option) => (
+        option.kind !== "alias"
+        && option.value !== normalizedAliasId
+        && option.value !== `alias:${normalizedAliasId}`
+      )),
+      (draft?.targets || []).map((row) => row?.ref)
+    ),
+    [routeOptions, normalizedAliasId, draft?.targets]
   );
   const primaryRefs = (draft?.targets || []).map((row) => String(row?.ref || "").trim());
   const hasBlankRows = (draft?.targets || []).some((row) => !String(row?.ref || "").trim());
@@ -2845,9 +5222,7 @@ function ModelAliasCard({
     targets: (draft?.targets || []).map((row) => ({ ref: String(row?.ref || "").trim(), weight: String(row?.weight || "1").trim() }))
   });
   const isDirty = initialSignature !== draftSignature;
-  const issue = disabled
-    ? disabledReason
-    : !normalizedAliasId
+  const validationIssue = !normalizedAliasId
       ? "Alias id is required."
       : !QUICK_START_ALIAS_ID_PATTERN.test(normalizedAliasId)
         ? "Alias id must start with a letter or number and use letters, numbers, dots, underscores, colons, or hyphens."
@@ -2862,113 +5237,301 @@ function ModelAliasCard({
             : hasSelfReference
               ? "An alias cannot target itself."
               : "";
+  const issue = disabled ? disabledReason : validationIssue;
+  const visibleIssue = disabled
+    ? disabledReason
+    : (showIssueOnSubmitOnly && validationIssue && !submitAttempted ? "" : validationIssue);
   const locked = disabled || busy;
+  const selectedAliasId = String(normalizedAliasId || aliasId || "").trim();
+  const selectedAliasLabel = selectedAliasId || "Select alias";
+  const removeAliasDisabled = locked || isFixedDefault || isNew;
+  const removeAliasLabel = isFixedDefault
+    ? "Default alias cannot be removed"
+    : `Remove alias ${selectedAliasId || aliasId}`;
+  const aliasSwitcherTriggerWidth = useMemo(
+    () => measureAliasSwitcherWidth(selectedAliasLabel),
+    [selectedAliasLabel]
+  );
   const isDefault = isFixedDefault || defaultModel === aliasId || defaultModel === normalizedAliasId;
   const isAmpDefault = ampDefaultRoute === aliasId || ampDefaultRoute === normalizedAliasId;
+  const aliasIdPlaceholder = isNew ? "Enter alias name. Example: claude-opus" : undefined;
   const strategyEntries = useMemo(
     () => buildAliasStrategyEntries({ ...draft, fallbackTargets: [] }, { ...alias, fallbackTargets: [] }, routeOptions),
     [draft, alias, routeOptions]
   );
 
   async function handleApplyClick() {
+    setSubmitAttempted(true);
+    if (issue) return false;
     const result = await onApply(aliasId, { ...draft, fallbackTargets: [] });
     if (result && isNew) onDiscard(aliasId);
+    return result;
+  }
+
+  async function handleSaveStrategy(strategy) {
+    const nextDraft = { ...draft, strategy };
+    const result = await onApply(aliasId, { ...nextDraft, fallbackTargets: [] });
+    if (!result) return false;
+    if (isNew) {
+      onDiscard(aliasId);
+      return true;
+    }
+    setDraft(nextDraft);
+    return true;
+  }
+
+  async function handleInlineAliasRename() {
+    setSubmitAttempted(true);
+    if (issue) return false;
+    const result = await onApply(aliasId, { ...draft, fallbackTargets: [] });
+    if (result) {
+      setAliasIdEditing(false);
+      setSubmitAttempted(false);
+    }
+    return result;
+  }
+
+  function handleAliasIdBlur() {
+    if (alwaysShowAliasIdInput) return;
+    if (!hasAliasSwitcher) {
+      setAliasIdEditing(false);
+      return;
+    }
+
+    const currentAliasId = String(aliasId || "").trim();
+    const nextAliasId = String(draft?.id || "").trim();
+    if (!nextAliasId || nextAliasId === currentAliasId) {
+      setDraft((current) => ({ ...current, id: currentAliasId }));
+      setAliasIdEditing(false);
+      setSubmitAttempted(false);
+      return;
+    }
+
+    void handleInlineAliasRename();
+  }
+
+  function handleAliasIdKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setDraft((current) => ({ ...current, id: initialDraft.id }));
+      setAliasIdEditing(false);
+      setSubmitAttempted(false);
+      return;
+    }
+
+    if (!alwaysShowAliasIdInput && event.key === "Enter") {
+      event.preventDefault();
+      event.currentTarget.blur();
+    }
+  }
+
+  async function handleAliasIdActionClick() {
+    if (showAliasIdInput) {
+      const currentAliasId = String(aliasId || "").trim();
+      const nextAliasId = String(draft?.id || "").trim();
+      if (!nextAliasId || nextAliasId === currentAliasId) {
+        setDraft((current) => ({ ...current, id: currentAliasId }));
+        setAliasIdEditing(false);
+        setSubmitAttempted(false);
+        return;
+      }
+      await handleInlineAliasRename();
+      return;
+    }
+
+    setAliasIdEditing(true);
   }
 
   const content = (
     <div className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          {aliasIdEditing ? (
-            <Input
-              ref={aliasIdInputRef}
-              autoFocus={isNew}
-              value={draft.id}
-              onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))}
-              onBlur={() => setAliasIdEditing(false)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === "Escape") {
-                  event.preventDefault();
-                  setAliasIdEditing(false);
-                }
-              }}
-              disabled={locked || (isFixedDefault && !isNew)}
-              className="max-w-[22rem] font-semibold"
-            />
-          ) : (
-            isFixedDefault && !isNew ? (
-              <div className="truncate text-base font-semibold text-foreground">{aliasId}</div>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {hasAliasSwitcher ? (
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <div className={cn(
+                  "flex h-9 min-w-0 max-w-full overflow-hidden rounded-lg border border-input bg-background/80 shadow-sm transition focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/40",
+                  showAliasIdInput ? "flex-1" : "w-fit"
+                )}>
+                  <div className="flex shrink-0 items-center border-r border-border/70 bg-secondary/55 px-2.5 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                    Select an alias
+                  </div>
+                  {showAliasIdInput ? (
+                    <Input
+                      ref={aliasIdInputRef}
+                      value={draft.id}
+                      placeholder={aliasIdPlaceholder}
+                      onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))}
+                      onBlur={handleAliasIdBlur}
+                      onKeyDown={handleAliasIdKeyDown}
+                      disabled={locked || isFixedDefault}
+                      className="h-full min-w-[12rem] flex-1 rounded-none border-0 bg-transparent px-3 text-sm font-medium shadow-none focus:border-transparent focus:ring-0"
+                    />
+                  ) : (
+                    <Select value={aliasSwitcher.value || undefined} onValueChange={aliasSwitcher.onValueChange}>
+                      <SelectTrigger
+                        className="h-full min-w-[10rem] flex-none rounded-none border-0 bg-transparent px-3 pr-[50px] text-left text-sm font-medium shadow-none focus:border-transparent focus:ring-0"
+                        style={{ width: `${aliasSwitcherTriggerWidth}px`, maxWidth: "100%" }}
+                      >
+                        <SelectValue placeholder="Select alias" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {aliasSwitcher.entries.map(([entryAliasId, entryAlias]) => (
+                          <SelectItem
+                            key={entryAliasId}
+                            value={entryAliasId}
+                            searchText={`${entryAliasId} ${(entryAlias?.targets || []).length} ${(entryAlias?.fallbackTargets || []).length}`}
+                          >
+                            {entryAliasId}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                  {!showAliasIdInput ? (
+                    <button
+                      type="button"
+                      className="flex h-full w-10 shrink-0 items-center justify-center border-l border-border/70 text-muted-foreground transition hover:bg-accent/60 hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60 disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => void onCopyAliasId(selectedAliasId)}
+                      disabled={locked || !selectedAliasId}
+                      aria-label={`Copy alias id ${selectedAliasId}`}
+                      title={selectedAliasId ? `Copy alias id ${selectedAliasId}` : "Alias id is not ready yet"}
+                    >
+                      <CopyIcon className="h-4 w-4 shrink-0" />
+                    </button>
+                  ) : null}
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-9 w-9 rounded-lg border-border/70 bg-background/70 p-0 text-muted-foreground shadow-none hover:bg-background/90 hover:text-foreground"
+                  onMouseDown={(event) => {
+                    if (showAliasIdInput) event.preventDefault();
+                  }}
+                  onClick={() => void handleAliasIdActionClick()}
+                  disabled={locked || isFixedDefault}
+                  aria-label={showAliasIdInput ? "Save alias id" : (isFixedDefault ? "Default alias id cannot be edited" : "Edit alias id")}
+                  title={showAliasIdInput ? "Save alias id" : (isFixedDefault ? "Default alias id cannot be edited" : "Edit alias id")}
+                >
+                  {showAliasIdInput ? <CheckIcon className="h-4 w-4 shrink-0" /> : <EditIcon className="h-4 w-4 shrink-0" />}
+                </Button>
+                {!isNew ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-9 w-9 rounded-lg border-border/70 bg-background/70 p-0 text-muted-foreground shadow-none hover:border-destructive hover:bg-background/90 hover:text-destructive"
+                    onClick={() => onRemove(aliasId)}
+                    disabled={removeAliasDisabled}
+                    aria-label={removeAliasLabel}
+                    title={removeAliasLabel}
+                  >
+                    <TrashIcon className="h-4 w-4 shrink-0" />
+                  </Button>
+                ) : null}
+              </div>
             ) : (
-              <button
-                type="button"
-                className="group inline-flex max-w-full items-center gap-2 rounded-lg text-left text-base font-semibold text-foreground transition hover:bg-primary/5 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                onClick={() => setAliasIdEditing(true)}
-                disabled={locked}
-                aria-label="Edit alias id"
-                title="Edit alias id"
-              >
-                <span className="truncate">{isNew ? (normalizedAliasId || "New alias") : normalizedAliasId || aliasId}</span>
-                <EditIcon className="h-4 w-4 shrink-0" />
-              </button>
-            )
-          )}
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            {isDefault ? <Badge variant="success">Default route</Badge> : null}
-            {isAmpDefault ? <Badge variant="info">AMP default</Badge> : null}
+              <>
+                {showAliasIdInput ? (
+                  <Input
+                    ref={aliasIdInputRef}
+                    autoFocus={isNew}
+                    value={draft.id}
+                    placeholder={aliasIdPlaceholder}
+                    onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))}
+                    onBlur={handleAliasIdBlur}
+                    onKeyDown={handleAliasIdKeyDown}
+                    disabled={locked || (isFixedDefault && !isNew)}
+                    className="max-w-[22rem] font-semibold"
+                  />
+                ) : (
+                  isFixedDefault && !isNew ? (
+                    <div className="truncate text-base font-semibold text-foreground">{aliasId}</div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="group inline-flex max-w-full items-center gap-2 rounded-lg text-left text-base font-semibold text-foreground transition hover:bg-primary/5 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                      onClick={() => setAliasIdEditing(true)}
+                      disabled={locked}
+                      aria-label="Edit alias id"
+                      title="Edit alias id"
+                    >
+                      <span className="truncate">{isNew ? (normalizedAliasId || "New alias") : normalizedAliasId || aliasId}</span>
+                      <EditIcon className="h-4 w-4 shrink-0" />
+                    </button>
+                  )
+                )}
+                {titleAccessory ? <div className="min-w-[11rem] max-w-full">{titleAccessory}</div> : null}
+              </>
+            )}
           </div>
+          {!isFixedDefault ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {isDefault ? <Badge variant="success">Default route</Badge> : null}
+              {isAmpDefault ? <Badge variant="info">AMP default</Badge> : null}
+            </div>
+          ) : null}
         </div>
         <div className="flex items-start gap-2 self-start">
           <Button
             type="button"
             variant="outline"
-            size="sm"
-            className="group gap-1.5 normal-case tracking-normal"
+            size="default"
+            className="group h-9 gap-0 overflow-hidden rounded-lg border-border/70 bg-background/70 px-0 text-sm font-medium normal-case tracking-normal shadow-none hover:bg-background/90"
             onClick={() => onOpenStrategyModal({
               aliasLabel: normalizedAliasId || (isNew ? "New alias" : aliasId),
               strategy: draft?.strategy || "auto",
               entries: strategyEntries,
-              disabled: locked,
-              onSave: (strategy) => setDraft((current) => ({ ...current, strategy }))
+              disabled: locked || Boolean(issue),
+              onSave: handleSaveStrategy
             })}
             disabled={locked}
           >
-            <EditIcon className="h-4 w-4 shrink-0" />
-            {`Strategy: ${formatModelAliasStrategyLabel(draft.strategy || "auto")}`}
+            <span className="flex h-full shrink-0 items-center border-r border-border/70 bg-secondary/55 px-2.5 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
+              Routing stratergy
+            </span>
+            <span className="inline-flex min-w-0 items-center gap-2 px-3 text-left">
+              <span className="truncate">{formatModelAliasStrategyLabel(draft.strategy || "auto")}</span>
+              <EditIcon className="h-4 w-4 shrink-0" />
+            </span>
           </Button>
+          {!hasAliasSwitcher && !isNew ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9 w-9 rounded-lg border-border/70 bg-background/70 p-0 text-muted-foreground shadow-none hover:border-destructive hover:bg-background/90 hover:text-destructive"
+              onClick={() => onRemove(aliasId)}
+              disabled={removeAliasDisabled}
+              aria-label={removeAliasLabel}
+              title={removeAliasLabel}
+            >
+              <TrashIcon className="h-4 w-4 shrink-0" />
+            </Button>
+          ) : null}
         </div>
       </div>
 
       <RouteTargetListEditor
-        title="Targets"
+        title="Manage model in alias"
         rows={draft.targets}
         onChange={(targets) => setDraft((current) => ({ ...current, targets }))}
         options={filteredRouteOptions}
         disabled={locked}
         addLabel="Add target"
         emptyLabel="No targets yet. This alias can stay empty until you wire routes back in."
-        helperText="Drag targets to change the alias preference order. Existing weights and target metadata stay attached when the ref is unchanged."
+        helperText="Drag to reorder targets. Weights and metadata stay with the same ref."
         draftPlaceholder="Add a new target"
-        trailingDraftRow
+        showDraftRow
+        showDraftFocusButton
         showWeightInput
-        helperAction={!isNew && !isFixedDefault ? (
-          <Button
-            type="button"
-            variant="danger"
-            size="sm"
-            className="gap-1.5 normal-case tracking-normal"
-            onClick={() => onRemove(aliasId)}
-            disabled={locked}
-          >
-            <TrashIcon className="h-4 w-4" />
-            Remove alias
-          </Button>
-        ) : null}
         filterOtherSelectedValues
         excludedValues={[]}
       />
 
-      {issue ? <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{issue}</div> : null}
-      {!issue && isFixedDefault && !hasTargets ? (
+      {visibleIssue ? <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{visibleIssue}</div> : null}
+      {!visibleIssue && isFixedDefault && !hasTargets ? (
         <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
           The fixed <code>default</code> route is empty. Requests routed to <code>default</code> or <code>smart</code> will return 500 until you add a working target.
         </div>
@@ -2982,9 +5545,23 @@ function ModelAliasCard({
             ) : null}
           </div>
           <div className="flex flex-wrap justify-end gap-2">
-            {isDirty ? <Button type="button" variant="ghost" onClick={() => setDraft(initialDraft)} disabled={locked}>Reset</Button> : null}
-            {isDirty && !issue ? (
-              <Button type="button" onClick={() => void handleApplyClick()} disabled={locked}>{busy ? "Saving…" : (isNew ? "Create alias" : "Apply alias")}</Button>
+            {isDirty ? (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  setDraft(initialDraft);
+                  setSubmitAttempted(false);
+                }}
+                disabled={locked}
+              >
+                Reset
+              </Button>
+            ) : null}
+            {(isNew || (isDirty && !issue)) ? (
+              <Button type="button" onClick={() => void handleApplyClick()} disabled={locked}>
+                {busy ? "Saving…" : (isNew ? "Create alias" : "Apply alias")}
+              </Button>
             ) : null}
           </div>
         </div>
@@ -3007,19 +5584,22 @@ function ModelAliasCard({
 
 function ModelAliasSection({
   aliases,
+  config,
   aliasIds,
   routeOptions,
   defaultModel,
   ampDefaultRoute,
   disabledReason = "",
   busy = false,
-  requestAddAliasToken = 0,
   onApplyAlias,
-  onRemoveAlias
+  onRemoveAlias,
+  onCopyAliasId
 }) {
   const aliasEntries = Object.entries(aliases || {});
   const disabled = Boolean(disabledReason);
   const [pendingNewAliasKey, setPendingNewAliasKey] = useState("");
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [selectedAliasId, setSelectedAliasId] = useState("");
   const pendingAliasSeed = useMemo(() => createPendingAliasSeed(), []);
   const [strategyModalState, setStrategyModalState] = useState({
     open: false,
@@ -3034,11 +5614,6 @@ function ModelAliasSection({
     if (disabled || busy) return;
     setPendingNewAliasKey(`draft-${Date.now()}`);
   }
-
-  useEffect(() => {
-    if (!requestAddAliasToken) return;
-    handleCreateNewAlias();
-  }, [requestAddAliasToken]);
 
   function handleDiscardNewAlias(key) {
     if (!key || key === pendingNewAliasKey) {
@@ -3068,37 +5643,79 @@ function ModelAliasSection({
     }));
   }
 
+  async function handleApplyAliasDraft(aliasId, draftAlias) {
+    const result = await onApplyAlias(aliasId, draftAlias);
+    if (result) {
+      const nextAliasId = String(draftAlias?.id || aliasId || "").trim() || aliasId;
+      setSelectedAliasId(nextAliasId);
+    }
+    return result;
+  }
+
+  useEffect(() => {
+    const availableAliasIds = aliasEntries.map(([aliasId]) => aliasId);
+    if (availableAliasIds.length === 0) {
+      if (selectedAliasId) setSelectedAliasId("");
+      return;
+    }
+    if (!selectedAliasId || !availableAliasIds.includes(selectedAliasId)) {
+      setSelectedAliasId(availableAliasIds[0]);
+    }
+  }, [aliasEntries, selectedAliasId]);
+
+  const activeAliasEntry = aliasEntries.find(([aliasId]) => aliasId === selectedAliasId) || aliasEntries[0] || null;
+  const activeAliasId = activeAliasEntry?.[0] || "";
+  const activeAlias = activeAliasEntry?.[1] || null;
+  const activeAliasSwitcher = aliasEntries.length > 1
+    ? {
+      value: activeAliasId,
+      onValueChange: setSelectedAliasId,
+      entries: aliasEntries
+    }
+    : null;
+
   return (
     <>
       <Card>
         <CardHeader>
-          <div className="space-y-1">
-            <CardDescription>Model aliases give clients one stable route name that can point to multiple provider/models, so you can swap, balance, and fail over without changing client config.</CardDescription>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1">
+              <CardDescription>Model aliases give clients one stable route across multiple provider/models, so you can swap, balance, and fail over without changing client config.</CardDescription>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={() => setHelpOpen(true)}>
+                Help
+              </Button>
+              <Button type="button" size="sm" onClick={handleCreateNewAlias} disabled={disabled || busy}>
+                {busy ? "Saving…" : "Add alias"}
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
           {disabled ? <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{disabledReason}</div> : null}
 
           {aliasEntries.length > 0 ? (
-            <div className="grid gap-4">
-              {aliasEntries.map(([aliasId, alias]) => (
-                <ModelAliasCard
-                  key={aliasId}
-                  aliasId={aliasId}
-                  alias={alias}
-                  aliasIds={aliasIds}
-                  routeOptions={routeOptions}
-                  defaultModel={defaultModel}
-                  ampDefaultRoute={ampDefaultRoute}
-                  disabled={disabled}
-                  disabledReason={disabledReason}
-                  busy={busy}
-                  onApply={onApplyAlias}
-                  onRemove={onRemoveAlias}
-                  onOpenStrategyModal={handleOpenStrategyModal}
-                />
-              ))}
-            </div>
+            activeAliasId && activeAlias ? (
+              <ModelAliasCard
+                key={activeAliasId}
+                aliasId={activeAliasId}
+                alias={activeAlias}
+                aliasIds={aliasIds}
+                routeOptions={routeOptions}
+                defaultModel={defaultModel}
+                ampDefaultRoute={ampDefaultRoute}
+                disabled={disabled}
+                disabledReason={disabledReason}
+                busy={busy}
+                onApply={handleApplyAliasDraft}
+                onRemove={onRemoveAlias}
+                onCopyAliasId={onCopyAliasId}
+                onOpenStrategyModal={handleOpenStrategyModal}
+                aliasSwitcher={activeAliasSwitcher}
+                framed={false}
+              />
+            ) : null
           ) : (
             <div className="rounded-2xl border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">No model aliases yet. Add one to expose stable routes like <code>coding</code> or <code>chat.fast</code> in the Web UI.</div>
           )}
@@ -3110,53 +5727,49 @@ function ModelAliasSection({
         onClose={handleCloseCreateAliasModal}
         title="Add alias"
         description="Set a stable client-facing route, choose its strategy, and order the targets it should use."
+        showCloseButton={false}
         contentClassName="max-h-[92vh] max-w-5xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
         bodyClassName="max-h-[calc(92vh-5.5rem)]"
       >
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Alias</div>
-                <div className="mt-1 text-sm text-muted-foreground">Create a stable route id and map it to one or more provider/model targets.</div>
-              </div>
-              <Badge variant="outline">New route</Badge>
-            </div>
-          </div>
-
-          {pendingNewAliasKey ? (
-            <ModelAliasCard
-              key={pendingNewAliasKey}
-              aliasId={pendingNewAliasKey}
-              alias={pendingAliasSeed}
-              aliasIds={aliasIds}
-              routeOptions={routeOptions}
-              defaultModel={defaultModel}
-              ampDefaultRoute={ampDefaultRoute}
-              disabled={disabled}
-              disabledReason={disabledReason}
-              busy={busy}
-              onApply={onApplyAlias}
-              onRemove={onRemoveAlias}
-              isNew
-              onDiscard={handleDiscardNewAlias}
-              onOpenStrategyModal={handleOpenStrategyModal}
-              framed={false}
-            />
-          ) : null}
-        </div>
+        {pendingNewAliasKey ? (
+          <ModelAliasCard
+            key={pendingNewAliasKey}
+            aliasId={pendingNewAliasKey}
+            alias={pendingAliasSeed}
+            aliasIds={aliasIds}
+            routeOptions={routeOptions}
+            defaultModel={defaultModel}
+            ampDefaultRoute={ampDefaultRoute}
+            disabled={disabled}
+            disabledReason={disabledReason}
+            busy={busy}
+            onApply={handleApplyAliasDraft}
+            onRemove={onRemoveAlias}
+            onCopyAliasId={onCopyAliasId}
+            isNew
+            alwaysShowAliasIdInput
+            showIssueOnSubmitOnly
+            onDiscard={handleDiscardNewAlias}
+            onOpenStrategyModal={handleOpenStrategyModal}
+            framed={false}
+          />
+        ) : null}
       </Modal>
 
       <ModelAliasStrategyModal
         open={strategyModalState.open}
         onClose={handleCloseStrategyModal}
-        onSave={(strategy) => {
-          strategyModalState.onSave?.(strategy);
-        }}
+        onSave={(strategy) => strategyModalState.onSave?.(strategy)}
         aliasLabel={strategyModalState.aliasLabel}
         initialStrategy={strategyModalState.strategy}
         entries={strategyModalState.entries}
         disabled={strategyModalState.disabled}
+      />
+
+      <AliasGuideModal
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        config={config}
       />
     </>
   );
@@ -3183,17 +5796,26 @@ function SummaryChipButton({ children, onClick, disabled = false, title = "", cl
 function ProviderCard({
   provider,
   onRemove,
+  onCopyModelId,
   onApplyProviderDetails,
   onApplyProviderModels,
+  onSaveAndCloseEditor,
   disabledReason = "",
   busy = false
 }) {
   const initialDraft = useMemo(() => createProviderInlineDraftState(provider), [provider]);
   const [draft, setDraft] = useState(initialDraft);
   const [editOpen, setEditOpen] = useState(false);
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false);
   const [editTab, setEditTab] = useState("provider");
   const [editFocusTarget, setEditFocusTarget] = useState("");
   const [modelFocusRequest, setModelFocusRequest] = useState(0);
+  const [modelEditorState, setModelEditorState] = useState({
+    isDirty: false,
+    issue: "",
+    locked: false,
+    rows: []
+  });
   const endpointSectionRef = useRef(null);
   const endpointInputRef = useRef(null);
   const rateLimitSectionRef = useRef(null);
@@ -3243,20 +5865,57 @@ function ProviderCard({
         : !String(draft?.name || "").trim()
           ? "Provider name is required."
           : !isSubscription && resolvedEndpoints.length === 0
-            ? "Add at least one endpoint for API-based providers."
+            ? "Add at least one endpoint for API Key providers."
             : !isSubscription && resolvedEndpoints.some((endpoint) => !isLikelyHttpEndpoint(endpoint))
-              ? "All endpoints must start with http:// or https://."
+            ? "All endpoints must start with http:// or https://."
               : rateLimitIssue;
+  const providerDraftForSave = isSubscription ? draft : { ...draft, endpoints: resolvedEndpoints, endpointDraft: "" };
+  const hasModelUnsavedChanges = Boolean(modelEditorState.isDirty);
+  const hasUnsavedChanges = isDirty || hasModelUnsavedChanges;
+  const closeDirtyLabels = [
+    isDirty ? "provider settings" : "",
+    hasModelUnsavedChanges ? "model list" : ""
+  ].filter(Boolean);
+  const closeDetails = [
+    isDirty && issue ? `Provider: ${issue}` : "",
+    hasModelUnsavedChanges && modelEditorState.issue ? `Models: ${modelEditorState.issue}` : ""
+  ].filter(Boolean).join(" ");
+  const saveAndCloseDisabled = locked
+    || (isDirty && Boolean(issue))
+    || (hasModelUnsavedChanges && (Boolean(modelEditorState.issue) || modelEditorState.locked))
+    || typeof onSaveAndCloseEditor !== "function";
 
   async function handleApplyClick() {
-    return onApplyProviderDetails(
+    const saved = await onApplyProviderDetails(
       provider.id,
-      isSubscription ? draft : { ...draft, endpoints: resolvedEndpoints, endpointDraft: "" }
+      providerDraftForSave
     );
+    if (saved) finalizeCloseEditModal();
+    return saved;
+  }
+
+  async function handleApplyModelsAndClose(rows) {
+    const saved = await onApplyProviderModels(provider.id, rows);
+    if (saved) finalizeCloseEditModal();
+    return saved;
   }
 
   function handleResetProviderDraft() {
     setDraft(initialDraft);
+  }
+
+  function finalizeCloseEditModal() {
+    setConfirmCloseOpen(false);
+    setEditOpen(false);
+    setEditTab("provider");
+    setEditFocusTarget("");
+    setDraft(initialDraft);
+    setModelEditorState({
+      isDirty: false,
+      issue: "",
+      locked: false,
+      rows: []
+    });
   }
 
   useEffect(() => {
@@ -3275,6 +5934,7 @@ function ProviderCard({
   }, [editOpen, editTab, editFocusTarget]);
 
   function handleOpenEditModal(tab = "provider", focusTarget = "") {
+    setConfirmCloseOpen(false);
     setEditTab(tab);
     setEditFocusTarget(focusTarget);
     if (tab === "models" && focusTarget === "models") {
@@ -3284,10 +5944,21 @@ function ProviderCard({
   }
 
   function handleCloseEditModal() {
-    setEditOpen(false);
-    setEditTab("provider");
-    setEditFocusTarget("");
-    setDraft(initialDraft);
+    if (hasUnsavedChanges) {
+      setConfirmCloseOpen(true);
+      return;
+    }
+    finalizeCloseEditModal();
+  }
+
+  async function handleSaveAndCloseEditModal() {
+    if (saveAndCloseDisabled) return;
+    const saved = await onSaveAndCloseEditor(provider.id, {
+      providerDraft: isDirty ? providerDraftForSave : null,
+      modelRows: hasModelUnsavedChanges ? modelEditorState.rows : null
+    });
+    if (!saved) return;
+    finalizeCloseEditModal();
   }
 
   return (
@@ -3334,9 +6005,8 @@ function ProviderCard({
               {modelIds.map((modelId) => (
                 <SummaryChipButton
                   key={`${provider.id}-${modelId}`}
-                  onClick={() => handleOpenEditModal("models", "models")}
-                  disabled={locked}
-                  title={`Edit models for ${provider.name || provider.id}`}
+                  onClick={() => onCopyModelId?.(modelId)}
+                  title={`Copy model id ${modelId}`}
                   className="max-w-full"
                 >
                   <span className="truncate">{modelId}</span>
@@ -3353,7 +6023,7 @@ function ProviderCard({
         title={`Edit · ${provider.id}`}
         description="Switch between provider settings and model list. Each tab saves independently."
         contentClassName="max-h-[92vh] max-w-5xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
-        bodyClassName="max-h-[calc(92vh-5.5rem)]"
+        bodyClassName="max-h-[calc(92vh-5.5rem)] pb-0"
       >
         <Tabs value={editTab} onValueChange={setEditTab}>
           <TabsList className="w-full justify-start">
@@ -3361,14 +6031,14 @@ function ProviderCard({
             <TabsTrigger value="models">Model list</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="provider" className="space-y-4">
+          <TabsContent forceMount value="provider" className={cn("space-y-4 pb-4", editTab !== "provider" ? "hidden" : null)}>
             <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Provider</div>
                   <div className="mt-1 text-sm text-muted-foreground">Update provider identity and connection settings here.</div>
                 </div>
-                <Badge variant="outline">{isSubscription ? "Subscription" : "API-based"}</Badge>
+                <Badge variant="outline">{isSubscription ? "Subscription" : "API Key"}</Badge>
               </div>
             </div>
 
@@ -3402,7 +6072,7 @@ function ProviderCard({
                       inputRef={endpointInputRef}
                       inputClassName="placeholder:text-muted-foreground/55"
                       placeholder="Click here to type new endpoint"
-                      helperText="Paste one or more candidate endpoints. Example for OpenAI-compatible providers: https://api.openai.com/v1"
+                      helperText="Paste one or more endpoints"
                     />
                   </Field>
                 </div>
@@ -3410,7 +6080,6 @@ function ProviderCard({
                   <div className="md:col-span-2 xl:col-span-4">
                     <Field
                       label="Rate limit"
-                      hint="Ids are generated from request and window values. Duplicate caps are blocked automatically."
                       stacked
                       headerAction={(
                         <Button
@@ -3449,7 +6118,7 @@ function ProviderCard({
             </div>
           </TabsContent>
 
-          <TabsContent value="models">
+          <TabsContent forceMount value="models" className={cn(editTab !== "models" ? "hidden" : null)}>
             <ProviderModelsEditor
               provider={provider}
               disabled={Boolean(disabledReason)}
@@ -3457,11 +6126,22 @@ function ProviderCard({
               busy={busy}
               framed={false}
               focusRequest={modelFocusRequest}
-              onApply={(rows) => onApplyProviderModels(provider.id, rows)}
+              onStateChange={setModelEditorState}
+              onApply={handleApplyModelsAndClose}
             />
           </TabsContent>
         </Tabs>
       </Modal>
+
+      <UnsavedChangesModal
+        open={confirmCloseOpen}
+        onKeepEditing={() => setConfirmCloseOpen(false)}
+        onDiscardAndClose={finalizeCloseEditModal}
+        onSaveAndClose={handleSaveAndCloseEditModal}
+        saveDisabled={saveAndCloseDisabled}
+        dirtyLabels={closeDirtyLabels}
+        details={closeDetails}
+      />
     </>
   );
 }
@@ -3469,8 +6149,10 @@ function ProviderCard({
 function ProviderList({
   providers,
   onRemove,
+  onCopyModelId,
   onApplyProviderDetails,
   onApplyProviderModels,
+  onSaveAndCloseEditor,
   disabledReason = "",
   busy = false
 }) {
@@ -3491,8 +6173,10 @@ function ProviderList({
           key={provider.id}
           provider={provider}
           onRemove={onRemove}
+          onCopyModelId={onCopyModelId}
           onApplyProviderDetails={onApplyProviderDetails}
           onApplyProviderModels={onApplyProviderModels}
+          onSaveAndCloseEditor={onSaveAndCloseEditor}
           disabledReason={disabledReason}
           busy={busy}
         />
@@ -3505,8 +6189,10 @@ function ProviderModelsSection({
   providers,
   onAddProvider,
   onRemove,
+  onCopyModelId,
   onApplyProviderDetails,
   onApplyProviderModels,
+  onSaveAndCloseEditor,
   disabledReason = "",
   busy = false
 }) {
@@ -3523,8 +6209,10 @@ function ProviderModelsSection({
         <ProviderList
           providers={providers}
           onRemove={onRemove}
+          onCopyModelId={onCopyModelId}
           onApplyProviderDetails={onApplyProviderDetails}
           onApplyProviderModels={onApplyProviderModels}
+          onSaveAndCloseEditor={onSaveAndCloseEditor}
           disabledReason={disabledReason}
           busy={busy}
         />
@@ -3533,49 +6221,21 @@ function ProviderModelsSection({
   );
 }
 
-function ConnectionFilePathsCard({
-  primaryLabel = "Config file",
-  primaryPath = "",
-  secondaryLabel = "Backup file",
-  secondaryPath = "",
-  endpointUrl = ""
-}) {
-  return (
-    <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
-      <div className="grid gap-3 xl:grid-cols-2">
-        <div>
-          <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">{primaryLabel}</div>
-          <div className="mt-2 break-all rounded-xl border border-border/70 bg-background px-3 py-3 font-mono text-xs text-foreground">
-            {primaryPath || "Not resolved"}
-          </div>
-        </div>
-        <div>
-          <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">{secondaryLabel}</div>
-          <div className="mt-2 break-all rounded-xl border border-border/70 bg-background px-3 py-3 font-mono text-xs text-foreground">
-            {secondaryPath || "Not resolved"}
-          </div>
-        </div>
-      </div>
-      <div className="mt-3 text-xs text-muted-foreground">
-        Endpoint: <span className="font-mono">{endpointUrl || "Router URL not ready yet"}</span>
-      </div>
-    </div>
-  );
-}
-
 function AmpSettingsPanel({
   rows,
   routeOptions,
+  webSearchSnapshot,
   ampClientUrl,
   ampClientGlobal,
   routingBusy,
-  openAmpConfigBusy,
   onToggleGlobalRouting,
-  onOpenAmpConfigFile,
   onInboundChange,
   onOutboundChange,
   onCreateEntry,
   onRemoveEntry,
+  onOpenWebSearchTab,
+  onOpenConfigPath,
+  onOpenSecretsPath,
   hasMasterKey,
   disabledReason,
   autosaveState
@@ -3588,11 +6248,15 @@ function AmpSettingsPanel({
   const globalRoutingEnabled = ampClientGlobal?.routedViaRouter === true;
   const globalRoutingError = String(ampClientGlobal?.error || "").trim();
   const canEnableGlobalRouting = Boolean(hasMasterKey && ampClientUrl && !disabledReason && !globalRoutingError);
+  const configuredSearchProviderCount = Number(webSearchSnapshot?.configuredProviderCount) || 0;
+  const showWebSearchWarning = globalRoutingEnabled && configuredSearchProviderCount === 0;
 
   const statusVariant = disabledReason
     ? "warning"
     : autosaveState.status === "error"
       ? "danger"
+      : autosaveState.status === "pending"
+        ? "outline"
       : autosaveState.status === "saving"
         ? "info"
         : autosaveState.savedAt
@@ -3603,16 +6267,22 @@ function AmpSettingsPanel({
     ? "Needs review"
     : autosaveState.status === "error"
       ? "Save failed"
-      : autosaveState.status === "saving"
-        ? "Auto-saving"
+        : autosaveState.status === "pending"
+          ? "Unsaved"
+        : autosaveState.status === "saving"
+          ? "saving..."
         : autosaveState.savedAt
-          ? "Auto-saved"
+          ? "Saved"
           : "Ready";
 
   const statusMessage = disabledReason
     ? disabledReason
     : autosaveState.status === "error"
       ? autosaveState.message
+      : autosaveState.status === "pending"
+        ? "Unsaved changes queued. Auto-save will run shortly."
+      : autosaveState.status === "saving"
+        ? "Saving changes..."
       : autosaveState.savedAt
         ? `Last saved ${formatTime(autosaveState.savedAt)}.`
         : "AMP route changes auto-save after valid edits.";
@@ -3635,17 +6305,22 @@ function AmpSettingsPanel({
   return (
     <div className="grid gap-4">
       <Card>
-        <CardHeader className="flex flex-row items-start justify-between gap-3 p-4 pb-0">
-          <div className="space-y-1">
-            <CardTitle>Use AMP via LLM-Router</CardTitle>
-            <CardDescription className="text-xs leading-5">
-              {globalRoutingEnabled ? "Connected" : "Not connected"}
-            </CardDescription>
+        <CardHeader className="flex flex-col gap-3 p-4 pb-0 sm:flex-row sm:items-start sm:justify-between">
+          <div className="space-y-2">
+            <CardTitle className="flex items-center gap-2">
+              <span>Use AMP via LLM Router</span>
+            </CardTitle>
+            <ConnectionStatusChipRow
+              primaryLabel="Config file"
+              primaryValue={ampClientGlobal?.settingsFilePath || ""}
+              onOpenPrimary={onOpenConfigPath}
+              secondaryLabel="Secrets file"
+              secondaryValue={ampClientGlobal?.secretsFilePath || ""}
+              secondaryIcon={<SecretFileIcon className="h-3 w-3" />}
+              onOpenSecondary={onOpenSecretsPath}
+            />
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <Button type="button" size="sm" variant="outline" onClick={onOpenAmpConfigFile} disabled={openAmpConfigBusy}>
-              {openAmpConfigBusy ? "Opening…" : "Open AMP Config File"}
-            </Button>
             <Button
               type="button"
               size="sm"
@@ -3673,13 +6348,16 @@ function AmpSettingsPanel({
           </div>
         ) : null}
 
-        <ConnectionFilePathsCard
-          primaryLabel="Config file"
-          primaryPath={ampClientGlobal?.settingsFilePath || ""}
-          secondaryLabel="Secrets file"
-          secondaryPath={ampClientGlobal?.secretsFilePath || ""}
-          endpointUrl={ampClientGlobal?.configuredUrl || ampClientUrl}
-        />
+        {showWebSearchWarning ? (
+          <div className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <div className="max-w-3xl">
+              AMP is connected, but no alternative web search provider is configured. AMP web search is only available through the shared Web Search tab.
+            </div>
+            <Button type="button" size="sm" variant="outline" onClick={onOpenWebSearchTab}>
+              Open Web Search
+            </Button>
+          </div>
+        ) : null}
 
         {disabledReason ? (
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">{disabledReason}</div>
@@ -3693,7 +6371,7 @@ function AmpSettingsPanel({
                 <div className="flex flex-wrap items-center gap-2">
                   <Badge variant={statusVariant}>{statusLabel}</Badge>
                   <Badge variant="outline">{rows.length} routes</Badge>
-                  <Button type="button" size="sm" variant="outline" onClick={handleOpenAddEntry}>Add route mapping</Button>
+                  <Button type="button" size="sm" onClick={handleOpenAddEntry}>Add custom mapping</Button>
                 </div>
               </div>
               <div className="text-xs text-muted-foreground">{statusMessage}</div>
@@ -3721,21 +6399,16 @@ function AmpSettingsPanel({
                       />
                     </Field>
 
-                    <Field label="Route target" hint="Alias or provider/model route in llm-router">
+                    <Field label="Route target" hint="Alias or provider/model route in LLM Router">
                       <Select value={newOutbound || undefined} onValueChange={setNewOutbound}>
                         <SelectTrigger>
                           <SelectValue placeholder="Select local route" />
                         </SelectTrigger>
                         <SelectContent>
-                          {routeOptions.map((option) => (
-                            <SelectItem
-                              key={option.value}
-                              value={option.value}
-                              searchText={`${option.label || ""} ${option.value || ""} ${option.hint || ""}`}
-                            >
-                              {`${option.label} · ${option.hint}`}
-                            </SelectItem>
-                          ))}
+                          {renderSelectOptionNodes(routeOptions, {
+                            keyPrefix: "amp-route-create",
+                            includeHint: true
+                          })}
                         </SelectContent>
                       </Select>
                     </Field>
@@ -3757,10 +6430,16 @@ function AmpSettingsPanel({
                       </div>
 
                       <Field label="Inbound wildcard" hint={row.defaultMatch ? `Default: ${row.defaultMatch}` : "AMP model pattern"}>
-                        <Input
+                        <BufferedTextInput
+                          commitOnBlur
                           value={row.inbound}
-                          onChange={(event) => onInboundChange(row.id, event.target.value)}
+                          onValueCommit={(value) => onInboundChange(row.id, value)}
                           placeholder={row.defaultMatch || "gpt-*-codex*"}
+                          onKeyDown={(event) => {
+                            if (event.key !== "Enter") return;
+                            event.preventDefault();
+                            event.currentTarget.blur();
+                          }}
                         />
                       </Field>
 
@@ -3771,15 +6450,10 @@ function AmpSettingsPanel({
                           </SelectTrigger>
                           <SelectContent>
                             {!row.removable ? <SelectItem value="__default__">Use default route</SelectItem> : null}
-                            {routeOptions.map((option) => (
-                              <SelectItem
-                                key={option.value}
-                                value={option.value}
-                                searchText={`${option.label || ""} ${option.value || ""} ${option.hint || ""}`}
-                              >
-                                {`${option.label} · ${option.hint}`}
-                              </SelectItem>
-                            ))}
+                            {renderSelectOptionNodes(routeOptions, {
+                              keyPrefix: `amp-route-${row.id}`,
+                              includeHint: true
+                            })}
                           </SelectContent>
                         </Select>
                       </Field>
@@ -3795,43 +6469,449 @@ function AmpSettingsPanel({
   );
 }
 
+function HostedWebSearchEndpointModal({
+  open = false,
+  onClose = () => {},
+  candidates = [],
+  onTestAndAdd = async () => {},
+  disabledReason = ""
+}) {
+  const [selectedProviderId, setSelectedProviderId] = useState("");
+  const [selectedModelId, setSelectedModelId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [issue, setIssue] = useState("");
+  const providerOptions = Array.isArray(candidates) ? candidates : [];
+  const selectedProvider = providerOptions.find((provider) => provider.providerId === selectedProviderId) || providerOptions[0] || null;
+  const modelOptions = Array.isArray(selectedProvider?.models) ? selectedProvider.models : [];
+
+  useEffect(() => {
+    if (!open) {
+      setBusy(false);
+      setIssue("");
+      return;
+    }
+
+    const defaultProviderId = providerOptions[0]?.providerId || "";
+    setSelectedProviderId((current) => {
+      const currentExists = providerOptions.some((provider) => provider.providerId === current);
+      return currentExists ? current : defaultProviderId;
+    });
+  }, [open, providerOptions]);
+
+  useEffect(() => {
+    const nextModelId = modelOptions[0]?.value || "";
+    setSelectedModelId((current) => {
+      const currentExists = modelOptions.some((model) => model.value === current);
+      return currentExists ? current : nextModelId;
+    });
+  }, [modelOptions]);
+
+  const routeId = buildHostedWebSearchProviderId(selectedProviderId, selectedModelId);
+  const canSubmit = open && !busy && !disabledReason && selectedProviderId && selectedModelId;
+
+  async function handleSubmit() {
+    if (!canSubmit) return;
+    setBusy(true);
+    setIssue("");
+    try {
+      await onTestAndAdd({
+        providerId: selectedProviderId,
+        modelId: selectedModelId
+      });
+      onClose();
+    } catch (error) {
+      setIssue(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        if (busy) return;
+        onClose();
+      }}
+      title="Add ChatGPT Search Endpoint"
+      description="Choose a configured OpenAI-compatible GPT route. Test runs a live Responses API request with the native web search tool, then saves the route on success."
+      contentClassName="max-h-[92vh] max-w-3xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
+      showCloseButton={false}
+      footer={(
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={() => void handleSubmit()} disabled={!canSubmit}>
+            {busy ? "Testing…" : "Test connection"}
+          </Button>
+        </div>
+      )}
+    >
+      <div className="space-y-4">
+        {disabledReason ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            {disabledReason}
+          </div>
+        ) : null}
+
+        {!disabledReason && providerOptions.length === 0 ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            No configured OpenAI-compatible GPT providers are available yet. Add a provider with a GPT model first.
+          </div>
+        ) : null}
+
+        {providerOptions.length > 0 ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            <Field label="Provider" hint="Configured provider or ChatGPT subscription" stacked>
+              <Select value={selectedProviderId || undefined} onValueChange={setSelectedProviderId} disabled={busy || Boolean(disabledReason)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose provider" />
+                </SelectTrigger>
+                <SelectContent>
+                  {providerOptions.map((provider) => (
+                    <SelectItem key={provider.providerId} value={provider.providerId}>
+                      {provider.providerLabel}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+
+            <Field label="GPT model" hint="Only GPT models on OpenAI-compatible routes are listed" stacked>
+              <Select value={selectedModelId || undefined} onValueChange={setSelectedModelId} disabled={busy || Boolean(disabledReason) || modelOptions.length === 0}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {modelOptions.map((model) => (
+                    <SelectItem key={model.routeId} value={model.value}>
+                      {model.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
+        ) : null}
+
+        {routeId ? (
+          <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3">
+            <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Saved route id</div>
+            <div className="mt-1 text-sm font-medium text-foreground">{routeId}</div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">This route stores only the provider/model reference. No separate API key or quota is saved here.</div>
+          </div>
+        ) : null}
+
+        {issue ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            {issue}
+          </div>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
+function WebSearchSettingsPanel({
+  webSearchConfig,
+  webSearchProviders,
+  hostedSearchCandidates,
+  onWebSearchStrategyChange,
+  onWebSearchProviderChange,
+  onWebSearchProviderMove,
+  onRemoveWebSearchProvider,
+  onAddHostedSearchEndpoint,
+  disabledReason,
+  autosaveState
+}) {
+  const [hostedSearchModalOpen, setHostedSearchModalOpen] = useState(false);
+  const searchStrategy = String(webSearchConfig?.strategy || "ordered").trim() === "quota-balance" ? "quota-balance" : "ordered";
+  const canAddHostedSearchEndpoint = Array.isArray(hostedSearchCandidates) && hostedSearchCandidates.some((provider) => Array.isArray(provider?.models) && provider.models.length > 0);
+  const statusMessage = disabledReason
+    ? disabledReason
+    : autosaveState.status === "error"
+      ? autosaveState.message
+      : autosaveState.status === "pending"
+        ? "Unsaved changes queued. Auto-save will run shortly."
+      : autosaveState.status === "saving"
+        ? "Saving changes..."
+      : autosaveState.savedAt
+        ? `Last saved ${formatTime(autosaveState.savedAt)}.`
+        : "";
+
+  return (
+    <>
+      <Card>
+        <CardHeader className="flex flex-col gap-4 p-4 pb-0 xl:flex-row xl:items-start xl:justify-between">
+          <div className="space-y-1">
+            <CardTitle>Web Search</CardTitle>
+            <CardDescription className="text-xs leading-5">
+              Shared web search routing for AMP and other router-managed tools.
+            </CardDescription>
+            {statusMessage ? <div className="text-xs text-muted-foreground">{statusMessage}</div> : null}
+          </div>
+
+          <div className="flex w-full shrink-0 flex-wrap items-end justify-end gap-3 xl:w-auto">
+            <div className="min-w-[12rem] space-y-1">
+              <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Routing strategy</div>
+              <Select value={searchStrategy} onValueChange={onWebSearchStrategyChange} disabled={Boolean(disabledReason)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose strategy" />
+                </SelectTrigger>
+                <SelectContent>
+                  {AMP_WEB_SEARCH_STRATEGY_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <Button
+              type="button"
+              variant="outline"
+              className="gap-2"
+              onClick={() => setHostedSearchModalOpen(true)}
+              disabled={Boolean(disabledReason) || !canAddHostedSearchEndpoint}
+            >
+              <PlusIcon className="h-3.5 w-3.5" />
+              <span>Endpoint</span>
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4 p-4">
+          <div className="space-y-3">
+            {(webSearchProviders || []).map((provider) => {
+              if (provider.kind === "hosted") {
+                const runtimeIssue = provider.runtimeState && provider.runtimeState.ready === false
+                  ? "This provider/model route is no longer available or is not OpenAI-compatible."
+                  : "";
+                return (
+                  <div key={provider.key} className="rounded-2xl border border-border/70 bg-background/80 p-4">
+                    <div className="flex flex-col gap-4">
+                      <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <ProviderStatusDot active={provider.active} />
+                            <div className="text-sm font-medium text-foreground">{provider.label}</div>
+                            <Badge variant="outline">GPT Search</Badge>
+                          </div>
+                          <div className="mt-1 text-xs break-all text-muted-foreground">{provider.routeId}</div>
+                          <div className="mt-2 text-xs leading-5 text-muted-foreground">Uses the provider&apos;s native OpenAI Responses web search tool. No local API key or quota is stored here.</div>
+                        </div>
+                        <div className="flex items-center gap-2 self-start">
+                          <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-background/70 p-1">
+                            <MoveUpButton
+                              disabled={Boolean(disabledReason) || provider.displayIndex <= 0}
+                              label={`Move ${provider.routeId} up`}
+                              onClick={() => onWebSearchProviderMove(provider.id, "up")}
+                            />
+                            <MoveDownButton
+                              disabled={Boolean(disabledReason) || provider.displayIndex >= provider.displayCount - 1}
+                              label={`Move ${provider.routeId} down`}
+                              onClick={() => onWebSearchProviderMove(provider.id, "down")}
+                            />
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => onRemoveWebSearchProvider(provider.id)}
+                            disabled={Boolean(disabledReason)}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      </div>
+
+                      {runtimeIssue ? (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                          {runtimeIssue}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              }
+
+              const credentialField = provider.credentialField;
+              const credentialValue = String(provider?.credentialValue || "").trim();
+              return (
+                <div key={provider.key} className="rounded-2xl border border-border/70 bg-background/80 p-4">
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <ProviderStatusDot active={provider.active} />
+                          <div className="text-sm font-medium text-foreground">{provider.label}</div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 self-start rounded-xl border border-border/70 bg-background/70 p-1">
+                        <MoveUpButton
+                          disabled={Boolean(disabledReason) || provider.displayIndex <= 0}
+                          label={`Move ${provider.label} up`}
+                          onClick={() => onWebSearchProviderMove(provider.id, "up")}
+                        />
+                        <MoveDownButton
+                          disabled={Boolean(disabledReason) || provider.displayIndex >= provider.displayCount - 1}
+                          label={`Move ${provider.label} down`}
+                          onClick={() => onWebSearchProviderMove(provider.id, "down")}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid gap-3 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.35fr)]">
+                      <Field
+                        label={provider.credentialLabel}
+                        hint={provider.credentialField === "url" ? "Required to enable this backend." : "Required to enable this backend. Stored in router config."}
+                        stacked
+                        className="gap-1"
+                        headerClassName="min-h-0"
+                        hintClassName="leading-4"
+                      >
+                        <BufferedTextInput
+                          type={provider.credentialField === "url" ? "text" : "password"}
+                          autoComplete="off"
+                          value={credentialValue}
+                          placeholder={provider.credentialPlaceholder}
+                          onValueChange={(value) => onWebSearchProviderChange(provider.id, credentialField, value)}
+                          disabled={Boolean(disabledReason)}
+                        />
+                      </Field>
+
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <Field
+                          label="Result per call"
+                          hint="Empty keeps the default of 5."
+                          stacked
+                          className="gap-1"
+                          headerClassName="min-h-0"
+                          hintClassName="leading-4"
+                        >
+                          <TransientIntegerInput
+                            value={provider.resultPerCallInput}
+                            placeholder="Default: 5"
+                            allowEmptyCommit
+                            onValueChange={(value) => onWebSearchProviderChange(provider.id, "count", value)}
+                            disabled={Boolean(disabledReason)}
+                          />
+                        </Field>
+
+                        <Field
+                          label="Monthly limit"
+                          hint="0 keeps quotas self-managed."
+                          stacked
+                          className="gap-1"
+                          headerClassName="min-h-0"
+                          hintClassName="leading-4"
+                        >
+                          <TransientIntegerInput
+                            value={String(provider.limit || 0)}
+                            onValueChange={(value) => onWebSearchProviderChange(provider.id, "limit", value)}
+                            disabled={Boolean(disabledReason)}
+                          />
+                        </Field>
+
+                        <Field
+                          label="Synced remaining"
+                          hint="Adjust after manual upstream sync."
+                          stacked
+                          className="gap-1"
+                          headerClassName="min-h-0"
+                          hintClassName="leading-4"
+                        >
+                          <TransientIntegerInput
+                            value={String(provider.remaining || 0)}
+                            onValueChange={(value) => onWebSearchProviderChange(provider.id, "remaining", value)}
+                            disabled={Boolean(disabledReason)}
+                          />
+                        </Field>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </CardContent>
+      </Card>
+
+      <HostedWebSearchEndpointModal
+        open={hostedSearchModalOpen}
+        onClose={() => setHostedSearchModalOpen(false)}
+        candidates={hostedSearchCandidates}
+        onTestAndAdd={onAddHostedSearchEndpoint}
+        disabledReason={disabledReason}
+      />
+    </>
+  );
+}
+
 function CodingToolSettingsPanel({
   toolName,
-  openButtonLabel,
   toolState,
   endpointUrl,
   routeOptions,
   connectionBusy,
   bindingBusy,
-  openConfigBusy,
   onToggleRouting,
-  onOpenConfigFile,
   onBindingChange,
   hasMasterKey,
   disabledReason,
-  bindingFields = []
+  onOpenPrimaryPath,
+  onOpenSecondaryPath,
+  secondaryPathLabel = "Backup file",
+  secondaryPathIcon = <BackupFileIcon className="h-3 w-3" />,
+  bindingFields = [],
+  guideContent = null
 }) {
   const routingEnabled = toolState?.routedViaRouter === true;
   const routingError = String(toolState?.error || "").trim();
   const canEnableRouting = Boolean(hasMasterKey && endpointUrl && !disabledReason && !routingError);
+  const currentManagedBindingValues = useMemo(() => {
+    const reservedValues = new Set(["__unset__"]);
+    for (const field of bindingFields) {
+      for (const option of (Array.isArray(field?.extraOptions) ? field.extraOptions : [])) {
+        const value = String(option?.value || "").trim();
+        if (value) reservedValues.add(value);
+      }
+      for (const option of (Array.isArray(field?.options) ? field.options : [])) {
+        const value = String(option?.value || "").trim();
+        if (value) reservedValues.add(value);
+      }
+    }
+
+    return bindingFields
+      .filter((field) => field?.usesRouteOptions !== false)
+      .map((field) => String(field?.value || "").trim())
+      .filter((value) => value && !reservedValues.has(value));
+  }, [bindingFields]);
   const resolvedRouteOptions = withCurrentManagedRouteOptions(
     routeOptions,
-    bindingFields.map((field) => field?.value)
+    currentManagedBindingValues
   );
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-start justify-between gap-3 p-4 pb-0">
-        <div className="space-y-1">
-          <CardTitle>{`Use ${toolName} via LLM-Router`}</CardTitle>
-          <CardDescription className="text-xs leading-5">
-            {routingEnabled ? "Connected" : "Not connected"}
-          </CardDescription>
+      <CardHeader className="flex flex-col gap-3 p-4 pb-0 sm:flex-row sm:items-start sm:justify-between">
+        <div className="space-y-2">
+          <CardTitle className="flex items-center gap-2">
+            <span>{`Use ${toolName} via LLM Router`}</span>
+          </CardTitle>
+          <ConnectionStatusChipRow
+            primaryLabel="Config file"
+            primaryValue={toolState?.configFilePath || toolState?.settingsFilePath || ""}
+            onOpenPrimary={onOpenPrimaryPath}
+            secondaryLabel={secondaryPathLabel}
+            secondaryValue={toolState?.backupFilePath || ""}
+            secondaryIcon={secondaryPathIcon}
+            onOpenSecondary={onOpenSecondaryPath}
+          />
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <Button type="button" size="sm" variant="outline" onClick={onOpenConfigFile} disabled={openConfigBusy}>
-            {openConfigBusy ? "Opening…" : openButtonLabel}
-          </Button>
+          {guideContent ? <PanelGuideButton guideContent={guideContent} /> : null}
           <Button
             type="button"
             size="sm"
@@ -3862,31 +6942,17 @@ function CodingToolSettingsPanel({
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">{disabledReason}</div>
         ) : null}
 
-        <ConnectionFilePathsCard
-          primaryLabel="Config file"
-          primaryPath={toolState?.configFilePath || toolState?.settingsFilePath || ""}
-          secondaryLabel="Backup file"
-          secondaryPath={toolState?.backupFilePath || ""}
-          endpointUrl={endpointUrl}
-        />
-
         <div className="rounded-2xl border border-border/70 bg-background/60 p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
             <div>
               <div className="text-sm font-medium text-foreground">Model bindings</div>
-              <div className="mt-1 text-xs text-muted-foreground">Prefer LLM-Router aliases here so you can retarget models later from the Alias &amp; Fallback tab.</div>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge variant={routingEnabled ? "success" : "outline"}>
-                {routingEnabled ? "Managed by router" : "Connect first"}
-              </Badge>
-              <Badge variant="outline">{resolvedRouteOptions.length} route options</Badge>
+              <div className="mt-1 text-xs text-muted-foreground">Prefer LLM Router aliases here so you can retarget models later from the Alias &amp; Fallback tab.</div>
             </div>
           </div>
 
-          {resolvedRouteOptions.length === 0 ? (
+          {bindingFields.length === 0 ? (
             <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-              Add at least one alias or provider/model route before choosing tool-specific model bindings.
+              No tool bindings are available yet.
             </div>
           ) : (
             <div className="mt-4 grid gap-3">
@@ -3898,10 +6964,10 @@ function CodingToolSettingsPanel({
                       <Badge variant="outline">{field.envKey}</Badge>
                     </div>
                     <div className="mb-3 text-xs leading-5 text-muted-foreground">{field.description}</div>
-                    <BindingRouteSelect
+                    <BindingValueSelect
                       field={field}
-                      options={resolvedRouteOptions}
-                      disabled={!routingEnabled || bindingBusy || resolvedRouteOptions.length === 0}
+                      routeOptions={resolvedRouteOptions}
+                      disabled={!routingEnabled || bindingBusy}
                       onValueChange={(value) => onBindingChange(field.id, value === "__unset__" ? "" : value)}
                     />
                   </div>
@@ -3915,34 +6981,179 @@ function CodingToolSettingsPanel({
   );
 }
 
-function BindingRouteSelect({
+function getGuideCalloutClasses(variant = "outline") {
+  switch (variant) {
+    case "success":
+      return "border-emerald-200 bg-emerald-50";
+    case "warning":
+      return "border-amber-200 bg-amber-50";
+    case "danger":
+      return "border-rose-200 bg-rose-50";
+    case "info":
+      return "border-sky-200 bg-sky-50";
+    default:
+      return "border-border/70 bg-background/70";
+  }
+}
+
+function getGuideCalloutTextClasses(variant = "outline") {
+  switch (variant) {
+    case "success":
+      return "text-emerald-950";
+    case "warning":
+      return "text-amber-950";
+    case "danger":
+      return "text-rose-950";
+    case "info":
+      return "text-sky-950";
+    default:
+      return "text-foreground";
+  }
+}
+
+function PanelGuideButton({
+  guideContent
+}) {
+  const [open, setOpen] = useState(false);
+  const title = String(guideContent?.title || "").trim() || "Guide";
+  const description = String(guideContent?.description || "").trim();
+  const badges = Array.isArray(guideContent?.badges)
+    ? guideContent.badges.filter(Boolean)
+    : [];
+  const highlights = Array.isArray(guideContent?.highlights)
+    ? guideContent.highlights.filter(Boolean)
+    : [];
+  const sections = Array.isArray(guideContent?.sections)
+    ? guideContent.sections.filter(Boolean)
+    : [];
+  const callout = guideContent?.callout && guideContent.callout.body
+    ? guideContent.callout
+    : null;
+  const calloutVariant = callout?.variant || "outline";
+
+  if (highlights.length === 0 && sections.length === 0 && !callout) return null;
+
+  return (
+    <>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        aria-label={title}
+        onClick={() => setOpen(true)}
+      >
+        Guide
+      </Button>
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        title={title}
+        description={description}
+        contentClassName="max-h-[92vh] max-w-4xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
+        bodyClassName="max-h-[calc(92vh-5.5rem)]"
+      >
+        <div className="space-y-4">
+          {badges.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-2">
+              {badges.map((badge, index) => (
+                <Badge
+                  key={`${title}-badge-${index}`}
+                  variant={badge?.variant || "outline"}
+                >
+                  {badge?.label}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+
+          {callout ? (
+            <div className={cn("rounded-2xl border p-4", getGuideCalloutClasses(calloutVariant))}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant={["success", "warning", "danger", "info"].includes(calloutVariant) ? calloutVariant : "outline"}>
+                  {calloutVariant === "success"
+                    ? "Current best fit"
+                    : calloutVariant === "warning"
+                      ? "Needs attention"
+                      : calloutVariant === "info"
+                        ? "Current behavior"
+                        : "Guide note"}
+                </Badge>
+                <div className={cn("text-sm font-medium", getGuideCalloutTextClasses(calloutVariant))}>
+                  {callout.title}
+                </div>
+              </div>
+              <div className={cn("mt-3 text-sm leading-6", getGuideCalloutTextClasses(calloutVariant))}>
+                {callout.body}
+              </div>
+            </div>
+          ) : null}
+
+          {highlights.length > 0 ? (
+            <div className={cn("grid gap-4", highlights.length > 2 ? "md:grid-cols-3" : "md:grid-cols-2")}>
+              {highlights.map((entry, index) => (
+                <div key={`${title}-highlight-${index}`} className="rounded-2xl border border-border/70 bg-background/70 p-4">
+                  {entry?.eyebrow ? (
+                    <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">{entry.eyebrow}</div>
+                  ) : null}
+                  <div className="mt-2 text-sm font-medium text-foreground">{entry?.title}</div>
+                  <div className="mt-2 text-sm leading-6 text-muted-foreground">{entry?.body}</div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {sections.map((section, sectionIndex) => {
+            const items = Array.isArray(section?.items) ? section.items.filter(Boolean) : [];
+            return (
+              <div key={`${title}-section-${sectionIndex}`} className="rounded-2xl border border-border/70 bg-background/70 p-4">
+                <div className="text-sm font-medium text-foreground">{section?.title}</div>
+                {section?.description ? (
+                  <div className="mt-2 text-sm leading-6 text-muted-foreground">{section.description}</div>
+                ) : null}
+                {items.length > 0 ? (
+                  <div className="mt-3 space-y-3">
+                    {items.map((item, itemIndex) => (
+                      <div key={`${title}-section-${sectionIndex}-item-${itemIndex}`} className="flex gap-3 text-sm leading-6 text-foreground">
+                        <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-foreground/50" />
+                        <div className="min-w-0">{item}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+function BindingValueSelect({
   field,
-  options,
+  routeOptions,
   disabled = false,
   onValueChange
 }) {
   const selectValue = String(field?.value || "").trim() || (field?.allowUnset ? "__unset__" : "");
   const selectOptions = useMemo(() => {
+    const routeDrivenOptions = field?.usesRouteOptions === false ? [] : routeOptions;
+    const explicitOptions = Array.isArray(field?.options) ? field.options : [];
+    const extraOptions = Array.isArray(field?.extraOptions) ? field.extraOptions : [];
     return field?.allowUnset
-      ? [{ value: "__unset__", label: "Inherit tool default", hint: "" }, ...options]
-      : [...options];
-  }, [field?.allowUnset, options]);
+      ? [{ value: "__unset__", label: "Inherit tool default", hint: "" }, ...extraOptions, ...explicitOptions, ...routeDrivenOptions]
+      : [...extraOptions, ...explicitOptions, ...routeDrivenOptions];
+  }, [field?.allowUnset, field?.extraOptions, field?.options, field?.usesRouteOptions, routeOptions]);
 
   return (
-    <Select value={selectValue} onValueChange={onValueChange} disabled={disabled}>
+    <Select value={selectValue} onValueChange={onValueChange} disabled={disabled || selectOptions.length === 0}>
       <SelectTrigger>
         <SelectValue placeholder={field.placeholder || "Select a route"} />
       </SelectTrigger>
       <SelectContent>
-        {selectOptions.length > 0 ? selectOptions.map((option) => (
-          <SelectItem
-            key={`${field.id}-${option.value}`}
-            value={option.value}
-            searchText={`${option.label || ""} ${option.value || ""} ${option.hint || ""}`}
-          >
-            {option.label}
-          </SelectItem>
-        )) : (
+        {selectOptions.length > 0 ? renderSelectOptionNodes(selectOptions, {
+          keyPrefix: field.id || "binding-option"
+        }) : (
           <SelectItem value="__no-route-options" disabled>No routes available</SelectItem>
         )}
       </SelectContent>
@@ -3950,27 +7161,82 @@ function BindingRouteSelect({
   );
 }
 
-function LogList({ logs }) {
+function LogList({
+  logs,
+  activityLogEnabled = true,
+  activityFilter = "usage",
+  busyAction = "",
+  onActivityFilterChange,
+  onToggleEnabled,
+  onClear
+}) {
+  const normalizedLogs = Array.isArray(logs) ? logs : [];
+  const filteredLogs = normalizedLogs.filter((entry) => activityFilter === "all"
+    ? true
+    : getActivityEntryCategory(entry) === activityFilter);
+  const activeCategoryMeta = ACTIVITY_CATEGORY_META[activityFilter] || ACTIVITY_CATEGORY_META.usage;
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Activity</CardTitle>
-        <CardDescription>Router actions, live reloads, saves, and config tests stream here.</CardDescription>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="space-y-1">
+            <CardTitle>Activity</CardTitle>
+            <CardDescription>
+              {activityLogEnabled
+                ? "Router actions, request fallbacks, and runtime issues stream here."
+                : "Activity logging is paused. Re-enable it to capture router actions, request fallbacks, and runtime issues."}
+            </CardDescription>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <div className="min-w-[13rem]">
+              <Select value={activityFilter} onValueChange={onActivityFilterChange} searchEnabled={false}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Filter category" />
+                </SelectTrigger>
+                <SelectContent>
+                  {ACTIVITY_FILTER_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button type="button" size="sm" variant="outline" onClick={onClear} disabled={busyAction !== "" || !logs?.length}>
+              {busyAction === "clear" ? "Clearing…" : "Clear log"}
+            </Button>
+            <Button type="button" size="sm" variant={activityLogEnabled ? "outline" : "default"} onClick={onToggleEnabled} disabled={busyAction !== ""}>
+              {busyAction === "toggle"
+                ? "Updating…"
+                : (activityLogEnabled ? "Disable log" : "Enable log")}
+            </Button>
+          </div>
+        </div>
       </CardHeader>
       <CardContent>
         <div className="max-h-[32rem] space-y-3 overflow-auto pr-1">
-          {logs?.length ? logs.map((entry) => (
+          {filteredLogs.length ? filteredLogs.map((entry) => {
+            const category = getActivityEntryCategory(entry);
+            const categoryMeta = ACTIVITY_CATEGORY_META[category] || ACTIVITY_CATEGORY_META.usage;
+            return (
             <div key={entry.id} className="rounded-2xl border border-border/70 bg-background/80 px-4 py-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <span className={cn("inline-flex h-2.5 w-2.5 rounded-full ring-4", LOG_LEVEL_STYLES[entry.level] || LOG_LEVEL_STYLES.info)} />
+                  <Badge variant={categoryMeta.badgeVariant}>{categoryMeta.label}</Badge>
                   <span className="text-sm font-medium text-foreground">{entry.message}</span>
                 </div>
                 <span className="text-xs text-muted-foreground">{formatTime(entry.time)}</span>
               </div>
               {entry.detail ? <div className="mt-2 text-sm leading-6 text-muted-foreground">{entry.detail}</div> : null}
             </div>
-          )) : (
+            );
+          }) : normalizedLogs.length ? (
+            <div className="rounded-2xl border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
+              No {activeCategoryMeta.emptyLabel} activity matches the current filter. Switch the dropdown to inspect the hidden categories.
+            </div>
+          ) : (
             <div className="rounded-2xl border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
               Activity is quiet. Save config changes or start the router to populate this stream.
             </div>
@@ -4374,8 +7640,12 @@ function RateLimitModelSelector({
       </div>
 
       {open ? (
-        <div
-          className="absolute bottom-full left-0 right-0 z-30 mb-1 rounded-xl border border-border/70 bg-popover p-2 shadow-lg"
+        <AdaptiveDropdownPanel
+          open={open}
+          anchorRef={rootRef}
+          preferredSide="top"
+          desiredHeight={192}
+          className="p-2"
           onMouseDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => {
@@ -4396,7 +7666,7 @@ function RateLimitModelSelector({
           </label>
           <div className="my-1 border-t border-border/70" />
           {knownModelIds.length > 0 ? (
-            <div className="max-h-48 overflow-y-auto">
+            <div>
               {knownModelIds.map((modelId) => (
                 <label key={modelId} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-sm text-foreground transition hover:bg-secondary/60">
                   <input
@@ -4412,7 +7682,7 @@ function RateLimitModelSelector({
           ) : (
             <div className="px-2 py-2 text-sm text-muted-foreground">No models available yet.</div>
           )}
-        </div>
+        </AdaptiveDropdownPanel>
       ) : null}
     </div>
   );
@@ -4424,7 +7694,7 @@ function RateLimitBucketsEditor({
   availableModelIds = [],
   disabled = false,
   inputRef = null,
-  helperText = "Leave models empty to apply the cap to all model.",
+  helperText = "",
   onValidBlur = null
 }) {
   const normalizedRows = Array.isArray(rows) ? rows : [];
@@ -4586,7 +7856,7 @@ function RateLimitBucketsEditor({
           );
         })}
       </div>
-      <div className="text-xs leading-5 text-muted-foreground">{helperText}</div>
+      {helperText ? <div className="text-xs leading-5 text-muted-foreground">{helperText}</div> : null}
     </div>
   );
 }
@@ -4741,38 +8011,6 @@ function AliasTargetEditor({ providerId, values, onChange }) {
   );
 }
 
-function LiveUpdatesIndicator({ status = "connecting", attempt = 0, onRetry }) {
-  const tone = status === "connected"
-    ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-    : status === "reconnecting"
-      ? "border-amber-200 bg-amber-50 text-amber-800"
-      : "border-sky-200 bg-sky-50 text-sky-800";
-  const dotTone = status === "connected"
-    ? "bg-emerald-500"
-    : status === "reconnecting"
-      ? "bg-amber-500"
-      : "bg-sky-500";
-  const label = status === "connected"
-    ? "Live"
-    : status === "reconnecting"
-      ? `Reconnecting${attempt > 1 ? ` · ${attempt}` : ""}`
-      : "Connecting";
-
-  return (
-    <div className="fixed bottom-4 right-4 z-40">
-      <div className={cn("flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm backdrop-blur", tone)}>
-        <span className={cn("inline-flex h-2 w-2 rounded-full", dotTone)} />
-        <span className="font-medium">{label}</span>
-        {status !== "connected" ? (
-          <button className="font-medium uppercase tracking-[0.16em] underline underline-offset-2" onClick={onRetry} type="button">
-            Retry now
-          </button>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
 function QuickStartWizard({
   baseConfig,
   onApplyDraft,
@@ -4802,8 +8040,8 @@ function QuickStartWizard({
   const isAdditionalProviderFlow = !isEditMode && seedMode === "blank" && hasCompletedProviderSetup(baseConfig);
 
   const steps = [
-    { title: "Provider", detail: "Choose API-based or OAuth first, then enter the provider details needed for that connection type." },
-    { title: "Models", detail: "Add model ids, then configure one or more rate limits for all models or selected models. API-based providers are tested before continue." },
+    { title: "Provider", detail: "Choose API Key or OAuth first, then enter the provider details needed for that connection type." },
+    { title: "Models", detail: "Add model ids, then configure one or more rate limits for all models or selected models. API Key providers are tested before continue." },
     { title: "Default", detail: "Order the models behind the fixed `default` route before you finish." }
   ];
 
@@ -4931,6 +8169,7 @@ function QuickStartWizard({
           ? ""
           : (profileWasAuto ? nextDefaults.subscriptionProfile : current.subscriptionProfile),
         modelIds: modelsWereDefault ? nextDefaults.modelIds : current.modelIds,
+        modelContextWindows: modelsWereDefault ? {} : (current.modelContextWindows || {}),
         modelDraft: "",
         rateLimitRows: nextConnectionType === "api"
           ? nextDefaults.rateLimitRows
@@ -4968,21 +8207,49 @@ function QuickStartWizard({
           ...(Object.keys(customHeaders).length > 0 ? { headers: customHeaders } : {})
         })
       });
-      setModelDiscovery({ signature: apiConnectionSignature, result: payload.result });
-      if ((payload.result?.models || []).length > 0) {
+      const discoveredModelIds = (payload.result?.models || [])
+        .map((modelId) => String(modelId || "").trim())
+        .filter(Boolean);
+      let discoveredModelContextWindows = {};
+
+      if (discoveredModelIds.length > 0) {
+        try {
+          const contextResults = await lookupLiteLlmContextWindow(discoveredModelIds);
+          discoveredModelContextWindows = buildLiteLlmModelContextWindowMap(contextResults);
+        } catch {
+          discoveredModelContextWindows = {};
+        }
+      }
+
+      const nextDiscoveryResult = {
+        ...(payload.result && typeof payload.result === "object" ? payload.result : {}),
+        modelContextWindows: discoveredModelContextWindows
+      };
+      setModelDiscovery({ signature: apiConnectionSignature, result: nextDiscoveryResult });
+
+      if (discoveredModelIds.length > 0) {
         setQuickStart((current) => {
           if (buildQuickStartApiSignature(current) !== apiConnectionSignature || current.connectionType !== "api") return current;
           const currentModelIds = Array.isArray(current.modelIds) ? current.modelIds : [];
-          const discoveredModelIds = payload.result.models.map((modelId) => String(modelId || "").trim()).filter(Boolean);
           const nextModelIds = force && currentModelIds.length > 0
             ? Array.from(new Set([...currentModelIds, ...discoveredModelIds]))
             : currentModelIds.length > 0
               ? currentModelIds
               : discoveredModelIds;
-          if (JSON.stringify(nextModelIds) === JSON.stringify(currentModelIds)) return current;
+          const nextModelContextWindows = {
+            ...(current.modelContextWindows && typeof current.modelContextWindows === "object" ? current.modelContextWindows : {}),
+            ...discoveredModelContextWindows
+          };
+          if (
+            JSON.stringify(nextModelIds) === JSON.stringify(currentModelIds)
+            && JSON.stringify(nextModelContextWindows) === JSON.stringify(current.modelContextWindows || {})
+          ) {
+            return current;
+          }
           return {
             ...current,
-            modelIds: nextModelIds
+            modelIds: nextModelIds,
+            modelContextWindows: nextModelContextWindows
           };
         });
         setModelDiscoveryError("");
@@ -5137,13 +8404,30 @@ function QuickStartWizard({
       : stepIndex === 1 && quickStart.connectionType === "api" && !hasFreshApiTest
         ? "Continue will test this provider against the entered endpoints and model ids using your API key or env."
         : steps[stepIndex].detail);
+  const modelHelperText = quickStart.connectionType === "oauth-claude"
+    ? "Examples: claude-opus-4-6 claude-sonnet-4-6 claude-haiku-4-5"
+    : quickStart.connectionType === "oauth-gpt"
+      ? "Examples: gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex-mini"
+      : (
+        <>
+          <span>
+            Examples: gpt-4o-mini gpt-4.1-mini
+            {Object.keys(activeDiscoveryResult?.modelContextWindows || {}).length > 0
+              ? ` · ${Object.keys(activeDiscoveryResult?.modelContextWindows || {}).length} context size${Object.keys(activeDiscoveryResult?.modelContextWindows || {}).length === 1 ? "" : "s"} ready`
+              : ""}
+          </span>
+          <span className="ml-2 text-amber-700">
+            Auto-discovered model ids may be incomplete or inaccurate if the provider is misconfigured. Verify the list and add or remove model ids yourself.
+          </span>
+        </>
+      );
   const showStepBadge = !isAdditionalProviderFlow;
   const headingTitle = isEditMode ? "Edit provider" : isAdditionalProviderFlow ? "Add provider" : "Quick start wizard";
   const headingDescription = isEditMode
     ? "Update this provider in place. Change endpoints, model ids, rate limits, alias, or provider id, then save the refreshed config."
     : isAdditionalProviderFlow
-      ? "Add another provider with endpoints, model ids, rate limits, and a stable alias. API-based providers are auto-tested before save."
-      : "Add the first provider, models list, rate limits, stable alias, and then start the router. API-based providers are auto-tested before save.";
+      ? "Add another provider with endpoints, model ids, rate limits, and a stable alias. API Key providers are auto-tested before save."
+      : "Add the first provider, models list, rate limits, stable alias, and then start the router. API Key providers are auto-tested before save.";
   const wizardContent = (
     <div className="space-y-5">
       <div className="rounded-2xl border border-border/70 bg-secondary/25 px-3 py-3">
@@ -5235,7 +8519,7 @@ function QuickStartWizard({
                   commitOnBlur
                   isValueValid={isLikelyHttpEndpoint}
                   placeholder="Example: https://api.openai.com/v1"
-                  helperText="Paste one or more candidate endpoints. Example for OpenAI-compatible providers: https://api.openai.com/v1"
+                  helperText="Paste one or more endpoints"
                 />
               </Field>
               <Field label="API key or env">
@@ -5275,19 +8559,25 @@ function QuickStartWizard({
               disabled={busyAction === "test"}
               valueStates={quickStart.connectionType === "api" ? modelTestStates : {}}
               placeholder="Paste model ids"
-              helperText={quickStart.connectionType === "oauth-claude"
-                ? "Examples: claude-opus-4-6 claude-sonnet-4-6 claude-haiku-4-5"
-                : quickStart.connectionType === "oauth-gpt"
-                  ? "Examples: gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex-mini"
-                  : "Examples: gpt-4o-mini gpt-4.1-mini"}
+              helperText={modelHelperText}
               suggestedValues={suggestedModelIds}
             />
           </Field>
+          {quickStart.connectionType === "api" && discoveringModels ? (
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+              <div className="flex items-center gap-2 font-medium">
+                <InlineSpinner />
+                Loading provider models
+              </div>
+              <div className="mt-1 text-xs leading-5 text-sky-800/90">
+                LLM Router is checking the provider model list and matching context sizes for the discovered models.
+              </div>
+            </div>
+          ) : null}
           {quickStart.connectionType === "api" ? (
             <>
               <Field
                 label="Rate limit"
-                hint="Ids are generated from request and window values. Duplicate caps are blocked automatically."
                 stacked
                 headerAction={(
                   <Button
@@ -5403,11 +8693,11 @@ function QuickStartWizard({
         </div>
       ) : null}
 
-      <div className="flex flex-col gap-3 border-t border-border/70 pt-4 md:flex-row md:items-center md:justify-between">
-        <div className={cn("text-sm", stepError || testError ? "text-amber-700" : "text-muted-foreground")}>
+      <div className="flex flex-col gap-3 border-t border-border/70 pt-4 md:flex-row md:items-start md:justify-between md:gap-4">
+        <div className={cn("min-w-0 flex-1 text-sm md:max-w-2xl", stepError || testError ? "text-amber-700" : "text-muted-foreground")}>
           {footerMessage}
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 md:justify-end">
           {stepIndex > 0 ? <Button variant="ghost" onClick={() => setStepIndex((current) => Math.max(current - 1, 0))}>Back</Button> : null}
           {stepIndex < steps.length - 1 ? (
             <Button onClick={() => void handleContinue()} disabled={Boolean(stepError) || busyAction !== ""}>
@@ -5468,22 +8758,19 @@ export function App() {
   const [saving, setSaving] = useState(false);
   const [validating, setValidating] = useState(false);
   const [openEditorBusy, setOpenEditorBusy] = useState(false);
-  const [openAmpConfigBusy, setOpenAmpConfigBusy] = useState(false);
-  const [openCodexConfigBusy, setOpenCodexConfigBusy] = useState(false);
-  const [openClaudeConfigBusy, setOpenClaudeConfigBusy] = useState(false);
   const [routerBusy, setRouterBusy] = useState("");
   const [startupBusy, setStartupBusy] = useState("");
   const [activeTab, setActiveTab] = useState("model-alias");
-  const [aliasCreateRequest, setAliasCreateRequest] = useState(0);
   const [remoteConfigUpdated, setRemoteConfigUpdated] = useState(false);
   const [providerWizardOpen, setProviderWizardOpen] = useState(false);
   const [providerWizardKey, setProviderWizardKey] = useState(0);
-  const [liveUpdates, setLiveUpdates] = useState({ status: "connecting", attempt: 0 });
   const [ampRoutingBusy, setAmpRoutingBusy] = useState("");
   const [codexRoutingBusy, setCodexRoutingBusy] = useState("");
   const [claudeRoutingBusy, setClaudeRoutingBusy] = useState("");
   const [codexBindingsBusy, setCodexBindingsBusy] = useState(false);
   const [claudeBindingsBusy, setClaudeBindingsBusy] = useState(false);
+  const [activityLogBusy, setActivityLogBusy] = useState("");
+  const [activityFilter, setActivityFilter] = useState("usage");
   const [ampAutosaveRequest, setAmpAutosaveRequest] = useState(null);
   const [ampAutosaveState, setAmpAutosaveState] = useState({
     status: "idle",
@@ -5495,8 +8782,6 @@ export function App() {
   const baselineRef = useRef("");
   const eventSourceRef = useRef(null);
   const reconnectTimerRef = useRef(null);
-  const reconnectAttemptRef = useRef(0);
-  const reconnectNowRef = useRef(() => {});
   const ampAutosaveTimerRef = useRef(null);
   const ampAutosaveSequenceRef = useRef(0);
   const masterKeyBootstrapRef = useRef("");
@@ -5536,29 +8821,50 @@ export function App() {
     [editableConfig]
   );
   const managedRouteOptions = useMemo(() => buildManagedRouteOptions(editableConfig), [editableConfig]);
-  const aliasSummaryItems = useMemo(
-    () => Object.keys(modelAliases).map((aliasId) => ({
-      value: aliasId,
-      label: aliasId
-    })),
-    [modelAliases]
-  );
   const providerEditorDisabledReason = parsedDraftState.parseError ? `Fix the raw JSON parse error first: ${parsedDraftState.parseError}` : "";
   const ampEditableConfig = editableConfig;
   const ampClientUrl = useMemo(() => buildAmpClientUrl(), []);
   const ampClientGlobal = snapshot?.ampClient?.global || {};
+  const webSearchSnapshot = snapshot?.webSearch || snapshot?.ampWebSearch || null;
   const codexCliState = snapshot?.codingTools?.codexCli || {};
   const claudeCodeState = snapshot?.codingTools?.claudeCode || {};
+  const ampTabConnected = ampClientGlobal?.routedViaRouter === true;
+  const codexTabConnected = codexCliState?.routedViaRouter === true;
+  const claudeTabConnected = claudeCodeState?.routedViaRouter === true;
+  const activityLogState = snapshot?.activityLog || { enabled: true };
+  const activityLogEnabled = activityLogState?.enabled !== false;
   const ampRouteOptions = useMemo(() => buildManagedRouteOptions(ampEditableConfig), [ampEditableConfig]);
   const ampRows = useMemo(() => buildAmpEntityRows(ampEditableConfig), [ampEditableConfig]);
+  const webSearchConfig = useMemo(
+    () => ensureWebSearchConfigShape(ensureAmpDraftConfigShape(ampEditableConfig)),
+    [ampEditableConfig]
+  );
+  const webSearchProviders = useMemo(
+    () => buildWebSearchProviderRows(ampEditableConfig, webSearchSnapshot),
+    [ampEditableConfig, webSearchSnapshot]
+  );
+  const hostedSearchCandidates = useMemo(() => {
+    const existingIds = new Set(
+      (Array.isArray(webSearchConfig?.providers) ? webSearchConfig.providers : [])
+        .map((provider) => normalizeWebSearchProviderKey(provider?.id))
+        .filter(Boolean)
+    );
+    return buildHostedWebSearchCandidateGroups(ampEditableConfig, existingIds);
+  }, [ampEditableConfig, webSearchConfig]);
   const ampDisabledReason = parsedDraftState.parseError
     ? `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`
     : (ampRouteOptions.length === 0 ? "Add at least one alias or provider/model route before configuring AMP." : "");
+  const webSearchDisabledReason = parsedDraftState.parseError
+    ? `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`
+    : "";
   const codingToolDisabledReason = parsedDraftState.parseError
     ? `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`
     : (managedRouteOptions.length === 0 ? "Add at least one alias or provider/model route before configuring coding-tool bindings." : "");
   const codexRouteOptions = useMemo(
-    () => withCurrentManagedRouteOptions(managedRouteOptions, [codexCliState?.bindings?.defaultModel]),
+    () => withCurrentManagedRouteOptions(
+      managedRouteOptions,
+      isCodexCliInheritModelBinding(codexCliState?.bindings?.defaultModel) ? [] : [codexCliState?.bindings?.defaultModel]
+    ),
     [managedRouteOptions, codexCliState?.bindings?.defaultModel]
   );
   const claudeRouteOptions = useMemo(
@@ -5628,6 +8934,7 @@ export function App() {
     }
     if (!ampAutosaveRequest) return;
 
+    const delayMs = ampAutosaveRequest.immediate === true ? 0 : 450;
     ampAutosaveTimerRef.current = setTimeout(() => {
       ampAutosaveTimerRef.current = null;
       const currentSequence = ampAutosaveRequest.sequence;
@@ -5665,7 +8972,7 @@ export function App() {
           showNotice("error", message);
         }
       })();
-    }, 450);
+    }, delayMs);
 
     return () => {
       if (ampAutosaveTimerRef.current) {
@@ -5692,10 +8999,6 @@ export function App() {
     if (!hasProviders && providerWizardOpen) setProviderWizardOpen(false);
   }, [hasProviders, providerWizardOpen]);
 
-  function handleRequestNewAlias() {
-    setAliasCreateRequest((current) => current + 1);
-  }
-
   function showNotice(tone, message) {
     noticeIdRef.current += 1;
     setNotices((current) => [...current, { id: `notice-${noticeIdRef.current}`, tone, message }]);
@@ -5703,10 +9006,6 @@ export function App() {
 
   function dismissNotice(noticeId) {
     setNotices((current) => current.filter((notice) => notice.id !== noticeId));
-  }
-
-  function handleRetryLiveUpdates() {
-    reconnectNowRef.current();
   }
 
   function applySnapshot(nextSnapshot, { preserveDraft = false } = {}) {
@@ -5755,8 +9054,6 @@ export function App() {
 
     function scheduleReconnect() {
       if (cancelled || reconnectTimerRef.current) return;
-      reconnectAttemptRef.current += 1;
-      setLiveUpdates({ status: "reconnecting", attempt: reconnectAttemptRef.current });
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null;
         connectEventSource({ isReconnect: true });
@@ -5767,14 +9064,11 @@ export function App() {
       if (cancelled) return;
       clearReconnectTimer();
       closeEventSource();
-      setLiveUpdates({ status: isReconnect ? "reconnecting" : "connecting", attempt: reconnectAttemptRef.current });
       const source = new EventSource("/api/events");
       eventSourceRef.current = source;
 
       source.onopen = () => {
         if (cancelled || eventSourceRef.current !== source) return;
-        reconnectAttemptRef.current = 0;
-        setLiveUpdates({ status: "connected", attempt: 0 });
         if (isReconnect) {
           void loadState({
             preserveDraft: draftRef.current !== baselineRef.current
@@ -5808,18 +9102,25 @@ export function App() {
         }
       });
 
+      source.addEventListener("logs", (event) => {
+        if (cancelled || eventSourceRef.current !== source) return;
+        try {
+          const payload = JSON.parse(event.data);
+          setSnapshot((current) => current ? {
+            ...current,
+            ...(payload?.activityLog ? { activityLog: payload.activityLog } : {}),
+            logs: Array.isArray(payload?.logs) ? payload.logs : []
+          } : current);
+        } catch {
+        }
+      });
+
       source.onerror = () => {
         if (cancelled || eventSourceRef.current !== source) return;
         closeEventSource();
         scheduleReconnect();
       };
     }
-
-    reconnectNowRef.current = () => {
-      if (cancelled) return;
-      clearReconnectTimer();
-      connectEventSource({ isReconnect: true });
-    };
 
     (async () => {
       try {
@@ -5838,7 +9139,6 @@ export function App() {
 
     return () => {
       cancelled = true;
-      reconnectNowRef.current = () => {};
       clearReconnectTimer();
       closeEventSource();
     };
@@ -5889,13 +9189,19 @@ export function App() {
     }
   }
 
-  function queueAmpAutosave(rawText) {
+  function queueAmpAutosave(rawText, { immediate = false } = {}) {
     const sequence = ampAutosaveSequenceRef.current + 1;
     ampAutosaveSequenceRef.current = sequence;
     setAmpAutosaveRequest({
       sequence,
-      rawText
+      rawText,
+      immediate: immediate === true
     });
+    setAmpAutosaveState((current) => ({
+      status: "pending",
+      message: "",
+      savedAt: current.savedAt
+    }));
   }
 
   function handleDraftChange(value) {
@@ -5945,7 +9251,7 @@ export function App() {
       return false;
     }
     if (isApiProvider && resolvedEndpoints.length === 0) {
-      showNotice("warning", "API-based providers require at least one valid http(s) endpoint.");
+      showNotice("warning", "API Key providers require at least one valid http(s) endpoint.");
       return false;
     }
     if (isApiProvider && resolvedEndpoints.some((endpoint) => !isLikelyHttpEndpoint(endpoint))) {
@@ -5970,6 +9276,189 @@ export function App() {
     });
     try {
       await saveInlineConfigObject(nextConfig, `Updated provider ${resolvedProviderId}.`, { showSuccessNotice });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function handleSaveProviderEditorChanges(
+    providerId,
+    { providerDraft = null, modelRows = null, showSuccessNotice = true } = {}
+  ) {
+    if (providerEditorDisabledReason) {
+      showNotice("warning", providerEditorDisabledReason);
+      return false;
+    }
+
+    const existingProvider = providers.find((entry) => entry?.id === providerId);
+    if (!existingProvider) {
+      showNotice("error", `Provider '${providerId}' was not found.`);
+      return false;
+    }
+
+    const hasProviderDraft = Boolean(providerDraft && typeof providerDraft === "object");
+    const hasModelRows = Array.isArray(modelRows);
+    if (!hasProviderDraft && !hasModelRows) return true;
+
+    const isApiProvider = inferQuickStartConnectionType(existingProvider) === "api";
+    const resolvedProviderId = hasProviderDraft ? String(providerDraft?.id || "").trim() : providerId;
+    const resolvedProviderName = hasProviderDraft
+      ? String(providerDraft?.name || "").trim()
+      : String(existingProvider?.name || providerId).trim();
+    const resolvedEndpoints = hasProviderDraft
+      ? (Array.isArray(providerDraft?.endpoints)
+        ? normalizeUniqueTrimmedValues(providerDraft.endpoints)
+        : mergeChipValuesAndDraft([], providerDraft?.endpoint || ""))
+      : collectQuickStartEndpoints(existingProvider);
+    const resolvedRateLimitRows = hasProviderDraft && Array.isArray(providerDraft?.rateLimitRows)
+      ? resolveRateLimitDraftRows(providerDraft.rateLimitRows)
+      : [];
+    const nextRows = hasModelRows
+      ? modelRows
+        .map((row) => ({
+          ...row,
+          id: String(row?.id || "").trim(),
+          contextWindow: normalizeContextWindowInput(row?.contextWindow || "")
+        }))
+        .filter((row) => row.id)
+      : [];
+
+    if (hasProviderDraft) {
+      const knownModelIds = hasModelRows
+        ? nextRows.map((row) => row.id)
+        : collectProviderModelIds(existingProvider);
+
+      if (!resolvedProviderId) {
+        showNotice("warning", "Provider id is required.");
+        return false;
+      }
+      if (!QUICK_START_PROVIDER_ID_PATTERN.test(resolvedProviderId)) {
+        showNotice("warning", "Provider id must start with a letter and use lowercase letters, digits, or dashes only.");
+        return false;
+      }
+      if (!resolvedProviderName) {
+        showNotice("warning", "Provider name is required.");
+        return false;
+      }
+      if (resolvedProviderId !== providerId && providers.some((entry) => entry?.id === resolvedProviderId)) {
+        showNotice("warning", `Provider id "${resolvedProviderId}" already exists.`);
+        return false;
+      }
+      if (isApiProvider && resolvedEndpoints.length === 0) {
+        showNotice("warning", "API Key providers require at least one valid http(s) endpoint.");
+        return false;
+      }
+      if (isApiProvider && resolvedEndpoints.some((endpoint) => !isLikelyHttpEndpoint(endpoint))) {
+        showNotice("warning", "One or more endpoints are invalid. Use full http:// or https:// URLs.");
+        return false;
+      }
+      const rateLimitIssue = isApiProvider
+        ? validateRateLimitDraftRows(resolvedRateLimitRows, {
+            knownModelIds,
+            requireAtLeastOne: true
+          })
+        : "";
+      if (rateLimitIssue) {
+        showNotice("warning", rateLimitIssue);
+        return false;
+      }
+    }
+
+    if (hasModelRows) {
+      if (nextRows.length === 0) {
+        showNotice("warning", "Keep at least one model id on the provider.");
+        return false;
+      }
+      if (hasDuplicateTrimmedValues(nextRows.map((row) => row.id))) {
+        showNotice("warning", "Model ids must be unique for each provider.");
+        return false;
+      }
+      const hasInvalidContextWindow = nextRows.some((row) => {
+        const rawValue = String(row?.contextWindow || "").trim();
+        if (!rawValue) return false;
+        const parsed = Number.parseInt(rawValue, 10);
+        return !Number.isFinite(parsed) || parsed <= 0 || String(parsed) !== rawValue;
+      });
+      if (hasInvalidContextWindow) {
+        showNotice("warning", "Context windows must be positive integers when set.");
+        return false;
+      }
+
+      const currentModelIds = collectProviderModelIds(existingProvider);
+      const newModelIds = nextRows
+        .map((row) => row.id)
+        .filter((modelId) => !currentModelIds.includes(modelId));
+
+      if (isApiProvider && newModelIds.length > 0) {
+        if (resolvedEndpoints.length === 0) {
+          showNotice("warning", `Provider '${resolvedProviderId}' needs at least one endpoint before testing new models.`);
+          return false;
+        }
+
+        const credentialPayload = getStoredProviderCredentialPayload(existingProvider);
+        if (!credentialPayload.apiKey && !credentialPayload.apiKeyEnv) {
+          showNotice("warning", `Provider '${resolvedProviderId}' needs an API key or env before testing new models.`);
+          return false;
+        }
+
+        try {
+          const result = await fetchJsonLineStream("/api/config/test-provider-stream", {
+            method: "POST",
+            headers: JSON_HEADERS,
+            body: JSON.stringify({
+              endpoints: resolvedEndpoints,
+              models: newModelIds,
+              ...credentialPayload,
+              ...(existingProvider?.headers && typeof existingProvider.headers === "object" && !Array.isArray(existingProvider.headers)
+                ? { headers: existingProvider.headers }
+                : {})
+            })
+          });
+          const confirmedModels = new Set(Array.isArray(result?.models) ? result.models : []);
+          const unresolvedModels = newModelIds.filter((modelId) => !confirmedModels.has(modelId));
+          if (!result?.ok || unresolvedModels.length > 0) {
+            const warningMessage = unresolvedModels.length > 0
+              ? `New model test failed for ${resolvedProviderId}: ${unresolvedModels.join(", ")}.`
+              : (result?.warnings || []).join(" ") || `New model test failed for ${resolvedProviderId}.`;
+            showNotice("warning", warningMessage);
+            return false;
+          }
+        } catch (error) {
+          showNotice("error", error instanceof Error ? error.message : String(error));
+          return false;
+        }
+      }
+    }
+
+    let nextConfig = parsedDraftState.value || persistedConfig;
+    if (hasProviderDraft) {
+      nextConfig = applyProviderInlineEdits(nextConfig, providerId, {
+        ...providerDraft,
+        endpoints: resolvedEndpoints,
+        rateLimitRows: resolvedRateLimitRows
+      });
+    }
+    if (hasModelRows) {
+      nextConfig = applyProviderModelEdits(nextConfig, hasProviderDraft ? resolvedProviderId : providerId, nextRows);
+    }
+
+    const successMessage = hasProviderDraft && hasModelRows
+      ? `Updated provider ${resolvedProviderId} and saved its model list.`
+      : hasProviderDraft
+        ? `Updated provider ${resolvedProviderId}.`
+        : (() => {
+          const currentModelIds = collectProviderModelIds(existingProvider);
+          const newModelIds = nextRows
+            .map((row) => row.id)
+            .filter((modelId) => !currentModelIds.includes(modelId));
+          return newModelIds.length > 0
+            ? `Tested ${newModelIds.length} new model${newModelIds.length === 1 ? "" : "s"} and updated ${resolvedProviderId}.`
+            : `Updated models for ${resolvedProviderId}.`;
+        })();
+
+    try {
+      await saveInlineConfigObject(nextConfig, successMessage, { showSuccessNotice });
       return true;
     } catch {
       return false;
@@ -6019,16 +9508,57 @@ export function App() {
     }
   }
 
-  async function handleCopySummaryItem(item, itemLabel) {
-    const value = String(item?.value || "").trim();
+  async function handleCopyAliasId(aliasId) {
+    const value = String(aliasId || "").trim();
     if (!value) {
-      showNotice("warning", `${itemLabel} is not ready yet.`);
+      showNotice("warning", "Alias id is not ready yet.");
       return;
     }
 
     try {
       await copyTextToClipboard(value);
-      showNotice("success", `${itemLabel} copied to clipboard.`);
+      showNotice("success", `Alias id ${value} copied to clipboard.`);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleOpenFilePath(pathValue, label, {
+    ensureMode = "none",
+    successMessage = ""
+  } = {}) {
+    const value = String(pathValue || "").trim();
+    if (!value) {
+      showNotice("warning", `${label} is not resolved yet.`);
+      return;
+    }
+
+    try {
+      await fetchJson("/api/file/open", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          editorId: "default",
+          filePath: value,
+          ensureMode
+        })
+      });
+      showNotice("success", successMessage || `Opened ${label} in the default app.`);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleCopyProviderModelId(modelId) {
+    const value = String(modelId || "").trim();
+    if (!value) {
+      showNotice("warning", "Model id is not ready yet.");
+      return;
+    }
+
+    try {
+      await copyTextToClipboard(value);
+      showNotice("success", `Model id ${value} copied to clipboard.`);
     } catch (error) {
       showNotice("error", error instanceof Error ? error.message : String(error));
     }
@@ -6264,6 +9794,97 @@ export function App() {
     queueAmpAutosave(rawText);
   }
 
+  function handleWebSearchStrategyChange(value) {
+    if (webSearchDisabledReason) {
+      showNotice("warning", webSearchDisabledReason);
+      return;
+    }
+
+    const nextConfig = updateWebSearchConfig(parsedDraftState.value || persistedConfig, {
+      strategy: value
+    });
+    const rawText = `${JSON.stringify(nextConfig, null, 2)}\n`;
+    handleDraftChange(rawText);
+    queueAmpAutosave(rawText);
+  }
+
+  function handleWebSearchProviderChange(providerId, field, value) {
+    if (webSearchDisabledReason) {
+      showNotice("warning", webSearchDisabledReason);
+      return;
+    }
+
+    const nextConfig = updateWebSearchProviderConfig(parsedDraftState.value || persistedConfig, providerId, {
+      [field]: value
+    });
+    const rawText = `${JSON.stringify(nextConfig, null, 2)}\n`;
+    handleDraftChange(rawText);
+    queueAmpAutosave(rawText, {
+      immediate: shouldImmediateAutosaveWebSearchProviderChange(providerId, field, value)
+    });
+  }
+
+  function handleWebSearchProviderMove(providerId, direction) {
+    if (webSearchDisabledReason) {
+      showNotice("warning", webSearchDisabledReason);
+      return;
+    }
+
+    const nextConfig = moveWebSearchProviderConfig(parsedDraftState.value || persistedConfig, providerId, direction);
+    const rawText = `${JSON.stringify(nextConfig, null, 2)}\n`;
+    handleDraftChange(rawText);
+    queueAmpAutosave(rawText);
+  }
+
+  function handleRemoveWebSearchProvider(providerId) {
+    if (webSearchDisabledReason) {
+      showNotice("warning", webSearchDisabledReason);
+      return;
+    }
+
+    const nextConfig = removeWebSearchProviderConfig(parsedDraftState.value || persistedConfig, providerId);
+    const rawText = `${JSON.stringify(nextConfig, null, 2)}\n`;
+    handleDraftChange(rawText);
+    queueAmpAutosave(rawText, { immediate: true });
+  }
+
+  async function handleAddHostedSearchEndpoint({ providerId, modelId }) {
+    if (webSearchDisabledReason) {
+      throw new Error(webSearchDisabledReason);
+    }
+
+    const routeId = buildHostedWebSearchProviderId(providerId, modelId);
+    if (!routeId) {
+      throw new Error("Choose a provider and GPT model before testing.");
+    }
+
+    const existingIds = new Set(
+      (Array.isArray(webSearchConfig?.providers) ? webSearchConfig.providers : [])
+        .map((provider) => normalizeWebSearchProviderKey(provider?.id))
+        .filter(Boolean)
+    );
+    if (existingIds.has(normalizeWebSearchProviderKey(routeId))) {
+      throw new Error(`Web search route '${routeId}' is already configured.`);
+    }
+
+    const payload = await fetchJson("/api/config/test-web-search-provider", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        providerId,
+        modelId,
+        rawText: draftText
+      })
+    });
+
+    const nextConfig = addHostedWebSearchProviderConfig(parsedDraftState.value || persistedConfig, providerId, modelId);
+    const rawText = `${JSON.stringify(nextConfig, null, 2)}\n`;
+    handleDraftChange(rawText);
+    queueAmpAutosave(rawText, { immediate: true });
+    showNotice("success", `Added ${routeId} to shared web search routing.`);
+    return payload?.result || null;
+  }
+
   async function handleCreateAmpEntry({ inbound, outbound }) {
     if (ampDisabledReason) {
       showNotice("warning", ampDisabledReason);
@@ -6397,54 +10018,6 @@ export function App() {
     }
   }
 
-  async function handleOpenAmpConfigFileDefault() {
-    setOpenAmpConfigBusy(true);
-    try {
-      await fetchJson("/api/amp/config/open", {
-        method: "POST",
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ editorId: "default" })
-      });
-      showNotice("success", "Opened AMP config file in the default app.");
-    } catch (error) {
-      showNotice("error", error instanceof Error ? error.message : String(error));
-    } finally {
-      setOpenAmpConfigBusy(false);
-    }
-  }
-
-  async function handleOpenCodexConfigFileDefault() {
-    setOpenCodexConfigBusy(true);
-    try {
-      await fetchJson("/api/codex-cli/config/open", {
-        method: "POST",
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ editorId: "default" })
-      });
-      showNotice("success", "Opened Codex CLI config file in the default app.");
-    } catch (error) {
-      showNotice("error", error instanceof Error ? error.message : String(error));
-    } finally {
-      setOpenCodexConfigBusy(false);
-    }
-  }
-
-  async function handleOpenClaudeConfigFileDefault() {
-    setOpenClaudeConfigBusy(true);
-    try {
-      await fetchJson("/api/claude-code/config/open", {
-        method: "POST",
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ editorId: "default" })
-      });
-      showNotice("success", "Opened Claude Code config file in the default app.");
-    } catch (error) {
-      showNotice("error", error instanceof Error ? error.message : String(error));
-    } finally {
-      setOpenClaudeConfigBusy(false);
-    }
-  }
-
   async function handleToggleCodexCliRouting() {
     const routingEnabled = codexCliState?.routedViaRouter === true;
     const shouldEnable = !routingEnabled;
@@ -6474,7 +10047,8 @@ export function App() {
           rawText: shouldEnable ? draftText : undefined,
           endpointUrl: ampClientUrl,
           bindings: shouldEnable ? {
-            defaultModel: codexCliState?.bindings?.defaultModel || ampDefaultRoute
+            defaultModel: codexCliState?.bindings?.defaultModel || ampDefaultRoute,
+            thinkingLevel: codexCliState?.bindings?.thinkingLevel || ""
           } : undefined
         })
       });
@@ -6520,7 +10094,8 @@ export function App() {
             defaultOpusModel: claudeCodeState?.bindings?.defaultOpusModel || "",
             defaultSonnetModel: claudeCodeState?.bindings?.defaultSonnetModel || "",
             defaultHaikuModel: claudeCodeState?.bindings?.defaultHaikuModel || "",
-            subagentModel: claudeCodeState?.bindings?.subagentModel || ""
+            subagentModel: claudeCodeState?.bindings?.subagentModel || "",
+            thinkingLevel: claudeCodeState?.bindings?.thinkingLevel || ""
           } : undefined
         })
       });
@@ -6534,20 +10109,23 @@ export function App() {
   }
 
   async function handleCodexBindingChange(fieldId, value) {
-    if (fieldId !== "defaultModel") return;
+    const nextBindings = {
+      defaultModel: codexCliState?.bindings?.defaultModel || ampDefaultRoute,
+      thinkingLevel: codexCliState?.bindings?.thinkingLevel || ""
+    };
+    nextBindings[fieldId] = value;
+
     setCodexBindingsBusy(true);
     try {
       await fetchJson("/api/codex-cli/model-bindings", {
         method: "POST",
         headers: JSON_HEADERS,
         body: JSON.stringify({
-          bindings: {
-            defaultModel: value
-          }
+          bindings: nextBindings
         })
       });
       await loadState({ preserveDraft: true });
-      showNotice("success", "Codex CLI model binding updated.");
+      showNotice("success", "Codex CLI bindings updated.");
     } catch (error) {
       showNotice("error", error instanceof Error ? error.message : String(error));
     } finally {
@@ -6561,7 +10139,8 @@ export function App() {
       defaultOpusModel: claudeCodeState?.bindings?.defaultOpusModel || "",
       defaultSonnetModel: claudeCodeState?.bindings?.defaultSonnetModel || "",
       defaultHaikuModel: claudeCodeState?.bindings?.defaultHaikuModel || "",
-      subagentModel: claudeCodeState?.bindings?.subagentModel || ""
+      subagentModel: claudeCodeState?.bindings?.subagentModel || "",
+      thinkingLevel: claudeCodeState?.bindings?.thinkingLevel || ""
     };
     nextBindings[fieldId] = value;
 
@@ -6619,6 +10198,47 @@ export function App() {
     }
   }
 
+  async function handleToggleActivityLog() {
+    const nextEnabled = !activityLogEnabled;
+    setActivityLogBusy("toggle");
+    try {
+      const payload = await fetchJson("/api/activity-log/settings", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ enabled: nextEnabled })
+      });
+      applySnapshot(payload, { preserveDraft: true });
+      showNotice("success", payload.message || `Activity log ${nextEnabled ? "enabled" : "disabled"}.`);
+    } catch (error) {
+      await loadState({ preserveDraft: true }).catch(() => {});
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setActivityLogBusy("");
+    }
+  }
+
+  async function handleClearActivityLog() {
+    const confirmed = typeof window === "undefined"
+      ? true
+      : window.confirm("Clear the shared activity log file? This also clears the Activity tab for connected web console sessions.");
+    if (!confirmed) return;
+
+    setActivityLogBusy("clear");
+    try {
+      const payload = await fetchJson("/api/activity-log/clear", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: "{}"
+      });
+      applySnapshot(payload, { preserveDraft: true });
+      showNotice("success", payload.message || "Activity log cleared.");
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setActivityLogBusy("");
+    }
+  }
+
   async function handleRemoveProvider(providerId) {
     const provider = providers.find((entry) => entry.id === providerId);
     const confirmed = typeof window === "undefined"
@@ -6653,7 +10273,6 @@ export function App() {
   if (showOnboarding) {
     return (
       <div className="console-shell min-h-screen px-4 py-6 md:px-6">
-        <LiveUpdatesIndicator status={liveUpdates.status} attempt={liveUpdates.attempt} onRetry={handleRetryLiveUpdates} />
         <div className="mx-auto flex max-w-5xl flex-col gap-4">
           <ToastStack notices={notices} onDismiss={dismissNotice} />
           <div id="quick-start-wizard">
@@ -6677,49 +10296,92 @@ export function App() {
 
   return (
     <div className="console-shell min-h-screen px-4 py-4 md:px-6 md:py-6">
-      <LiveUpdatesIndicator status={liveUpdates.status} attempt={liveUpdates.attempt} onRetry={handleRetryLiveUpdates} />
       <div className="mx-auto flex max-w-7xl flex-col gap-4">
         <Card className="overflow-hidden">
           <CardContent className="p-5">
             <div className="space-y-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <h1 className="text-2xl font-semibold tracking-tight text-foreground">LLM Router Web Console</h1>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <h1 className="inline-flex items-center gap-2 text-2xl font-semibold tracking-tight text-foreground">
+                    <span>LLM Router Web Console</span>
+                    <ConnectedIndicatorDot connected={routerRunning} size="md" srLabel="Router running" />
+                  </h1>
                 </div>
-                <div className="flex flex-wrap items-center justify-end gap-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      size="sm"
-                      variant={routerRunning ? "danger" : undefined}
-                      onClick={() => runRouterAction(routerRunning ? "stop" : "start")}
-                      disabled={routerBusy !== ""}
-                    >
-                      {routerActionLabel}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={handleOpenConfigFileDefault} disabled={openEditorBusy}>
-                      {openEditorBusy ? "Opening…" : "Open config file"}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => runStartupAction(startupInstalled ? "disable" : "enable")}
-                      disabled={startupBusy !== ""}
-                    >
-                      {startupActionLabel}
-                    </Button>
-                  </div>
-                  <HeaderAccessGroup
-                    endpointValue={ampClientUrl || LOCAL_ROUTER_ORIGIN}
-                    endpointDisabled={!ampClientUrl}
-                    gatewayValue={effectiveMasterKey ? maskedMasterKey : "Generating…"}
-                    gatewayPending={!effectiveMasterKey}
-                    gatewayDisabled={!effectiveMasterKey || saving}
-                    rotateDisabled={saving}
-                    onCopyEndpoint={handleCopyApiEndpoint}
-                    onCopyGatewayKey={handleCopyMasterKey}
-                    onRotateKey={handleRotateMasterKey}
-                  />
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <a
+                    href={GITHUB_SPONSORS_URL}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="inline-flex h-8 items-center gap-2 rounded-lg border border-amber-300 bg-amber-50/90 px-3 text-xs font-medium uppercase tracking-[0.16em] text-amber-900 transition-colors hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    aria-label="Support LLM Router via GitHub Sponsors"
+                    title="Support LLM Router"
+                  >
+                    <HeartIcon className="h-3.5 w-3.5" />
+                    <span>Buy me a coffee</span>
+                  </a>
+                  <a
+                    href={GITHUB_REPO_URL}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="inline-flex h-8 items-center gap-2 rounded-lg border border-border bg-background/80 px-3 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    aria-label="Open the LLM Router GitHub repository"
+                    title="Open GitHub repository"
+                  >
+                    <GitHubIcon className="h-3.5 w-3.5" />
+                    <span>Repo</span>
+                  </a>
                 </div>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant={routerRunning ? "outline" : undefined}
+                    className="px-2 sm:px-3"
+                    onClick={() => runRouterAction(routerRunning ? "stop" : "start")}
+                    disabled={routerBusy !== ""}
+                    aria-label={routerActionLabel}
+                    title={routerActionLabel}
+                  >
+                    {routerRunning ? <PauseIcon className="h-3.5 w-3.5" /> : <PlayIcon className="h-3.5 w-3.5" />}
+                    <span className="hidden sm:inline">{routerActionLabel}</span>
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="px-2 sm:px-3"
+                    onClick={handleOpenConfigFileDefault}
+                    disabled={openEditorBusy}
+                    aria-label={openEditorBusy ? "Opening config file" : "Open config file"}
+                    title={openEditorBusy ? "Opening config file" : "Open config file"}
+                  >
+                    <FolderIcon className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">{openEditorBusy ? "Opening…" : "Open config file"}</span>
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="px-2 sm:px-3"
+                    onClick={() => runStartupAction(startupInstalled ? "disable" : "enable")}
+                    disabled={startupBusy !== ""}
+                    aria-label={startupActionLabel}
+                    title={startupActionLabel}
+                  >
+                    <PowerIcon className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">{startupActionLabel}</span>
+                  </Button>
+                </div>
+                <HeaderAccessGroup
+                  endpointValue={ampClientUrl || LOCAL_ROUTER_ORIGIN}
+                  endpointDisabled={!ampClientUrl}
+                  gatewayValue={effectiveMasterKey ? maskedMasterKey : "Generating…"}
+                  gatewayPending={!effectiveMasterKey}
+                  gatewayDisabled={!effectiveMasterKey || saving}
+                  rotateDisabled={saving}
+                  onCopyEndpoint={handleCopyApiEndpoint}
+                  onCopyGatewayKey={handleCopyMasterKey}
+                  onRotateKey={handleRotateMasterKey}
+                />
               </div>
               {(saving || validating) ? (
                 <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
@@ -6750,16 +10412,14 @@ export function App() {
         <ToastStack notices={notices} onDismiss={dismissNotice} />
 
         <div className="space-y-4">
-          <ConsoleSummarySection
-            aliasItems={aliasSummaryItems}
-            onCopyAlias={(item) => handleCopySummaryItem(item, `Alias ${item.value}`)}
-          />
           <ProviderModelsSection
             providers={providers}
             onAddProvider={handleOpenQuickStart}
             onRemove={handleRemoveProvider}
+            onCopyModelId={handleCopyProviderModelId}
             onApplyProviderDetails={handleApplyProviderDetails}
             onApplyProviderModels={handleApplyProviderModels}
+            onSaveAndCloseEditor={handleSaveProviderEditorChanges}
             disabledReason={providerEditorDisabledReason}
             busy={saving}
           />
@@ -6769,30 +10429,42 @@ export function App() {
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <TabsList>
               <TabsTrigger value="model-alias">Alias &amp; Fallback</TabsTrigger>
-              <TabsTrigger value="amp">AMP</TabsTrigger>
-              <TabsTrigger value="codex-cli">Codex CLI</TabsTrigger>
-              <TabsTrigger value="claude-code">Claude Code</TabsTrigger>
+              <TabsTrigger value="amp">
+                <span className="inline-flex items-center gap-2">
+                  <span>AMP</span>
+                  <ConnectedIndicatorDot connected={ampTabConnected} srLabel="AMP connected" />
+                </span>
+              </TabsTrigger>
+              <TabsTrigger value="codex-cli">
+                <span className="inline-flex items-center gap-2">
+                  <span>Codex CLI</span>
+                  <ConnectedIndicatorDot connected={codexTabConnected} srLabel="Codex CLI connected" />
+                </span>
+              </TabsTrigger>
+              <TabsTrigger value="claude-code">
+                <span className="inline-flex items-center gap-2">
+                  <span>Claude Code</span>
+                  <ConnectedIndicatorDot connected={claudeTabConnected} srLabel="Claude Code connected" />
+                </span>
+              </TabsTrigger>
+              <TabsTrigger value="web-search">Web Search</TabsTrigger>
               <TabsTrigger value="activity">Activity</TabsTrigger>
             </TabsList>
-            {activeTab === "model-alias" ? (
-              <Button onClick={handleRequestNewAlias} disabled={Boolean(providerEditorDisabledReason) || saving}>
-                {saving ? "Saving…" : "Add alias"}
-              </Button>
-            ) : null}
           </div>
 
           <TabsContent value="model-alias" className="space-y-4">
             <ModelAliasSection
               aliases={modelAliases}
+              config={editableConfig}
               aliasIds={Object.keys(modelAliases)}
               routeOptions={managedRouteOptions}
               defaultModel={String(editableConfig?.defaultModel || "").trim()}
               ampDefaultRoute={ampDefaultRoute}
               disabledReason={providerEditorDisabledReason}
               busy={saving}
-              requestAddAliasToken={aliasCreateRequest}
               onApplyAlias={handleApplyModelAlias}
               onRemoveAlias={handleRemoveModelAlias}
+              onCopyAliasId={handleCopyAliasId}
             />
           </TabsContent>
 
@@ -6800,16 +10472,24 @@ export function App() {
             <AmpSettingsPanel
               rows={ampRows}
               routeOptions={ampRouteOptions}
+              webSearchSnapshot={webSearchSnapshot}
               ampClientUrl={ampClientUrl}
               ampClientGlobal={ampClientGlobal}
               routingBusy={ampRoutingBusy}
-              openAmpConfigBusy={openAmpConfigBusy}
               onToggleGlobalRouting={handleToggleAmpGlobalRouting}
-              onOpenAmpConfigFile={handleOpenAmpConfigFileDefault}
               onInboundChange={handleAmpInboundChange}
               onOutboundChange={handleAmpOutboundChange}
               onCreateEntry={handleCreateAmpEntry}
               onRemoveEntry={handleRemoveAmpEntry}
+              onOpenWebSearchTab={() => setActiveTab("web-search")}
+              onOpenConfigPath={() => handleOpenFilePath(ampClientGlobal?.settingsFilePath, "AMP config file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened AMP config file in the default app."
+              })}
+              onOpenSecretsPath={() => handleOpenFilePath(ampClientGlobal?.secretsFilePath, "AMP secrets file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened AMP secrets file in the default app."
+              })}
               hasMasterKey={Boolean(String(ampEditableConfig?.masterKey || "").trim())}
               disabledReason={ampDisabledReason}
               autosaveState={ampAutosaveState}
@@ -6819,27 +10499,54 @@ export function App() {
           <TabsContent value="codex-cli" className="space-y-4">
             <CodingToolSettingsPanel
               toolName="Codex CLI"
-              openButtonLabel="Open Codex CLI Config File"
               toolState={codexCliState}
               endpointUrl={codexCliState?.configuredBaseUrl || `${ampClientUrl ? `${ampClientUrl}/openai/v1` : ""}`}
               routeOptions={codexRouteOptions}
               connectionBusy={codexRoutingBusy}
               bindingBusy={codexBindingsBusy}
-              openConfigBusy={openCodexConfigBusy}
               onToggleRouting={handleToggleCodexCliRouting}
-              onOpenConfigFile={handleOpenCodexConfigFileDefault}
               onBindingChange={handleCodexBindingChange}
               hasMasterKey={Boolean(effectiveMasterKey)}
               disabledReason={codingToolDisabledReason}
+              onOpenPrimaryPath={() => handleOpenFilePath(codexCliState?.configFilePath, "Codex CLI config file", {
+                ensureMode: "text",
+                successMessage: "Opened Codex CLI config file in the default app."
+              })}
+              onOpenSecondaryPath={() => handleOpenFilePath(codexCliState?.backupFilePath, "Codex CLI backup file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened Codex CLI backup file in the default app."
+              })}
+              guideContent={buildCodexCliGuideContent({
+                bindingValue: codexCliState?.bindings?.defaultModel,
+                thinkingLevel: codexCliState?.bindings?.thinkingLevel,
+                configFilePath: codexCliState?.configFilePath,
+                endpointUrl: codexCliState?.configuredBaseUrl || `${ampClientUrl ? `${ampClientUrl}/openai/v1` : ""}`
+              })}
               bindingFields={[
                 {
                   id: "defaultModel",
                   label: "Default model",
-                  description: "Sets the Codex CLI global `model` value so prompts go to one managed route or alias by default.",
+                  description: "Choose a managed route/alias to set Codex CLI `model`, or use Inherit Codex CLI model to keep Codex built-in model names and route them through same-name LLM Router aliases.",
                   envKey: "model",
                   value: codexCliState?.bindings?.defaultModel || "",
                   allowUnset: false,
-                  placeholder: "Select a default route"
+                  placeholder: "Select a default route",
+                  extraOptions: [{
+                    value: CODEX_CLI_INHERIT_MODEL_VALUE,
+                    label: "Inherit Codex CLI model",
+                    hint: "Keep Codex built-in model names; route them via same-name aliases in LLM Router"
+                  }]
+                },
+                {
+                  id: "thinkingLevel",
+                  label: "Thinking level",
+                  description: "Maps to Codex CLI `model_reasoning_effort`. Official values are `minimal`, `low`, `medium`, `high`, and `xhigh` (`xhigh` is model-dependent).",
+                  envKey: "model_reasoning_effort",
+                  value: codexCliState?.bindings?.thinkingLevel || "",
+                  allowUnset: true,
+                  usesRouteOptions: false,
+                  placeholder: "Inherit Codex default",
+                  options: CODEX_THINKING_LEVEL_OPTIONS
                 }
               ]}
             />
@@ -6848,18 +10555,28 @@ export function App() {
           <TabsContent value="claude-code" className="space-y-4">
             <CodingToolSettingsPanel
               toolName="Claude Code"
-              openButtonLabel="Open Claude Code Config File"
               toolState={claudeCodeState}
               endpointUrl={claudeCodeState?.configuredBaseUrl || `${ampClientUrl ? `${ampClientUrl}/anthropic` : ""}`}
               routeOptions={claudeRouteOptions}
               connectionBusy={claudeRoutingBusy}
               bindingBusy={claudeBindingsBusy}
-              openConfigBusy={openClaudeConfigBusy}
               onToggleRouting={handleToggleClaudeCodeRouting}
-              onOpenConfigFile={handleOpenClaudeConfigFileDefault}
               onBindingChange={handleClaudeBindingChange}
               hasMasterKey={Boolean(effectiveMasterKey)}
               disabledReason={codingToolDisabledReason}
+              onOpenPrimaryPath={() => handleOpenFilePath(claudeCodeState?.settingsFilePath, "Claude Code config file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened Claude Code config file in the default app."
+              })}
+              onOpenSecondaryPath={() => handleOpenFilePath(claudeCodeState?.backupFilePath, "Claude Code backup file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened Claude Code backup file in the default app."
+              })}
+              guideContent={buildClaudeCodeGuideContent({
+                bindings: claudeCodeState?.bindings,
+                settingsFilePath: claudeCodeState?.settingsFilePath,
+                endpointUrl: claudeCodeState?.configuredBaseUrl || `${ampClientUrl ? `${ampClientUrl}/anthropic` : ""}`
+              })}
               bindingFields={[
                 {
                   id: "primaryModel",
@@ -6905,13 +10622,47 @@ export function App() {
                   value: claudeCodeState?.bindings?.subagentModel || "",
                   allowUnset: true,
                   placeholder: "Select a sub-agent route"
+                },
+                {
+                  id: "thinkingLevel",
+                  label: "Thinking level",
+                  description: "Claude Code documents `MAX_THINKING_TOKENS`, not a fixed effort enum. This LLM Router control maps stable levels to that setting.",
+                  envKey: "MAX_THINKING_TOKENS",
+                  value: claudeCodeState?.bindings?.thinkingLevel || "",
+                  allowUnset: true,
+                  usesRouteOptions: false,
+                  placeholder: "Inherit Claude Code adaptive default",
+                  options: CLAUDE_THINKING_LEVEL_OPTIONS
                 }
               ]}
             />
           </TabsContent>
 
+          <TabsContent value="web-search" className="space-y-4">
+            <WebSearchSettingsPanel
+              webSearchConfig={webSearchConfig}
+              webSearchProviders={webSearchProviders}
+              hostedSearchCandidates={hostedSearchCandidates}
+              onWebSearchStrategyChange={handleWebSearchStrategyChange}
+              onWebSearchProviderChange={handleWebSearchProviderChange}
+              onWebSearchProviderMove={handleWebSearchProviderMove}
+              onRemoveWebSearchProvider={handleRemoveWebSearchProvider}
+              onAddHostedSearchEndpoint={handleAddHostedSearchEndpoint}
+              disabledReason={webSearchDisabledReason}
+              autosaveState={ampAutosaveState}
+            />
+          </TabsContent>
+
           <TabsContent value="activity">
-            <LogList logs={snapshot?.logs || []} />
+            <LogList
+              logs={snapshot?.logs || []}
+              activityLogEnabled={activityLogEnabled}
+              activityFilter={activityFilter}
+              busyAction={activityLogBusy}
+              onActivityFilterChange={setActivityFilter}
+              onToggleEnabled={handleToggleActivityLog}
+              onClear={handleClearActivityLog}
+            />
           </TabsContent>
         </Tabs>
 
@@ -6919,7 +10670,7 @@ export function App() {
           open={showProviderWizardModal}
           onClose={handleHideQuickStart}
           title="Add provider"
-          description="Add another provider with endpoints, model ids, rate limits, and a stable alias. API-based providers are auto-tested before save."
+          description="Add another provider with endpoints, model ids, rate limits, and a stable alias. API Key providers are auto-tested before save."
           contentClassName="max-h-[92vh] max-w-5xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
           bodyClassName="max-h-[calc(92vh-5.5rem)]"
         >

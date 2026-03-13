@@ -48,7 +48,7 @@ function buildConfig(raw = {}) {
   });
 }
 
-function makeOpenAIRequest(model) {
+function makeOpenAIRequest(model, overrides = {}) {
   return new Request("http://router.local/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -59,7 +59,45 @@ function makeOpenAIRequest(model) {
       messages: [
         { role: "user", content: "Hello" }
       ],
-      stream: false
+      stream: false,
+      ...overrides
+    })
+  });
+}
+
+function makeAmpClaudeRequest(model, overrides = {}, headerOverrides = {}) {
+  return new Request("http://router.local/api/provider/anthropic/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+      "user-agent": "Mp/JS 0.74.0",
+      ...headerOverrides
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: "Hello" }
+      ],
+      ...overrides
+    })
+  });
+}
+
+function makeAmpResponsesRequest(model, overrides = {}, headerOverrides = {}) {
+  return new Request("http://router.local/api/provider/openai/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "Mp/JS 0.74.0",
+      ...headerOverrides
+    },
+    body: JSON.stringify({
+      model,
+      input: "Hello",
+      max_output_tokens: 1024,
+      ...overrides
     })
   });
 }
@@ -156,6 +194,383 @@ test("alias route executes via live handler and round-robins targets", { concurr
       "gpt-4o-mini",
       "claude-3-5-haiku"
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("mixed-window alias routes large requests to a fitting target before the first upstream call", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini", contextWindow: 128000 }]
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku", contextWindow: 200000 }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      return claudeSuccess(payload.model);
+    };
+
+    const largeBody = makeOpenAIRequest("chat.default", {
+      messages: [
+        { role: "user", content: "A".repeat(320_000) }
+      ],
+      max_tokens: 64_000
+    });
+    const response = await fetchHandler(largeBody, {});
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamModels, ["claude-3-5-haiku"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("AMP smart requests apply the observed 168k context floor before route selection", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      smart: {
+        strategy: "ordered",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini", contextWindow: 128000 }]
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku", contextWindow: 200000 }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpClaudeRequest("smart"), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamModels, ["claude-3-5-haiku"]);
+    assert.equal(response.headers.get("x-llm-router-context-required"), "168000");
+    assert.equal(response.headers.get("x-llm-router-context-hint-source"), "amp:model:smart");
+    assert.equal(response.headers.get("x-llm-router-context-risk"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("AMP deep requests apply the observed 272k context floor before route selection", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      deep: {
+        strategy: "ordered",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "openrouter/gpt-4.1" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [
+          { id: "gpt-4o-mini", contextWindow: 200000 },
+          { id: "gpt-4.1", contextWindow: 300000 }
+        ]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      return jsonPayloadResponse({
+        id: "resp_1",
+        object: "response",
+        model: payload.model,
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "ok" }]
+          }
+        ]
+      });
+    };
+
+    const response = await fetchHandler(makeAmpResponsesRequest("deep"), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamModels, ["gpt-4.1"]);
+    assert.equal(response.headers.get("x-llm-router-context-required"), "272000");
+    assert.equal(response.headers.get("x-llm-router-context-hint-source"), "amp:model:deep");
+    assert.equal(response.headers.get("x-llm-router-context-risk"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("AMP large requests apply the observed 936k context floor before route selection", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      large: {
+        strategy: "ordered",
+        targets: [
+          { ref: "anthropic/claude-3-5-haiku" },
+          { ref: "anthropic/claude-sonnet-4-5" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [
+          { id: "claude-3-5-haiku", contextWindow: 200000 },
+          { id: "claude-sonnet-4-5", contextWindow: 1000000 }
+        ]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      return claudeSuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpClaudeRequest("large"), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamModels, ["claude-sonnet-4-5"]);
+    assert.equal(response.headers.get("x-llm-router-context-required"), "936000");
+    assert.equal(response.headers.get("x-llm-router-context-hint-source"), "amp:model:large");
+    assert.equal(response.headers.get("x-llm-router-context-risk"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("AMP Anthropic 1M beta requests prefer a 1M-capable target", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [
+          { ref: "anthropic/claude-3-5-haiku" },
+          { ref: "anthropic/claude-sonnet-4-5" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [
+          { id: "claude-3-5-haiku", contextWindow: 200000 },
+          { id: "claude-sonnet-4-5", contextWindow: 1000000 }
+        ]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      return claudeSuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpClaudeRequest(
+      "chat.default",
+      {},
+      {
+        "anthropic-beta": "fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07"
+      }
+    ), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamModels, ["claude-sonnet-4-5"]);
+    assert.equal(response.headers.get("x-llm-router-context-required"), "1000000");
+    assert.equal(
+      response.headers.get("x-llm-router-context-hint-source"),
+      "amp:anthropic-beta:context-1m-2025-08-07"
+    );
+    assert.equal(response.headers.get("x-llm-router-context-risk"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("AMP Anthropic 1M beta requests surface context risk when every target is undersized", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [
+          { ref: "openrouter/gpt-4o-mini" },
+          { ref: "anthropic/claude-3-5-haiku" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini", contextWindow: 128000 }]
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-3-5-haiku", contextWindow: 200000 }]
+      }
+    ]
+  });
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: createMemoryStateStore()
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      if (String(url).includes("/messages")) {
+        return claudeSuccess(payload.model);
+      }
+      return openAISuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeAmpClaudeRequest(
+      "chat.default",
+      {},
+      {
+        "anthropic-beta": "context-1m-2025-08-07"
+      }
+    ), {
+      LLM_ROUTER_DEBUG_ROUTING: "true"
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamModels, ["claude-3-5-haiku"]);
+    assert.equal(response.headers.get("x-llm-router-context-required"), "1000000");
+    assert.equal(
+      response.headers.get("x-llm-router-context-risk"),
+      "selected-context-window-below-required:200000<1000000"
+    );
   } finally {
     globalThis.fetch = originalFetch;
     if (typeof fetchHandler.close === "function") {

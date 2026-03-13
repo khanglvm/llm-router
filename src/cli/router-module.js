@@ -22,6 +22,22 @@ import { probeProvider, probeProviderEndpointMatrix } from "../node/provider-pro
 import { runStartCommand } from "../node/start-command.js";
 import { runWebCommand } from "../node/web-command.js";
 import { resolveListenPort } from "../node/listen-port.js";
+import { createLiteLlmContextLookupHelper } from "../node/litellm-context-catalog.js";
+import {
+  readAmpClientRoutingState as readAmpClientRoutingStateFile,
+  unpatchAmpClientConfigFiles as unpatchAmpClientConfigFilesFile
+} from "../node/amp-client-config.js";
+import {
+  patchClaudeCodeSettingsFile,
+  patchCodexCliConfigFile,
+  readClaudeCodeRoutingState,
+  readCodexCliRoutingState,
+  resolveClaudeCodeSettingsFilePath,
+  resolveCodexCliConfigFilePath,
+  resolveCodexCliModelCatalogFilePath,
+  unpatchClaudeCodeSettingsFile,
+  unpatchCodexCliConfigFile
+} from "../node/coding-tool-config.js";
 import { installStartup, restartStartup, startupStatus, stopStartup, uninstallStartup } from "../node/startup-manager.js";
 import {
   buildStartArgsFromState,
@@ -30,8 +46,10 @@ import {
   spawnDetachedStart,
   stopProcessByPid
 } from "../node/instance-state.js";
+import { listListeningPids, reclaimPort } from "../node/port-reclaim.js";
 import {
   CONFIG_VERSION,
+  DEFAULT_MODEL_ALIAS_ID,
   configHasProvider,
   DEFAULT_AMP_ENTITY_DEFINITIONS,
   DEFAULT_AMP_SIGNATURE_DEFINITIONS,
@@ -52,6 +70,12 @@ import {
   LOCAL_ROUTER_ORIGIN,
   LOCAL_ROUTER_PORT
 } from "../shared/local-router-defaults.js";
+import {
+  CODEX_CLI_INHERIT_MODEL_VALUE,
+  isCodexCliInheritModelBinding,
+  normalizeClaudeCodeThinkingLevel,
+  normalizeCodexCliReasoningEffort
+} from "../shared/coding-tool-bindings.js";
 import { FORMATS } from "../translator/index.js";
 import {
   CLOUDFLARE_ACCOUNT_ID_ENV_NAME,
@@ -83,6 +107,8 @@ import {
 const EXIT_SUCCESS = 0;
 const EXIT_FAILURE = 1;
 const EXIT_VALIDATION = 2;
+const APP_NAME = "LLM Router";
+const CLI_COMMAND = "llr";
 const NPM_PACKAGE_NAME = "@khanglvm/llm-router";
 const STRONG_MASTER_KEY_MIN_LENGTH = 24;
 const DEFAULT_GENERATED_MASTER_KEY_LENGTH = 48;
@@ -219,19 +245,6 @@ async function runPromptWithEscape(promiseFactory) {
   } catch (error) {
     if (isPromptCancelledError(error)) return PROMPT_CANCELLED;
     throw error;
-  }
-}
-
-function emitInteractiveResult(context, result) {
-  const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
-  const error = typeof context?.terminal?.error === "function" ? context.terminal.error.bind(context.terminal) : line;
-  if (!result) return;
-  if (result.ok === false) {
-    error?.(String(result.errorMessage || result.data || "Operation failed."));
-    return;
-  }
-  if (result.data) {
-    line?.(String(result.data));
   }
 }
 
@@ -1313,7 +1326,7 @@ function printAmpInboundModelHelp(context, entry = null) {
   const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
   const routeKey = String(entry?.routeKey || entry?.inbound || "").trim();
   const defaultMatch = getAmpDefaultMatchForRouteKey(routeKey);
-  info?.("Inbound AMP model matches what AMP sends before llm-router chooses a local route.");
+  info?.(`Inbound AMP model matches what AMP sends before ${APP_NAME} chooses a local route.`);
   line?.("Use built-in keys like smart/rush/deep/oracle or your own wildcard pattern like gpt-*-codex*.");
   if (defaultMatch) {
     line?.(`Default built-in match for '${routeKey}': ${defaultMatch}`);
@@ -1325,7 +1338,7 @@ function printAmpQuickSetupGuide(context, config) {
   const info = typeof context?.terminal?.info === "function" ? context.terminal.info.bind(context.terminal) : null;
   const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
   const recommendedRoute = resolveAmpBootstrapRouteRef(config);
-  info?.("Quick setup patches AMP to use your local llm-router, then picks one default route.");
+  info?.(`Quick setup patches AMP to use your local ${APP_NAME}, then picks one default route.`);
   line?.(`Recommended default route: ${recommendedRoute || "(set a model alias like chat.default first)"}`);
   line?.("You can map smart/rush/deep/oracle later from 'Common AMP routes'.");
 }
@@ -1675,7 +1688,7 @@ async function promptAmpClientPatchPlan(context, {
 } = {}) {
   const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
   const scope = normalizeAmpClientSettingsScope(await context.prompts.select({
-    message: "Where should AMP use llm-router?",
+    message: `Where should AMP use ${APP_NAME}?`,
     options: [
       { value: "workspace", label: "This workspace", hint: ".amp/settings.json" },
       { value: "global", label: "All projects", hint: "~/.config/amp/settings.json" }
@@ -1685,21 +1698,21 @@ async function promptAmpClientPatchPlan(context, {
 
   const endpointUrl = normalizeAmpClientProxyUrl(await suggestAmpClientProxyUrl());
   if (!endpointUrl) {
-    throw new Error("Could not determine a local llm-router URL for AMP patching.");
+    throw new Error(`Could not determine a local ${APP_NAME} URL for AMP patching.`);
   }
   line?.(`AMP will send requests to ${endpointUrl}.`);
 
   let apiKey = String(currentPlan?.apiKey || config?.masterKey || "").trim();
   if (apiKey) {
     const useSuggestedKey = await context.prompts.confirm({
-      message: `Use this llm-router key for AMP? (${maskSecret(apiKey)})`,
+      message: `Use this ${APP_NAME} key for AMP? (${maskSecret(apiKey)})`,
       initialValue: true
     });
     if (!useSuggestedKey) apiKey = "";
   }
   if (!apiKey) {
     apiKey = await promptSecretInput(context, {
-      message: "llm-router API key for AMP",
+      message: `${APP_NAME} API key for AMP`,
       required: true,
       validate: (value) => String(value || "").trim() ? undefined : "API key is required."
     });
@@ -1761,13 +1774,13 @@ async function resolveAmpClientPatchPlanFromArgs(context, {
   let apiKey = String(explicitApiKey ?? config?.masterKey ?? "").trim();
   if (!apiKey && canUseInteractivePrompts(context, ["text", "confirm"])) {
     apiKey = await promptSecretInput(context, {
-      message: "Local llm-router API key to store in AMP secrets.json",
+      message: `Local ${APP_NAME} API key to store in AMP secrets.json`,
       required: true,
       validate: (value) => String(value || "").trim() ? undefined : "API key is required."
     });
   }
   if (!String(apiKey || "").trim()) {
-    return { plan: null, error: "amp-client-api-key is required (or set masterKey in config) when patching AMP client files with the local llm-router gateway key." };
+    return { plan: null, error: `amp-client-api-key is required (or set masterKey in config) when patching AMP client files with the local ${APP_NAME} gateway key.` };
   }
 
   return {
@@ -1930,7 +1943,7 @@ async function manageAmpSimpleRoutesWizard(context, config, amp) {
         message: "Default AMP route",
         initialValue: resolvePreferredAmpRoute(config, amp),
         includeClearOption: true,
-        clearLabel: "Use llm-router defaultModel",
+        clearLabel: `Use ${APP_NAME} defaultModel`,
         clearHint: config.defaultModel || "no global defaultModel set",
         textPlaceholder: "chat.default"
       }));
@@ -2165,6 +2178,54 @@ function getDefaultSubscriptionModelListInput(
   return defaults.join(",");
 }
 
+function resolveLiteLlmContextLookupFn(context) {
+  return typeof context?.lookupLiteLlmContextWindow === "function"
+    ? context.lookupLiteLlmContextWindow
+    : createLiteLlmContextLookupHelper();
+}
+
+async function maybeFillMissingModelContextWindows(context, modelIds = [], modelContextWindows = {}, {
+  enabled = false
+} = {}) {
+  const normalizedModelIds = dedupeList(modelIds);
+  const nextModelContextWindows = { ...(modelContextWindows || {}) };
+  if (!enabled || normalizedModelIds.length === 0) {
+    return {
+      modelContextWindows: nextModelContextWindows,
+      filledCount: 0
+    };
+  }
+
+  const missingModelIds = normalizedModelIds.filter((modelId) => !normalizeModelContextWindowValue(nextModelContextWindows[modelId]));
+  if (missingModelIds.length === 0) {
+    return {
+      modelContextWindows: nextModelContextWindows,
+      filledCount: 0
+    };
+  }
+
+  const lookupLiteLlmContextWindow = resolveLiteLlmContextLookupFn(context);
+  const results = await lookupLiteLlmContextWindow({
+    models: missingModelIds,
+    limit: 6
+  });
+
+  let filledCount = 0;
+  for (const result of (Array.isArray(results) ? results : [])) {
+    const query = String(result?.query || "").trim();
+    const contextWindow = normalizeModelContextWindowValue(result?.exactMatch?.contextWindow);
+    if (!query || !contextWindow) continue;
+    if (normalizeModelContextWindowValue(nextModelContextWindows[query])) continue;
+    nextModelContextWindows[query] = contextWindow;
+    filledCount += 1;
+  }
+
+  return {
+    modelContextWindows: nextModelContextWindows,
+    filledCount
+  };
+}
+
 function normalizeNameForCompare(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -2186,7 +2247,7 @@ function printProviderInputGuidance(context) {
   const warn = typeof context?.terminal?.warn === "function" ? context.terminal.warn.bind(context.terminal) : null;
   const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
   const output = warn || line;
-  output?.("Compliance: using provider resources through llm-router may violate provider terms. Continue only if you're allowed to do so.");
+  output?.(`Compliance: using provider resources through ${APP_NAME} may violate provider terms. Continue only if you're allowed to do so.`);
 }
 
 function trimOuterPunctuation(value) {
@@ -2394,6 +2455,54 @@ function validateProviderModelListInput(raw, { allowEmpty = false } = {}) {
     return allowEmpty ? undefined : "Enter at least one valid model id.";
   }
   return undefined;
+}
+
+function normalizeModelContextWindowValue(value) {
+  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseModelContextWindowsInput(raw) {
+  if (!raw) return {};
+
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return Object.fromEntries(
+      Object.entries(raw)
+        .map(([modelId, value]) => [String(modelId || "").trim(), normalizeModelContextWindowValue(value)])
+        .filter(([modelId, contextWindow]) => Boolean(modelId && contextWindow))
+    );
+  }
+
+  const text = String(raw || "").trim();
+  if (!text) return {};
+
+  try {
+    const parsedJson = JSON.parse(text);
+    if (parsedJson && typeof parsedJson === "object" && !Array.isArray(parsedJson)) {
+      return parseModelContextWindowsInput(parsedJson);
+    }
+  } catch {
+    // Fall through to entry parsing.
+  }
+
+  const entries = text
+    .split(/[\n,]+/g)
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean);
+  const output = {};
+
+  for (const entry of entries) {
+    const separatorIndex = entry.search(/\s*(?:=|:)\s*/);
+    if (separatorIndex === -1) continue;
+    const match = entry.match(/^(.*?)\s*(?:=|:)\s*(.+)$/);
+    if (!match) continue;
+    const modelId = String(match[1] || "").trim();
+    const contextWindow = normalizeModelContextWindowValue(match[2]);
+    if (!modelId || !contextWindow) continue;
+    output[modelId] = contextWindow;
+  }
+
+  return output;
 }
 
 function normalizeQualifiedModelToken(token) {
@@ -3140,6 +3249,7 @@ function buildProviderModelRows(provider) {
   ]);
   return (provider?.models || []).map((model) => ([
     model?.id || "(unknown)",
+    Number.isFinite(Number(model?.contextWindow)) ? String(Math.floor(Number(model.contextWindow))) : "Unknown",
     formatRequestFormatList(dedupeList([...(model?.formats || []), ...providerFormats])),
     dedupeList(model?.fallbackModels || []).join(", ") || "None"
   ]));
@@ -3189,6 +3299,40 @@ function buildOperationReport(title, rows, extraSections = []) {
   );
 }
 
+function buildConfigValidationReport({
+  configPath,
+  exists,
+  normalizedConfig,
+  parseError,
+  validationErrors
+}) {
+  const providers = Array.isArray(normalizedConfig?.providers) ? normalizedConfig.providers : [];
+  const aliasCount = normalizedConfig?.modelAliases && typeof normalizedConfig.modelAliases === "object" && !Array.isArray(normalizedConfig.modelAliases)
+    ? Object.keys(normalizedConfig.modelAliases).length
+    : 0;
+  const issues = parseError
+    ? [`JSON parse error: ${parseError}`]
+    : validationErrors;
+
+  return buildOperationReport(
+    "Config Validation",
+    [
+      ["Config File", configPath],
+      ["Exists", formatYesNo(Boolean(exists))],
+      ["JSON Parse", parseError ? "Failed" : "Passed"],
+      ["Validation", parseError ? "Blocked by parse error" : (validationErrors.length === 0 ? "Passed" : `Failed (${validationErrors.length} issue(s))`)],
+      ["Schema Version", normalizedConfig?.version ? String(normalizedConfig.version) : "(unknown)"],
+      ["Providers", String(providers.length)],
+      ["Model Aliases", String(aliasCount)],
+      ["Rate-Limit Buckets", String(countConfiguredRateLimitBuckets(normalizedConfig))],
+      ["Master Key Configured", formatYesNo(Boolean(normalizedConfig?.masterKey))]
+    ],
+    [
+      renderListSection("Issues", issues, { emptyMessage: "None." })
+    ]
+  );
+}
+
 function buildModelAliasTargetRows(targets) {
   return (targets || []).map((target) => ([
     target?.ref || "(invalid target)",
@@ -3230,7 +3374,7 @@ function buildProviderSavedReport({
     "Endpoint Mapping\n" + renderAsciiTable(["Endpoint Type", "URL"], buildProviderEndpointRows(provider), {
       emptyMessage: "No endpoints configured."
     }),
-    "Models\n" + renderAsciiTable(["Model", "Request Format(s)", "Silent Fallbacks"], buildProviderModelRows(provider), {
+    "Models\n" + renderAsciiTable(["Model", "Context Window", "Request Format(s)", "Silent Fallbacks"], buildProviderModelRows(provider), {
       emptyMessage: "No models configured."
     }),
     "Rate-Limit Buckets\n" + renderAsciiTable(["Bucket", "Bucket ID", "Scope", "Request Limit", "Time Window"], buildRateLimitBucketRows(provider?.rateLimits || []), {
@@ -3361,7 +3505,7 @@ function buildProviderConfigSection(provider) {
     "Endpoint Mapping\n" + renderAsciiTable(["Endpoint Type", "URL"], buildProviderEndpointRows(provider), {
       emptyMessage: "No endpoints configured."
     }),
-    "Models\n" + renderAsciiTable(["Model", "Request Format(s)", "Silent Fallbacks"], buildProviderModelRows(provider), {
+    "Models\n" + renderAsciiTable(["Model", "Context Window", "Request Format(s)", "Silent Fallbacks"], buildProviderModelRows(provider), {
       emptyMessage: "No models configured."
     }),
     "Rate-Limit Buckets\n" + renderAsciiTable(["Bucket", "Bucket ID", "Scope", "Request Limit", "Time Window"], buildRateLimitBucketRows(provider?.rateLimits || []), {
@@ -3412,6 +3556,362 @@ export function summarizeConfig(config, configPath, { includeSecrets = false } =
       { emptyMessage: "No model aliases configured." }
     )
   );
+}
+
+function pickDefaultManagedRoute(config = {}) {
+  const configuredDefault = String(config?.defaultModel || "").trim();
+  if (configuredDefault) return configuredDefault;
+
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? Object.keys(config.modelAliases).map((aliasId) => String(aliasId || "").trim()).filter(Boolean)
+    : [];
+  if (aliases.length > 0) return aliases[0];
+
+  for (const provider of Array.isArray(config?.providers) ? config.providers : []) {
+    if (provider?.enabled === false) continue;
+    const providerId = String(provider?.id || "").trim();
+    if (!providerId) continue;
+    const model = Array.isArray(provider?.models)
+      ? provider.models.find((entry) => entry?.enabled !== false && String(entry?.id || "").trim())
+      : null;
+    if (model?.id) return `${providerId}/${model.id}`;
+  }
+
+  return "";
+}
+
+function normalizeCodexBindingState(bindings = {}) {
+  const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+  const defaultModel = String(source.defaultModel || "").trim();
+  return {
+    defaultModel: isCodexCliInheritModelBinding(defaultModel)
+      ? CODEX_CLI_INHERIT_MODEL_VALUE
+      : defaultModel,
+    thinkingLevel: normalizeCodexCliReasoningEffort(source.thinkingLevel)
+  };
+}
+
+function normalizeCodexBindingsInput(bindings = {}, config = {}) {
+  const normalized = normalizeCodexBindingState(bindings);
+  return {
+    defaultModel: isCodexCliInheritModelBinding(normalized.defaultModel)
+      ? CODEX_CLI_INHERIT_MODEL_VALUE
+      : (normalized.defaultModel || pickDefaultManagedRoute(config)),
+    thinkingLevel: normalized.thinkingLevel
+  };
+}
+
+function normalizeClaudeBindingState(bindings = {}) {
+  const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+  return {
+    primaryModel: String(source.primaryModel || "").trim(),
+    defaultOpusModel: String(source.defaultOpusModel || "").trim(),
+    defaultSonnetModel: String(source.defaultSonnetModel || "").trim(),
+    defaultHaikuModel: String(source.defaultHaikuModel || "").trim(),
+    subagentModel: String(source.subagentModel || "").trim(),
+    thinkingLevel: normalizeClaudeCodeThinkingLevel(source.thinkingLevel)
+  };
+}
+
+function listManagedDirectRouteRefs(config = {}) {
+  const routeRefs = new Set();
+
+  for (const provider of Array.isArray(config?.providers) ? config.providers : []) {
+    if (provider?.enabled === false) continue;
+    const providerId = String(provider?.id || "").trim();
+    if (!providerId) continue;
+    for (const model of Array.isArray(provider?.models) ? provider.models : []) {
+      if (model?.enabled === false) continue;
+      const modelId = String(model?.id || "").trim();
+      if (!modelId) continue;
+      routeRefs.add(`${providerId}/${modelId}`);
+    }
+  }
+
+  return [...routeRefs];
+}
+
+function describeManagedAlias(aliasId, alias = null) {
+  const primaryTargets = dedupeList(Array.isArray(alias?.targets) ? alias.targets.map((target) => target?.ref) : []);
+  const fallbackTargets = dedupeList(Array.isArray(alias?.fallbackTargets) ? alias.fallbackTargets.map((target) => target?.ref) : []);
+
+  if (primaryTargets.length === 0 && fallbackTargets.length === 0) {
+    return `LLM Router alias '${aliasId}'.`;
+  }
+
+  const parts = [];
+  if (primaryTargets.length > 0) {
+    parts.push(`Routes to ${primaryTargets.join(", ")}`);
+  }
+  if (fallbackTargets.length > 0) {
+    parts.push(`fallbacks ${fallbackTargets.join(", ")}`);
+  }
+  return `${parts.join("; ")}.`;
+}
+
+function describeManagedDirectRoute(routeRef, config = {}) {
+  const normalizedRef = String(routeRef || "").trim();
+  if (!normalizedRef || !normalizedRef.includes("/")) {
+    return normalizedRef ? `LLM Router route '${normalizedRef}'.` : "LLM Router route.";
+  }
+
+  const slashIndex = normalizedRef.indexOf("/");
+  const providerId = normalizedRef.slice(0, slashIndex).trim();
+  const modelId = normalizedRef.slice(slashIndex + 1).trim();
+  const provider = Array.isArray(config?.providers)
+    ? config.providers.find((entry) => String(entry?.id || "").trim() === providerId)
+    : null;
+  const providerName = String(provider?.name || providerId).trim() || providerId;
+  const model = Array.isArray(provider?.models)
+    ? provider.models.find((entry) => String(entry?.id || "").trim() === modelId)
+    : null;
+  const fallbackModels = dedupeList(Array.isArray(model?.fallbackModels) ? model.fallbackModels : []);
+
+  if (fallbackModels.length > 0) {
+    return `LLM Router route to ${providerName} model '${modelId}' with fallbacks ${fallbackModels.join(", ")}.`;
+  }
+  return `LLM Router route to ${providerName} model '${modelId}'.`;
+}
+
+function createCodexCliModelCatalogEntry(slug, description) {
+  return {
+    slug,
+    display_name: slug,
+    description,
+    default_reasoning_level: "medium",
+    supported_reasoning_levels: [
+      { effort: "minimal", description: "Minimum reasoning for the fastest supported responses" },
+      { effort: "low", description: "Fast responses with lighter reasoning" },
+      { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
+      { effort: "high", description: "Greater reasoning depth for complex problems" },
+      { effort: "xhigh", description: "Extra high reasoning depth for complex problems on supported models" }
+    ],
+    shell_type: "shell_command",
+    visibility: "list",
+    supported_in_api: true,
+    priority: 0,
+    upgrade: null,
+    base_instructions: "You are Codex, a coding agent based on GPT-5.",
+    supports_reasoning_summaries: true,
+    default_reasoning_summary: "auto",
+    support_verbosity: true,
+    default_verbosity: "low",
+    apply_patch_tool_type: "freeform",
+    truncation_policy: {
+      mode: "tokens",
+      limit: 10000
+    },
+    supports_parallel_tool_calls: true,
+    context_window: 272000,
+    effective_context_window_percent: 95,
+    experimental_supported_tools: [],
+    input_modalities: ["text", "image"],
+    prefer_websockets: false
+  };
+}
+
+function buildCodexCliModelCatalog(config = {}, bindings = {}) {
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+  const boundModel = String(bindings?.defaultModel || "").trim();
+  if (isCodexCliInheritModelBinding(boundModel)) {
+    return { models: [] };
+  }
+
+  const catalogEntries = new Map();
+  const aliasIds = new Set(
+    Object.keys(aliases)
+      .map((aliasId) => String(aliasId || "").trim())
+      .filter((aliasId) => aliasId && aliasId !== DEFAULT_MODEL_ALIAS_ID)
+  );
+  const directRouteRefs = new Set(listManagedDirectRouteRefs(config));
+
+  if (boundModel) {
+    if (boundModel.includes("/")) directRouteRefs.add(boundModel);
+    else aliasIds.add(boundModel);
+  }
+
+  for (const aliasId of aliasIds) {
+    catalogEntries.set(aliasId, createCodexCliModelCatalogEntry(
+      aliasId,
+      describeManagedAlias(aliasId, aliases[aliasId])
+    ));
+  }
+  for (const routeRef of directRouteRefs) {
+    catalogEntries.set(routeRef, createCodexCliModelCatalogEntry(
+      routeRef,
+      describeManagedDirectRoute(routeRef, config)
+    ));
+  }
+
+  const models = [...catalogEntries.values()]
+    .sort((left, right) => String(left.slug).localeCompare(String(right.slug)));
+  return models.length > 0 ? { models } : undefined;
+}
+
+function formatCodexBindingLabel(defaultModel = "") {
+  return isCodexCliInheritModelBinding(defaultModel)
+    ? "Inherit Codex CLI model"
+    : (String(defaultModel || "").trim() || "No model selected");
+}
+
+async function readAmpClientRoutingStates({
+  cwd = process.cwd(),
+  env = process.env,
+  endpointUrl = LOCAL_ROUTER_ORIGIN,
+  settingsScope = "",
+  settingsFilePath = ""
+} = {}) {
+  const scopes = settingsScope ? [normalizeAmpClientSettingsScope(settingsScope)] : ["global", "workspace"];
+  const states = [];
+
+  for (const scope of scopes.filter(Boolean)) {
+    const resolvedSettingsFilePath = scope === normalizeAmpClientSettingsScope(settingsScope)
+      ? String(settingsFilePath || "").trim()
+      : "";
+    const state = await readAmpClientRoutingStateFile({
+      scope,
+      settingsFilePath: resolvedSettingsFilePath,
+      endpointUrl,
+      cwd,
+      env
+    });
+    states.push({
+      ...state,
+      secretsFilePath: resolveAmpClientSecretsFilePath({ env })
+    });
+  }
+
+  return states;
+}
+
+async function buildCodingToolRoutingSnapshot({
+  config,
+  cwd = process.cwd(),
+  env = process.env,
+  args = {}
+} = {}) {
+  const endpointUrl = String(readArg(args, ["endpoint-url", "endpointUrl"], LOCAL_ROUTER_ORIGIN) || LOCAL_ROUTER_ORIGIN).trim();
+  const ampStates = await readAmpClientRoutingStates({
+    cwd,
+    env,
+    endpointUrl,
+    settingsScope: readArg(args, ["amp-client-settings-scope", "ampClientSettingsScope"], ""),
+    settingsFilePath: readArg(args, ["amp-client-settings-file", "ampClientSettingsFile"], "")
+  }).catch((error) => ([{
+    scope: "global",
+    settingsFilePath: resolveAmpClientSettingsFilePath({ scope: "global", cwd, env }),
+    secretsFilePath: resolveAmpClientSecretsFilePath({ env }),
+    configuredUrl: "",
+    routedViaRouter: false,
+    settingsExists: false,
+    error: error instanceof Error ? error.message : String(error)
+  }]));
+  const codexCli = await readCodexCliRoutingState({
+    configFilePath: readArg(args, ["codex-config-file", "codexConfigFile"], ""),
+    endpointUrl,
+    env
+  }).catch((error) => ({
+    tool: "codex-cli",
+    configFilePath: resolveCodexCliConfigFilePath({ env }),
+    backupFilePath: "",
+    configuredBaseUrl: "",
+    configuredModelCatalogJson: "",
+    bindings: {
+      defaultModel: "",
+      thinkingLevel: ""
+    },
+    routedViaRouter: false,
+    error: error instanceof Error ? error.message : String(error)
+  }));
+  const claudeCode = await readClaudeCodeRoutingState({
+    settingsFilePath: readArg(args, ["claude-code-settings-file", "claudeCodeSettingsFile", "claude-settings-file", "claudeSettingsFile"], ""),
+    endpointUrl,
+    env
+  }).catch((error) => ({
+    tool: "claude-code",
+    settingsFilePath: resolveClaudeCodeSettingsFilePath({ env }),
+    backupFilePath: "",
+    configuredBaseUrl: "",
+    bindings: {
+      primaryModel: "",
+      defaultOpusModel: "",
+      defaultSonnetModel: "",
+      defaultHaikuModel: "",
+      subagentModel: "",
+      thinkingLevel: ""
+    },
+    routedViaRouter: false,
+    error: error instanceof Error ? error.message : String(error)
+  }));
+  return {
+    endpointUrl,
+    ampStates,
+    codexCli,
+    claudeCode,
+    masterKeyConfigured: Boolean(String(config?.masterKey || "").trim())
+  };
+}
+
+function buildAmpClientStatusSection(ampStates = []) {
+  const rows = ampStates.map((state) => ([
+    state.scope || "(unknown)",
+    formatYesNo(state.routedViaRouter === true),
+    state.configuredUrl || "(not set)",
+    state.settingsFilePath || "(not found)"
+  ]));
+
+  return joinReportSections(
+    "AMP Client",
+    renderAsciiTable(["Scope", "Routed Via Router", "Configured URL", "Settings File"], rows, {
+      emptyMessage: "No AMP client settings found."
+    }),
+    renderListSection("Errors", ampStates.map((state) => state.error), { emptyMessage: "None." }),
+    renderListSection("Secrets", dedupeList(ampStates.map((state) => state.secretsFilePath)), {
+      emptyMessage: "No AMP secrets file detected."
+    })
+  );
+}
+
+function buildCodexCliStatusSection(state = {}) {
+  return renderKeyValueSection("Codex CLI", [
+    ["Routed Via Router", formatYesNo(state.routedViaRouter === true)],
+    ["Config File", state.configFilePath || resolveCodexCliConfigFilePath()],
+    ["Backup File", state.backupFilePath || "(not created)"],
+    ["Base URL", state.configuredBaseUrl || "(not set)"],
+    ["Model Binding", formatCodexBindingLabel(state.bindings?.defaultModel)],
+    ["Thinking Level", state.bindings?.thinkingLevel || "(not set)"],
+    ["Model Catalog", state.configuredModelCatalogJson || "(not set)"],
+    ["Error", state.error || "(none)"]
+  ]);
+}
+
+function buildClaudeCodeStatusSection(state = {}) {
+  return renderKeyValueSection("Claude Code", [
+    ["Routed Via Router", formatYesNo(state.routedViaRouter === true)],
+    ["Settings File", state.settingsFilePath || resolveClaudeCodeSettingsFilePath()],
+    ["Backup File", state.backupFilePath || "(not created)"],
+    ["Base URL", state.configuredBaseUrl || "(not set)"],
+    ["Primary Model", state.bindings?.primaryModel || "(not set)"],
+    ["Default Opus", state.bindings?.defaultOpusModel || "(not set)"],
+    ["Default Sonnet", state.bindings?.defaultSonnetModel || "(not set)"],
+    ["Default Haiku", state.bindings?.defaultHaikuModel || "(not set)"],
+    ["Subagent Model", state.bindings?.subagentModel || "(not set)"],
+    ["Thinking Level", state.bindings?.thinkingLevel || "(not set)"],
+    ["Error", state.error || "(none)"]
+  ]);
+}
+
+function buildProviderDiagnosticOverview(result = {}) {
+  return [
+    ["Working Formats", (result.workingFormats || []).join(", ") || "(none)"],
+    ["Preferred Format", result.preferredFormat || "(not detected)"],
+    ["OpenAI Endpoint", result.baseUrlByFormat?.openai || "(not detected)"],
+    ["Claude Endpoint", result.baseUrlByFormat?.claude || "(not detected)"],
+    ["Models", new Intl.NumberFormat("en-US").format((result.models || []).length)],
+    ["Warnings", new Intl.NumberFormat("en-US").format((result.warnings || []).length)]
+  ];
 }
 
 function runCommand(command, args, { cwd, input, envOverrides } = {}) {
@@ -3924,6 +4424,7 @@ async function readCurrentPackageVersion() {
 async function resolveLatestCliPath(fallbackCliPath = "") {
   const nodeBinDir = path.dirname(process.execPath);
   const candidates = [
+    path.join(nodeBinDir, "llr"),
     path.join(nodeBinDir, "llm-router"),
     path.join(nodeBinDir, "llm-router-route"),
     String(process.env.LLM_ROUTER_CLI_PATH || "").trim(),
@@ -4112,7 +4613,7 @@ async function reloadRunningInstance({
   return {
     ok: false,
     mode: "none",
-    reason: "No running llm-router instance detected."
+    reason: `No running ${APP_NAME} instance detected.`
   };
 }
 
@@ -4619,6 +5120,16 @@ async function resolveUpsertInput(context, existingConfig) {
   ) || "");
   const baseApiKey = String(readArg(args, ["api-key", "apiKey"], "") || "");
   const baseModels = String(readArg(args, ["models"], (selectedExisting?.models || []).map((m) => m.id).join(",")) || "");
+  const baseModelContextWindows = parseModelContextWindowsInput(readArg(
+    args,
+    ["model-context-windows", "modelContextWindows"],
+    ""
+  ));
+  const fillModelContextWindows = toBoolean(readArg(
+    args,
+    ["fill-model-context-windows", "fillModelContextWindows"],
+    false
+  ), false);
   const baseFormat = String(readArg(args, ["format"], selectedExisting?.format || "") || "");
   const baseFormats = parseModelListInput(readArg(args, ["formats"], (selectedExisting?.formats || []).join(",")));
   const hasHeadersArg = args.headers !== undefined;
@@ -4775,6 +5286,8 @@ async function resolveUpsertInput(context, existingConfig) {
       models: baseIsSubscription
         ? parseProviderModelListInput(subscriptionModelsInput)
         : parseProviderModelListInput(baseModels),
+      modelContextWindows: baseModelContextWindows,
+      fillModelContextWindows,
       format: baseIsSubscription ? (subscriptionPreset?.targetFormat || FORMATS.OPENAI) : baseFormat,
       formats: baseFormats,
       headers: parsedHeaders,
@@ -4902,6 +5415,8 @@ async function resolveUpsertInput(context, existingConfig) {
     claudeBaseUrl: baseClaudeBaseUrl,
     apiKey,
     models,
+    modelContextWindows: baseModelContextWindows,
+    fillModelContextWindows,
     format: probe ? "" : manualFormat,
     formats: baseFormats,
     headers: interactiveHeaders,
@@ -5481,6 +5996,29 @@ async function doUpsertProvider(context) {
   const effectiveFormat = isSubscriptionProvider
     ? FORMATS.OPENAI
     : (selectedFormat || (shouldProbe ? "" : "openai"));
+  let effectiveModelContextWindows = {
+    ...(input.modelContextWindows && typeof input.modelContextWindows === "object"
+      ? input.modelContextWindows
+      : {})
+  };
+
+  try {
+    const fillResult = await maybeFillMissingModelContextWindows(context, effectiveModels, effectiveModelContextWindows, {
+      enabled: Boolean(input.fillModelContextWindows)
+    });
+    effectiveModelContextWindows = fillResult.modelContextWindows;
+    if (fillResult.filledCount > 0) {
+      const line = typeof context?.terminal?.line === "function" ? context.terminal.line.bind(context.terminal) : null;
+      line?.(`LiteLLM filled ${fillResult.filledCount} model context window${fillResult.filledCount === 1 ? "" : "s"}.`);
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      errorMessage: `LiteLLM model context lookup failed: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
 
   const provider = buildProviderFromConfigInput({
     providerId: input.providerId,
@@ -5493,6 +6031,7 @@ async function doUpsertProvider(context) {
     claudeBaseUrl: effectiveClaudeBaseUrl,
     apiKey: isSubscriptionProvider ? undefined : input.apiKey,
     models: effectiveModels,
+    modelContextWindows: effectiveModelContextWindows,
     format: effectiveFormat,
     formats: input.formats,
     headers: input.headers,
@@ -5540,8 +6079,687 @@ async function doListConfig(context) {
   };
 }
 
+async function doValidateConfig(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  let exists = true;
+  let rawText = "";
+  try {
+    rawText = await fsPromises.readFile(configPath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      exists = false;
+      rawText = "";
+    } else {
+      throw error;
+    }
+  }
+
+  let normalizedConfig = normalizeRuntimeConfig({}, { migrateToVersion: CONFIG_VERSION });
+  let parseError = "";
+  if (rawText.trim()) {
+    try {
+      normalizedConfig = normalizeRuntimeConfig(
+        JSON.parse(rawText),
+        { migrateToVersion: CONFIG_VERSION }
+      );
+    } catch (error) {
+      parseError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  const validationErrors = parseError ? [] : validateRuntimeConfig(normalizedConfig);
+  const report = buildConfigValidationReport({
+    configPath,
+    exists,
+    normalizedConfig,
+    parseError,
+    validationErrors
+  });
+
+  if (parseError || validationErrors.length > 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: report
+    };
+  }
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: report
+  };
+}
+
 async function doListRouting(context) {
   return doListConfig(context);
+}
+
+async function resolveProviderProbeApiKey(args = {}) {
+  const apiKey = String(readArg(args, ["api-key", "apiKey"], "") || "").trim();
+  if (apiKey) return apiKey;
+
+  const apiKeyEnv = String(readArg(args, ["api-key-env", "apiKeyEnv"], "") || "").trim();
+  if (!apiKeyEnv) {
+    throw new Error("api-key or api-key-env is required for provider diagnostics.");
+  }
+
+  const envValue = String(process.env?.[apiKeyEnv] || "").trim();
+  if (!envValue) {
+    throw new Error(`Environment variable '${apiKeyEnv}' is not set.`);
+  }
+  return envValue;
+}
+
+function collectProviderProbeEndpoints(args = {}) {
+  return dedupeList([
+    ...parseEndpointListInput(readArg(args, ["endpoints"], "")),
+    String(readArg(args, ["base-url", "baseUrl"], "") || "").trim(),
+    String(readArg(args, ["openai-base-url", "openaiBaseUrl"], "") || "").trim(),
+    String(readArg(args, ["claude-base-url", "claudeBaseUrl", "anthropic-base-url", "anthropicBaseUrl"], "") || "").trim()
+  ].filter(Boolean));
+}
+
+function parseOptionalHeadersArg(args = {}) {
+  const headersValue = readArg(args, ["headers"], undefined);
+  if (headersValue === undefined) return {};
+  return parseJsonObjectArg(headersValue, "--headers");
+}
+
+async function doSnapshot(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const runtimeState = await getActiveRuntimeState().catch(() => null);
+  const startup = await startupStatus().catch((error) => ({
+    manager: "unknown",
+    serviceId: "llm-router",
+    installed: false,
+    running: false,
+    detail: error instanceof Error ? error.message : String(error)
+  }));
+  const toolSnapshot = await buildCodingToolRoutingSnapshot({ config, args });
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: joinReportSections(
+      "Router Snapshot",
+      renderKeyValueSection("Runtime", [
+        ["Router Endpoint", LOCAL_ROUTER_ORIGIN],
+        ["Running", formatYesNo(Boolean(runtimeState))],
+        ["Runtime PID", runtimeState?.pid ? String(runtimeState.pid) : "(not running)"],
+        ["Config Path", runtimeState?.configPath || configPath],
+        ["Watch Config", runtimeState ? formatYesNo(runtimeState.watchConfig !== false) : "(not running)"],
+        ["Watch Binary", runtimeState ? formatYesNo(runtimeState.watchBinary !== false) : "(not running)"],
+        ["Require Auth", runtimeState ? formatYesNo(runtimeState.requireAuth === true) : formatYesNo(Boolean(config?.masterKey))]
+      ]),
+      renderKeyValueSection("Startup", [
+        ["Installed", formatYesNo(Boolean(startup?.installed))],
+        ["Running", formatYesNo(Boolean(startup?.running))],
+        ["Manager", startup?.manager || "Unknown"],
+        ["Service Name", startup?.serviceId || "Unknown"],
+        ["Detail", String(startup?.detail || "").trim() || "(none)"]
+      ]),
+      summarizeConfig(config, configPath),
+      buildAmpClientStatusSection(toolSnapshot.ampStates),
+      buildCodexCliStatusSection(toolSnapshot.codexCli),
+      buildClaudeCodeStatusSection(toolSnapshot.claudeCode)
+    )
+  };
+}
+
+async function doToolStatus(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const snapshot = await buildCodingToolRoutingSnapshot({ config, args });
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "Coding Tool Routing Status",
+      [
+        ["Router Endpoint", snapshot.endpointUrl],
+        ["Config File", configPath],
+        ["Master Key Configured", formatYesNo(snapshot.masterKeyConfigured)]
+      ],
+      [
+        buildAmpClientStatusSection(snapshot.ampStates),
+        buildCodexCliStatusSection(snapshot.codexCli),
+        buildClaudeCodeStatusSection(snapshot.claudeCode)
+      ]
+    )
+  };
+}
+
+async function doSetAmpClientRouting(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const enabled = parseOptionalBoolean(readArg(args, ["enabled"], undefined)) !== false;
+
+  if (!enabled) {
+    const scope = normalizeAmpClientSettingsScope(readArg(args, ["amp-client-settings-scope", "ampClientSettingsScope"], "global")) || "global";
+    const settingsFilePath = resolveAmpClientSettingsFilePath({
+      scope,
+      explicitPath: readArg(args, ["amp-client-settings-file", "ampClientSettingsFile"], ""),
+      cwd: process.cwd(),
+      env: process.env
+    });
+    const secretsFilePath = resolveAmpClientSecretsFilePath({
+      explicitPath: readArg(args, ["amp-client-secrets-file", "ampClientSecretsFile"], ""),
+      env: process.env
+    });
+    const unpatchResult = await unpatchAmpClientConfigFilesFile({
+      settingsFilePath,
+      secretsFilePath,
+      endpointUrl: readArg(args, ["endpoint-url", "endpointUrl", "amp-client-url", "ampClientUrl"], ""),
+      env: process.env
+    });
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildOperationReport(
+        "AMP Client Routing Disabled",
+        [
+          ["Settings File", unpatchResult.settingsFilePath],
+          ["Secrets File", unpatchResult.secretsFilePath],
+          ["Settings Updated", formatYesNo(unpatchResult.settingsUpdated === true)],
+          ["Removed Secrets", String((unpatchResult.secretFieldsRemoved || []).length)]
+        ],
+        [
+          renderListSection("Removed Secret Keys", unpatchResult.secretFieldsRemoved, { emptyMessage: "None." })
+        ]
+      )
+    };
+  }
+
+  const patchResolution = await resolveAmpClientPatchPlanFromArgs(context, {
+    config,
+    cwd: process.cwd(),
+    env: process.env
+  });
+  if (patchResolution.error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: patchResolution.error
+    };
+  }
+
+  const patchPlan = patchResolution.plan;
+  if (!patchPlan) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "AMP client routing needs patch args. Pass --amp-client-settings-scope plus optional --amp-client-url / --amp-client-api-key."
+    };
+  }
+
+  const bootstrap = await maybeBootstrapAmpPatchDefaults({
+    config,
+    amp: config?.amp,
+    patchPlan,
+    env: process.env,
+    homeDir: os.homedir()
+  });
+  if (bootstrap.error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: bootstrap.error
+    };
+  }
+
+  const previousAmpSignature = serializeStable(config?.amp || {});
+  const nextAmpSignature = serializeStable(bootstrap.amp || {});
+  if (previousAmpSignature !== nextAmpSignature) {
+    await writeConfigFile({
+      ...config,
+      amp: bootstrap.amp
+    }, configPath);
+  }
+
+  const patchResult = await patchAmpClientConfigFiles(patchPlan);
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "AMP Client Routing Enabled",
+      [
+        ["Config File", configPath],
+        ["Settings File", patchResult.settingsFilePath],
+        ["Secrets File", patchResult.secretsFilePath],
+        ["Endpoint URL", patchResult.endpointUrl],
+        ["Config Bootstrapped", formatYesNo(previousAmpSignature !== nextAmpSignature)],
+        ["Bootstrap Default Route", bootstrap.bootstrapRouteRef || "(none)"]
+      ],
+      [
+        buildAmpConfigSection(bootstrap.amp),
+        buildAmpClientPatchSection(patchResult)
+      ]
+    )
+  };
+}
+
+async function doSetCodexCliRouting(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const endpointUrl = String(readArg(args, ["endpoint-url", "endpointUrl"], LOCAL_ROUTER_ORIGIN) || LOCAL_ROUTER_ORIGIN).trim();
+  const configFilePath = String(readArg(args, ["codex-config-file", "codexConfigFile"], "") || "").trim();
+  const modelCatalogFilePath = String(readArg(args, ["codex-model-catalog-file", "codexModelCatalogFile"], "") || "").trim();
+  const enabled = parseOptionalBoolean(readArg(args, ["enabled"], undefined)) !== false;
+
+  if (!enabled) {
+    const unpatchResult = await unpatchCodexCliConfigFile({
+      configFilePath,
+      env: process.env
+    });
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildOperationReport(
+        "Codex CLI Routing Disabled",
+        [
+          ["Config File", unpatchResult.configFilePath],
+          ["Backup File", unpatchResult.backupFilePath],
+          ["Backup Restored", formatYesNo(unpatchResult.backupRestored === true)]
+        ]
+      )
+    };
+  }
+
+  const existingState = await readCodexCliRoutingState({
+    configFilePath,
+    endpointUrl,
+    env: process.env
+  });
+  const apiKey = String(
+    readArg(args, ["master-key", "masterKey", "api-key", "apiKey"], config?.masterKey || "") || ""
+  ).trim();
+  if (!apiKey) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `master-key (or config.masterKey) is required before routing Codex CLI through ${APP_NAME}.`
+    };
+  }
+
+  const bindings = normalizeCodexBindingsInput({
+    defaultModel: readArg(args, ["default-model", "defaultModel"], undefined) !== undefined
+      ? readArg(args, ["default-model", "defaultModel"], "")
+      : existingState.bindings?.defaultModel,
+    thinkingLevel: readArg(args, ["thinking-level", "thinkingLevel"], undefined) !== undefined
+      ? readArg(args, ["thinking-level", "thinkingLevel"], "")
+      : existingState.bindings?.thinkingLevel
+  }, config);
+  const patchResult = await patchCodexCliConfigFile({
+    configFilePath,
+    modelCatalogFilePath,
+    endpointUrl,
+    apiKey,
+    bindings,
+    modelCatalog: buildCodexCliModelCatalog(config, bindings),
+    captureBackup: true,
+    env: process.env
+  });
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "Codex CLI Routing Enabled",
+      [
+        ["Config File", patchResult.configFilePath],
+        ["Backup File", patchResult.backupFilePath],
+        ["Catalog File", patchResult.modelCatalogFilePath || resolveCodexCliModelCatalogFilePath({
+          configFilePath: patchResult.configFilePath
+        })],
+        ["Base URL", patchResult.baseUrl],
+        ["Model Binding", formatCodexBindingLabel(patchResult.bindings?.defaultModel)],
+        ["Thinking Level", patchResult.bindings?.thinkingLevel || "(not set)"]
+      ]
+    )
+  };
+}
+
+async function doSetClaudeCodeRouting(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const endpointUrl = String(readArg(args, ["endpoint-url", "endpointUrl"], LOCAL_ROUTER_ORIGIN) || LOCAL_ROUTER_ORIGIN).trim();
+  const settingsFilePath = String(readArg(args, ["claude-code-settings-file", "claudeCodeSettingsFile", "claude-settings-file", "claudeSettingsFile"], "") || "").trim();
+  const enabled = parseOptionalBoolean(readArg(args, ["enabled"], undefined)) !== false;
+
+  if (!enabled) {
+    const unpatchResult = await unpatchClaudeCodeSettingsFile({
+      settingsFilePath,
+      env: process.env
+    });
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildOperationReport(
+        "Claude Code Routing Disabled",
+        [
+          ["Settings File", unpatchResult.settingsFilePath],
+          ["Backup File", unpatchResult.backupFilePath],
+          ["Backup Restored", formatYesNo(unpatchResult.backupRestored === true)]
+        ]
+      )
+    };
+  }
+
+  const existingState = await readClaudeCodeRoutingState({
+    settingsFilePath,
+    endpointUrl,
+    env: process.env
+  });
+  const apiKey = String(
+    readArg(args, ["master-key", "masterKey", "api-key", "apiKey"], config?.masterKey || "") || ""
+  ).trim();
+  if (!apiKey) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `master-key (or config.masterKey) is required before routing Claude Code through ${APP_NAME}.`
+    };
+  }
+
+  const existingBindings = normalizeClaudeBindingState(existingState.bindings);
+  const fallbackPrimaryModel = existingBindings.primaryModel || pickDefaultManagedRoute(config);
+  const bindings = normalizeClaudeBindingState({
+    primaryModel: readArg(args, ["primary-model", "primaryModel"], undefined) !== undefined
+      ? readArg(args, ["primary-model", "primaryModel"], "")
+      : fallbackPrimaryModel,
+    defaultOpusModel: readArg(args, ["default-opus-model", "defaultOpusModel"], undefined) !== undefined
+      ? readArg(args, ["default-opus-model", "defaultOpusModel"], "")
+      : existingBindings.defaultOpusModel,
+    defaultSonnetModel: readArg(args, ["default-sonnet-model", "defaultSonnetModel"], undefined) !== undefined
+      ? readArg(args, ["default-sonnet-model", "defaultSonnetModel"], "")
+      : existingBindings.defaultSonnetModel,
+    defaultHaikuModel: readArg(args, ["default-haiku-model", "defaultHaikuModel"], undefined) !== undefined
+      ? readArg(args, ["default-haiku-model", "defaultHaikuModel"], "")
+      : existingBindings.defaultHaikuModel,
+    subagentModel: readArg(args, ["subagent-model", "subagentModel"], undefined) !== undefined
+      ? readArg(args, ["subagent-model", "subagentModel"], "")
+      : existingBindings.subagentModel,
+    thinkingLevel: readArg(args, ["thinking-level", "thinkingLevel"], undefined) !== undefined
+      ? readArg(args, ["thinking-level", "thinkingLevel"], "")
+      : existingBindings.thinkingLevel
+  });
+
+  const patchResult = await patchClaudeCodeSettingsFile({
+    settingsFilePath,
+    endpointUrl,
+    apiKey,
+    bindings,
+    captureBackup: true,
+    env: process.env
+  });
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "Claude Code Routing Enabled",
+      [
+        ["Settings File", patchResult.settingsFilePath],
+        ["Backup File", patchResult.backupFilePath],
+        ["Base URL", patchResult.baseUrl],
+        ["Primary Model", patchResult.bindings?.primaryModel || "(not set)"],
+        ["Subagent Model", patchResult.bindings?.subagentModel || "(not set)"],
+        ["Thinking Level", patchResult.bindings?.thinkingLevel || "(not set)"]
+      ]
+    )
+  };
+}
+
+async function doDiscoverProviderModels(context) {
+  const args = context.args || {};
+  let headers;
+  try {
+    headers = parseOptionalHeadersArg(args);
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  const endpoints = collectProviderProbeEndpoints(args);
+  if (endpoints.length === 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "At least one endpoint is required. Pass --endpoints or --base-url."
+    };
+  }
+
+  let apiKey;
+  try {
+    apiKey = await resolveProviderProbeApiKey(args);
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  const workingFormats = new Set();
+  const discoveredModels = [];
+  const discoveredModelSet = new Set();
+  const baseUrlByFormat = {};
+  const authByFormat = {};
+  let preferredFormat = "";
+
+  for (const endpoint of endpoints) {
+    const result = await probeProvider({
+      baseUrl: endpoint,
+      apiKey,
+      headers,
+      timeoutMs: 8000
+    });
+
+    for (const format of (result.workingFormats || [])) {
+      workingFormats.add(format);
+    }
+    for (const [format, baseUrl] of Object.entries(result.baseUrlByFormat || {})) {
+      if (!baseUrlByFormat[format]) baseUrlByFormat[format] = baseUrl;
+    }
+    for (const [format, auth] of Object.entries(result.authByFormat || {})) {
+      if (!authByFormat[format]) authByFormat[format] = auth;
+    }
+    if (!preferredFormat && result.preferredFormat) {
+      preferredFormat = result.preferredFormat;
+    }
+    for (const modelId of (result.models || [])) {
+      if (discoveredModelSet.has(modelId)) continue;
+      discoveredModelSet.add(modelId);
+      discoveredModels.push(modelId);
+    }
+  }
+
+  const warnings = [];
+  if (discoveredModels.length === 0) {
+    warnings.push("Model list API did not return any models. Add model ids manually if needed.");
+  }
+  if (workingFormats.size === 0) {
+    warnings.push("No working endpoint format detected yet. Run test-provider after choosing models.");
+  }
+  const discoveryOk = discoveredModels.length > 0 && workingFormats.size > 0;
+
+  return {
+    ok: discoveryOk,
+    mode: context.mode,
+    exitCode: discoveryOk ? EXIT_SUCCESS : EXIT_FAILURE,
+    data: buildOperationReport(
+      discoveryOk ? "Provider Model Discovery" : "Provider Model Discovery Incomplete",
+      buildProviderDiagnosticOverview({
+        workingFormats: [...workingFormats],
+        preferredFormat: preferredFormat || null,
+        baseUrlByFormat,
+        models: discoveredModels,
+        warnings
+      }),
+      [
+        renderListSection("Endpoints", endpoints),
+        renderListSection("Models", discoveredModels, { emptyMessage: "No models discovered." }),
+        renderListSection("Warnings", warnings, { emptyMessage: "None." })
+      ]
+    )
+  };
+}
+
+async function doTestProvider(context) {
+  const args = context.args || {};
+  let headers;
+  try {
+    headers = parseOptionalHeadersArg(args);
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  const endpoints = collectProviderProbeEndpoints(args);
+  const models = parseProviderModelListInput(readArg(args, ["models"], ""));
+  if (endpoints.length === 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "At least one endpoint is required. Pass --endpoints or --base-url."
+    };
+  }
+  if (models.length === 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "At least one model is required. Pass --models=model-a,model-b."
+    };
+  }
+
+  let apiKey;
+  try {
+    apiKey = await resolveProviderProbeApiKey(args);
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  const result = await probeProviderEndpointMatrix({
+    endpoints,
+    models,
+    apiKey,
+    headers,
+    requestsPerMinute: toPositiveInteger(
+      readArg(args, ["probe-rpm", "probe-requests-per-minute", "probeRequestsPerMinute"], DEFAULT_PROBE_REQUESTS_PER_MINUTE),
+      DEFAULT_PROBE_REQUESTS_PER_MINUTE
+    )
+  });
+  const endpointRows = (result.endpointMatrix || []).map((entry) => ([
+    entry.endpoint,
+    (entry.workingFormats || []).join(", ") || "(none)",
+    Object.values(entry.modelsByFormat || {})
+      .flat()
+      .filter(Boolean)
+      .length
+      .toString(),
+    entry.preferredFormat || "(not detected)"
+  ]));
+
+  return {
+    ok: result.ok,
+    mode: context.mode,
+    exitCode: result.ok ? EXIT_SUCCESS : EXIT_FAILURE,
+    data: buildOperationReport(
+      result.ok ? "Provider Probe Passed" : "Provider Probe Completed With Gaps",
+      buildProviderDiagnosticOverview(result),
+      [
+        "Endpoint Matrix\n" + renderAsciiTable(
+          ["Endpoint", "Working Formats", "Confirmed Models", "Preferred Format"],
+          endpointRows,
+          { emptyMessage: "No endpoint checks completed." }
+        ),
+        renderListSection("Supported Models", result.models, { emptyMessage: "None." }),
+        renderListSection("Unresolved Models", result.unresolvedModels, { emptyMessage: "None." }),
+        renderListSection("Warnings", result.warnings, { emptyMessage: "None." })
+      ]
+    )
+  };
+}
+
+async function doLiteLlmContextLookup(context) {
+  const args = context.args || {};
+  const models = parseProviderModelListInput(readArg(args, ["models", "model"], ""));
+  if (models.length === 0) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: "At least one model is required. Pass --models=model-a,model-b."
+    };
+  }
+
+  const lookupLiteLlmContextWindow = createLiteLlmContextLookupHelper();
+  const results = await lookupLiteLlmContextWindow({ models });
+  const rows = results.map((entry) => ([
+    entry.query,
+    entry.exactMatch?.model || "(none)",
+    entry.exactMatch?.contextWindow || entry.medianContextWindow || "(unknown)",
+    (entry.suggestions || []).slice(0, 3).map((item) => item.model).join(", ") || "(none)"
+  ]));
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "LiteLLM Context Lookup",
+      [
+        ["Queries", String(results.length)],
+        ["Exact Matches", String(results.filter((entry) => entry.exactMatch).length)]
+      ],
+      [
+        "Results\n" + renderAsciiTable(
+          ["Query", "Exact Match", "Context Window", "Top Suggestions"],
+          rows,
+          { emptyMessage: "No lookup results." }
+        )
+      ]
+    )
+  };
 }
 
 async function doMigrateConfig(context) {
@@ -6831,7 +8049,7 @@ async function doSetAmpConfig(context) {
         ok: false,
         mode: context.mode,
         exitCode: EXIT_VALIDATION,
-        errorMessage: "No AMP config changes requested. Run 'llm-router config' for the interactive AMP wizard or pass --amp-* flags."
+        errorMessage: `No AMP config changes requested. Run '${CLI_COMMAND} config' for the web console or pass --amp-* flags.`
       };
     }
 
@@ -7024,7 +8242,7 @@ async function doStartupInstall(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_VALIDATION,
-      errorMessage: `Config not found at ${configPath}. Run 'llm-router config' first.`
+      errorMessage: `Config not found at ${configPath}. Run '${CLI_COMMAND} config' first.`
     };
   }
 
@@ -7034,7 +8252,7 @@ async function doStartupInstall(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_VALIDATION,
-      errorMessage: `No providers configured in ${configPath}. Run 'llm-router config'.`
+      errorMessage: `No providers configured in ${configPath}. Run '${CLI_COMMAND} config'.`
     };
   }
   if (requireAuth && !config.masterKey) {
@@ -7042,13 +8260,13 @@ async function doStartupInstall(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_VALIDATION,
-      errorMessage: `Local auth requires masterKey in ${configPath}. Run 'llm-router config --operation=set-master-key' first.`
+      errorMessage: `Local auth requires masterKey in ${configPath}. Run '${CLI_COMMAND} config --operation=set-master-key' first.`
     };
   }
 
   if (canPrompt()) {
     const confirm = await context.prompts.confirm({
-      message: `Install llm-router startup service on ${process.platform}?`,
+      message: `Install ${APP_NAME} startup service on ${process.platform}?`,
       initialValue: true
     });
     if (!confirm) {
@@ -7079,7 +8297,7 @@ async function doStartupInstall(context) {
 async function doStartupUninstall(context) {
   if (canPrompt()) {
     const confirm = await context.prompts.confirm({
-      message: "Uninstall llm-router OS startup service?",
+      message: `Uninstall ${APP_NAME} OS startup service?`,
       initialValue: false
     });
     if (!confirm) {
@@ -7135,1197 +8353,12 @@ function listProviderModelIds(provider) {
   return dedupeList((provider?.models || []).map((model) => model?.id).filter(Boolean));
 }
 
-function buildInteractiveConfigRootSections(config) {
-  const providers = config?.providers || [];
-  const providerCount = providers.length;
-  const modelCount = providers.reduce((sum, provider) => sum + listProviderModelIds(provider).length, 0);
-  const aliasCount = Object.keys(config?.modelAliases || {}).length;
-  const hasMasterKey = Boolean(String(config?.masterKey || "").trim());
-  const ampConfigured = hasConfiguredAmp(config);
-
-  return [
-    {
-      value: "providers",
-      label: "Providers",
-      hint: providerCount > 0 ? `${formatItemCount(providerCount, "provider")} connected` : "add your first provider"
-    },
-    {
-      value: "models",
-      label: "Models",
-      hint: modelCount > 0 ? `${formatItemCount(modelCount, "model")} configured` : "edit provider model lists"
-    },
-    {
-      value: "model-alias",
-      label: "Model Alias",
-      hint: aliasCount > 0 ? `${formatItemCount(aliasCount, "alias")} configured` : "group routes under one name"
-    },
-    {
-      value: "amp",
-      label: "AMP",
-      hint: ampConfigured ? "proxy + routes configured" : "configure AMP routing"
-    },
-    {
-      value: "startup",
-      label: "Startup",
-      hint: "run llm-router automatically"
-    },
-    {
-      value: "other-settings",
-      label: "Other setting",
-      hint: hasMasterKey ? "master key, fallbacks, review" : "master key missing"
-    }
-  ];
-}
-
-function buildProviderSelectionOptionsForModels(providers) {
-  return (providers || []).map((provider) => ({
-    value: provider.id,
-    label: provider.id,
-    hint: formatItemCount(listProviderModelIds(provider).length, "model")
-  }));
-}
-
-function providerSupportsMultipleFormats(provider) {
-  const formats = dedupeList([...(provider?.formats || []), provider?.format].filter(Boolean));
-  return formats.length > 1;
-}
-
-function repairDefaultModelReference(config, preferredProviderId = "") {
-  const next = structuredClone(config);
-  const defaultModel = String(next.defaultModel || "").trim();
-  if (!defaultModel) return next;
-  if (Object.prototype.hasOwnProperty.call(next.modelAliases || {}, defaultModel)) return next;
-
-  const slashIndex = defaultModel.indexOf("/");
-  if (slashIndex <= 0) return next;
-  const providerId = defaultModel.slice(0, slashIndex).trim();
-  const modelId = defaultModel.slice(slashIndex + 1).trim();
-  const provider = (next.providers || []).find((entry) => entry?.id === providerId);
-  const exists = (provider?.models || []).some((model) => model?.id === modelId || (model?.aliases || []).includes(modelId));
-  if (exists) return next;
-
-  const fallbackProvider = (next.providers || []).find((entry) => entry?.id === preferredProviderId && (entry?.models || []).length > 0)
-    || (next.providers || []).find((entry) => (entry?.models || []).length > 0);
-  next.defaultModel = fallbackProvider?.models?.[0]
-    ? `${fallbackProvider.id}/${fallbackProvider.models[0].id}`
-    : undefined;
-  return next;
-}
-
-function buildUpdatedProviderModels(existingProvider, requestedModelIds, probe = null) {
-  const existingById = new Map((existingProvider?.models || []).map((model) => [model.id, model]));
-  const probeModelSupport = probe?.modelSupport && typeof probe.modelSupport === "object" ? probe.modelSupport : {};
-  const probePreferredFormat = probe?.modelPreferredFormat && typeof probe.modelPreferredFormat === "object"
-    ? probe.modelPreferredFormat
-    : {};
-
-  return dedupeList(requestedModelIds).map((modelId) => {
-    const existing = existingById.get(modelId);
-    if (existing) return existing;
-    const preferredFormat = probePreferredFormat[modelId];
-    const formats = preferredFormat
-      ? [preferredFormat]
-      : dedupeList(probeModelSupport[modelId] || []);
-    return formats.length > 0
-      ? { id: modelId, formats }
-      : { id: modelId };
-  });
-}
-
-async function saveUpdatedProviderConfig(configPath, config, provider, {
-  setDefaultModel = false
-} = {}) {
-  const nextConfig = repairDefaultModelReference(applyConfigChanges(config, {
-    provider,
-    setDefaultModel
-  }), provider?.id);
-  return writeConfigFile(nextConfig, configPath);
-}
-
-async function editProviderNameInteractive(context, configPath, providerId) {
-  const config = await readConfigFile(configPath);
-  const provider = (config.providers || []).find((entry) => entry.id === providerId);
-  if (!provider) {
-    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
-  }
-
-  const nextName = await promptTextWithEscape(context, {
-    message: "Provider name",
-    required: true,
-    initialValue: String(provider.name || provider.id || ""),
-    validate: (value) => {
-      const candidate = String(value || "").trim();
-      if (!candidate) return "Provider Friendly Name is required.";
-      const duplicate = findProviderByFriendlyName(config.providers || [], candidate, { excludeId: provider.id });
-      return duplicate ? `Provider Friendly Name '${candidate}' already exists (provider-id: ${duplicate.id}). Use a unique name.` : undefined;
-    }
-  });
-  if (nextName === PROMPT_CANCELLED) return null;
-
-  const saved = await saveUpdatedProviderConfig(configPath, config, {
-    ...provider,
-    name: String(nextName || "").trim()
-  });
-  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
-  return {
-    ok: true,
-    mode: context.mode,
-    exitCode: EXIT_SUCCESS,
-    data: buildOperationReport("Provider Name Updated", [
-      ["Provider ID", updated.id],
-      ["Provider Name", updated.name || updated.id]
-    ])
-  };
-}
-
-async function editProviderEndpointsInteractive(context, configPath, providerId) {
-  const config = await readConfigFile(configPath);
-  const provider = (config.providers || []).find((entry) => entry.id === providerId);
-  if (!provider) {
-    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
-  }
-  if (normalizeProviderTypeInput(provider.type) === PROVIDER_TYPE_SUBSCRIPTION) {
-    return {
-      ok: false,
-      mode: context.mode,
-      exitCode: EXIT_VALIDATION,
-      errorMessage: `Provider '${providerId}' uses OAuth-managed endpoints. Add a new provider if you need a different subscription route.`
-    };
-  }
-
-  const endpointsInput = await promptTextWithEscape(context, {
-    message: "Provider endpoints (comma-separated URLs)",
-    required: true,
-    initialValue: providerEndpointsFromConfig(provider).join(","),
-    validate: (value) => validateEndpointListInput(value)
-  });
-  if (endpointsInput === PROMPT_CANCELLED) return null;
-
-  const endpoints = parseEndpointListInput(endpointsInput);
-  maybeReportInputCleanup(context, "endpoint", endpointsInput, endpoints);
-
-  let nextProvider = {
-    ...provider,
-    baseUrl: endpoints[0] || "",
-    baseUrlByFormat: undefined
-  };
-
-  if (endpoints.length > 1 || providerSupportsMultipleFormats(provider)) {
-    if (!String(provider.apiKey || "").trim()) {
-      return {
-        ok: false,
-        mode: context.mode,
-        exitCode: EXIT_VALIDATION,
-        errorMessage: `Provider '${providerId}' needs a stored apiKey before auto-detecting endpoint formats.`
-      };
-    }
-
-    const probe = await probeProviderEndpointMatrix({
-      endpoints,
-      models: listProviderModelIds(provider),
-      apiKey: provider.apiKey,
-      extraHeaders: provider.headers,
-      requestsPerMinute: DEFAULT_PROBE_REQUESTS_PER_MINUTE,
-      progressCallback: probeProgressReporter(context)
-    });
-
-    if (!Array.isArray(probe?.workingFormats) || probe.workingFormats.length === 0) {
-      return {
-        ok: false,
-        mode: context.mode,
-        exitCode: EXIT_FAILURE,
-        errorMessage: "Endpoint auto-detection failed. Re-enter the endpoints or keep the previous value."
-      };
-    }
-
-    nextProvider = buildProviderFromConfigInput({
-      providerId: provider.id,
-      name: provider.name,
-      baseUrl: probe.baseUrl,
-      openaiBaseUrl: probe.baseUrlByFormat?.openai,
-      claudeBaseUrl: probe.baseUrlByFormat?.claude,
-      apiKey: provider.apiKey,
-      headers: provider.headers,
-      models: listProviderModelIds(provider),
-      format: probe.preferredFormat || provider.format,
-      formats: probe.workingFormats,
-      probe
-    });
-    nextProvider.rateLimits = provider.rateLimits || [];
-  }
-
-  const saved = await saveUpdatedProviderConfig(configPath, config, nextProvider);
-  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || nextProvider;
-  return {
-    ok: true,
-    mode: context.mode,
-    exitCode: EXIT_SUCCESS,
-    data: buildOperationReport("Provider Endpoints Updated", [
-      ["Provider ID", updated.id],
-      ["Endpoint Count", String(providerEndpointsFromConfig(updated).length)]
-    ], [
-      "Endpoint Mapping\n" + renderAsciiTable(["Endpoint Type", "URL"], buildProviderEndpointRows(updated), {
-        emptyMessage: "No endpoints configured."
-      })
-    ])
-  };
-}
-
-async function editProviderHeadersInteractive(context, configPath, providerId) {
-  const config = await readConfigFile(configPath);
-  const provider = (config.providers || []).find((entry) => entry.id === providerId);
-  if (!provider) {
-    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
-  }
-
-  const headersInput = await promptTextWithEscape(context, {
-    message: "Custom headers JSON",
-    initialValue: JSON.stringify(applyDefaultHeaders(provider.headers || {}, { force: true }))
-  });
-  if (headersInput === PROMPT_CANCELLED) return null;
-
-  const saved = await saveUpdatedProviderConfig(configPath, config, {
-    ...provider,
-    headers: applyDefaultHeaders(parseJsonObjectArg(headersInput, "Custom headers"), { force: true })
-  });
-  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
-  return {
-    ok: true,
-    mode: context.mode,
-    exitCode: EXIT_SUCCESS,
-    data: buildOperationReport("Provider Headers Updated", [
-      ["Provider ID", updated.id],
-      ["Header Count", String(Object.keys(updated.headers || {}).length)]
-    ])
-  };
-}
-
-async function removeProviderInteractive(context, configPath, providerId) {
-  const config = await readConfigFile(configPath);
-  const provider = (config.providers || []).find((entry) => entry.id === providerId);
-  if (!provider) {
-    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
-  }
-
-  const confirm = await runPromptWithEscape(() => context.prompts.confirm({
-    message: `Delete provider '${providerId}'?`,
-    initialValue: false
-  }));
-  if (confirm === PROMPT_CANCELLED || !confirm) return null;
-
-  let nextConfig = removeProvider(config, providerId);
-  nextConfig = repairDefaultModelReference(nextConfig);
-  await writeConfigFile(nextConfig, configPath);
-  return {
-    ok: true,
-    mode: context.mode,
-    exitCode: EXIT_SUCCESS,
-    data: `Removed provider '${providerId}'.`
-  };
-}
-
-async function manageProviderRateLimitsInteractive(context, configPath, providerId) {
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    const provider = (config.providers || []).find((entry) => entry.id === providerId);
-    if (!provider) {
-      return {
-        ok: false,
-        mode: context.mode,
-        exitCode: EXIT_VALIDATION,
-        errorMessage: `Provider '${providerId}' not found.`
-      };
-    }
-
-    printRateLimitBucketIntro(context);
-    const action = await promptSelectWithEscape(context, {
-      message: `Rate limits · ${providerId}`,
-      options: [
-        { value: "create", label: "Create", hint: "add one or more buckets" },
-        { value: "edit", label: "Edit", hint: provider.rateLimits?.length ? "change an existing bucket" : "none yet" },
-        { value: "remove", label: "Remove", hint: provider.rateLimits?.length ? "delete a bucket" : "none yet" },
-        { value: "review", label: "Review", hint: "show current buckets" }
-      ]
-    });
-
-    if (action === PROMPT_CANCELLED) return lastResult;
-
-    if (action === "review") {
-      lastResult = {
-        ok: true,
-        mode: context.mode,
-        exitCode: EXIT_SUCCESS,
-        data: buildProviderRateLimitReview(provider)
-      };
-      emitInteractiveResult(context, lastResult);
-      continue;
-    }
-
-    if (action === "remove") {
-      const bucketOptions = buildRateLimitBucketPromptOptions(provider);
-      if (bucketOptions.length === 0) {
-        lastResult = {
-          ok: true,
-          mode: context.mode,
-          exitCode: EXIT_SUCCESS,
-          data: buildProviderRateLimitReview(provider)
-        };
-        emitInteractiveResult(context, lastResult);
-        continue;
-      }
-
-      const bucketId = await promptSelectWithEscape(context, {
-        message: "Remove bucket",
-        options: bucketOptions
-      });
-      if (bucketId === PROMPT_CANCELLED) continue;
-
-      const confirm = await runPromptWithEscape(() => context.prompts.confirm({
-        message: `Remove '${bucketId}'?`,
-        initialValue: false
-      }));
-      if (confirm === PROMPT_CANCELLED || !confirm) continue;
-
-      const updated = setProviderRateLimitsInConfig(config, {
-        providerId,
-        removeBucketId: String(bucketId || "")
-      });
-      if (!updated.changed && updated.reason) {
-        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-        emitInteractiveResult(context, lastResult);
-        continue;
-      }
-      await writeConfigFile(updated.config, configPath);
-      lastResult = {
-        ok: true,
-        mode: context.mode,
-        exitCode: EXIT_SUCCESS,
-        data: buildProviderRateLimitReport({
-          title: `Rate-Limit Bucket Removed: ${bucketId}`,
-          providerId,
-          rateLimits: updated.rateLimits || []
-        })
-      };
-      emitInteractiveResult(context, lastResult);
-      continue;
-    }
-
-    if (action === "edit") {
-      const bucketOptions = buildRateLimitBucketPromptOptions(provider);
-      if (bucketOptions.length === 0) {
-        lastResult = {
-          ok: true,
-          mode: context.mode,
-          exitCode: EXIT_SUCCESS,
-          data: buildProviderRateLimitReview(provider)
-        };
-        emitInteractiveResult(context, lastResult);
-        continue;
-      }
-      const bucketId = await promptSelectWithEscape(context, {
-        message: "Edit bucket",
-        options: bucketOptions
-      });
-      if (bucketId === PROMPT_CANCELLED) continue;
-      const bucket = (provider.rateLimits || []).find((entry) => entry.id === bucketId) || null;
-      const reservedIds = new Set((provider.rateLimits || []).map((entry) => entry.id));
-      const wizard = await promptRateLimitBucketWizard(context, { provider, initialBucket: bucket, reservedIds });
-      if (!wizard?.bucket) {
-        if (wizard?.cancelled) continue;
-        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: wizard?.reason || "Invalid bucket input." };
-        emitInteractiveResult(context, lastResult);
-        continue;
-      }
-
-      const updated = setProviderRateLimitsInConfig(config, {
-        providerId,
-        buckets: [wizard.bucket],
-        replaceBuckets: false
-      });
-      if (!updated.changed && updated.reason) {
-        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-        emitInteractiveResult(context, lastResult);
-        continue;
-      }
-      await writeConfigFile(updated.config, configPath);
-      lastResult = {
-        ok: true,
-        mode: context.mode,
-        exitCode: EXIT_SUCCESS,
-        data: buildProviderRateLimitReport({
-          title: "Rate-Limit Buckets Updated",
-          providerId,
-          rateLimits: updated.rateLimits || []
-        })
-      };
-      emitInteractiveResult(context, lastResult);
-      continue;
-    }
-
-    const reservedIds = new Set((provider.rateLimits || []).map((entry) => entry.id));
-    const newBuckets = [];
-    let keepAdding = true;
-    while (keepAdding) {
-      const wizard = await promptRateLimitBucketWizard(context, { provider, reservedIds });
-      if (!wizard?.bucket) {
-        if (wizard?.cancelled) break;
-        lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: wizard?.reason || "Invalid bucket input." };
-        emitInteractiveResult(context, lastResult);
-        keepAdding = false;
-        continue;
-      }
-      newBuckets.push(wizard.bucket);
-      reservedIds.add(wizard.bucket.id);
-      keepAdding = await runPromptWithEscape(() => context.prompts.confirm({
-        message: "Add another bucket?",
-        initialValue: false
-      }));
-      if (keepAdding === PROMPT_CANCELLED) keepAdding = false;
-    }
-
-    if (newBuckets.length === 0) continue;
-
-    const updated = setProviderRateLimitsInConfig(config, {
-      providerId,
-      buckets: newBuckets,
-      replaceBuckets: false
-    });
-    if (!updated.changed && updated.reason) {
-      lastResult = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-      emitInteractiveResult(context, lastResult);
-      continue;
-    }
-    await writeConfigFile(updated.config, configPath);
-    lastResult = {
-      ok: true,
-      mode: context.mode,
-      exitCode: EXIT_SUCCESS,
-      data: buildProviderRateLimitReport({
-        title: "Rate-Limit Buckets Updated",
-        providerId,
-        rateLimits: updated.rateLimits || []
-      })
-    };
-    emitInteractiveResult(context, lastResult);
-  }
-}
-
-async function manageProviderDetailsInteractive(context, configPath, providerId) {
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    const provider = (config.providers || []).find((entry) => entry.id === providerId);
-    if (!provider) return { result: lastResult, removed: true };
-
-    const action = await promptSelectWithEscape(context, {
-      message: `Provider · ${providerId}`,
-      options: [
-        { value: "edit-name", label: "Edit name", hint: provider.name || provider.id },
-        { value: "edit-endpoint", label: "Edit endpoint", hint: providerEndpointsFromConfig(provider).join(", ") || "not set" },
-        { value: "edit-headers", label: "Edit headers", hint: `${Object.keys(provider.headers || {}).length} configured` },
-        { value: "edit-rate-limit", label: "Edit rate limit", hint: formatItemCount((provider.rateLimits || []).length, "bucket") },
-        { value: "remove-provider", label: "Remove provider", hint: "delete this provider" }
-      ]
-    });
-
-    if (action === PROMPT_CANCELLED) {
-      return { result: lastResult, removed: false };
-    }
-
-    let result = null;
-    if (action === "edit-name") result = await editProviderNameInteractive(context, configPath, providerId);
-    if (action === "edit-endpoint") result = await editProviderEndpointsInteractive(context, configPath, providerId);
-    if (action === "edit-headers") result = await editProviderHeadersInteractive(context, configPath, providerId);
-    if (action === "edit-rate-limit") result = await manageProviderRateLimitsInteractive(context, configPath, providerId);
-    if (action === "remove-provider") {
-      result = await removeProviderInteractive(context, configPath, providerId);
-      if (result?.ok) {
-        emitInteractiveResult(context, result);
-        return { result, removed: true };
-      }
-    }
-
-    if (!result) continue;
-    lastResult = result;
-    emitInteractiveResult(context, result);
-  }
-}
-
-async function manageProvidersInteractive(context, configPath) {
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    const selection = await promptSelectWithEscape(context, {
-      message: "Providers",
-      options: buildProviderPromptOptions(config.providers || [], {
-        includeCreateOption: true,
-        createLabel: "Add new",
-        createHint: "connect API key or OAuth"
-      })
-    });
-
-    if (selection === PROMPT_CANCELLED) {
-      return { result: lastResult };
-    }
-
-    if (selection === "__new__") {
-      const result = await doUpsertProvider(context);
-      lastResult = result;
-      emitInteractiveResult(context, result);
-      continue;
-    }
-
-    const detail = await manageProviderDetailsInteractive(context, configPath, String(selection || ""));
-    if (detail?.result) lastResult = detail.result;
-  }
-}
-
-async function probeNewStandardProviderModels(context, provider, requestedModelIds, newModelIds) {
-  if (!String(provider?.apiKey || "").trim()) {
-    return {
-      ok: false,
-      errorMessage: `Provider '${provider?.id || "(unknown)"}' needs a stored apiKey before auto-testing new models.`
-    };
-  }
-
-  const endpoints = providerEndpointsFromConfig(provider);
-  if (endpoints.length === 0) {
-    return {
-      ok: false,
-      errorMessage: `Provider '${provider?.id || "(unknown)"}' has no endpoints to test against.`
-    };
-  }
-
-  let nextRequestedModelIds = [...requestedModelIds];
-  let pendingModels = [...newModelIds];
-  const confirmedModels = new Set();
-  let combinedProbe = {
-    models: [],
-    modelSupport: {},
-    modelPreferredFormat: {}
-  };
-
-  while (pendingModels.length > 0) {
-    const probe = await probeProviderEndpointMatrix({
-      endpoints,
-      models: pendingModels,
-      apiKey: provider.apiKey,
-      extraHeaders: provider.headers,
-      requestsPerMinute: DEFAULT_PROBE_REQUESTS_PER_MINUTE,
-      progressCallback: probeProgressReporter(context)
-    });
-
-    combinedProbe = {
-      ...combinedProbe,
-      models: dedupeList([...(combinedProbe.models || []), ...(probe?.models || [])]),
-      modelSupport: {
-        ...(combinedProbe.modelSupport || {}),
-        ...(probe?.modelSupport || {})
-      },
-      modelPreferredFormat: {
-        ...(combinedProbe.modelPreferredFormat || {}),
-        ...(probe?.modelPreferredFormat || {})
-      }
-    };
-
-    for (const modelId of (probe?.models || [])) {
-      confirmedModels.add(modelId);
-    }
-
-    const unresolvedModels = dedupeList(
-      Array.isArray(probe?.unresolvedModels) && probe.unresolvedModels.length > 0
-        ? probe.unresolvedModels
-        : pendingModels.filter((modelId) => !confirmedModels.has(modelId))
-    );
-
-    if (unresolvedModels.length === 0) {
-      return {
-        ok: true,
-        requestedModelIds: nextRequestedModelIds,
-        probe: combinedProbe
-      };
-    }
-
-    const renamedInput = await promptTextWithEscape(context, {
-      message: "Undetected new models (update names, comma-separated; blank removes them)",
-      required: false,
-      initialValue: unresolvedModels.join(","),
-      validate: (value) => validateProviderModelListInput(value, { allowEmpty: true })
-    });
-    if (renamedInput === PROMPT_CANCELLED) {
-      return {
-        ok: false,
-        errorMessage: "Cancelled while updating undetected model names."
-      };
-    }
-
-    const renamedModels = parseProviderModelListInput(renamedInput);
-    maybeReportInputCleanup(context, "model", renamedInput, renamedModels);
-    nextRequestedModelIds = dedupeList([
-      ...nextRequestedModelIds.filter((modelId) => !unresolvedModels.includes(modelId)),
-      ...renamedModels
-    ]);
-    pendingModels = renamedModels.filter((modelId) => !confirmedModels.has(modelId));
-  }
-
-  return {
-    ok: true,
-    requestedModelIds: nextRequestedModelIds,
-    probe: combinedProbe
-  };
-}
-
-async function editProviderModelsInteractive(context, configPath, providerId) {
-  const config = await readConfigFile(configPath);
-  const provider = (config.providers || []).find((entry) => entry.id === providerId);
-  if (!provider) {
-    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
-  }
-
-  const currentModelIds = listProviderModelIds(provider);
-  const modelsInput = await promptTextWithEscape(context, {
-    message: `Models · ${providerId} (comma-separated)`,
-    required: true,
-    initialValue: currentModelIds.join(","),
-    validate: (value) => validateProviderModelListInput(value)
-  });
-  if (modelsInput === PROMPT_CANCELLED) return null;
-
-  let requestedModelIds = parseProviderModelListInput(modelsInput);
-  maybeReportInputCleanup(context, "model", modelsInput, requestedModelIds);
-
-  if (serializeStable(requestedModelIds) === serializeStable(currentModelIds)) {
-    const saved = await saveUpdatedProviderConfig(configPath, config, {
-      ...provider,
-      models: buildUpdatedProviderModels(provider, requestedModelIds)
-    });
-    const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
-    return {
-      ok: true,
-      mode: context.mode,
-      exitCode: EXIT_SUCCESS,
-      data: buildOperationReport("Provider Models Saved", [
-        ["Provider ID", updated.id],
-        ["Model Count", String(listProviderModelIds(updated).length)],
-        ["New Models Tested", "0"]
-      ])
-    };
-  }
-
-  const newModelIds = requestedModelIds.filter((modelId) => !currentModelIds.includes(modelId));
-  let probe = null;
-
-  if (newModelIds.length > 0) {
-    if (normalizeProviderTypeInput(provider.type) === PROVIDER_TYPE_SUBSCRIPTION) {
-      try {
-        await ensureSubscriptionAuthenticated(context, {
-          profile: provider.subscriptionProfile || provider.id,
-          subscriptionType: provider.subscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX,
-          forceLogin: false,
-          deviceCode: false
-        });
-      } catch (error) {
-        return {
-          ok: false,
-          mode: context.mode,
-          exitCode: EXIT_FAILURE,
-          errorMessage: `Subscription OAuth login failed: ${error instanceof Error ? error.message : String(error)}`
-        };
-      }
-
-      const result = await probeSubscriptionModels(context, {
-        providerId: provider.id,
-        providerName: provider.name,
-        subscriptionType: provider.subscriptionType || SUBSCRIPTION_TYPE_CHATGPT_CODEX,
-        subscriptionProfile: provider.subscriptionProfile || provider.id,
-        models: newModelIds,
-        headers: provider.headers
-      });
-      if (!result?.ok) {
-        return {
-          ok: false,
-          mode: context.mode,
-          exitCode: EXIT_FAILURE,
-          errorMessage: [
-            "New subscription model test failed.",
-            ...(result?.failures || []).map((entry) => `${entry.modelId}: ${entry.details}`)
-          ].join(" ")
-        };
-      }
-      probe = result.probe;
-    } else {
-      const result = await probeNewStandardProviderModels(context, provider, requestedModelIds, newModelIds);
-      if (!result.ok) {
-        return {
-          ok: false,
-          mode: context.mode,
-          exitCode: EXIT_FAILURE,
-          errorMessage: result.errorMessage
-        };
-      }
-      requestedModelIds = result.requestedModelIds;
-      probe = result.probe;
-    }
-  }
-
-  const saved = await saveUpdatedProviderConfig(configPath, config, {
-    ...provider,
-    models: buildUpdatedProviderModels(provider, requestedModelIds, probe)
-  });
-  const updated = (saved.providers || []).find((entry) => entry.id === providerId) || provider;
-  return {
-    ok: true,
-    mode: context.mode,
-    exitCode: EXIT_SUCCESS,
-    data: buildOperationReport("Provider Models Updated", [
-      ["Provider ID", updated.id],
-      ["Model Count", String(listProviderModelIds(updated).length)],
-      ["New Models Tested", String(newModelIds.length)]
-    ], [
-      "Models\n" + renderAsciiTable(["Model", "Request Format(s)", "Silent Fallbacks"], buildProviderModelRows(updated), {
-        emptyMessage: "No models configured."
-      })
-    ])
-  };
-}
-
-async function manageModelsInteractive(context, configPath) {
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    if (!config.providers.length) {
-      return {
-        result: {
-          ok: true,
-          mode: context.mode,
-          exitCode: EXIT_SUCCESS,
-          data: "No providers configured."
-        }
-      };
-    }
-
-    const providerId = await promptSelectWithEscape(context, {
-      message: "Models",
-      options: buildProviderSelectionOptionsForModels(config.providers)
-    });
-    if (providerId === PROMPT_CANCELLED) {
-      return { result: lastResult };
-    }
-
-    const result = await editProviderModelsInteractive(context, configPath, String(providerId || ""));
-    if (!result) continue;
-    lastResult = result;
-    emitInteractiveResult(context, result);
-  }
-}
-
-async function createModelAliasInteractive(context, configPath) {
-  const config = await readConfigFile(configPath);
-  const aliasId = await promptTextWithEscape(context, {
-    message: "Alias ID (e.g. chat.default)",
-    required: true,
-    validate: (value) => {
-      const candidate = String(value || "").trim();
-      if (!candidate) return "Alias ID is required.";
-      if (!MODEL_ALIAS_ID_PATTERN.test(candidate)) return "Use letters/numbers and . _ : - separators.";
-      return undefined;
-    }
-  });
-  if (aliasId === PROMPT_CANCELLED) return null;
-
-  const strategy = await promptSelectWithEscape(context, {
-    message: "Strategy",
-    options: MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => ({
-      value: option.value,
-      label: option.label,
-      hint: option.hint
-    })),
-    initialValue: "auto"
-  });
-  if (strategy === PROMPT_CANCELLED) return null;
-
-  const targets = await promptTextWithEscape(context, {
-    message: "Primary routes (<route>@<weight>)",
-    required: true,
-    placeholder: "openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2"
-  });
-  if (targets === PROMPT_CANCELLED) return null;
-
-  const fallbackTargets = await promptTextWithEscape(context, {
-    message: "Fallback routes (optional)",
-    required: false,
-    placeholder: "openrouter/gpt-4o"
-  });
-  if (fallbackTargets === PROMPT_CANCELLED) return null;
-
-  const updated = upsertModelAliasInConfig(config, {
-    aliasId: String(aliasId || "").trim(),
-    strategy,
-    targets,
-    fallbackTargets
-  });
-  if (!updated.changed && updated.reason) {
-    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-  }
-  await writeConfigFile(updated.config, configPath);
-  const savedAliasId = updated.aliasId || String(aliasId || "").trim();
-  return {
-    ok: true,
-    mode: context.mode,
-    exitCode: EXIT_SUCCESS,
-    data: buildModelAliasSavedReport(savedAliasId, updated.config.modelAliases?.[savedAliasId])
-  };
-}
-
-async function manageModelAliasDetailsInteractive(context, configPath, aliasId) {
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    const alias = config.modelAliases?.[aliasId];
-    if (!alias) return { result: lastResult, removed: true };
-
-    const action = await promptSelectWithEscape(context, {
-      message: `Model Alias · ${aliasId}`,
-      options: [
-        { value: "edit-strategy", label: "Edit strategy", hint: formatModelAliasStrategyLabel(alias.strategy) },
-        { value: "edit-targets", label: "Edit targets", hint: formatItemCount((alias.targets || []).length, "target") },
-        { value: "edit-fallback-targets", label: "Edit fallback targets", hint: formatItemCount((alias.fallbackTargets || []).length, "fallback") },
-        { value: "remove-alias", label: "Remove alias", hint: "delete this alias" }
-      ]
-    });
-
-    if (action === PROMPT_CANCELLED) return { result: lastResult, removed: false };
-
-    let result = null;
-    if (action === "edit-strategy") {
-      const strategy = await promptSelectWithEscape(context, {
-        message: "Strategy",
-        options: MODEL_ROUTING_STRATEGY_OPTIONS.map((option) => ({
-          value: option.value,
-          label: option.label,
-          hint: option.hint
-        })),
-        initialValue: normalizeModelAliasStrategy(alias.strategy || "auto") || "auto"
-      });
-      if (strategy === PROMPT_CANCELLED) continue;
-      const updated = upsertModelAliasInConfig(config, { aliasId, strategy });
-      if (!updated.changed && updated.reason) {
-        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-      } else {
-        await writeConfigFile(updated.config, configPath);
-        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildModelAliasSavedReport(aliasId, updated.config.modelAliases?.[aliasId]) };
-      }
-    }
-
-    if (action === "edit-targets") {
-      const targetsInput = await promptTextWithEscape(context, {
-        message: "Primary routes (<route>@<weight>)",
-        required: true,
-        initialValue: formatAliasTargetsForSummary(alias.targets || []) === "(none)" ? "" : formatAliasTargetsForSummary(alias.targets || [])
-      });
-      if (targetsInput === PROMPT_CANCELLED) continue;
-      const updated = upsertModelAliasInConfig(config, { aliasId, targets: targetsInput });
-      if (!updated.changed && updated.reason) {
-        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-      } else {
-        await writeConfigFile(updated.config, configPath);
-        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildModelAliasSavedReport(aliasId, updated.config.modelAliases?.[aliasId]) };
-      }
-    }
-
-    if (action === "edit-fallback-targets") {
-      const fallbackInput = await promptTextWithEscape(context, {
-        message: "Fallback routes (optional)",
-        required: false,
-        initialValue: formatAliasTargetsForSummary(alias.fallbackTargets || []) === "(none)" ? "" : formatAliasTargetsForSummary(alias.fallbackTargets || [])
-      });
-      if (fallbackInput === PROMPT_CANCELLED) continue;
-      const updated = upsertModelAliasInConfig(config, {
-        aliasId,
-        fallbackTargets: fallbackInput,
-        clearFallbackTargets: String(fallbackInput || "").trim() === ""
-      });
-      if (!updated.changed && updated.reason) {
-        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: updated.reason };
-      } else {
-        await writeConfigFile(updated.config, configPath);
-        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildModelAliasSavedReport(aliasId, updated.config.modelAliases?.[aliasId]) };
-      }
-    }
-
-    if (action === "remove-alias") {
-      const confirm = await runPromptWithEscape(() => context.prompts.confirm({
-        message: `Remove model alias '${aliasId}'?`,
-        initialValue: false
-      }));
-      if (confirm === PROMPT_CANCELLED || !confirm) continue;
-      const removal = removeModelAliasFromConfig(config, aliasId);
-      if (!removal.changed) {
-        result = { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: removal.reason };
-      } else {
-        await writeConfigFile(removal.config, configPath);
-        result = { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Removed model alias '${removal.aliasId}'.` };
-        emitInteractiveResult(context, result);
-        return { result, removed: true };
-      }
-    }
-
-    if (!result) continue;
-    lastResult = result;
-    emitInteractiveResult(context, result);
-  }
-}
-
-async function manageModelAliasesInteractive(context, configPath) {
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    const selection = await promptSelectWithEscape(context, {
-      message: "Model Alias",
-      options: buildAliasPromptOptions(config.modelAliases || {}, {
-        includeCreateOption: true,
-        createLabel: "Add new Alias",
-        createHint: "group routes under one name"
-      })
-    });
-
-    if (selection === PROMPT_CANCELLED) return { result: lastResult };
-
-    if (selection === "__new__") {
-      const result = await createModelAliasInteractive(context, configPath);
-      if (!result) continue;
-      lastResult = result;
-      emitInteractiveResult(context, result);
-      continue;
-    }
-
-    const detail = await manageModelAliasDetailsInteractive(context, configPath, String(selection || ""));
-    if (detail?.result) lastResult = detail.result;
-  }
-}
-
-async function manageStartupInteractive(context) {
-  const selection = await promptSelectWithEscape(context, {
-    message: "Startup",
-    options: [
-      { value: "startup-install", label: "Install", hint: "enable OS startup" },
-      { value: "startup-status", label: "Status", hint: "check installed/running" },
-      { value: "startup-uninstall", label: "Uninstall", hint: "remove OS startup" },
-      { value: "__back__", label: "Back", hint: "return to root" }
-    ]
-  });
-
-  if (selection === PROMPT_CANCELLED || selection === "__back__") return null;
-  if (selection === "startup-install") return doStartupInstall(context);
-  if (selection === "startup-status") return doStartupStatus(context);
-  return doStartupUninstall(context);
-}
-
-async function manageOtherSettingsInteractive(context) {
-  const configPath = readArg(context.args || {}, ["config", "configPath"], getDefaultConfigPath());
-  const config = await readConfigFile(configPath);
-  const selection = await promptSelectWithEscape(context, {
-    message: "Other setting",
-    options: [
-      { value: "set-master-key", label: "Master key", hint: config.masterKey ? "update or rotate" : "protect access" },
-      { value: "set-model-fallbacks", label: "Fallbacks", hint: countConfiguredFallbackRoutes(config) > 0 ? "edit silent failover" : "add silent failover" },
-      { value: "list", label: "Config summary", hint: "providers, aliases, AMP" },
-      { value: "list-routing", label: "Routing summary", hint: "routing-focused view" },
-      { value: "migrate-config", label: "Migrate config", hint: "upgrade schema version" },
-      { value: "__back__", label: "Back", hint: "return to root" }
-    ]
-  });
-
-  if (selection === PROMPT_CANCELLED || selection === "__back__") return null;
-  if (selection === "set-master-key") return doSetMasterKey(context);
-  if (selection === "set-model-fallbacks") return doSetModelFallbacks(context);
-  if (selection === "list") return doListConfig(context);
-  if (selection === "list-routing") return doListRouting(context);
-  return doMigrateConfig(context);
-}
-
-async function runInteractiveConfigMenu(context) {
-  const configPath = readArg(context.args || {}, ["config", "configPath"], getDefaultConfigPath());
-  let lastResult = null;
-
-  while (true) {
-    const config = await readConfigFile(configPath);
-    const sectionId = await promptSelectWithEscape(context, {
-      message: "What do you want to manage?",
-      options: buildInteractiveConfigRootSections(config)
-    });
-
-    if (sectionId === PROMPT_CANCELLED) {
-      return lastResult || {
-        ok: true,
-        mode: context.mode,
-        exitCode: EXIT_SUCCESS,
-        data: "No changes made."
-      };
-    }
-
-    let result = null;
-    if (sectionId === "providers") {
-      const managed = await manageProvidersInteractive(context, configPath);
-      result = managed?.result || null;
-    }
-    if (sectionId === "models") {
-      const managed = await manageModelsInteractive(context, configPath);
-      result = managed?.result || null;
-    }
-    if (sectionId === "model-alias") {
-      const managed = await manageModelAliasesInteractive(context, configPath);
-      result = managed?.result || null;
-    }
-    if (sectionId === "amp") {
-      result = await doSetAmpConfig(context);
-    }
-    if (sectionId === "startup") {
-      result = await manageStartupInteractive(context);
-    }
-    if (sectionId === "other-settings") {
-      result = await manageOtherSettingsInteractive(context);
-    }
-
-    if (result) lastResult = result;
-  }
-}
-
-function buildConfigMenuSections(config) {
-  const providerCount = (config?.providers || []).length;
-  const modelCount = (config?.providers || []).reduce((sum, provider) => sum + (provider?.models || []).length, 0);
-  const aliasCount = Object.keys(config?.modelAliases || {}).length;
-  const fallbackCount = countConfiguredFallbackRoutes(config);
-  const bucketCount = countConfiguredRateLimitBuckets(config);
-  const hasMasterKey = Boolean(String(config?.masterKey || "").trim());
-  const ampConfigured = hasConfiguredAmp(config);
-
-  return [
-    {
-      value: "providers",
-      label: "Providers",
-      hint: providerCount > 0
-        ? `${formatItemCount(providerCount, "provider")} · ${formatItemCount(modelCount, "model")}`
-        : "connect your first provider",
-      operations: [
-        { value: "upsert-provider", label: "Add or edit", hint: "API key or OAuth" },
-        { value: "remove-provider", label: "Remove provider", hint: providerCount > 0 ? "delete a provider" : "none yet" },
-        { value: "remove-model", label: "Remove model", hint: modelCount > 0 ? "trim a provider model list" : "none yet" }
-      ]
-    },
-    {
-      value: "routing",
-      label: "Routing",
-      hint: aliasCount > 0 || fallbackCount > 0 || bucketCount > 0
-        ? [
-            formatItemCount(aliasCount, "alias"),
-            formatItemCount(fallbackCount, "fallback"),
-            formatItemCount(bucketCount, "bucket")
-          ].join(" · ")
-        : "aliases, fallbacks, limits",
-      operations: [
-        { value: "upsert-model-alias", label: "Aliases", hint: aliasCount > 0 ? "create or edit" : "group routes" },
-        { value: "remove-model-alias", label: "Remove alias", hint: aliasCount > 0 ? "delete an alias" : "none yet" },
-        { value: "set-model-fallbacks", label: "Fallbacks", hint: fallbackCount > 0 ? "edit silent failover" : "add silent failover" },
-        { value: "set-provider-rate-limits", label: "Rate limits", hint: bucketCount > 0 ? "edit request caps" : "add request caps" }
-      ]
-    },
-    {
-      value: "security",
-      label: "Security",
-      hint: hasMasterKey ? "master key set" : "master key missing",
-      operations: [
-        { value: "set-master-key", label: "Master key", hint: hasMasterKey ? "update or rotate" : "protect access" }
-      ]
-    },
-    {
-      value: "amp",
-      label: "AMP",
-      hint: ampConfigured ? "proxy + routes configured" : "Amp CLI proxy + routing",
-      operations: [
-        { value: "set-amp-config", label: "AMP setup", hint: "proxy, mappings, client patch" }
-      ]
-    },
-    {
-      value: "startup",
-      label: "Startup",
-      hint: "run llm-router automatically",
-      operations: [
-        { value: "startup-install", label: "Install", hint: "enable OS startup" },
-        { value: "startup-status", label: "Status", hint: "check installed/running" },
-        { value: "startup-uninstall", label: "Uninstall", hint: "remove OS startup" }
-      ]
-    },
-    {
-      value: "review",
-      label: "Review",
-      hint: "see current config",
-      operations: [
-        { value: "list", label: "Config summary", hint: "providers, aliases, AMP" },
-        { value: "list-routing", label: "Routing summary", hint: "same config view, routing-focused" }
-      ]
-    },
-    {
-      value: "advanced",
-      label: "Advanced",
-      hint: "schema migration",
-      operations: [
-        { value: "migrate-config", label: "Migrate config", hint: "upgrade schema version" }
-      ]
-    }
-  ];
-}
-
 async function resolveConfigOperation(context) {
   const opArg = String(readArg(context.args, ["operation", "op"], "") || "").trim();
-  if (opArg) return opArg;
-
-  if (canUseInteractivePrompts(context, ["select"])) {
-    const configPath = readArg(context.args || {}, ["config", "configPath"], getDefaultConfigPath());
-    const config = await readConfigFile(configPath);
-
-    while (true) {
-      const sections = buildConfigMenuSections(config);
-      const sectionId = await context.prompts.select({
-        message: "What do you want to manage?",
-        options: sections.map((section) => ({
-          value: section.value,
-          label: section.label,
-          hint: section.hint
-        }))
-      });
-      const section = sections.find((entry) => entry.value === sectionId);
-      if (!section) break;
-      if (section.operations.length === 1) return section.operations[0].value;
-
-      const operation = await context.prompts.select({
-        message: section.label,
-        options: [
-          ...section.operations,
-          { value: "__back__", label: "Back", hint: "pick another section" }
-        ]
-      });
-      if (operation === "__back__") continue;
-      return operation;
-    }
-  }
-
-  return "list";
+  return opArg || "list";
 }
 
 async function runConfigAction(context) {
-  const explicitOperation = String(readArg(context?.args || {}, ["operation", "op"], "") || "").trim();
-  if (!explicitOperation && canUseInteractivePrompts(context, ["select", "text", "confirm"])) {
-    return runInteractiveConfigMenu(context);
-  }
-
   const op = await resolveConfigOperation(context);
 
   switch (op) {
@@ -8353,12 +8386,33 @@ async function runConfigAction(context) {
     case "set-amp-config":
     case "set-amp":
       return doSetAmpConfig(context);
+    case "set-amp-client-routing":
+    case "set-amp-client":
+      return doSetAmpClientRouting(context);
+    case "set-codex-cli-routing":
+    case "set-codex-cli":
+      return doSetCodexCliRouting(context);
+    case "set-claude-code-routing":
+    case "set-claude-code":
+      return doSetClaudeCodeRouting(context);
+    case "discover-provider-models":
+      return doDiscoverProviderModels(context);
+    case "test-provider":
+      return doTestProvider(context);
+    case "litellm-context-lookup":
+      return doLiteLlmContextLookup(context);
     case "migrate-config":
       return doMigrateConfig(context);
     case "list":
       return doListConfig(context);
+    case "validate":
+      return doValidateConfig(context);
     case "list-routing":
       return doListRouting(context);
+    case "snapshot":
+      return doSnapshot(context);
+    case "tool-status":
+      return doToolStatus(context);
     case "startup-install":
       return doStartupInstall(context);
     case "startup-uninstall":
@@ -8444,7 +8498,7 @@ async function runStopAction(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_FAILURE,
-      errorMessage: `Failed to stop llm-router: ${error instanceof Error ? error.message : String(error)}`
+      errorMessage: `Failed to stop ${APP_NAME}: ${error instanceof Error ? error.message : String(error)}`
     };
   }
   if (!stopped.ok) {
@@ -8452,7 +8506,7 @@ async function runStopAction(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_FAILURE,
-      errorMessage: stopped.reason || "Failed to stop llm-router."
+      errorMessage: stopped.reason || `Failed to stop ${APP_NAME}.`
     };
   }
 
@@ -8492,7 +8546,7 @@ async function runStopAction(context) {
     ok: true,
     mode: context.mode,
     exitCode: EXIT_SUCCESS,
-    data: "No running llm-router instance found."
+    data: `No running ${APP_NAME} instance found.`
   };
 }
 
@@ -8509,7 +8563,7 @@ async function runReloadAction(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_FAILURE,
-      errorMessage: `Failed to reload llm-router: ${error instanceof Error ? error.message : String(error)}`
+      errorMessage: `Failed to reload ${APP_NAME}: ${error instanceof Error ? error.message : String(error)}`
     };
   }
 
@@ -8518,7 +8572,7 @@ async function runReloadAction(context) {
       ok: false,
       mode: context.mode,
       exitCode: EXIT_FAILURE,
-      errorMessage: result.reason || "Failed to reload llm-router."
+      errorMessage: result.reason || `Failed to reload ${APP_NAME}.`
     };
   }
 
@@ -8544,7 +8598,7 @@ async function runReloadAction(context) {
       mode: context.mode,
       exitCode: result.detail?.exitCode ?? (result.detail?.ok ? EXIT_SUCCESS : EXIT_FAILURE),
       data: result.detail?.data,
-      errorMessage: result.detail?.errorMessage || (result.detail?.ok ? undefined : "Failed to restart llm-router.")
+      errorMessage: result.detail?.errorMessage || (result.detail?.ok ? undefined : `Failed to restart ${APP_NAME}.`)
     };
   }
 
@@ -8552,7 +8606,81 @@ async function runReloadAction(context) {
     ok: false,
     mode: context.mode,
     exitCode: EXIT_FAILURE,
-    errorMessage: result.reason || "No running llm-router instance detected."
+    errorMessage: result.reason || `No running ${APP_NAME} instance detected.`
+  };
+}
+
+async function runReclaimAction(context) {
+  const terminal = context.terminal || {};
+  const port = LOCAL_ROUTER_PORT;
+  const listListeningPidsFn = typeof context.listListeningPids === "function"
+    ? context.listListeningPids
+    : (targetPort) => listListeningPids(targetPort);
+  const reclaimPortFn = typeof context.reclaimPort === "function"
+    ? context.reclaimPort
+    : (args) => reclaimPort(args);
+
+  const beforeProbe = listListeningPidsFn(port);
+  if (beforeProbe.ok && (beforeProbe.pids || []).length === 0) {
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildOperationReport(
+        "Router Port Reclaim",
+        [
+          ["Port", String(port)],
+          ["Busy Before", "No"],
+          ["Reclaimed", "No"],
+          ["Listener PID(s)", "(none)"]
+        ]
+      )
+    };
+  }
+
+  let reclaimed;
+  try {
+    reclaimed = await reclaimPortFn({
+      port,
+      line: (message) => terminal.line?.(message),
+      error: (message) => terminal.error?.(message)
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      errorMessage: `Failed to reclaim router port ${port}: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  if (!reclaimed?.ok) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_FAILURE,
+      errorMessage: reclaimed?.errorMessage || `Failed to reclaim router port ${port}.`
+    };
+  }
+
+  const afterProbe = listListeningPidsFn(port);
+  const remainingPids = afterProbe.ok ? afterProbe.pids || [] : [];
+  const beforePids = beforeProbe.ok ? beforeProbe.pids || [] : [];
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "Router Port Reclaim",
+      [
+        ["Port", String(port)],
+        ["Busy Before", formatYesNo(beforePids.length > 0)],
+        ["Reclaimed", "Yes"],
+        ["Listener PID(s) Before", beforePids.length > 0 ? beforePids.join(", ") : "(none)"],
+        ["Listener PID(s) After", remainingPids.length > 0 ? remainingPids.join(", ") : "(none)"]
+      ]
+    )
   };
 }
 
@@ -8940,6 +9068,11 @@ async function runAiHelpAction(context) {
     });
   }
 
+  const portProbe = !serverRunning ? listListeningPids(LOCAL_ROUTER_PORT) : { ok: true, pids: [] };
+  const portBusyPids = !serverRunning && portProbe.ok
+    ? (portProbe.pids || []).filter((pid) => Number.isInteger(pid) && pid > 0)
+    : [];
+
   const healthProbe = liveTest.tests?.health || null;
   const openaiModelsProbe = liveTest.tests?.openaiModels || null;
   const claudeModelsProbe = liveTest.tests?.claudeModels || null;
@@ -8966,19 +9099,19 @@ async function runAiHelpAction(context) {
 
   const suggestions = [];
   if (providerCount === 0) {
-    suggestions.push("Add first provider with at least one model. Run: llm-router config --operation=upsert-provider --provider-id=<id> --name=\"<name>\" --base-url=<url> --api-key=<key> --models=<model1,model2>");
-    suggestions.push("Or add OAuth-backed subscription provider. Run: llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default (or use --subscription-type=claude-code).");
+    suggestions.push(`Add first provider with at least one model. Run: ${CLI_COMMAND} config --operation=upsert-provider --provider-id=<id> --name="<name>" --base-url=<url> --api-key=<key> --models=<model1,model2>`);
+    suggestions.push(`Or add OAuth-backed subscription provider. Run: ${CLI_COMMAND} config --operation=upsert-provider --provider-id=chatgpt --name="GPT Sub" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default (or use --subscription-type=claude-code).`);
   } else {
     const providersWithoutModels = providers
       .filter((provider) => (provider.models || []).filter((model) => model && model.enabled !== false).length === 0)
       .map((provider) => provider.id);
     if (providersWithoutModels.length > 0) {
-      suggestions.push(`Add models to provider(s) with empty model list: ${providersWithoutModels.join(", ")}. Run: llm-router config --operation=upsert-provider --provider-id=<id> --models=<model1,model2>`);
+      suggestions.push(`Add models to provider(s) with empty model list: ${providersWithoutModels.join(", ")}. Run: ${CLI_COMMAND} config --operation=upsert-provider --provider-id=<id> --models=<model1,model2>`);
     }
   }
 
   if (modelCount > 0 && aliasCount === 0) {
-    suggestions.push("Create a model alias/group for stable app routing. Run: llm-router config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=<provider/model,...>");
+    suggestions.push(`Create a model alias/group for stable app routing. Run: ${CLI_COMMAND} config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=<provider/model,...>`);
   }
 
   if (aliasCount > 0) {
@@ -8991,32 +9124,35 @@ async function runAiHelpAction(context) {
   }
 
   if (providerCount > 0 && rateLimitBucketCount === 0) {
-    suggestions.push("Add at least one provider rate-limit bucket for quota safety. Run: llm-router config --operation=set-provider-rate-limits --provider-id=<id> --bucket-name=\"Monthly cap\" --bucket-models=all --bucket-requests=<n> --bucket-window=month:1");
+    suggestions.push(`Add at least one provider rate-limit bucket for quota safety. Run: ${CLI_COMMAND} config --operation=set-provider-rate-limits --provider-id=<id> --bucket-name="Monthly cap" --bucket-models=all --bucket-requests=<n> --bucket-window=month:1`);
   }
 
   if (!hasMasterKey) {
-    suggestions.push("Set master key for authenticated access. Run: llm-router config --operation=set-master-key --generate-master-key=true");
+    suggestions.push(`Set master key for authenticated access. Run: ${CLI_COMMAND} config --operation=set-master-key --generate-master-key=true`);
   }
 
   if (!serverRunning) {
-    suggestions.push(`Start local proxy server. Run: llm-router start${hasMasterKey ? " --require-auth=true" : ""}`);
+    suggestions.push(`Start local proxy server. Run: ${CLI_COMMAND} start${hasMasterKey ? " --require-auth=true" : ""}`);
+    if (portBusyPids.length > 0) {
+      suggestions.push(`Port ${LOCAL_ROUTER_PORT} is occupied by PID(s) ${portBusyPids.join(", ")}. Reclaim it with: ${CLI_COMMAND} reclaim`);
+    }
   } else {
-    suggestions.push(`Local proxy is running on http://${runtimeState.host}:${runtimeState.port}. Apply config changes with llm-router config; updates hot-reload automatically.`);
+    suggestions.push(`Local proxy is running on http://${runtimeState.host}:${runtimeState.port}. Apply config changes with ${CLI_COMMAND} config; updates hot-reload automatically.`);
   }
 
   if (serverRunning && skipLiveTest) {
-    suggestions.push("Run live llm-router API test before patching coding-tool config. Re-run: llm-router ai-help --skip-live-test=false");
+    suggestions.push(`Run a live ${APP_NAME} API test before patching coding-tool config. Re-run: ${CLI_COMMAND} ai-help --skip-live-test=false`);
   }
 
   if (liveTest.ran && claudePatchGate !== "ready") {
-    suggestions.push("Claude/OpenCode patch gate is blocked. Fix llm-router auth/provider/model readiness, then re-run llm-router ai-help.");
+    suggestions.push(`Claude/OpenCode patch gate is blocked. Fix ${APP_NAME} auth/provider/model readiness, then re-run ${CLI_COMMAND} ai-help.`);
   }
   if (liveTest.ran && codexPatchGate === "blocked-responses-endpoint-missing") {
-    suggestions.push("Codex CLI requires OpenAI Responses API. Current llm-router endpoint does not expose /openai/v1/responses; do not patch Codex until this gate is resolved.");
+    suggestions.push(`Codex CLI requires OpenAI Responses API. Current ${APP_NAME} endpoint does not expose /openai/v1/responses; do not patch Codex until this gate is resolved.`);
   }
 
   if (suggestions.length === 0) {
-    suggestions.push("No blocking setup gaps detected. Review routing summary with: llm-router config --operation=list-routing");
+    suggestions.push(`No blocking setup gaps detected. Review routing summary with: ${CLI_COMMAND} config --operation=list-routing`);
   }
 
   const runtimeConfigPathForDisplay = runtimeConfigPath ? toHomeRelativePath(runtimeConfigPath) : "";
@@ -9025,25 +9161,31 @@ async function runAiHelpAction(context) {
 
   const lines = [
     "# AI-HELP",
-    "ENTITY: llm-router",
+    `ENTITY: ${APP_NAME}`,
     "MODE: cli-automation",
     "PROFILE: agent-guide-v2",
     "",
     "## INTRO",
-    "Use this output as an AI-agent operating brief for llm-router.",
-    "The agent should auto-discover commands, inspect current state, configure llm-router on your behalf, run live API gates, and only then patch coding tool configs.",
+    `Use this output as an AI-agent operating brief for ${APP_NAME}.`,
+    `The agent should auto-discover commands, inspect current state, configure ${APP_NAME} on your behalf, run live API gates, and only then patch coding tool configs.`,
     "",
-    "## WHAT AGENT CAN DO WITH LLM-ROUTER",
-    "- explain llm-router capabilities and current setup readiness",
+    `## WHAT AGENT CAN DO WITH ${APP_NAME.toUpperCase()}`,
+    `- explain ${APP_NAME} capabilities and current setup readiness`,
     "- set provider, model list, model alias/group, and rate-limit buckets via CLI",
-    "- validate local llm-router endpoint health/model-list/routes with real API probes",
-    "- patch coding tools (Claude Code, Codex CLI, OpenCode) after pre-patch gates pass",
+    `- validate raw ${APP_NAME} config JSON + schema before applying routing changes`,
+    `- validate local ${APP_NAME} endpoint health/model-list/routes with real API probes`,
+    `- reclaim the fixed local router port when another listener is blocking startup`,
+    "- patch Claude Code, Codex CLI, and AMP client configs directly via CLI after pre-patch gates pass",
     "",
     "## DISCOVERY COMMANDS",
-    "- llm-router -h",
-    "- llm-router config -h",
-    "- llm-router start -h",
-    "- llm-router deploy -h",
+    `- ${CLI_COMMAND} -h`,
+    `- ${CLI_COMMAND} config -h`,
+    `- ${CLI_COMMAND} start -h`,
+    `- ${CLI_COMMAND} reclaim`,
+    `- ${CLI_COMMAND} deploy -h`,
+    `- ${CLI_COMMAND} config --operation=validate`,
+    `- ${CLI_COMMAND} config --operation=snapshot`,
+    `- ${CLI_COMMAND} config --operation=tool-status`,
     "",
     "## CURRENT STATE",
     `- config_path=${configPath}`,
@@ -9056,16 +9198,17 @@ async function runAiHelpAction(context) {
     `- master_key_configured=${hasMasterKey}`,
     `- local_server_running=${serverRunning}`,
     serverRunning ? `- local_server_endpoint=http://${runtimeState.host}:${runtimeState.port}` : "",
+    !serverRunning && portBusyPids.length > 0 ? `- local_router_port_busy=true (pids=${portBusyPids.join(", ")})` : "",
     runtimeState ? `- local_server_require_auth=${runtimeRequiresAuth}` : "",
     runtimeConfigPathForDisplay ? `- local_server_config_path=${runtimeConfigPathForDisplay}` : "",
     "",
     "## MODEL/GROUP DECISION INPUT (REQUIRED BEFORE PATCHING TOOL CONFIG)",
-    "- Ask user to choose target_tool: claude-code | codex-cli | opencode",
+    "- Ask user to choose target_tool: claude-code | codex-cli | amp-client",
     "- Ask user to choose target_model_or_group for that tool",
     `- available_alias_groups=${aliasIds.join(", ") || "(none)"}`,
     `- available_direct_models=${directModelRefs.join(", ") || "(none)"}`,
     `- decision_options_preview=${modelDecisionOptions.slice(0, 12).join(", ") || "(none)"}`,
-    "- If user chooses an alias/group, keep alias id unchanged so llm-router balancing still works.",
+    `- If user chooses an alias/group, keep alias id unchanged so ${APP_NAME} balancing still works.`,
     "",
     "## PRE-PATCH API GATE (MUST PASS BEFORE EDITING TOOL CONFIG)",
     `- live_test_mode=${skipLiveTest ? "skipped-by-flag" : (liveTest.ran ? "executed" : "pending-local-server")}`,
@@ -9091,75 +9234,61 @@ async function runAiHelpAction(context) {
       jsonBody: { model: "<target_model_or_group>", input: "ping" }
     })}  # required for Codex CLI compatibility`,
     "",
-    "## LLM-ROUTER CONFIG WORKFLOWS (CLI)",
-    "1. Upsert provider + models:",
-    "   llm-router config --operation=upsert-provider --provider-id=<id> --name=\"<name>\" --endpoints=<url1,url2> --api-key=<key> --models=<model1,model2>",
-    "1b. Upsert subscription provider (OAuth-backed ChatGPT Codex / Claude Code):",
-    "   llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default",
-    "   llm-router config --operation=upsert-provider --provider-id=claude-sub --name=\"Claude Sub\" --type=subscription --subscription-type=claude-code --subscription-profile=default",
-    "   llm-router subscription login --subscription-type=chatgpt-codex --profile=default",
-    "   llm-router subscription login --subscription-type=claude-code --profile=default",
-    "2. Upsert model alias/group:",
-    "   llm-router config --operation=upsert-model-alias --alias-id=<alias> --strategy=auto --targets=<provider/model,...>",
-    "3. Set provider rate limit bucket:",
-    "   llm-router config --operation=set-provider-rate-limits --provider-id=<id> --bucket-name=\"Monthly cap\" --bucket-models=all --bucket-requests=<n> --bucket-window=month:1",
-    "4. Review final routing summary:",
-    "   llm-router config --operation=list-routing",
+    `## ${APP_NAME.toUpperCase()} CONFIG WORKFLOWS (CLI)`,
+    "0. Validate raw config JSON + schema:",
+    `   ${CLI_COMMAND} config --operation=validate`,
+    "1. Snapshot current runtime + tool routing state:",
+    `   ${CLI_COMMAND} config --operation=snapshot`,
+    `   ${CLI_COMMAND} config --operation=tool-status`,
+    "2. Upsert provider + models:",
+    `   ${CLI_COMMAND} config --operation=upsert-provider --provider-id=<id> --name="<name>" --endpoints=<url1,url2> --api-key=<key> --models=<model1,model2>`,
+    "2a. Run standalone provider diagnostics before saving when needed:",
+    `   ${CLI_COMMAND} config --operation=discover-provider-models --endpoints=<url1,url2> --api-key=<key>`,
+    `   ${CLI_COMMAND} config --operation=test-provider --endpoints=<url1,url2> --api-key=<key> --models=<model1,model2>`,
+    `   ${CLI_COMMAND} config --operation=litellm-context-lookup --models=<model1,model2>`,
+    "2b. Upsert subscription provider (OAuth-backed ChatGPT Codex / Claude Code):",
+    `   ${CLI_COMMAND} config --operation=upsert-provider --provider-id=chatgpt --name="GPT Sub" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default`,
+    `   ${CLI_COMMAND} config --operation=upsert-provider --provider-id=claude-sub --name="Claude Sub" --type=subscription --subscription-type=claude-code --subscription-profile=default`,
+    `   ${CLI_COMMAND} subscription login --subscription-type=chatgpt-codex --profile=default`,
+    `   ${CLI_COMMAND} subscription login --subscription-type=claude-code --profile=default`,
+    "3. Upsert model alias/group:",
+    `   ${CLI_COMMAND} config --operation=upsert-model-alias --alias-id=<alias> --strategy=auto --targets=<provider/model,...>`,
+    "4. Set provider rate limit bucket:",
+    `   ${CLI_COMMAND} config --operation=set-provider-rate-limits --provider-id=<id> --bucket-name="Monthly cap" --bucket-models=all --bucket-requests=<n> --bucket-window=month:1`,
+    "5. Review final routing summary:",
+    `   ${CLI_COMMAND} config --operation=list-routing`,
+    "6. Reclaim the fixed local router port when startup is blocked by another listener:",
+    `   ${CLI_COMMAND} reclaim`,
     "",
     "## CODING TOOL PATCH PLAYBOOK",
     "### Claude Code",
-    "- patch_target_priority=.claude/settings.local.json (project) -> ~/.claude/settings.json (user)",
     "- required_gate=patch_gate_claude_code=ready",
-    "- set env keys: ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL",
-    "```json",
-    "{",
-    "  \"env\": {",
-    `    \"ANTHROPIC_BASE_URL\": \"${gatewayBaseUrlForGuide}/anthropic\",`,
-    "    \"ANTHROPIC_AUTH_TOKEN\": \"<master_key>\",",
-    "    \"ANTHROPIC_MODEL\": \"<target_model_or_group>\"",
-    "  }",
-    "}",
-    "```",
+    `- enable/update route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=<target_model_or_group>`,
+    `- optional bindings: --default-opus-model=<route> --default-sonnet-model=<route> --default-haiku-model=<route> --subagent-model=<route> --thinking-level=low|medium|high|max`,
+    `- disable route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=false`,
     "",
     "### Codex CLI",
-    "- patch_target_priority=.codex/config.toml (project) -> ~/.codex/config.toml (user)",
     "- required_gate=patch_gate_codex_cli=ready",
     "- hard requirement: Codex uses OpenAI Responses API; /openai/v1/responses must be reachable",
-    "```toml",
-    "model_provider = \"llm_router\"",
-    "model = \"<target_model_or_group>\"",
+    `- managed binding mode: ${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=true --default-model=<target_model_or_group>`,
+    `- inherit-cli mode: ${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=true --default-model=${CODEX_CLI_INHERIT_MODEL_VALUE}`,
+    `- optional reasoning flag: --thinking-level=minimal|low|medium|high|xhigh`,
+    `- disable route: ${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=false`,
     "",
-    "[model_providers.llm_router]",
-    "name = \"llm-router\"",
-    `base_url = \"${gatewayBaseUrlForGuide}/openai/v1\"`,
-    "wire_api = \"responses\"",
-    "env_http_headers = { Authorization = \"LLM_ROUTER_AUTH_HEADER\" }",
-    "```",
-    "- export env before launching Codex: export LLM_ROUTER_AUTH_HEADER='Bearer <master_key>'",
+    "### AMP Client",
+    "- use this when AMP should globally route through the local LLM Router gateway",
+    `- enable/update route: ${CLI_COMMAND} config --operation=set-amp-client-routing --enabled=true --amp-client-settings-scope=workspace`,
+    `- disable route: ${CLI_COMMAND} config --operation=set-amp-client-routing --enabled=false --amp-client-settings-scope=workspace`,
+    `- router-side AMP config still lives under ${CLI_COMMAND} config --operation=set-amp-config ...`,
     "",
     "### OpenCode",
-    "- patch_target_priority=./opencode.json (project) -> ~/.config/opencode/opencode.json (user)",
-    "- required_gate=patch_gate_opencode=ready",
-    "```json",
-    "{",
-    "  \"model\": \"<target_model_or_group>\",",
-    "  \"small_model\": \"<target_model_or_group>\",",
-    "  \"provider\": {",
-    "    \"llm-router\": {",
-    "      \"options\": {",
-    `        \"baseURL\": \"${gatewayBaseUrlForGuide}/openai\",`,
-    "        \"apiKey\": \"<master_key>\"",
-    "      }",
-    "    }",
-    "  }",
-    "}",
-    "```",
+    "- no first-class llr patch command currently; use manual config edits only after the same OpenAI gate checks pass",
     "",
     "## NEXT SUGGESTIONS",
     ...suggestions.map((item, index) => `${index + 1}. ${item}`),
     "",
     "## UPDATE RULE",
-    "When local server is running, llm-router config changes are hot-reloaded in memory (no manual restart required).",
+    `When the local server is running, ${CLI_COMMAND} config changes are hot-reloaded in memory (no manual restart required).`,
     "Agent policy: always run live API gate checks first, then patch tool configs only after gate status is ready."
   ].filter(Boolean);
 
@@ -9623,7 +9752,7 @@ async function runDeployAction(context) {
           "Notes",
           [
             generatedDeployMasterKey
-              ? "Generated a deploy-time master key. Persist it with `llm-router config --operation=set-master-key --master-key=...` if needed."
+              ? `Generated a deploy-time master key. Persist it with \`${CLI_COMMAND} config --operation=set-master-key --master-key=...\` if needed.`
               : "",
             wranglerTargetMessage
           ],
@@ -10043,7 +10172,7 @@ async function runSubscriptionStatusAction(context) {
       if (profiles.length === 0) {
         lines.push("  No authenticated profiles found.");
         lines.push("");
-        lines.push(`  To login: llm-router subscription login --subscription-type=${subscriptionType} --profile=<name>`);
+        lines.push(`  To login: ${CLI_COMMAND} subscription login --subscription-type=${subscriptionType} --profile=<name>`);
       } else {
         for (const p of profiles) {
           const status = await getAuthStatus(p, { subscriptionType });
@@ -10078,23 +10207,23 @@ const routerModule = {
   actions: [
     {
       actionId: "start",
-      description: "Start local llm-router route.",
-      tui: { steps: ["start-server"] },
+      description: "Start the local LLM Router gateway.",
+      tui: { steps: ["cli-only"] },
       commandline: { requiredArgs: [], optionalArgs: ["config", "watch-config", "watch-binary", "require-auth"] },
       help: {
-        summary: "Start local llm-router on localhost. Hot-reloads config in memory and auto-relaunches after llm-router upgrades.",
+        summary: "Start the local LLM Router gateway on localhost. Hot-reloads config in memory and auto-relaunches after upgrades.",
         args: [
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" },
           { name: "watch-config", required: false, description: "Hot-reload config in memory without process restart.", example: "--watch-config=true" },
-          { name: "watch-binary", required: false, description: "Watch for llm-router upgrades and relaunch the latest version.", example: "--watch-binary=true" },
+          { name: "watch-binary", required: false, description: "Watch for LLM Router upgrades and relaunch the latest version.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require local API auth using config.masterKey.", example: "--require-auth=true" }
         ],
-        examples: ["llm-router start", "llm-router start --require-auth=true"],
+        examples: [`${CLI_COMMAND} start`, `${CLI_COMMAND} start --require-auth=true`],
         useCases: [
           {
             name: "run local route",
             description: "Serve Anthropic and OpenAI route endpoints locally.",
-            command: "llm-router start"
+            command: `${CLI_COMMAND} start`
           }
         ],
         keybindings: ["Ctrl+C stop"]
@@ -10104,10 +10233,10 @@ const routerModule = {
     {
       actionId: "web",
       description: "Open a local Claude-light web console for config editing and router control.",
-      tui: { steps: ["open-web-console"] },
+      tui: { steps: ["cli-only"] },
       commandline: { requiredArgs: [], optionalArgs: ["host", "port", "config", "open", "router-watch-config", "router-watch-binary", "router-require-auth", "allow-remote-clients"] },
       help: {
-        summary: "Launch the browser-based llm-router console with a richer UI for editing config JSON, probing providers, and starting or stopping the local router.",
+        summary: "Launch the browser-based LLM Router console with a richer UI for editing config JSON, probing providers, and starting or stopping the local router.",
         args: [
           { name: "host", required: false, description: "Web console listen host.", example: "--host=127.0.0.1" },
           { name: "port", required: false, description: "Web console listen port (or use LLM_ROUTER_WEB_PORT / PORT env).", example: "--port=8788" },
@@ -10118,12 +10247,12 @@ const routerModule = {
           { name: "router-require-auth", required: false, description: "Default auth requirement for the managed router.", example: "--router-require-auth=false" },
           { name: "allow-remote-clients", required: false, description: "Allow non-localhost browser access to the management UI (not recommended).", example: "--allow-remote-clients=true" }
         ],
-        examples: ["llm-router web", "llm-router web --port=9090", "llm-router web --open=false"],
+        examples: [`${CLI_COMMAND} web`, `${CLI_COMMAND} web --port=9090`, `${CLI_COMMAND} web --open=false`],
         useCases: [
           {
             name: "manage router in browser",
             description: "Use a Claude-light web UI to edit config, probe providers, and control the local route server.",
-            command: "llm-router web"
+            command: `${CLI_COMMAND} web`
           }
         ],
         keybindings: ["Exit Web button", "Ctrl+C stop"]
@@ -10132,18 +10261,18 @@ const routerModule = {
     },
     {
       actionId: "stop",
-      description: "Stop a running llm-router instance (manual or OS startup-managed).",
-      tui: { steps: ["stop-instance"] },
+      description: "Stop a running LLM Router instance (manual or OS startup-managed).",
+      tui: { steps: ["cli-only"] },
       commandline: { requiredArgs: [], optionalArgs: [] },
       help: {
-        summary: "Stop a running llm-router instance.",
+        summary: "Stop a running LLM Router instance.",
         args: [],
-        examples: ["llm-router stop"],
+        examples: [`${CLI_COMMAND} stop`],
         useCases: [
           {
             name: "stop instance",
             description: "Stops startup-managed service or running terminal process.",
-            command: "llm-router stop"
+            command: `${CLI_COMMAND} stop`
           }
         ],
         keybindings: []
@@ -10151,19 +10280,39 @@ const routerModule = {
       run: runStopAction
     },
     {
-      actionId: "reload",
-      description: "Force restart running llm-router instance.",
-      tui: { steps: ["reload-instance"] },
+      actionId: "reclaim",
+      description: "Force-free the fixed local router port when another listener is blocking startup.",
+      tui: { steps: ["cli-only"] },
       commandline: { requiredArgs: [], optionalArgs: [] },
       help: {
-        summary: "Restart running llm-router: restart startup service or restart terminal instance in current terminal.",
+        summary: "Reclaim the fixed local router port by stopping whatever process is currently listening on it.",
         args: [],
-        examples: ["llm-router reload"],
+        examples: [`${CLI_COMMAND} reclaim`],
+        useCases: [
+          {
+            name: "free blocked port",
+            description: "Stops the current listener on the fixed local router port so LLM Router can start cleanly.",
+            command: `${CLI_COMMAND} reclaim`
+          }
+        ],
+        keybindings: []
+      },
+      run: runReclaimAction
+    },
+    {
+      actionId: "reload",
+      description: "Force restart a running LLM Router instance.",
+      tui: { steps: ["cli-only"] },
+      commandline: { requiredArgs: [], optionalArgs: [] },
+      help: {
+        summary: "Restart a running LLM Router instance: restart the startup service or restart a terminal instance in the current terminal.",
+        args: [],
+        examples: [`${CLI_COMMAND} reload`],
         useCases: [
           {
             name: "force restart",
-            description: "Restarts currently running llm-router instance.",
-            command: "llm-router reload"
+            description: "Restarts the currently running LLM Router instance.",
+            command: `${CLI_COMMAND} reload`
           }
         ],
         keybindings: []
@@ -10172,8 +10321,8 @@ const routerModule = {
     },
     {
       actionId: "update",
-      description: "Update llm-router global package to latest and reload running instance.",
-      tui: { steps: ["npm-install", "reload-running"] },
+      description: "Update the global LLM Router package to latest and reload the running instance.",
+      tui: { steps: ["cli-only"] },
       commandline: { requiredArgs: [], optionalArgs: ["check", "check-only", "install"] },
       help: {
         summary: "Check latest npm version, optionally install it, and reload any running instance onto the latest installed build.",
@@ -10182,12 +10331,12 @@ const routerModule = {
           { name: "check-only", required: false, description: "Alias for --check=true.", example: "--check-only=true" },
           { name: "install", required: false, description: "Force install or skip install after the version check.", example: "--install=true" }
         ],
-        examples: ["llm-router update", "llm-router update --check=true", "llm-router update --install=true"],
+        examples: [`${CLI_COMMAND} update`, `${CLI_COMMAND} update --check=true`, `${CLI_COMMAND} update --install=true`],
         useCases: [
           {
             name: "upgrade cli",
             description: "Checks for updates, installs latest global package, and reloads startup/manual running instance.",
-            command: "llm-router update"
+            command: `${CLI_COMMAND} update`
           }
         ],
         keybindings: []
@@ -10196,8 +10345,8 @@ const routerModule = {
     },
     {
       actionId: "ai-help",
-      description: "Print AI-agent guide with llm-router setup workflows, live API gates, and coding-tool patch playbooks.",
-      tui: { steps: ["print-ai-help"] },
+      description: "Print an AI-agent guide with LLM Router setup workflows, live API gates, and coding-tool patch playbooks.",
+      tui: { steps: ["cli-only"] },
       commandline: {
         requiredArgs: [],
         optionalArgs: [
@@ -10208,24 +10357,24 @@ const routerModule = {
         ]
       },
       help: {
-        summary: "AI guide for setup + operation: state snapshot, provider/alias/rate-limit workflows, live gateway tests, and patch rules for Claude/Codex/OpenCode.",
+        summary: "AI guide for setup + operation: config validation, state snapshot, provider workflows, live gateway tests, reclaim guidance, and patch rules for Claude/Codex/OpenCode.",
         args: [
           { name: "config", required: false, description: "Path to config file used for state-aware suggestions.", example: "--config=~/.llm-router.json" },
-          { name: "skip-live-test", required: false, description: "Skip live llm-router API probes in ai-help output.", example: "--skip-live-test=true" },
+          { name: "skip-live-test", required: false, description: "Skip live LLM Router API probes in ai-help output.", example: "--skip-live-test=true" },
           { name: "live-test-timeout-ms", required: false, description: `HTTP timeout for ai-help live probes (default ${DEFAULT_AI_HELP_GATEWAY_TEST_TIMEOUT_MS}ms).`, example: "--live-test-timeout-ms=8000" },
           { name: "gateway-auth-token", required: false, description: "Override auth token for live probes when runtime config differs from selected --config.", example: "--gateway-auth-token=gw_..." }
         ],
         examples: [
-          "llm-router ai-help",
-          "llm-router ai-help --config=~/.llm-router.json",
-          "llm-router ai-help --skip-live-test=true",
-          "llm-router ai-help --live-test-timeout-ms=8000"
+          `${CLI_COMMAND} ai-help`,
+          `${CLI_COMMAND} ai-help --config=~/.llm-router.json`,
+          `${CLI_COMMAND} ai-help --skip-live-test=true`,
+          `${CLI_COMMAND} ai-help --live-test-timeout-ms=8000`
         ],
         useCases: [
           {
             name: "agent setup brief",
-            description: "Generate a machine-readable operating guide so AI agents can configure llm-router, run pre-patch API gates, and patch tool configs safely.",
-            command: "llm-router ai-help"
+            description: "Generate a machine-readable operating guide so AI agents can configure LLM Router, run pre-patch API gates, and patch tool configs safely.",
+            command: `${CLI_COMMAND} ai-help`
           }
         ],
         keybindings: []
@@ -10234,12 +10383,11 @@ const routerModule = {
     },
     {
       actionId: "config",
-      description: "Config manager for providers/models/master-key/AMP/startup service.",
-      tui: { steps: ["select-operation", "execute"] },
+      description: "Config manager for providers, diagnostics, coding-tool routing, AMP, and startup service.",
+      tui: { steps: ["cli-only"] },
       commandline: {
         requiredArgs: [],
         optionalArgs: [
-          "tui",
           "operation",
           "op",
           "config",
@@ -10256,7 +10404,12 @@ const routerModule = {
           "claude-base-url",
           "anthropic-base-url",
           "api-key",
+          "api-key-env",
+          "endpoint-url",
+          "enabled",
           "models",
+          "model-context-windows",
+          "fill-model-context-windows",
           "bucket-models",
           "bucket-id",
           "bucket-name",
@@ -10283,6 +10436,16 @@ const routerModule = {
           "generate-master-key",
           "master-key-length",
           "master-key-prefix",
+          "default-model",
+          "thinking-level",
+          "primary-model",
+          "default-opus-model",
+          "default-sonnet-model",
+          "default-haiku-model",
+          "subagent-model",
+          "codex-config-file",
+          "codex-model-catalog-file",
+          "claude-code-settings-file",
           "amp-upstream-url",
           "amp-upstream-api-key",
           "amp-restrict-management-to-localhost",
@@ -10326,10 +10489,9 @@ const routerModule = {
         ]
       },
       help: {
-        summary: "Manage providers, model aliases, rate-limit buckets, AMP proxy settings, master key, and OS startup. `llm-router config` opens the web console by default; use --tui for the terminal UI or --operation for direct commandline actions.",
+        summary: `Manage providers, diagnostics, config validation, coding-tool routing, model aliases, rate-limit buckets, AMP proxy settings, master key, and OS startup. \`${CLI_COMMAND} config\` opens the web console by default; use \`--operation\` for direct CLI actions.`,
         args: [
-          { name: "tui", required: false, description: "Open the terminal UI instead of the default browser-based console when using `llm-router config`.", example: "--tui" },
-          { name: "operation", required: false, description: "Config operation (optional; prompts if omitted).", example: "--operation=upsert-provider" },
+          { name: "operation", required: false, description: "Config operation (optional; defaults to a config summary when omitted in direct CLI mode).", example: "--operation=upsert-provider" },
           { name: "provider-id", required: false, description: "Provider id (lowercase letters/numbers/dashes).", example: "--provider-id=openrouter-primary" },
           { name: "name", required: false, description: "Provider Friendly Name (must be unique; shown in management screen).", example: "--name=OpenRouter Primary" },
           { name: "type", required: false, description: "Provider type: standard (API key) | subscription (OAuth).", example: "--type=subscription" },
@@ -10341,7 +10503,12 @@ const routerModule = {
           { name: "openai-base-url", required: false, description: "For standard provider: OpenAI endpoint base URL (format-specific override).", example: "--openai-base-url=https://ramclouds.me/v1" },
           { name: "claude-base-url", required: false, description: "For standard provider: Anthropic endpoint base URL (format-specific override).", example: "--claude-base-url=https://ramclouds.me" },
           { name: "api-key", required: false, description: "For standard provider: API key.", example: "--api-key=sk-or-v1-..." },
+          { name: "api-key-env", required: false, description: "For provider diagnostics: environment variable that contains the API key.", example: "--api-key-env=OPENAI_API_KEY" },
+          { name: "endpoint-url", required: false, description: `For coding-tool routing operations: local ${APP_NAME} gateway origin (defaults to ${LOCAL_ROUTER_ORIGIN}).`, example: `--endpoint-url=${LOCAL_ROUTER_ORIGIN}` },
+          { name: "enabled", required: false, description: "For coding-tool routing operations: enable routing when true, restore direct config when false.", example: "--enabled=false" },
           { name: "models", required: false, description: "Model list (comma-separated IDs; strips common log/error noise). Subscription defaults are prefilled by subscription-type and all selected models are live-validated before save.", example: "--models=claude-sonnet-4-6,claude-opus-4-6" },
+          { name: "model-context-windows", required: false, description: "Optional model context window map for upsert-provider. Accepts JSON or `model=value` entries.", example: "--model-context-windows='{\"gpt-4o-mini\":128000,\"gpt-4o\":128000}'" },
+          { name: "fill-model-context-windows", required: false, description: "For upsert-provider: auto-fill missing model context windows from LiteLLM exact matches before save.", example: "--fill-model-context-windows=true" },
           { name: "model", required: false, description: "Single model id (used by remove-model).", example: "--model=gpt-4o" },
           { name: "fallback-models", required: false, description: "Qualified fallback models for set-model-fallbacks (comma-separated).", example: "--fallback-models=openrouter/gpt-4o,anthropic/claude-3-7-sonnet" },
           { name: "clear-fallbacks", required: false, description: "Clear all fallback models for set-model-fallbacks.", example: "--clear-fallbacks=true" },
@@ -10367,8 +10534,18 @@ const routerModule = {
           { name: "generate-master-key", required: false, description: "Generate a strong master key automatically (set-master-key flow).", example: "--generate-master-key=true" },
           { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
           { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
+          { name: "default-model", required: false, description: `For set-codex-cli-routing: managed route binding, or ${CODEX_CLI_INHERIT_MODEL_VALUE} to keep Codex's own model selection.`, example: "--default-model=chat.default" },
+          { name: "thinking-level", required: false, description: "For set-codex-cli-routing / set-claude-code-routing: reasoning level.", example: "--thinking-level=medium" },
+          { name: "primary-model", required: false, description: "For set-claude-code-routing: primary ANTHROPIC_MODEL route.", example: "--primary-model=chat.default" },
+          { name: "default-opus-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_OPUS_MODEL route.", example: "--default-opus-model=chat.deep" },
+          { name: "default-sonnet-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_SONNET_MODEL route.", example: "--default-sonnet-model=chat.default" },
+          { name: "default-haiku-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_HAIKU_MODEL route.", example: "--default-haiku-model=chat.fast" },
+          { name: "subagent-model", required: false, description: "For set-claude-code-routing: CLAUDE_CODE_SUBAGENT_MODEL route.", example: "--subagent-model=chat.review" },
+          { name: "codex-config-file", required: false, description: "Explicit Codex CLI config.toml path for routing/status operations.", example: "--codex-config-file=./.codex/config.toml" },
+          { name: "codex-model-catalog-file", required: false, description: "Explicit Codex model catalog JSON path for routing operations.", example: "--codex-model-catalog-file=./.codex/llm-router-model-catalog.json" },
+          { name: "claude-code-settings-file", required: false, description: "Explicit Claude Code settings.json path for routing/status operations.", example: "--claude-code-settings-file=./.claude/settings.local.json" },
           { name: "amp-upstream-url", required: false, description: "AMP upstream base URL for management proxying and unresolved fallback routing.", example: "--amp-upstream-url=https://ampcode.com" },
-          { name: "amp-upstream-api-key", required: false, description: "AMP upstream API key used when llm-router proxies AMP management routes.", example: "--amp-upstream-api-key=amp_..." },
+          { name: "amp-upstream-api-key", required: false, description: "AMP upstream API key used when LLM Router proxies AMP management routes.", example: "--amp-upstream-api-key=amp_..." },
           { name: "amp-restrict-management-to-localhost", required: false, description: "Restrict AMP management proxy routes to localhost clients.", example: "--amp-restrict-management-to-localhost=true" },
           { name: "amp-force-model-mappings", required: false, description: "Apply AMP model mappings before local bare-model lookup.", example: "--amp-force-model-mappings=true" },
           { name: "amp-preset", required: false, description: "New AMP schema preset: builtin (default) or none.", example: "--amp-preset=builtin" },
@@ -10379,12 +10556,12 @@ const routerModule = {
           { name: "amp-model-mappings", required: false, description: "AMP model mappings as JSON or 'from => to' entries separated by newlines/commas.", example: "--amp-model-mappings=\"* => rc/gpt-5.3-codex\"" },
           { name: "amp-subagent-definitions", required: false, description: "AMP subagent definitions as JSON or 'agent => model-pattern|pattern' entries separated by newlines/commas.", example: "--amp-subagent-definitions=\"oracle => gpt-5.4|gpt-5.4*, planner => gpt-6*\"" },
           { name: "amp-subagent-mappings", required: false, description: "AMP subagent mappings as JSON object or 'agent => route' entries separated by newlines/commas.", example: "--amp-subagent-mappings=\"oracle => rc/gpt-5.3-codex, librarian => rc/gpt-5.3-codex\"" },
-          { name: "patch-amp-client-config", required: false, description: "Patch AMP local settings/secrets so only amp.url and apiKey@<url> point to this llm-router gateway.", example: "--patch-amp-client-config=true" },
+          { name: "patch-amp-client-config", required: false, description: "Patch AMP local settings/secrets so only amp.url and apiKey@<url> point to this LLM Router gateway.", example: "--patch-amp-client-config=true" },
           { name: "amp-client-settings-scope", required: false, description: "AMP settings scope when patching: global or workspace.", example: "--amp-client-settings-scope=workspace" },
           { name: "amp-client-settings-file", required: false, description: "Explicit AMP settings.json path override for patching.", example: "--amp-client-settings-file=./.amp/settings.json" },
           { name: "amp-client-secrets-file", required: false, description: "Explicit AMP secrets.json path override for patching.", example: "--amp-client-secrets-file=~/.local/share/amp/secrets.json" },
-          { name: "amp-client-url", required: false, description: "Local llm-router URL written to AMP settings as amp.url when patching.", example: `--amp-client-url=${LOCAL_ROUTER_ORIGIN}` },
-          { name: "amp-client-api-key", required: false, description: "Local llm-router gateway key written to AMP secrets as apiKey@<url> when patching.", example: "--amp-client-api-key=gw_..." },
+          { name: "amp-client-url", required: false, description: "Local LLM Router URL written to AMP settings as amp.url when patching.", example: `--amp-client-url=${LOCAL_ROUTER_ORIGIN}` },
+          { name: "amp-client-api-key", required: false, description: "Local LLM Router gateway key written to AMP secrets as apiKey@<url> when patching.", example: "--amp-client-api-key=gw_..." },
           { name: "clear-amp-upstream-url", required: false, description: "Clear the AMP upstream URL.", example: "--clear-amp-upstream-url=true" },
           { name: "clear-amp-upstream-api-key", required: false, description: "Clear the AMP upstream API key.", example: "--clear-amp-upstream-api-key=true" },
           { name: "clear-amp-default-route", required: false, description: "Clear the new AMP schema defaultRoute.", example: "--clear-amp-default-route=true" },
@@ -10393,53 +10570,62 @@ const routerModule = {
           { name: "clear-amp-overrides", required: false, description: "Clear all new AMP schema override entries.", example: "--clear-amp-overrides=true" },
           { name: "clear-amp-model-mappings", required: false, description: "Clear all AMP model mappings.", example: "--clear-amp-model-mappings=true" },
           { name: "clear-amp-subagent-definitions", required: false, description: "Clear all custom AMP subagent definitions so unmatched AMP models fall back to defaultModel.", example: "--clear-amp-subagent-definitions=true" },
-          { name: "reset-amp-subagent-definitions", required: false, description: "Reset AMP subagent definitions back to llm-router built-ins.", example: "--reset-amp-subagent-definitions=true" },
+          { name: "reset-amp-subagent-definitions", required: false, description: "Reset AMP subagent definitions back to the built-in LLM Router defaults.", example: "--reset-amp-subagent-definitions=true" },
           { name: "clear-amp-subagent-mappings", required: false, description: "Clear all AMP subagent mappings.", example: "--clear-amp-subagent-mappings=true" },
           { name: "target-version", required: false, description: "For migrate-config: target schema version.", example: "--target-version=2" },
           { name: "create-backup", required: false, description: "For migrate-config: create backup before write.", example: "--create-backup=true" },
           { name: "watch-config", required: false, description: "For startup-install/start: enable in-memory config hot reload.", example: "--watch-config=true" },
-          { name: "watch-binary", required: false, description: "For startup-install: detect llm-router upgrades and auto-relaunch under OS startup.", example: "--watch-binary=true" },
+          { name: "watch-binary", required: false, description: "For startup-install: detect LLM Router upgrades and auto-relaunch under OS startup.", example: "--watch-binary=true" },
           { name: "require-auth", required: false, description: "Require masterKey auth for local start/startup-install.", example: "--require-auth=true" },
           { name: "config", required: false, description: "Path to config file.", example: "--config=~/.llm-router.json" }
         ],
         examples: [
-          "llm-router config",
-          "llm-router config --tui",
-          "llm-router config --operation=upsert-provider --provider-id=ramclouds --name=RamClouds --api-key=sk-... --endpoints=https://ramclouds.me,https://ramclouds.me/v1 --models=claude-opus-4-6-thinking,gpt-5.3-codex",
-          "llm-router config --operation=upsert-provider --provider-id=chatgpt --name=\"GPT Sub\" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default",
-          "llm-router config --operation=upsert-provider --provider-id=claude-sub --name=\"Claude Sub\" --type=subscription --subscription-type=claude-code --subscription-profile=default",
-          "llm-router subscription login --subscription-type=chatgpt-codex --profile=default",
-          "llm-router subscription login --subscription-type=claude-code --profile=default",
-          "llm-router config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2 --fallback-targets=openrouter/gpt-4o",
-          "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-id=openrouter-all-month --bucket-models=all --bucket-requests=20000 --bucket-window=month:1",
-          "llm-router config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-name=\"6-hours cap\" --bucket-models=all --bucket-requests=600 --bucket-window=hour:6",
-          "llm-router config --operation=migrate-config --target-version=2 --create-backup=true",
-          "llm-router config --operation=set-model-fallbacks --provider-id=openrouter --model=gpt-4o --fallback-models=anthropic/claude-3-7-sonnet,openrouter/gpt-4.1-mini",
-          "llm-router config --operation=remove-model --provider-id=openrouter --model=gpt-4o",
-          `llm-router config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN}`,
-          "llm-router config --operation=set-amp-config --amp-default-route=chat.default --amp-routes=\"smart => chat.smart, rush => chat.fast, @google-gemini-flash-shared => chat.tools\"",
-          "llm-router config --operation=set-amp-config --amp-preset=builtin --amp-raw-model-routes=\"gpt-*-codex* => chat.deep\" --amp-overrides='{\"entities\":[{\"id\":\"reviewer\",\"type\":\"feature\",\"match\":[\"gemini-4-pro*\"],\"route\":\"chat.review\"}]}'",
-          "llm-router config --operation=set-amp-config --amp-upstream-url=https://ampcode.com --amp-upstream-api-key=amp_... --amp-force-model-mappings=true --amp-model-mappings=\"* => rc/gpt-5.3-codex\"",
-          "llm-router config --operation=set-amp-config --amp-subagent-mappings=\"oracle => rc/gpt-5.3-codex, librarian => rc/gpt-5.3-codex, search => rc/gpt-5.3-codex, look-at => rc/gpt-5.3-codex\"",
-          `llm-router config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN} --amp-client-api-key=gw_...`,
-          "llm-router config --operation=list-routing",
-          "llm-router config --operation=startup-install"
+          `${CLI_COMMAND} config`,
+          `${CLI_COMMAND} config --operation=validate`,
+          `${CLI_COMMAND} config --operation=snapshot`,
+          `${CLI_COMMAND} config --operation=tool-status`,
+          `${CLI_COMMAND} config --operation=discover-provider-models --endpoints=https://openrouter.ai/api/v1 --api-key=sk-...`,
+          `${CLI_COMMAND} config --operation=test-provider --endpoints=https://openrouter.ai/api/v1 --api-key=sk-... --models=gpt-4o-mini,gpt-4o`,
+          `${CLI_COMMAND} config --operation=litellm-context-lookup --models=gpt-4o-mini,gpt-4o`,
+          `${CLI_COMMAND} config --operation=upsert-provider --provider-id=ramclouds --name=RamClouds --api-key=sk-... --endpoints=https://ramclouds.me,https://ramclouds.me/v1 --models=claude-opus-4-6-thinking,gpt-5.3-codex`,
+          `${CLI_COMMAND} config --operation=upsert-provider --provider-id=openrouter --name=OpenRouter --api-key=sk-... --base-url=https://openrouter.ai/api/v1 --models=gpt-4o-mini,gpt-4o --fill-model-context-windows=true`,
+          `${CLI_COMMAND} config --operation=upsert-provider --provider-id=chatgpt --name="GPT Sub" --type=subscription --subscription-type=chatgpt-codex --subscription-profile=default`,
+          `${CLI_COMMAND} config --operation=upsert-provider --provider-id=claude-sub --name="Claude Sub" --type=subscription --subscription-type=claude-code --subscription-profile=default`,
+          `${CLI_COMMAND} subscription login --subscription-type=chatgpt-codex --profile=default`,
+          `${CLI_COMMAND} subscription login --subscription-type=claude-code --profile=default`,
+          `${CLI_COMMAND} config --operation=upsert-model-alias --alias-id=chat.default --strategy=auto --targets=openrouter/gpt-4o-mini@3,anthropic/claude-3-5-haiku@2 --fallback-targets=openrouter/gpt-4o`,
+          `${CLI_COMMAND} config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-id=openrouter-all-month --bucket-models=all --bucket-requests=20000 --bucket-window=month:1`,
+          `${CLI_COMMAND} config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-name="6-hours cap" --bucket-models=all --bucket-requests=600 --bucket-window=hour:6`,
+          `${CLI_COMMAND} config --operation=migrate-config --target-version=2 --create-backup=true`,
+          `${CLI_COMMAND} config --operation=set-model-fallbacks --provider-id=openrouter --model=gpt-4o --fallback-models=anthropic/claude-3-7-sonnet,openrouter/gpt-4.1-mini`,
+          `${CLI_COMMAND} config --operation=remove-model --provider-id=openrouter --model=gpt-4o`,
+          `${CLI_COMMAND} config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN}`,
+          `${CLI_COMMAND} config --operation=set-amp-config --amp-default-route=chat.default --amp-routes="smart => chat.smart, rush => chat.fast, @google-gemini-flash-shared => chat.tools"`,
+          `${CLI_COMMAND} config --operation=set-amp-config --amp-preset=builtin --amp-raw-model-routes="gpt-*-codex* => chat.deep" --amp-overrides='{"entities":[{"id":"reviewer","type":"feature","match":["gemini-4-pro*"],"route":"chat.review"}]}'`,
+          `${CLI_COMMAND} config --operation=set-amp-config --amp-upstream-url=https://ampcode.com --amp-upstream-api-key=amp_... --amp-force-model-mappings=true --amp-model-mappings="* => rc/gpt-5.3-codex"`,
+          `${CLI_COMMAND} config --operation=set-amp-config --amp-subagent-mappings="oracle => rc/gpt-5.3-codex, librarian => rc/gpt-5.3-codex, search => rc/gpt-5.3-codex, look-at => rc/gpt-5.3-codex"`,
+          `${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=true --default-model=chat.default`,
+          `${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=chat.default --default-haiku-model=chat.fast`,
+          `${CLI_COMMAND} config --operation=set-amp-client-routing --enabled=true --amp-client-settings-scope=workspace`,
+          `${CLI_COMMAND} config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN} --amp-client-api-key=gw_...`,
+          `${CLI_COMMAND} config --operation=list-routing`,
+          `${CLI_COMMAND} config --operation=startup-install`
         ],
         useCases: [
           {
-            name: "interactive config",
-            description: "Add/edit/remove providers and manage startup.",
-            command: "llm-router config"
+            name: "web-first config",
+            description: "Open the web console or run direct config operations.",
+            command: `${CLI_COMMAND} config`
           }
         ],
-        keybindings: ["Enter confirm", "Esc cancel"]
+        keybindings: []
       },
       run: runConfigAction
     },
     {
       actionId: "deploy",
       description: "Guide/deploy current config to Cloudflare Worker.",
-      tui: { steps: ["validate", "confirm", "deploy"] },
+      tui: { steps: ["cli-only"] },
       commandline: {
         requiredArgs: [],
         optionalArgs: [
@@ -10486,31 +10672,31 @@ const routerModule = {
           { name: "out", required: false, description: "Write exported JSON to file.", example: "--out=.llm-router.worker.json" }
         ],
         examples: [
-          "llm-router deploy",
-          "llm-router deploy --dry-run=true",
-          "llm-router deploy --account-id=03819f97b5cb3101faecbbcb6019c4cc",
-          "llm-router deploy --workers-dev=true",
-          "llm-router deploy --route-pattern=router.example.com/* --zone-name=example.com",
-          "llm-router deploy --generate-master-key=true",
-          "llm-router deploy --export-only=true --out=.llm-router.worker.json",
-          "llm-router deploy --allow-large-config=true",
-          "llm-router deploy --env=production"
+          `${CLI_COMMAND} deploy`,
+          `${CLI_COMMAND} deploy --dry-run=true`,
+          `${CLI_COMMAND} deploy --account-id=03819f97b5cb3101faecbbcb6019c4cc`,
+          `${CLI_COMMAND} deploy --workers-dev=true`,
+          `${CLI_COMMAND} deploy --route-pattern=router.example.com/* --zone-name=example.com`,
+          `${CLI_COMMAND} deploy --generate-master-key=true`,
+          `${CLI_COMMAND} deploy --export-only=true --out=.llm-router.worker.json`,
+          `${CLI_COMMAND} deploy --allow-large-config=true`,
+          `${CLI_COMMAND} deploy --env=production`
         ],
         useCases: [
           {
             name: "cloudflare deploy",
             description: "Push LLM_ROUTER_CONFIG_JSON secret and deploy worker.",
-            command: "llm-router deploy"
+            command: `${CLI_COMMAND} deploy`
           }
         ],
-        keybindings: ["Enter confirm", "Esc cancel"]
+        keybindings: []
       },
       run: runDeployAction
     },
     {
       actionId: "worker-key",
       description: "Quickly create/update the LLM_ROUTER_MASTER_KEY Worker secret.",
-      tui: { steps: ["key-input", "confirm", "secret-put"] },
+      tui: { steps: ["cli-only"] },
       commandline: {
         requiredArgs: [],
         optionalArgs: [
@@ -10541,26 +10727,26 @@ const routerModule = {
           { name: "dry-run", required: false, description: "Print commands only.", example: "--dry-run=true" }
         ],
         examples: [
-          "llm-router worker-key --master-key=prod-token-v2",
-          "llm-router worker-key --generate-master-key=true",
-          "llm-router worker-key --env=production --master-key=rotated-key",
-          "llm-router worker-key --use-config-key=true"
+          `${CLI_COMMAND} worker-key --master-key=prod-token-v2`,
+          `${CLI_COMMAND} worker-key --generate-master-key=true`,
+          `${CLI_COMMAND} worker-key --env=production --master-key=rotated-key`,
+          `${CLI_COMMAND} worker-key --use-config-key=true`
         ],
         useCases: [
           {
             name: "rotate leaked key",
             description: "Set LLM_ROUTER_MASTER_KEY quickly without rebuilding the full worker config secret.",
-            command: "llm-router worker-key --master-key=new-secret"
+            command: `${CLI_COMMAND} worker-key --master-key=new-secret`
           }
         ],
-        keybindings: ["Enter confirm", "Esc cancel"]
+        keybindings: []
       },
       run: runWorkerKeyAction
     },
     {
       actionId: "subscription",
       description: "Manage subscription provider authentication (login, logout, status).",
-      tui: { steps: ["subscription-auth"] },
+      tui: { steps: ["cli-only"] },
       commandline: {
         requiredArgs: [],
         optionalArgs: ["profile", "device-code", "subscription-type"]
@@ -10573,29 +10759,29 @@ const routerModule = {
           { name: "device-code", required: false, description: "Use device code flow instead of browser (headless environments; chatgpt-codex only).", example: "--device-code=true" }
         ],
         examples: [
-          "llm-router subscription login",
-          "llm-router subscription login --subscription-type=chatgpt-codex --profile=personal",
-          "llm-router subscription login --subscription-type=claude-code --profile=work",
-          "llm-router subscription login --subscription-type=chatgpt-codex --device-code=true",
-          "llm-router subscription logout --profile=personal",
-          "llm-router subscription status",
-          "llm-router subscription status --subscription-type=claude-code --profile=personal"
+          `${CLI_COMMAND} subscription login`,
+          `${CLI_COMMAND} subscription login --subscription-type=chatgpt-codex --profile=personal`,
+          `${CLI_COMMAND} subscription login --subscription-type=claude-code --profile=work`,
+          `${CLI_COMMAND} subscription login --subscription-type=chatgpt-codex --device-code=true`,
+          `${CLI_COMMAND} subscription logout --profile=personal`,
+          `${CLI_COMMAND} subscription status`,
+          `${CLI_COMMAND} subscription status --subscription-type=claude-code --profile=personal`
         ],
         useCases: [
           {
             name: "browser login",
             description: "Login to subscription provider via browser OAuth.",
-            command: "llm-router subscription login --subscription-type=claude-code --profile=personal"
+            command: `${CLI_COMMAND} subscription login --subscription-type=claude-code --profile=personal`
           },
           {
             name: "device code login",
             description: "Login on headless server using device code flow (chatgpt-codex only).",
-            command: "llm-router subscription login --subscription-type=chatgpt-codex --device-code=true --profile=server"
+            command: `${CLI_COMMAND} subscription login --subscription-type=chatgpt-codex --device-code=true --profile=server`
           },
           {
             name: "check status",
             description: "Check authentication status for all profiles.",
-            command: "llm-router subscription status"
+            command: `${CLI_COMMAND} subscription status`
           }
         ],
         keybindings: []

@@ -12,7 +12,9 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function readAmpVisibleModel(requestBody) {
+function readAmpVisibleModel(requestBody, env = {}) {
+  const overrideModel = String(env?.LLM_ROUTER_DEBUG_AMP_VISIBLE_MODEL_OVERRIDE || "").trim();
+  if (overrideModel) return overrideModel;
   return typeof requestBody?.model === "string" ? requestBody.model.trim() : "";
 }
 
@@ -270,10 +272,10 @@ function rewriteAmpStreamResponse(response, visibleModel) {
   });
 }
 
-export async function maybeRewriteAmpClientResponse(response, { clientType, requestBody, stream = false } = {}) {
+export async function maybeRewriteAmpClientResponse(response, { clientType, requestBody, stream = false, env = {} } = {}) {
   if (clientType !== "amp" || !(response instanceof Response)) return response;
 
-  const visibleModel = readAmpVisibleModel(requestBody);
+  const visibleModel = readAmpVisibleModel(requestBody, env);
   if (!visibleModel) return response;
 
   const contentType = String(response.headers.get("content-type") || "").toLowerCase();

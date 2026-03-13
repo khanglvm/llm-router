@@ -12,6 +12,11 @@ function dedupe(values) {
   return [...new Set((values || []).filter(Boolean).map((value) => String(value).trim()).filter(Boolean))];
 }
 
+function normalizePositiveInteger(value) {
+  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function normalizeProviderType(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return normalized === PROVIDER_TYPE_SUBSCRIPTION ? PROVIDER_TYPE_SUBSCRIPTION : undefined;
@@ -67,22 +72,47 @@ function normalizeModelArray(models) {
       if (!id) return null;
       const formats = dedupe(entry.formats || entry.format || []).filter((value) => value === "openai" || value === "claude");
       const variant = typeof entry.variant === "string" ? entry.variant.trim() : "";
+      const contextWindow = normalizePositiveInteger(
+        entry.contextWindow
+        ?? entry.context_window
+        ?? entry.contextLimit
+        ?? entry.context_limit
+      );
       return {
         id,
         ...(formats.length > 0 ? { formats } : {}),
-        ...(variant ? { variant } : {})
+        ...(variant ? { variant } : {}),
+        ...(contextWindow ? { contextWindow } : {})
       };
     })
     .filter(Boolean);
 }
 
-function buildModelsWithPreferredFormat(modelIds, modelSupport = {}, modelPreferredFormat = {}) {
+function normalizeModelContextWindows(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  return Object.fromEntries(
+    Object.entries(input)
+      .map(([modelId, value]) => [String(modelId || "").trim(), normalizePositiveInteger(value)])
+      .filter(([modelId, contextWindow]) => Boolean(modelId && contextWindow))
+  );
+}
+
+function buildModelsWithPreferredFormat(modelIds, modelSupport = {}, modelPreferredFormat = {}, modelContextWindows = {}) {
   return normalizeModelArray(modelIds.map((id) => {
     const preferred = modelPreferredFormat[id];
+    const contextWindow = normalizePositiveInteger(modelContextWindows[id]);
     if (preferred) {
-      return { id, formats: [preferred] };
+      return {
+        id,
+        formats: [preferred],
+        ...(contextWindow ? { contextWindow } : {})
+      };
     }
-    return { id, formats: modelSupport[id] || [] };
+    return {
+      id,
+      formats: modelSupport[id] || [],
+      ...(contextWindow ? { contextWindow } : {})
+    };
   }));
 }
 
@@ -107,6 +137,10 @@ export function buildProviderFromConfigInput(input) {
   ).trim() || "default";
   const baseUrlByFormat = normalizeBaseUrlByFormatInput(input);
   const explicitModelIds = parseModelListInput(input.models);
+  const modelContextWindows = normalizeModelContextWindows(
+    input.modelContextWindows
+    || input["model-context-windows"]
+  );
   const probeModelSupport = input.probe?.modelSupport && typeof input.probe.modelSupport === "object"
     ? input.probe.modelSupport
     : {};
@@ -114,10 +148,10 @@ export function buildProviderFromConfigInput(input) {
     ? input.probe.modelPreferredFormat
     : {};
   const explicitModels = explicitModelIds.length > 0
-    ? buildModelsWithPreferredFormat(explicitModelIds, probeModelSupport, probeModelPreferredFormat)
+    ? buildModelsWithPreferredFormat(explicitModelIds, probeModelSupport, probeModelPreferredFormat, modelContextWindows)
     : [];
   const probeModels = input.probe?.models?.length
-    ? buildModelsWithPreferredFormat(input.probe.models, probeModelSupport, probeModelPreferredFormat)
+    ? buildModelsWithPreferredFormat(input.probe.models, probeModelSupport, probeModelPreferredFormat, modelContextWindows)
     : [];
   const mergedModels = explicitModels.length > 0 ? explicitModels : probeModels;
   const endpointFormats = baseUrlByFormat ? Object.keys(baseUrlByFormat) : [];
@@ -185,12 +219,17 @@ function mergeProviderModelsWithExistingFallbacks(existingProvider, incomingProv
   const mergedModels = (incomingProvider?.models || []).map((model) => {
     const previous = existingModelById.get(model.id);
     const hasExplicitFallbacks = Object.prototype.hasOwnProperty.call(model, "fallbackModels");
-    if (hasExplicitFallbacks || !previous) return model;
-    if (!Object.prototype.hasOwnProperty.call(previous, "fallbackModels")) return model;
-    return {
-      ...model,
-      fallbackModels: previous.fallbackModels || []
-    };
+    const hasExplicitContextWindow = Object.prototype.hasOwnProperty.call(model, "contextWindow");
+    if (!previous) return model;
+
+    const nextModel = { ...model };
+    if (!hasExplicitFallbacks && Object.prototype.hasOwnProperty.call(previous, "fallbackModels")) {
+      nextModel.fallbackModels = previous.fallbackModels || [];
+    }
+    if (!hasExplicitContextWindow && Number.isFinite(Number(previous?.contextWindow))) {
+      nextModel.contextWindow = Number(previous.contextWindow);
+    }
+    return nextModel;
   });
 
   return {

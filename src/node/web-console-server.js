@@ -15,6 +15,7 @@ import {
   getFixedLocalRouterOrigin,
   readLocalServerSettings
 } from "./local-server-settings.js";
+import { appendActivityLogEntry, clearActivityLogFile, createActivityLogEntry, readActivityLogEntries, resolveActivityLogPath } from "./activity-log.js";
 import { listListeningPids, reclaimPort } from "./port-reclaim.js";
 import { probeProvider, probeProviderEndpointMatrix } from "./provider-probe.js";
 import { installStartup, startupStatus, stopStartup, uninstallStartup } from "./startup-manager.js";
@@ -50,10 +51,31 @@ import {
   resolveProviderApiKey,
   validateRuntimeConfig
 } from "../runtime/config.js";
+import {
+  buildAmpWebSearchSnapshot,
+  testHostedWebSearchProviderRoute
+} from "../runtime/handler/amp-web-search.js";
+import { resolveRuntimeFlags, resolveStateStoreOptions } from "../runtime/handler/runtime-policy.js";
+import { createStateStore } from "../runtime/state-store.js";
+import {
+  CODEX_CLI_INHERIT_MODEL_VALUE,
+  isCodexCliInheritModelBinding,
+  normalizeClaudeCodeThinkingLevel,
+  normalizeCodexCliReasoningEffort
+} from "../shared/coding-tool-bindings.js";
+import { applyActivityLogSettings, readActivityLogSettings } from "../shared/local-router-defaults.js";
+import {
+  createLiteLlmContextLookupHelper,
+  LITELLM_CONTEXT_CATALOG_URL
+} from "./litellm-context-catalog.js";
 
 const JSON_BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_ENTRIES = 150;
 const WEB_CONSOLE_APP_JS = readFileSync(fileURLToPath(new URL("./web-console-client.js", import.meta.url)), "utf8");
+
+function createLogStateSignature(entries = []) {
+  return JSON.stringify((entries || []).map((entry) => `${entry?.id || ""}:${entry?.time || ""}`));
+}
 
 async function loadWebConsoleDevAssets() {
   const module = await import("./web-console-dev-assets.js");
@@ -576,6 +598,19 @@ async function ensureJsonObjectFileExists(filePath, initialValue = {}) {
   }
 }
 
+async function ensureTextFileExists(filePath, initialValue = "") {
+  try {
+    await fs.access(filePath);
+  } catch (error) {
+    if (!(error && typeof error === "object" && error.code === "ENOENT")) {
+      throw error;
+    }
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, String(initialValue || ""), { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(filePath, 0o600);
+  }
+}
+
 export async function openFileInEditor(editorId, filePath, platform = process.platform) {
   const targetPath = path.resolve(filePath);
 
@@ -774,6 +809,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     host = "127.0.0.1",
     port = 8788,
     configPath = getDefaultConfigPath(),
+    activityLogPath = "",
     routerHost = FIXED_LOCAL_ROUTER_HOST,
     routerPort = FIXED_LOCAL_ROUTER_PORT,
     routerWatchConfig = true,
@@ -809,10 +845,32 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   const ampClientCwd = typeof deps.ampClientCwd === "string" && deps.ampClientCwd.trim() ? deps.ampClientCwd : process.cwd();
   const codexCliEnv = deps.codexCliEnv && typeof deps.codexCliEnv === "object" ? deps.codexCliEnv : process.env;
   const claudeCodeEnv = deps.claudeCodeEnv && typeof deps.claudeCodeEnv === "object" ? deps.claudeCodeEnv : process.env;
+  const runtimeEnv = deps.runtimeEnv && typeof deps.runtimeEnv === "object" ? deps.runtimeEnv : process.env;
   const loadWebConsoleDevAssetsFn = typeof deps.loadWebConsoleDevAssets === "function"
     ? deps.loadWebConsoleDevAssets
     : loadWebConsoleDevAssets;
   const resolvedRouterCliPath = String(cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim();
+  const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
+
+  async function readWebSearchState(config = null) {
+    if (!config || typeof config !== "object") return null;
+    const runtimeFlags = resolveRuntimeFlags({ runtime: "node" }, runtimeEnv);
+    const stateStore = await createStateStore(resolveStateStoreOptions({
+      runtime: "node",
+      defaultStateStoreBackend: "file"
+    }, runtimeEnv, runtimeFlags));
+
+    try {
+      return await buildAmpWebSearchSnapshot(config, {
+        env: runtimeEnv,
+        stateStore
+      });
+    } finally {
+      if (typeof stateStore?.close === "function") {
+        await stateStore.close();
+      }
+    }
+  }
 
   async function resolvePreferredAmpSettingsTarget() {
     const envOverride = String(ampClientEnv?.AMP_SETTINGS_FILE || "").trim();
@@ -910,15 +968,23 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
   function normalizeCodexBindingsInput(bindings = {}, config = {}) {
     const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+    const defaultModel = String(source.defaultModel || "").trim();
     return {
-      defaultModel: String(source.defaultModel || pickDefaultManagedRoute(config) || "").trim()
+      defaultModel: isCodexCliInheritModelBinding(defaultModel)
+        ? CODEX_CLI_INHERIT_MODEL_VALUE
+        : String(defaultModel || pickDefaultManagedRoute(config) || "").trim(),
+      thinkingLevel: normalizeCodexCliReasoningEffort(source.thinkingLevel)
     };
   }
 
   function normalizeCodexBindingState(bindings = {}) {
     const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+    const defaultModel = String(source.defaultModel || "").trim();
     return {
-      defaultModel: String(source.defaultModel || "").trim()
+      defaultModel: isCodexCliInheritModelBinding(defaultModel)
+        ? CODEX_CLI_INHERIT_MODEL_VALUE
+        : defaultModel,
+      thinkingLevel: normalizeCodexCliReasoningEffort(source.thinkingLevel)
     };
   }
 
@@ -990,10 +1056,11 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       description,
       default_reasoning_level: "medium",
       supported_reasoning_levels: [
+        { effort: "minimal", description: "Minimum reasoning for the fastest supported responses" },
         { effort: "low", description: "Fast responses with lighter reasoning" },
         { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
         { effort: "high", description: "Greater reasoning depth for complex problems" },
-        { effort: "xhigh", description: "Extra high reasoning depth for complex problems" }
+        { effort: "xhigh", description: "Extra high reasoning depth for complex problems on supported models" }
       ],
       shell_type: "shell_command",
       visibility: "list",
@@ -1024,6 +1091,9 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       ? config.modelAliases
       : {};
     const boundModel = String(bindings?.defaultModel || "").trim();
+    if (isCodexCliInheritModelBinding(boundModel)) {
+      return { models: [] };
+    }
     const catalogEntries = new Map();
     const aliasIds = new Set(
       Object.keys(aliases)
@@ -1063,7 +1133,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       defaultOpusModel: String(source.defaultOpusModel || "").trim(),
       defaultSonnetModel: String(source.defaultSonnetModel || "").trim(),
       defaultHaikuModel: String(source.defaultHaikuModel || "").trim(),
-      subagentModel: String(source.subagentModel || "").trim()
+      subagentModel: String(source.subagentModel || "").trim(),
+      thinkingLevel: normalizeClaudeCodeThinkingLevel(source.thinkingLevel)
     };
   }
 
@@ -1072,7 +1143,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   }
 
   function areCodexBindingsEqual(left = {}, right = {}) {
-    return String(left?.defaultModel || "").trim() === String(right?.defaultModel || "").trim();
+    const normalizedLeft = normalizeCodexBindingState(left);
+    const normalizedRight = normalizeCodexBindingState(right);
+    return (
+      normalizedLeft.defaultModel === normalizedRight.defaultModel
+      && normalizedLeft.thinkingLevel === normalizedRight.thinkingLevel
+    );
   }
 
   function areClaudeBindingsEqual(left = {}, right = {}) {
@@ -1082,6 +1158,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       && String(left?.defaultSonnetModel || "").trim() === String(right?.defaultSonnetModel || "").trim()
       && String(left?.defaultHaikuModel || "").trim() === String(right?.defaultHaikuModel || "").trim()
       && String(left?.subagentModel || "").trim() === String(right?.subagentModel || "").trim()
+      && normalizeClaudeCodeThinkingLevel(left?.thinkingLevel) === normalizeClaudeCodeThinkingLevel(right?.thinkingLevel)
     );
   }
 
@@ -1091,11 +1168,24 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
   function reconcileCodexBindingsForConfig(bindings = {}, previousConfig = {}, nextConfig = {}) {
     const currentBindings = normalizeCodexBindingState(bindings);
+    if (isCodexCliInheritModelBinding(currentBindings.defaultModel)) {
+      return {
+        defaultModel: CODEX_CLI_INHERIT_MODEL_VALUE,
+        thinkingLevel: currentBindings.thinkingLevel
+      };
+    }
     const rewriteContext = buildManagedRouteRewriteContext(previousConfig, nextConfig);
     const nextDefaultModel = reconcileManagedRouteBinding(currentBindings.defaultModel, rewriteContext);
     return {
-      defaultModel: nextDefaultModel || pickDefaultManagedRoute(nextConfig)
+      defaultModel: nextDefaultModel || pickDefaultManagedRoute(nextConfig),
+      thinkingLevel: currentBindings.thinkingLevel
     };
+  }
+
+  function formatCodexBindingLabel(defaultModel = "") {
+    return isCodexCliInheritModelBinding(defaultModel)
+      ? "Inherit Codex CLI model"
+      : (String(defaultModel || "").trim() || "No model selected");
   }
 
   function reconcileClaudeBindingsForConfig(bindings = {}, previousConfig = {}, nextConfig = {}) {
@@ -1106,7 +1196,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       defaultOpusModel: reconcileManagedRouteBinding(currentBindings.defaultOpusModel, rewriteContext),
       defaultSonnetModel: reconcileManagedRouteBinding(currentBindings.defaultSonnetModel, rewriteContext),
       defaultHaikuModel: reconcileManagedRouteBinding(currentBindings.defaultHaikuModel, rewriteContext),
-      subagentModel: reconcileManagedRouteBinding(currentBindings.subagentModel, rewriteContext)
+      subagentModel: reconcileManagedRouteBinding(currentBindings.subagentModel, rewriteContext),
+      thinkingLevel: currentBindings.thinkingLevel
     };
   }
 
@@ -1134,7 +1225,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         routedViaRouter: false,
         configuredBaseUrl: "",
         bindings: {
-          defaultModel: ""
+          defaultModel: "",
+          thinkingLevel: ""
         },
         endpointUrl,
         error: error instanceof Error ? error.message : String(error)
@@ -1170,7 +1262,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           defaultOpusModel: "",
           defaultSonnetModel: "",
           defaultHaikuModel: "",
-          subagentModel: ""
+          subagentModel: "",
+          thinkingLevel: ""
         },
         endpointUrl,
         error: error instanceof Error ? error.message : String(error)
@@ -1263,7 +1356,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       if (endpointOrKeyChanged) {
         addLog("info", "Updated Codex CLI route to match the local router.", buildCodexCliEndpointUrl(nextSettings));
       } else {
-        addLog("info", "Updated Codex CLI bindings to match the saved router config.", bindings.defaultModel || "No model selected");
+        addLog("info", "Updated Codex CLI bindings to match the saved router config.", formatCodexBindingLabel(bindings.defaultModel));
       }
       return true;
     } catch (error) {
@@ -1411,10 +1504,45 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       onProgress
     });
   };
+  const testHostedWebSearchProviderFn = typeof deps.testHostedWebSearchProvider === "function"
+    ? deps.testHostedWebSearchProvider
+    : async ({ runtimeConfig, providerId, modelId }) => {
+      const resolvedProviderId = String(providerId || "").trim();
+      const resolvedModelId = String(modelId || "").trim();
+      if (!resolvedProviderId || !resolvedModelId) {
+        const error = new Error("Provider id and model id are required before testing hosted web search.");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      try {
+        return await testHostedWebSearchProviderRoute({
+          runtimeConfig,
+          routeId: `${resolvedProviderId}/${resolvedModelId}`,
+          env: runtimeEnv
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (error && typeof error === "object" && Number.isFinite(error.statusCode)) {
+          throw error;
+        }
+        const wrapped = new Error(message);
+        wrapped.statusCode = (
+          message.includes("not configured")
+          || message.includes("not OpenAI-compatible")
+          || message.includes("is required")
+        ) ? 400 : 502;
+        throw wrapped;
+      }
+    };
+  const lookupLiteLlmContextWindowFn = typeof deps.lookupLiteLlmContextWindow === "function"
+    ? deps.lookupLiteLlmContextWindow
+    : createLiteLlmContextLookupHelper();
 
   const eventClients = new Set();
   const devEventClients = new Set();
   const logs = [];
+  let logStateSignature = createLogStateSignature(logs);
   let webServer = null;
   let closing = false;
   let resolveDone;
@@ -1423,7 +1551,10 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   let actualWebPort = Number(port);
   let configWatcher = null;
   let configWatchTimer = null;
+  let activityLogWatcher = null;
+  let activityLogWatchTimer = null;
   let ignoreConfigWatchUntil = 0;
+  let activityLogEnabled = true;
 
   const routerState = {
     host: FIXED_LOCAL_ROUTER_HOST,
@@ -1456,18 +1587,87 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     }
   }
 
+  function replaceLogs(nextEntries = []) {
+    logs.splice(0, logs.length, ...nextEntries);
+    logStateSignature = createLogStateSignature(logs);
+  }
+
+  function resolveActivityLogSnapshot(config = undefined) {
+    if (config !== undefined) {
+      const settings = readActivityLogSettings(config);
+      activityLogEnabled = settings.enabled;
+      return settings;
+    }
+    return { enabled: activityLogEnabled };
+  }
+
+  function emitLogState(config = undefined) {
+    pushEvent("logs", {
+      logs,
+      activityLog: resolveActivityLogSnapshot(config)
+    });
+  }
+
+  async function syncLogsFromFile({ config = undefined, broadcast = false } = {}) {
+    const nextEntries = await readActivityLogEntries(resolvedActivityLogPath, {
+      limit: MAX_LOG_ENTRIES
+    });
+    const nextSignature = createLogStateSignature(nextEntries);
+    if (nextSignature === logStateSignature) return false;
+    replaceLogs(nextEntries);
+    if (broadcast) {
+      emitLogState(config);
+    }
+    return true;
+  }
+
+  function scheduleActivityLogRefresh(reason = "change") {
+    if (activityLogWatchTimer) clearTimeout(activityLogWatchTimer);
+    activityLogWatchTimer = setTimeout(() => {
+      activityLogWatchTimer = null;
+      if (closing) return;
+      void syncLogsFromFile({ broadcast: true }).catch(() => {});
+    }, reason === "clear" ? 0 : 80);
+  }
+
+  function startActivityLogWatcher() {
+    const activityLogDir = path.dirname(resolvedActivityLogPath);
+    const activityLogFile = path.basename(resolvedActivityLogPath);
+    try {
+      activityLogWatcher = fsWatch(activityLogDir, (_eventType, filename) => {
+        if (closing) return;
+        if (filename && String(filename) !== activityLogFile) return;
+        scheduleActivityLogRefresh("watch");
+      });
+    } catch {
+      activityLogWatcher = null;
+    }
+  }
+
   function addLog(level, message, detail = "") {
-    const entry = {
-      id: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+    if (!activityLogEnabled) return null;
+    const entry = createActivityLogEntry({
       level,
       message,
       detail,
-      time: new Date().toISOString()
-    };
+      source: "web-console",
+      category: "router",
+      kind: "router-event"
+    });
     logs.unshift(entry);
     logs.splice(MAX_LOG_ENTRIES);
+    logStateSignature = createLogStateSignature(logs);
     pushEvent("log", entry);
+    void appendActivityLogEntry(resolvedActivityLogPath, entry).catch(() => {});
     return entry;
+  }
+
+  try {
+    const initialConfigState = await readConfigState(configPath);
+    resolveActivityLogSnapshot(initialConfigState.normalizedConfig);
+    await syncLogsFromFile({ config: initialConfigState.normalizedConfig });
+  } catch {
+    activityLogEnabled = true;
   }
 
   const devReloadScript = devMode ? String.raw`<script>
@@ -1602,7 +1802,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     };
   }
 
-  async function stopExternalRuntime(runtime, { reason = "Stopped another llm-router instance." } = {}) {
+  async function stopExternalRuntime(runtime, { reason = "Stopped another LLM Router instance." } = {}) {
     if (!runtime || Number(runtime.pid) === Number(process.pid)) return false;
 
     const runtimeUrl = `http://${formatHostForUrl(runtime.host, runtime.port)}`;
@@ -1615,7 +1815,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
     const stopped = await stopProcessByPidFn(runtime.pid);
     if (!stopped?.ok) {
-      const error = new Error(stopped?.reason || `Failed stopping llm-router pid ${runtime.pid}.`);
+      const error = new Error(stopped?.reason || `Failed stopping LLM Router pid ${runtime.pid}.`);
       error.statusCode = 409;
       throw error;
     }
@@ -1625,7 +1825,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     return true;
   }
 
-  async function stopUntrackedStartupRuntime({ reason = "Stopped startup-managed llm-router." } = {}) {
+  async function stopUntrackedStartupRuntime({ reason = "Stopped startup-managed LLM Router." } = {}) {
     const startup = await startupStatusFn().catch(() => null);
     if (!startup?.running) return false;
     await stopStartupFn();
@@ -1662,7 +1862,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     }
 
     if (!runtime) {
-      const startError = new Error(`Startup-managed llm-router did not become ready on http://${settings.host}:${settings.port}.`);
+      const startError = new Error(`Startup-managed LLM Router did not become ready on http://${settings.host}:${settings.port}.`);
       startError.statusCode = 500;
       throw startError;
     }
@@ -1712,11 +1912,11 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const externalRuntime = await readExternalRuntime(configLocalServer);
     if (externalRuntime) {
       await stopExternalRuntime(externalRuntime, {
-        reason: `Stopped existing llm-router so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
+        reason: `Stopped an existing LLM Router instance so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
       });
     } else {
       await stopUntrackedStartupRuntime({
-        reason: `Stopped startup-managed llm-router so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
+        reason: `Stopped the startup-managed LLM Router instance so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
       });
     }
 
@@ -1777,12 +1977,31 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     };
   }
 
+  async function persistActivityLogConfig(enabled) {
+    const currentConfigState = await readConfigState(configPath);
+    if (currentConfigState.parseError) {
+      const error = new Error(`Config JSON must parse before saving activity log settings: ${currentConfigState.parseError}`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const nextConfig = applyActivityLogSettings(
+      currentConfigState.normalizedConfig || buildDefaultConfigObject(),
+      { enabled: enabled === true }
+    );
+    ignoreConfigWatchUntil = Date.now() + 800;
+    const savedConfig = await writeConfigFile(nextConfig, configPath, { migrateToVersion: CONFIG_VERSION });
+    resolveActivityLogSnapshot(savedConfig);
+    return savedConfig;
+  }
+
   async function writeAndBroadcastConfig(parsed, { source = "" } = {}) {
     const previousConfigState = await readConfigState(configPath);
     const previousConfig = previousConfigState.normalizedConfig || buildDefaultConfigObject();
     const previousLocalServer = getConfigLocalServer(previousConfigState);
     ignoreConfigWatchUntil = Date.now() + 800;
     const savedConfig = await writeConfigFile(parsed, configPath, { migrateToVersion: CONFIG_VERSION });
+    resolveActivityLogSnapshot(savedConfig);
     const nextLocalServer = readLocalServerSettings(savedConfig, previousLocalServer);
 
     if (source !== "autosave") {
@@ -1870,6 +2089,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   async function buildSnapshot() {
     const configState = await readConfigState(configPath);
     const configLocalServer = getConfigLocalServer(configState);
+    const activityLog = resolveActivityLogSnapshot(configState.normalizedConfig);
     const startup = await startupStatusFn().catch((error) => ({
       manager: "unknown",
       serviceId: "llm-router",
@@ -1891,6 +2111,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const ampClientGlobal = await readAmpGlobalRoutingState(configLocalServer);
     const codexCliGlobal = await readCodexCliGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const claudeCodeGlobal = await readClaudeCodeGlobalRoutingState(configLocalServer, configState.normalizedConfig);
+    const webSearch = await readWebSearchState(configState.normalizedConfig).catch(() => null);
 
     return {
       web: {
@@ -1914,6 +2135,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       ampClient: {
         global: ampClientGlobal
       },
+      webSearch,
+      ampWebSearch: webSearch,
       codingTools: {
         codexCli: codexCliGlobal,
         claudeCode: claudeCodeGlobal
@@ -1923,6 +2146,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       },
       editors: detectAvailableEditorsFn(),
       externalRuntime,
+      activityLog,
       logs
     };
   }
@@ -1939,14 +2163,23 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       configWatchTimer = null;
       if (closing) return;
       if (Date.now() < ignoreConfigWatchUntil) return;
-      addLog("info", `Config file changed on disk (${reason}).`);
-      void reconcileManagedRouterWithConfig({ reason: `config-watch:${reason}` })
-        .catch((reconcileError) => {
+      void (async () => {
+        let latestConfigState = null;
+        try {
+          latestConfigState = await readConfigState(configPath);
+          resolveActivityLogSnapshot(latestConfigState.normalizedConfig);
+        } catch {
+          latestConfigState = null;
+        }
+        addLog("info", `Config file changed on disk (${reason}).`);
+        try {
+          await reconcileManagedRouterWithConfig({ reason: `config-watch:${reason}` });
+        } catch (reconcileError) {
           addLog("warn", "Managed router auto-start skipped.", reconcileError instanceof Error ? reconcileError.message : String(reconcileError));
-        })
-        .finally(() => {
-          void broadcastState();
-        });
+        } finally {
+          await broadcastState().catch(() => {});
+        }
+      })();
     }, 150);
   }
 
@@ -1995,7 +2228,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
     const stopped = await stopProcessByPidFn(activeRuntime.pid);
     if (!stopped?.ok) {
-      const stopError = new Error(stopped?.reason || `Failed stopping llm-router pid ${activeRuntime.pid}.`);
+      const stopError = new Error(stopped?.reason || `Failed stopping LLM Router pid ${activeRuntime.pid}.`);
       stopError.statusCode = 409;
       throw stopError;
     }
@@ -2070,11 +2303,11 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const externalRuntime = await readExternalRuntime(nextOptions);
     if (externalRuntime) {
       await stopExternalRuntime(externalRuntime, {
-        reason: "Stopped another llm-router instance before starting the managed router."
+        reason: "Stopped another LLM Router instance before starting the managed router."
       });
     } else {
       await stopUntrackedStartupRuntime({
-        reason: "Stopped startup-managed llm-router before starting the managed router."
+        reason: "Stopped the startup-managed LLM Router instance before starting the managed router."
       });
     }
 
@@ -2124,7 +2357,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         requireAuth: nextOptions.requireAuth
       });
       if (!started?.ok) {
-        const startError = new Error(started?.errorMessage || `Failed to start llm-router on http://${nextOptions.host}:${nextOptions.port}.`);
+        const startError = new Error(started?.errorMessage || `Failed to start LLM Router on http://${nextOptions.host}:${nextOptions.port}.`);
         startError.statusCode = 500;
         throw startError;
       }
@@ -2177,6 +2410,14 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       if (configWatcher) {
         configWatcher.close();
         configWatcher = null;
+      }
+      if (activityLogWatchTimer) {
+        clearTimeout(activityLogWatchTimer);
+        activityLogWatchTimer = null;
+      }
+      if (activityLogWatcher) {
+        activityLogWatcher.close();
+        activityLogWatcher = null;
       }
 
       for (const client of eventClients) {
@@ -2261,6 +2502,33 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      if (method === "POST" && requestUrl.pathname === "/api/activity-log/settings") {
+        const body = await readJsonBody(req);
+        const enabled = body?.enabled === false ? false : true;
+        const savedConfig = await persistActivityLogConfig(enabled);
+        await syncLogsFromFile({ config: savedConfig });
+        if (enabled) {
+          addLog("info", "Activity logging enabled.");
+        }
+        const snapshot = await broadcastState();
+        sendJson(res, 200, {
+          ...snapshot,
+          message: enabled ? "Activity log enabled." : "Activity log disabled."
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/activity-log/clear") {
+        await clearActivityLogFile(resolvedActivityLogPath);
+        replaceLogs([]);
+        emitLogState();
+        sendJson(res, 200, {
+          ...(await buildSnapshot()),
+          message: "Activity log cleared."
+        });
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/config/validate") {
         const body = await readJsonBody(req);
         const rawText = body?.rawText !== undefined
@@ -2319,6 +2587,48 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           ? `${(result.workingFormats || []).join(", ") || "No working formats"} · ${(result.models || []).length} model(s) confirmed`
           : (result.warnings || []).join(" ") || "Could not confirm a working endpoint/model combination.");
         sendJson(res, 200, { result });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/config/test-web-search-provider") {
+        const body = await readJsonBody(req);
+        const providerId = String(body?.providerId || "").trim();
+        const modelId = String(body?.modelId || "").trim();
+        const rawText = body?.rawText !== undefined
+          ? String(body.rawText || "")
+          : `${JSON.stringify(body?.config || {}, null, 2)}\n`;
+
+        if (!providerId || !modelId) {
+          sendJson(res, 400, { error: "Provider id and model id are required before testing hosted web search." });
+          return;
+        }
+
+        let normalizedConfig = null;
+        try {
+          const parsed = body?.config && typeof body.config === "object" && !Array.isArray(body.config)
+            ? body.config
+            : (rawText.trim() ? JSON.parse(rawText) : {});
+          normalizedConfig = normalizeRuntimeConfig(parsed, { migrateToVersion: CONFIG_VERSION });
+        } catch (error) {
+          sendJson(res, 400, { error: `Current config draft is invalid JSON: ${error instanceof Error ? error.message : String(error)}` });
+          return;
+        }
+
+        addLog("info", "Testing hosted web search route.", `${providerId}/${modelId}`);
+        try {
+          const result = await testHostedWebSearchProviderFn({
+            runtimeConfig: normalizedConfig,
+            providerId,
+            modelId
+          });
+          addLog("success", "Hosted web search route is ready.", `${providerId}/${modelId}`);
+          sendJson(res, 200, { result });
+        } catch (error) {
+          addLog("warn", "Hosted web search route test failed.", error instanceof Error ? error.message : String(error));
+          sendJson(res, Number(error?.statusCode) || 502, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
         return;
       }
 
@@ -2397,6 +2707,34 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           ? `${(result.models || []).length} model(s) discovered`
           : (result.warnings || []).join(" ") || "Could not discover models from the provider model list API.");
         sendJson(res, 200, { result });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/config/litellm-context-lookup") {
+        const body = await readJsonBody(req);
+        const models = Array.isArray(body?.models) ? body.models.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
+        if (models.length === 0) {
+          sendJson(res, 400, { error: "At least one model id is required before looking up context windows." });
+          return;
+        }
+
+        try {
+          const result = await lookupLiteLlmContextWindowFn({
+            models,
+            limit: body?.limit
+          });
+          sendJson(res, 200, {
+            result,
+            source: {
+              provider: "litellm",
+              url: LITELLM_CONTEXT_CATALOG_URL
+            }
+          });
+        } catch (error) {
+          sendJson(res, Number(error?.statusCode) || 502, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
         return;
       }
 
@@ -2586,7 +2924,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const snapshot = await broadcastState();
         sendJson(res, 200, {
           ...snapshot,
-          message: "AMP now routes via LLM-Router.",
+          message: "AMP now routes via LLM Router.",
           amp: {
             patchResult,
             bootstrapDefaultRoute: bootstrap.bootstrapRouteRef || "",
@@ -2660,7 +2998,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const snapshot = await broadcastState();
         sendJson(res, 200, {
           ...snapshot,
-          message: "Codex CLI now routes via LLM-Router.",
+          message: "Codex CLI now routes via LLM Router.",
           codingTools: {
             ...(snapshot.codingTools || {}),
             codexCli: {
@@ -2689,7 +3027,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           return;
         }
         if (!routingState.routedViaRouter) {
-          sendJson(res, 400, { error: "Connect Codex CLI to LLM-Router before updating model bindings." });
+          sendJson(res, 400, { error: "Connect Codex CLI to LLM Router before updating model bindings." });
           return;
         }
 
@@ -2702,7 +3040,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           captureBackup: false,
           env: codexCliEnv
         });
-        addLog("success", "Codex CLI model binding updated.", patchResult.bindings.defaultModel || "No model selected");
+        addLog("success", "Codex CLI model binding updated.", formatCodexBindingLabel(patchResult.bindings.defaultModel));
         const snapshot = await broadcastState();
         sendJson(res, 200, {
           ...snapshot,
@@ -2773,7 +3111,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const snapshot = await broadcastState();
         sendJson(res, 200, {
           ...snapshot,
-          message: "Claude Code now routes via LLM-Router.",
+          message: "Claude Code now routes via LLM Router.",
           codingTools: {
             ...(snapshot.codingTools || {}),
             claudeCode: {
@@ -2802,7 +3140,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           return;
         }
         if (!routingState.routedViaRouter) {
-          sendJson(res, 400, { error: "Connect Claude Code to LLM-Router before updating model bindings." });
+          sendJson(res, 400, { error: "Connect Claude Code to LLM Router before updating model bindings." });
           return;
         }
 
@@ -2828,6 +3166,49 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         await openConfigInEditorFn(editorId, configPath);
         addLog("info", `Opened config file in ${editorId}.`);
         sendJson(res, 200, { ok: true, editorId });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/file/open") {
+        const body = await readJsonBody(req);
+        const editorId = String(body?.editorId || "default").trim() || "default";
+        const rawFilePath = String(body?.filePath || "").trim();
+        const ensureMode = String(body?.ensureMode || "none").trim() || "none";
+        if (!rawFilePath) {
+          sendJson(res, 400, { error: "A file path is required." });
+          return;
+        }
+        if (!["none", "text", "jsonObject"].includes(ensureMode)) {
+          sendJson(res, 400, { error: "Unsupported file ensure mode." });
+          return;
+        }
+
+        const filePath = path.resolve(rawFilePath);
+        if (ensureMode === "jsonObject") {
+          await ensureJsonObjectFileExists(filePath, {});
+        } else if (ensureMode === "text") {
+          await ensureTextFileExists(filePath, "");
+        } else {
+          try {
+            await fs.access(filePath);
+          } catch (error) {
+            if (error && typeof error === "object" && error.code === "ENOENT") {
+              const missingFileError = new Error(`File does not exist yet: ${filePath}`);
+              missingFileError.statusCode = 404;
+              throw missingFileError;
+            }
+            throw error;
+          }
+        }
+
+        await openFileInEditorFn(editorId, filePath);
+        addLog("info", `Opened file in ${editorId}.`, filePath);
+        sendJson(res, 200, {
+          ok: true,
+          editorId,
+          filePath,
+          ensureMode
+        });
         return;
       }
 
@@ -2952,7 +3333,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const externalRuntime = await readExternalRuntime();
         if (externalRuntime) {
           await stopExternalRuntime(externalRuntime, {
-            reason: "Stopped another llm-router instance before enabling startup."
+            reason: "Stopped another LLM Router instance before enabling startup."
           });
         }
 
@@ -3134,6 +3515,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   addLog("info", `Web console listening on http://${formatHostForUrl(host, actualWebPort)}`);
   if (devMode) addLog("info", "Development mode enabled for web assets.");
   startConfigWatcher();
+  startActivityLogWatcher();
 
   try {
     await reconcileManagedRouterWithConfig({ reason: "web-console-startup" });

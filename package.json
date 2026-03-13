@@ -1,7 +1,7 @@
 {
   "name": "@khanglvm/llm-router",
   "version": "2.0.0-beta.1",
-  "description": "Single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
+  "description": "LLM Router: single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
   "keywords": [
     "llm-router",
     "llm-gateway",
@@ -17,7 +17,7 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "llm-router": "./src/cli-entry.js",
+    "llr": "./src/cli-entry.js",
     "llm-router-route": "./src/cli-entry.js"
   },
   "scripts": {

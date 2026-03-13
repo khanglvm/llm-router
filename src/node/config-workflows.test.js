@@ -155,3 +155,57 @@ test("buildProviderFromConfigInput applies Claude subscription defaults", () => 
   assert.equal(provider.format, "claude");
   assert.deepEqual(provider.models.map((model) => model.id), CLAUDE_CODE_SUBSCRIPTION_MODELS);
 });
+
+test("buildProviderFromConfigInput applies model context windows when provided", () => {
+  const provider = buildProviderFromConfigInput({
+    providerId: "openrouter",
+    name: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    format: "openai",
+    models: "gpt-4o-mini,gpt-4o",
+    modelContextWindows: {
+      "gpt-4o-mini": 128000,
+      "gpt-4o": "256000"
+    }
+  });
+
+  assert.deepEqual(provider.models.map((model) => ({
+    id: model.id,
+    contextWindow: model.contextWindow
+  })), [
+    { id: "gpt-4o-mini", contextWindow: 128000 },
+    { id: "gpt-4o", contextWindow: 256000 }
+  ]);
+});
+
+test("applyConfigChanges preserves existing context windows when upsert omits them", () => {
+  const existing = baseConfig();
+  existing.providers[0].models = [
+    { id: "gpt-4o-mini", contextWindow: 128000 },
+    { id: "gpt-4o", contextWindow: 256000 }
+  ];
+
+  const next = applyConfigChanges(existing, {
+    provider: {
+      id: "openrouter",
+      name: "OpenRouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      format: "openai",
+      formats: ["openai"],
+      apiKey: "sk-or-test",
+      models: [
+        { id: "gpt-4o-mini" },
+        { id: "gpt-4o" }
+      ]
+    },
+    setDefaultModel: false
+  });
+
+  assert.deepEqual(next.providers[0].models.map((model) => ({
+    id: model.id,
+    contextWindow: model.contextWindow
+  })), [
+    { id: "gpt-4o-mini", contextWindow: 128000 },
+    { id: "gpt-4o", contextWindow: 256000 }
+  ]);
+});

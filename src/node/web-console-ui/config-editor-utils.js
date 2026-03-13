@@ -272,6 +272,37 @@ function rewriteAliasTargetList(targets = [], rewriter) {
   return nextTargets;
 }
 
+function rewriteAmpRouteTargets(config = {}, rewriter) {
+  if (!config?.amp || typeof config.amp !== "object" || Array.isArray(config.amp)) {
+    return config;
+  }
+
+  const amp = config.amp;
+  const nextRoutes = {};
+  for (const [routeKey, target] of Object.entries(amp.routes && typeof amp.routes === "object" && !Array.isArray(amp.routes) ? amp.routes : {})) {
+    const nextTarget = String(rewriter(target) || "").trim();
+    if (!nextTarget) continue;
+    nextRoutes[routeKey] = nextTarget;
+  }
+  amp.routes = nextRoutes;
+
+  amp.rawModelRoutes = (Array.isArray(amp.rawModelRoutes) ? amp.rawModelRoutes : [])
+    .map((mapping) => {
+      if (!mapping || typeof mapping !== "object") return null;
+      if (!Object.prototype.hasOwnProperty.call(mapping, "to")) return { ...mapping };
+
+      const nextTarget = String(rewriter(mapping.to) || "").trim();
+      if (!nextTarget) return null;
+      return {
+        ...mapping,
+        to: nextTarget
+      };
+    })
+    .filter(Boolean);
+
+  return config;
+}
+
 function cleanupAliasReferences(config = {}) {
   const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
     ? config.modelAliases
@@ -289,6 +320,7 @@ function cleanupAliasReferences(config = {}) {
   }
 
   config.modelAliases = nextAliases;
+  rewriteAmpRouteTargets(config, (ref) => ref);
   return ensureTopLevelRoutes(config);
 }
 
@@ -301,7 +333,12 @@ function normalizeProviderModelRows(rows = []) {
     const sourceId = String(row?.sourceId || row?.originalId || "").trim();
     if (!id || seenIds.has(id)) continue;
     seenIds.add(id);
-    normalizedRows.push({ id, sourceId });
+    const parsedContextWindow = Number.parseInt(String(row?.contextWindow || "").trim(), 10);
+    normalizedRows.push({
+      id,
+      sourceId,
+      contextWindow: Number.isFinite(parsedContextWindow) && parsedContextWindow > 0 ? parsedContextWindow : null
+    });
   }
 
   return normalizedRows;
@@ -358,12 +395,23 @@ export function applyProviderModelEdits(config = {}, providerId, rows = []) {
       }
       nextModels.push({
         ...existingModelMap.get(matchedSourceId),
-        id: row.id
+        id: row.id,
+        ...(row.contextWindow
+          ? { contextWindow: row.contextWindow }
+          : {})
       });
+      if (!row.contextWindow) {
+        delete nextModels[nextModels.length - 1].contextWindow;
+      }
       continue;
     }
 
-    nextModels.push({ id: row.id });
+    nextModels.push({
+      id: row.id,
+      ...(row.contextWindow
+        ? { contextWindow: row.contextWindow }
+        : {})
+    });
   }
 
   const validModelIds = new Set(nextModels.map((model) => String(model?.id || "").trim()).filter(Boolean));
@@ -412,6 +460,7 @@ export function applyProviderModelEdits(config = {}, providerId, rows = []) {
   if (nextConfig?.amp && typeof nextConfig.amp === "object" && !Array.isArray(nextConfig.amp)) {
     nextConfig.amp.defaultRoute = rewriteProviderModelRef(nextConfig.amp.defaultRoute, providerId, renameMap, validModelIds);
   }
+  rewriteAmpRouteTargets(nextConfig, (ref) => rewriteProviderModelRef(ref, providerId, renameMap, validModelIds));
 
   return ensureTopLevelRoutes(nextConfig);
 }
@@ -473,6 +522,7 @@ export function applyProviderInlineEdits(config = {}, currentProviderId = "", dr
     if (nextConfig?.amp && typeof nextConfig.amp === "object" && !Array.isArray(nextConfig.amp)) {
       nextConfig.amp.defaultRoute = rewriteProviderReference(nextConfig.amp.defaultRoute, currentProviderId, renamedProviderId);
     }
+    rewriteAmpRouteTargets(nextConfig, (ref) => rewriteProviderReference(ref, currentProviderId, renamedProviderId));
   }
 
   return ensureTopLevelRoutes(nextConfig);
@@ -545,6 +595,7 @@ export function applyModelAliasEdits(config = {}, currentAliasId = "", draftAlia
     if (nextConfig?.amp && typeof nextConfig.amp === "object" && !Array.isArray(nextConfig.amp)) {
       nextConfig.amp.defaultRoute = rewriteAliasReference(nextConfig.amp.defaultRoute, currentAliasId, nextAliasId);
     }
+    rewriteAmpRouteTargets(nextConfig, (ref) => rewriteAliasReference(ref, currentAliasId, nextAliasId));
   }
 
   return cleanupAliasReferences(nextConfig);
@@ -584,6 +635,7 @@ export function removeModelAlias(config = {}, aliasId = "") {
   if (nextConfig?.amp && typeof nextConfig.amp === "object" && !Array.isArray(nextConfig.amp)) {
     nextConfig.amp.defaultRoute = rewriteAliasReference(nextConfig.amp.defaultRoute, targetAliasId);
   }
+  rewriteAmpRouteTargets(nextConfig, (ref) => rewriteAliasReference(ref, targetAliasId));
 
   return cleanupAliasReferences(nextConfig);
 }
@@ -611,6 +663,7 @@ export function createProviderModelDraftRows(provider = {}) {
   return (Array.isArray(provider?.models) ? provider.models : []).map((model, index) => ({
     key: `model-${provider?.id || "provider"}-${index}-${String(model?.id || "").trim() || "empty"}`,
     id: String(model?.id || "").trim(),
-    sourceId: String(model?.id || "").trim()
+    sourceId: String(model?.id || "").trim(),
+    contextWindow: Number.isFinite(model?.contextWindow) ? String(Math.floor(Number(model.contextWindow))) : ""
   }));
 }

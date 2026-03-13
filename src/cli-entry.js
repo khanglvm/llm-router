@@ -55,53 +55,6 @@ function parseBoolean(value, fallback = true) {
   return fallback;
 }
 
-function isBooleanLikeToken(value) {
-  if (value === undefined || value === null) return false;
-  return /^(?:1|0|true|false|yes|no|y|n|on|off)$/i.test(String(value).trim());
-}
-
-function readRawFlagValue(argv, flagName) {
-  const prefix = `--${flagName}`;
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (token === prefix) {
-      const next = argv[index + 1];
-      if (isBooleanLikeToken(next)) {
-        return next;
-      }
-      return true;
-    }
-    if (token.startsWith(`${prefix}=`)) {
-      return token.slice(prefix.length + 1);
-    }
-  }
-
-  return undefined;
-}
-
-function stripFlagFromArgv(argv, flagName) {
-  const prefix = `--${flagName}`;
-  const nextArgv = [];
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (token === prefix) {
-      const next = argv[index + 1];
-      if (isBooleanLikeToken(next)) {
-        index += 1;
-      }
-      continue;
-    }
-    if (token.startsWith(`${prefix}=`)) {
-      continue;
-    }
-    nextArgv.push(token);
-  }
-
-  return nextArgv;
-}
-
 function hasExplicitConfigOperation(args = {}) {
   return Boolean(String(args.operation || args.op || "").trim());
 }
@@ -142,7 +95,7 @@ async function promptStartupConflictResolution({ port }) {
 
   const lines = [
     "",
-    `Port ${port} is already used by the llm-router startup service.`,
+    `Port ${port} is already used by the LLM Router startup service.`,
     "Choose an action:",
     "1. Restart service",
     "2. Run here instead",
@@ -184,34 +137,6 @@ async function runStartFastPath(args) {
   return result.exitCode ?? (result.ok ? 0 : 1);
 }
 
-export function shouldExitTuiOnKeypress(character, key = {}) {
-  const sequence = typeof key?.sequence === "string" && key.sequence
-    ? key.sequence
-    : (typeof character === "string" ? character : "");
-  return sequence === "" || (key?.ctrl === true && String(key?.name || "").toLowerCase() === "c");
-}
-
-export function installTuiSigintExitHandler({
-  input = process.stdin,
-  isTTY = Boolean(process.stdout.isTTY && process.stdin?.isTTY),
-  exit = (code) => process.exit(code)
-} = {}) {
-  if (!isTTY || !input || typeof input.on !== "function" || typeof input.off !== "function") {
-    return () => {};
-  }
-
-  const onKeypress = (character, key) => {
-    if (shouldExitTuiOnKeypress(character, key)) {
-      exit(130);
-    }
-  };
-
-  input.on("keypress", onKeypress);
-  return () => {
-    input.off("keypress", onKeypress);
-  };
-}
-
 async function runSnapCli(argv, isTTY) {
   const [{ createRegistry, runSingleModuleCli }, { default: routerModule }] = await Promise.all([
     import("@levu/snap/dist/index.js"),
@@ -219,67 +144,71 @@ async function runSnapCli(argv, isTTY) {
   ]);
 
   const registry = createRegistry([routerModule]);
-  const disposeSigintHandler = installTuiSigintExitHandler({ isTTY });
-  try {
-    return await runSingleModuleCli({
-      registry,
-      argv,
-      moduleId: "router",
-      defaultActionId: "config",
-      helpDefaultTarget: "module",
-      isTTY
-    });
-  } finally {
-    disposeSigintHandler();
-  }
+  return runSingleModuleCli({
+    registry,
+    argv,
+    moduleId: "router",
+    defaultActionId: "config",
+    helpDefaultTarget: "module",
+    isTTY
+  });
 }
 
 export async function runCli(argv = process.argv.slice(2), isTTY = undefined, overrides = {}) {
   const runSnapCliImpl = overrides.runSnapCli || runSnapCli;
   const runStartFastPathImpl = overrides.runStartFastPath || runStartFastPath;
   const runWebCommandImpl = overrides.runWebCommand || runWebCommand;
-  const tuiRequested = parseBoolean(readRawFlagValue(argv, "tui"), false);
-  const normalizedArgv = stripFlagFromArgv(argv, "tui");
-  const parsed = parseSimpleArgs(normalizedArgv);
+  const errorImpl = overrides.error || ((message) => console.error(message));
+  const parsed = parseSimpleArgs(argv);
   const first = parsed.positional[0];
   const firstIsStart = first === "start";
   const firstIsWeb = first === "web";
   const firstIsConfig = first === "config";
+  const firstIsSetup = first === "setup";
   const explicitConfigOperation = hasExplicitConfigOperation(parsed.args);
+
+  if (Object.hasOwn(parsed.args, "tui")) {
+    errorImpl("The TUI flow has been removed. Use `llr` or `llr config` for the web console, or `llr config --operation=...` for direct CLI workflows.");
+    return 1;
+  }
 
   // Bare invocation opens the browser-based console by default.
   if (!first && !parsed.wantsHelp) {
-    if (tuiRequested || explicitConfigOperation) {
-      return runSnapCliImpl(["config", ...normalizedArgv], isTTY);
+    if (explicitConfigOperation) {
+      return runSnapCliImpl(["config", ...argv], isTTY);
     }
     return runWebFastPath(parsed.args, runWebCommandImpl);
   }
 
   // Fast-path explicit local start without loading Snap to minimize startup overhead.
   if (firstIsStart && !parsed.wantsHelp) {
-    const startArgs = normalizedArgv.slice(1);
+    const startArgs = argv.slice(1);
     const parsedStart = parseSimpleArgs(startArgs);
     return runStartFastPathImpl(parsedStart.args);
   }
 
   if (firstIsWeb && !parsed.wantsHelp) {
-    const webArgs = normalizedArgv.slice(1);
+    const webArgs = argv.slice(1);
     const parsedWeb = parseSimpleArgs(webArgs);
     return runWebFastPath(parsedWeb.args, runWebCommandImpl);
   }
 
   if (firstIsConfig && !parsed.wantsHelp && !explicitConfigOperation) {
-    if (tuiRequested) {
-      return runSnapCliImpl(normalizedArgv, isTTY);
-    }
-
-    const configArgs = parseSimpleArgs(normalizedArgv.slice(1));
+    const configArgs = parseSimpleArgs(argv.slice(1));
     return runWebFastPath(configArgs.args, runWebCommandImpl);
   }
 
-  const normalized = [...normalizedArgv];
+  if (firstIsSetup && !parsed.wantsHelp) {
+    const setupArgs = argv.slice(1);
+    const parsedSetup = parseSimpleArgs(setupArgs);
+    if (hasExplicitConfigOperation(parsedSetup.args)) {
+      return runSnapCliImpl(["config", ...setupArgs], isTTY);
+    }
+    return runWebFastPath(parsedSetup.args, runWebCommandImpl);
+  }
+
+  const normalized = [...argv];
   if (normalized[0] === "help") normalized[0] = "--help";
-  if (normalized[0] === "setup") normalized[0] = "config";
   return runSnapCliImpl(normalized, isTTY);
 }
 

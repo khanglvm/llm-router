@@ -67,7 +67,7 @@ export async function runWebCommand(options = {}) {
     return {
       ok: false,
       exitCode: 1,
-      errorMessage: `Failed to start llm-router web console: ${startError instanceof Error ? startError.message : String(startError)}`
+      errorMessage: `Failed to start the LLM Router web console: ${startError instanceof Error ? startError.message : String(startError)}`
     };
   }
 
