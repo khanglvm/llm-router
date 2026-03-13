@@ -3,6 +3,7 @@ import { extractAmpGeminiRouteInfo } from "./amp-gemini.js";
 import { toNonNegativeInteger } from "./utils.js";
 
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024;
+const DEFAULT_RESPONSES_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 const MIN_MAX_REQUEST_BODY_BYTES = 4 * 1024;
 const MAX_MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 60_000;
@@ -149,10 +150,14 @@ function resolveAmpProviderRoute(path, method) {
   return null;
 }
 
-export function resolveMaxRequestBodyBytes(env = {}) {
+export function resolveMaxRequestBodyBytes(env = {}, options = {}) {
+  const requestKind = String(options?.requestKind || "").trim().toLowerCase();
+  const fallbackLimit = requestKind === "responses"
+    ? DEFAULT_RESPONSES_MAX_REQUEST_BODY_BYTES
+    : DEFAULT_MAX_REQUEST_BODY_BYTES;
   const configured = toNonNegativeInteger(
     env?.LLM_ROUTER_MAX_REQUEST_BODY_BYTES,
-    DEFAULT_MAX_REQUEST_BODY_BYTES
+    fallbackLimit
   );
   return Math.min(
     MAX_MAX_REQUEST_BODY_BYTES,

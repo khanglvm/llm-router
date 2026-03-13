@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Raised the default inbound JSON body limit for OpenAI `/responses` requests from `1 MiB` to `8 MiB` while keeping other JSON routes at `1 MiB`. This prevents local `413 Request body too large` failures for Codex CLI and other Responses API clients carrying larger conversation state.
+
 ## [2.0.0-beta.2] - 2026-03-13
 
 ### Changed

@@ -251,6 +251,11 @@ Local config path:
 
 LLM Router also keeps related runtime and token state under the same namespace for backward compatibility with the published package.
 
+Useful runtime env knobs:
+
+- `LLM_ROUTER_MAX_REQUEST_BODY_BYTES`: caps inbound JSON body size for the local router and worker runtime. Default is `8 MiB` for `/responses` requests and `1 MiB` for other JSON endpoints.
+- `LLM_ROUTER_UPSTREAM_TIMEOUT_MS`: overrides the provider request timeout.
+
 ## Development
 
 Web UI dev loop:

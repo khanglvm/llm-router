@@ -437,7 +437,9 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     return jsonResponse({ error: "Unsupported Media Type. Use application/json." }, 415);
   }
 
-  const maxRequestBodyBytes = resolveMaxRequestBodyBytes(env);
+  const maxRequestBodyBytes = resolveMaxRequestBodyBytes(env, {
+    requestKind: options.requestKind
+  });
   let body;
   try {
     body = await parseJsonBodyWithLimit(request, maxRequestBodyBytes);
@@ -965,7 +967,9 @@ export function createFetchHandler(options) {
 
       let body;
       try {
-        body = await parseJsonBodyWithLimit(request, resolveMaxRequestBodyBytes(env));
+        body = await parseJsonBodyWithLimit(request, resolveMaxRequestBodyBytes(env, {
+          requestKind: route.requestKind
+        }));
       } catch (error) {
         if (error && typeof error === "object" && error.code === "REQUEST_BODY_TOO_LARGE") {
           return respond(jsonResponse({ error: "Request body too large" }, 413));
