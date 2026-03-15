@@ -516,7 +516,7 @@ export async function makeProviderCall({
     providerBody = declaredOpenAIHostedWebSearchRewrite.providerBody;
   }
   if (interceptAmpWebSearch) {
-    providerBody = rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat).providerBody;
+    providerBody = rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat, requestKind).providerBody;
   }
   logToolRouting({
     env,

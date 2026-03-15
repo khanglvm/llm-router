@@ -266,6 +266,92 @@ export function runNodeCli(args, {
   });
 }
 
+export function runCommandCapture(command, args = [], {
+  cwd = process.cwd(),
+  env = process.env,
+  label = command,
+  redactions = [],
+  timeoutMs = DEFAULT_TIMEOUT_MS
+} = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+    } catch (error) {
+      resolve({
+        ok: false,
+        code: 1,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        timedOut: false,
+        spawnError: error
+      });
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      child.kill("SIGKILL");
+      settled = true;
+      resolve({
+        ok: false,
+        code: child.exitCode ?? 1,
+        stdout,
+        stderr,
+        timedOut: true,
+        spawnError: null
+      });
+    }, timeoutMs);
+
+    child.stdout?.on("data", (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      process.stdout.write(`[${label}] ${redactSecrets(text, redactions)}`);
+    });
+
+    child.stderr?.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      process.stderr.write(`[${label}] ${redactSecrets(text, redactions)}`);
+    });
+
+    child.once("error", (error) => {
+      if (settled) return;
+      clearTimeout(timer);
+      settled = true;
+      resolve({
+        ok: false,
+        code: 1,
+        stdout,
+        stderr: `${stderr}${stderr ? "\n" : ""}${error instanceof Error ? error.message : String(error)}`,
+        timedOut: false,
+        spawnError: error
+      });
+    });
+
+    child.once("close", (code) => {
+      if (settled) return;
+      clearTimeout(timer);
+      settled = true;
+      resolve({
+        ok: code === 0,
+        code: code ?? 1,
+        stdout,
+        stderr,
+        timedOut: false,
+        spawnError: null
+      });
+    });
+  });
+}
+
 export function startCliServer({ configPath, port, env, cwd = process.cwd() }) {
   const child = spawn(process.execPath, [
     CLI_ENTRY,

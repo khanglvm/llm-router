@@ -1,6 +1,6 @@
 {
   "name": "@khanglvm/llm-router",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "LLM Router: single gateway endpoint for multi-provider LLMs with unified OpenAI+Anthropic format and seamless fallback",
   "keywords": [
     "llm-router",
@@ -31,7 +31,8 @@
     "deploy:worker": "node ./src/cli-entry.js deploy",
     "test:provider-live": "node --test --test-concurrency=1 ./test/live-provider-suite.test.js",
     "test:provider-smoke": "npm run test:provider-live",
-    "test:amp-smoke": "node ./scripts/amp-smoke-suite.mjs"
+    "test:amp-smoke": "node ./scripts/amp-smoke-suite.mjs",
+    "prepublishOnly": "npm run test:provider-live"
   },
   "dependencies": {
     "@levu/snap": "^0.3.13"

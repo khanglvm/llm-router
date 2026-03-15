@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import { createMemoryStateStore } from "./state-store.memory.js";
 import {
   buildAmpWebSearchSnapshot,
-  executeAmpWebSearch
+  executeAmpWebSearch,
+  rewriteProviderBodyForAmpWebSearch
 } from "./handler/amp-web-search.js";
+import { FORMATS } from "../translator/index.js";
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -140,6 +142,64 @@ test("executeAmpWebSearch quota-balance routing honors the persisted route curso
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("rewriteProviderBodyForAmpWebSearch emits OpenAI Responses-style function tools", () => {
+  const rewritten = rewriteProviderBodyForAmpWebSearch({
+    tools: [
+      { type: "web_search", external_web_access: true },
+      { type: "custom", name: "js_repl", format: { type: "grammar" } }
+    ]
+  }, FORMATS.OPENAI, "responses");
+
+  assert.equal(rewritten.hasWebSearch, true);
+  assert.deepEqual(rewritten.providerBody.tools, [
+    { type: "custom", name: "js_repl", format: { type: "grammar" } },
+    {
+      type: "function",
+      name: "web_search",
+      description: "Search the web for current information, news, documentation, or real-time facts.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query to run against the web."
+          }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    }
+  ]);
+});
+
+test("rewriteProviderBodyForAmpWebSearch keeps chat-completions tool shape for OpenAI non-responses requests", () => {
+  const rewritten = rewriteProviderBodyForAmpWebSearch({
+    tools: [{ type: "web_search", external_web_access: true }]
+  }, FORMATS.OPENAI, "chat");
+
+  assert.equal(rewritten.hasWebSearch, true);
+  assert.deepEqual(rewritten.providerBody.tools, [
+    {
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the web for current information, news, documentation, or real-time facts.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query to run against the web."
+            }
+          },
+          required: ["query"],
+          additionalProperties: false
+        }
+      }
+    }
+  ]);
 });
 
 test("executeAmpWebSearch can use hosted GPT provider routes", async () => {

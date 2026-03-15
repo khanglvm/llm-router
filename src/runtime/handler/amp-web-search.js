@@ -80,7 +80,7 @@ const READ_WEB_PAGE_FUNCTION_PARAMETERS = {
   additionalProperties: true
 };
 
-const OPENAI_WEB_SEARCH_TOOL = Object.freeze({
+const OPENAI_CHAT_WEB_SEARCH_TOOL = Object.freeze({
   type: "function",
   function: {
     name: SEARCH_TOOL_NAME,
@@ -89,19 +89,33 @@ const OPENAI_WEB_SEARCH_TOOL = Object.freeze({
   }
 });
 
+const OPENAI_RESPONSES_WEB_SEARCH_TOOL = Object.freeze({
+  type: "function",
+  name: SEARCH_TOOL_NAME,
+  description: "Search the web for current information, news, documentation, or real-time facts.",
+  parameters: WEB_SEARCH_FUNCTION_PARAMETERS
+});
+
 const CLAUDE_WEB_SEARCH_TOOL = Object.freeze({
   name: SEARCH_TOOL_NAME,
   description: "Search the web for current information, news, documentation, or real-time facts.",
   input_schema: WEB_SEARCH_FUNCTION_PARAMETERS
 });
 
-const OPENAI_READ_WEB_PAGE_TOOL = Object.freeze({
+const OPENAI_CHAT_READ_WEB_PAGE_TOOL = Object.freeze({
   type: "function",
   function: {
     name: READ_WEB_PAGE_TOOL_NAME,
     description: "Fetch and extract the readable text and table content from a web page URL.",
     parameters: READ_WEB_PAGE_FUNCTION_PARAMETERS
   }
+});
+
+const OPENAI_RESPONSES_READ_WEB_PAGE_TOOL = Object.freeze({
+  type: "function",
+  name: READ_WEB_PAGE_TOOL_NAME,
+  description: "Fetch and extract the readable text and table content from a web page URL.",
+  parameters: READ_WEB_PAGE_FUNCTION_PARAMETERS
 });
 
 const CLAUDE_READ_WEB_PAGE_TOOL = Object.freeze({
@@ -1269,7 +1283,20 @@ export function shouldInterceptAmpWebSearch({ clientType, originalBody, runtimeC
   return true;
 }
 
-export function rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat) {
+function getOpenAIInterceptToolDefinitions(requestKind) {
+  if (requestKind === "responses") {
+    return {
+      webSearch: OPENAI_RESPONSES_WEB_SEARCH_TOOL,
+      readWebPage: OPENAI_RESPONSES_READ_WEB_PAGE_TOOL
+    };
+  }
+  return {
+    webSearch: OPENAI_CHAT_WEB_SEARCH_TOOL,
+    readWebPage: OPENAI_CHAT_READ_WEB_PAGE_TOOL
+  };
+}
+
+export function rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat, requestKind = undefined) {
   const tools = Array.isArray(providerBody?.tools) ? providerBody.tools : [];
   if (tools.length === 0) {
     return {
@@ -1301,8 +1328,9 @@ export function rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat) {
   }
 
   if (targetFormat === FORMATS.OPENAI) {
-    if (interceptedToolNames.has(SEARCH_TOOL_NAME)) nextTools.push(OPENAI_WEB_SEARCH_TOOL);
-    if (interceptedToolNames.has(READ_WEB_PAGE_TOOL_NAME)) nextTools.push(OPENAI_READ_WEB_PAGE_TOOL);
+    const toolDefinitions = getOpenAIInterceptToolDefinitions(requestKind);
+    if (interceptedToolNames.has(SEARCH_TOOL_NAME)) nextTools.push(toolDefinitions.webSearch);
+    if (interceptedToolNames.has(READ_WEB_PAGE_TOOL_NAME)) nextTools.push(toolDefinitions.readWebPage);
   } else if (targetFormat === FORMATS.CLAUDE) {
     if (interceptedToolNames.has(SEARCH_TOOL_NAME)) nextTools.push(CLAUDE_WEB_SEARCH_TOOL);
     if (interceptedToolNames.has(READ_WEB_PAGE_TOOL_NAME)) nextTools.push(CLAUDE_READ_WEB_PAGE_TOOL);

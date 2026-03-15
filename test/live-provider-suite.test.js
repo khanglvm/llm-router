@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
 import { TextDecoder, TextEncoder } from "node:util";
+import { promises as fs } from "node:fs";
 import test from "node:test";
 import { JSDOM, VirtualConsole } from "jsdom";
 import { readConfigFile, writeConfigFile } from "../src/node/config-store.js";
 import { buildProviderFromConfigInput, applyConfigChanges } from "../src/node/config-workflows.js";
+import {
+  patchClaudeCodeSettingsFile,
+  patchCodexCliConfigFile,
+  unpatchClaudeCodeSettingsFile,
+  unpatchCodexCliConfigFile
+} from "../src/node/coding-tool-config.js";
+import { CODEX_CLI_INHERIT_MODEL_VALUE } from "../src/shared/coding-tool-bindings.js";
 import { startLocalRouteServer } from "../src/node/local-server.js";
 import { startWebConsoleServer } from "../src/node/web-console-server.js";
 import {
@@ -13,6 +23,7 @@ import {
   getAvailablePort,
   loadLiveSuiteSettings,
   resolveModelRequestFormat,
+  runCommandCapture,
   runNodeCli
 } from "./helpers/live-suite.js";
 
@@ -74,6 +85,161 @@ function pickInteractiveModels(provider) {
     return provider.models.slice(0, 2);
   }
   return provider.models.slice(0, 1);
+}
+
+function pickOpenAIProvider(providers) {
+  return providers.find((provider) => provider.openaiBaseUrl)
+    || providers[0]
+    || null;
+}
+
+function pickClaudeProvider(providers) {
+  return providers.find((provider) => provider.claudeBaseUrl)
+    || providers.find((provider) => provider.openaiBaseUrl && provider.models.some((model) => String(model?.id || "").toLowerCase().includes("claude")))
+    || null;
+}
+
+function pickAmpProvider(providers) {
+  return providers.find((provider) => provider.openaiBaseUrl && provider.claudeBaseUrl)
+    || providers.find((provider) => provider.claudeBaseUrl)
+    || providers.find((provider) => provider.openaiBaseUrl)
+    || null;
+}
+
+function buildToolRoutingConfig(provider, {
+  codexAlias = "",
+  claudeAlias = "",
+  ampDefaultRoute = ""
+} = {}) {
+  const rawModels = Array.isArray(provider?.models) ? provider.models : [];
+  const modelId = String(rawModels[0]?.id || rawModels[0] || "").trim();
+  assert.ok(provider?.id, "A live provider is required.");
+  assert.ok(modelId, `Provider '${provider?.id || "unknown"}' must expose at least one model.`);
+
+  const normalizedModels = rawModels.map((model) => {
+    if (model && typeof model === "object" && !Array.isArray(model)) return model;
+    const modelIdText = String(model || "").trim();
+    return {
+      id: modelIdText,
+      formats: modelIdText.toLowerCase().includes("claude") ? ["claude"] : ["openai"]
+    };
+  }).filter((model) => String(model?.id || "").trim());
+
+  const formats = [];
+  if (provider.openaiBaseUrl) formats.push("openai");
+  if (provider.claudeBaseUrl) formats.push("claude");
+  const baseUrlByFormat = {};
+  if (provider.openaiBaseUrl) baseUrlByFormat.openai = provider.openaiBaseUrl;
+  if (provider.claudeBaseUrl) baseUrlByFormat.claude = provider.claudeBaseUrl;
+
+  const routeRef = `${provider.id}/${modelId}`;
+  const modelAliases = {};
+  if (codexAlias) {
+    modelAliases[codexAlias] = {
+      id: codexAlias,
+      strategy: "ordered",
+      targets: [{ ref: routeRef }],
+      fallbackTargets: []
+    };
+  }
+  if (claudeAlias) {
+    modelAliases[claudeAlias] = {
+      id: claudeAlias,
+      strategy: "ordered",
+      targets: [{ ref: routeRef }],
+      fallbackTargets: []
+    };
+  }
+  if (ampDefaultRoute) {
+    modelAliases[ampDefaultRoute] = {
+      id: ampDefaultRoute,
+      strategy: "ordered",
+      targets: [{ ref: routeRef }],
+      fallbackTargets: []
+    };
+  }
+
+  return {
+    version: 2,
+    masterKey: "gw_live_suite_master_key_1234567890abcdefghijklmnop",
+    defaultModel: codexAlias || claudeAlias || ampDefaultRoute || routeRef,
+    providers: [{
+      id: provider.id,
+      name: provider.name || provider.id,
+      apiKey: provider.apiKey,
+      baseUrl: provider.openaiBaseUrl || provider.claudeBaseUrl || "",
+      baseUrlByFormat,
+      format: provider.claudeBaseUrl && !provider.openaiBaseUrl ? "claude" : "openai",
+      formats,
+      headers: provider.headers || {},
+      models: normalizedModels
+    }],
+    modelAliases,
+    amp: {
+      preset: "builtin",
+      restrictManagementToLocalhost: true,
+      defaultRoute: ampDefaultRoute || codexAlias || claudeAlias || routeRef
+    }
+  };
+}
+
+async function readAmpUpstreamApiKey({ env = process.env, homeDir = os.homedir() } = {}) {
+  const explicit = String(env.LLM_ROUTER_TEST_AMP_UPSTREAM_API_KEY || env.AMP_API_KEY || "").trim();
+  if (explicit) return explicit;
+
+  const dataHome = String(env.XDG_DATA_HOME || "").trim() || path.join(homeDir, ".local", "share");
+  const secretsPath = path.join(dataHome, "amp", "secrets.json");
+
+  try {
+    const raw = await fs.readFile(secretsPath, "utf8");
+    const parsed = raw.trim() ? JSON.parse(raw) : {};
+    const fromSecrets = String(
+      parsed["apiKey@https://ampcode.com"]
+      || parsed["apiKey@https://ampcode.com/"]
+      || ""
+    ).trim();
+    if (fromSecrets) return fromSecrets;
+  } catch {
+  }
+
+  try {
+    const routerConfigPath = path.join(homeDir, ".llm-router.json");
+    const raw = await fs.readFile(routerConfigPath, "utf8");
+    const parsed = raw.trim() ? JSON.parse(raw) : {};
+    return String(parsed?.amp?.upstreamApiKey || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function isAcceptableLiveToolFailure(output = "") {
+  return /high demand|provider network error|fetch failed|overloaded|temporar(?:y|ily) unavailable|rate limit/i.test(String(output || ""));
+}
+
+async function configureAmpClientFiles({
+  env,
+  endpointUrl,
+  apiKey
+}) {
+  const settingsPath = path.join(env.XDG_CONFIG_HOME, "amp", "settings.json");
+  const secretsPath = path.join(env.XDG_DATA_HOME, "amp", "secrets.json");
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  await fs.mkdir(path.dirname(secretsPath), { recursive: true });
+
+  await fs.writeFile(settingsPath, `${JSON.stringify({
+    "amp.url": endpointUrl,
+    "amp.dangerouslyAllowAll": true,
+    "amp.showCosts": false,
+    "amp.updates.mode": "disabled"
+  }, null, 2)}\n`, "utf8");
+  await fs.writeFile(secretsPath, `${JSON.stringify({
+    [`apiKey@${endpointUrl}`]: apiKey
+  }, null, 2)}\n`, "utf8");
+
+  return {
+    settingsPath,
+    secretsPath
+  };
 }
 
 function createFetchBackedEventSource(window) {
@@ -454,6 +620,233 @@ test("real-provider flows cover CLI and Web UI", {
       dom?.window.close();
       await routeServer?.close();
       await webServer?.close("test-cleanup");
+      await workspace.cleanup();
+    }
+  });
+
+  await t.test("Codex CLI inherit-model routing works end-to-end against the live router", {
+    timeout: Math.max(liveSuite.timeoutMs * 2, 180_000)
+  }, async (t) => {
+    const provider = pickOpenAIProvider(liveSuite.providers);
+    if (!provider?.openaiBaseUrl) {
+      t.skip("No OpenAI-compatible live provider configured for Codex CLI.");
+      return;
+    }
+
+    const workspace = await createIsolatedWorkspace("llm-router-live-codex-");
+    const env = workspace.buildEnv(liveSuite.envMap);
+    const configPath = workspace.configPath;
+    const port = await getAvailablePort();
+    const baseUrl = `http://${liveSuite.host}:${port}`;
+    let localServer = null;
+
+    try {
+      await writeConfigFile(buildToolRoutingConfig(provider, {
+        codexAlias: "gpt-5.4",
+        ampDefaultRoute: "amp-live"
+      }), configPath);
+
+      await fs.mkdir(path.join(env.CODEX_HOME || path.join(workspace.homeDir, ".codex")), { recursive: true });
+      const seededCodexConfig = [
+        'model = "gpt-5.4"',
+        'model_reasoning_effort = "xhigh"'
+      ].join("\n");
+      await fs.writeFile(path.join(env.CODEX_HOME || path.join(workspace.homeDir, ".codex"), "config.toml"), `${seededCodexConfig}\n`, "utf8");
+
+      localServer = await startLocalRouteServer({
+        host: liveSuite.host,
+        port,
+        configPath,
+        watchConfig: false
+      });
+
+      await patchCodexCliConfigFile({
+        endpointUrl: baseUrl,
+        apiKey: "gw_live_suite_master_key_1234567890abcdefghijklmnop",
+        bindings: {
+          defaultModel: CODEX_CLI_INHERIT_MODEL_VALUE,
+          thinkingLevel: "xhigh"
+        },
+        env
+      });
+
+      const result = await runCommandCapture("codex", [
+        "exec",
+        "--skip-git-repo-check",
+        "--color",
+        "never",
+        "-C",
+        workspace.cwd,
+        "Reply with exactly OK"
+      ], {
+        cwd: workspace.cwd,
+        env,
+        label: "codex-live",
+        timeoutMs: liveSuite.timeoutMs
+      });
+
+      assert.equal(result.timedOut, false, "Codex CLI timed out.");
+      assert.doesNotMatch(result.stdout + result.stderr, /tools\[\d+\]\.name|missing_required_parameter/i);
+      if (!result.ok) {
+        assert.equal(
+          isAcceptableLiveToolFailure(result.stdout + result.stderr),
+          true,
+          result.stderr || result.stdout || "Codex CLI failed."
+        );
+        return;
+      }
+      assert.match(result.stdout, /\bOK\b/i);
+    } finally {
+      await unpatchCodexCliConfigFile({ env }).catch(() => {});
+      await localServer?.close();
+      await workspace.cleanup();
+    }
+  });
+
+  await t.test("Claude Code routes through the live router with an alias model", {
+    timeout: Math.max(liveSuite.timeoutMs * 2, 180_000)
+  }, async (t) => {
+    const provider = pickClaudeProvider(liveSuite.providers);
+    if (!provider?.claudeBaseUrl) {
+      t.skip("No Anthropic-compatible live provider configured for Claude Code.");
+      return;
+    }
+
+    const workspace = await createIsolatedWorkspace("llm-router-live-claude-");
+    const env = workspace.buildEnv(liveSuite.envMap);
+    const configPath = workspace.configPath;
+    const port = await getAvailablePort();
+    const baseUrl = `http://${liveSuite.host}:${port}`;
+    let localServer = null;
+
+    try {
+      await writeConfigFile(buildToolRoutingConfig(provider, {
+        claudeAlias: "normal",
+        ampDefaultRoute: "amp-live"
+      }), configPath);
+
+      localServer = await startLocalRouteServer({
+        host: liveSuite.host,
+        port,
+        configPath,
+        watchConfig: false
+      });
+
+      await patchClaudeCodeSettingsFile({
+        endpointUrl: baseUrl,
+        apiKey: "gw_live_suite_master_key_1234567890abcdefghijklmnop",
+        bindings: {
+          primaryModel: "normal"
+        },
+        env
+      });
+
+      const result = await runCommandCapture("claude", [
+        "-p",
+        "--output-format",
+        "json",
+        "Reply with exactly OK"
+      ], {
+        cwd: workspace.cwd,
+        env,
+        label: "claude-live",
+        timeoutMs: liveSuite.timeoutMs
+      });
+
+      assert.equal(result.timedOut, false, "Claude Code timed out.");
+      if (!result.ok) {
+        assert.equal(
+          isAcceptableLiveToolFailure(result.stdout + result.stderr),
+          true,
+          result.stderr || result.stdout || "Claude Code failed."
+        );
+        return;
+      }
+      const payload = JSON.parse(result.stdout.trim());
+      assert.match(String(payload?.result || payload?.content?.[0]?.text || ""), /\bOK\b/i);
+    } finally {
+      await unpatchClaudeCodeSettingsFile({ env }).catch(() => {});
+      await localServer?.close();
+      await workspace.cleanup();
+    }
+  });
+
+  await t.test("AMP execute mode routes through the live router", {
+    timeout: Math.max(liveSuite.timeoutMs * 3, 240_000)
+  }, async (t) => {
+    const provider = pickAmpProvider(liveSuite.providers);
+    if (!provider?.openaiBaseUrl && !provider?.claudeBaseUrl) {
+      t.skip("No live provider configured for AMP routing.");
+      return;
+    }
+
+    const upstreamApiKey = await readAmpUpstreamApiKey({ env: liveSuite.envMap });
+    if (!upstreamApiKey) {
+      t.skip("AMP upstream API key not found in env or local AMP secrets.");
+      return;
+    }
+
+    const workspace = await createIsolatedWorkspace("llm-router-live-amp-");
+    const env = workspace.buildEnv(liveSuite.envMap);
+    const configPath = workspace.configPath;
+    const port = await getAvailablePort();
+    const baseUrl = `http://${liveSuite.host}:${port}`;
+    let localServer = null;
+
+    try {
+      const config = buildToolRoutingConfig(provider, {
+        codexAlias: "gpt-5.4",
+        claudeAlias: "normal",
+        ampDefaultRoute: "amp-live"
+      });
+      config.amp.upstreamUrl = "https://ampcode.com";
+      config.amp.upstreamApiKey = upstreamApiKey;
+      await writeConfigFile(config, configPath);
+
+      await configureAmpClientFiles({
+        env,
+        endpointUrl: baseUrl,
+        apiKey: "gw_live_suite_master_key_1234567890abcdefghijklmnop"
+      });
+
+      localServer = await startLocalRouteServer({
+        host: liveSuite.host,
+        port,
+        configPath,
+        watchConfig: false
+      });
+
+      const result = await runCommandCapture("amp", [
+        "--no-color",
+        "--no-ide",
+        "--no-jetbrains",
+        "-x",
+        "Reply with exactly OK",
+        "-m",
+        "smart"
+      ], {
+        cwd: workspace.cwd,
+        env: {
+          ...env,
+          AMP_URL: baseUrl,
+          AMP_API_KEY: "gw_live_suite_master_key_1234567890abcdefghijklmnop"
+        },
+        label: "amp-live",
+        timeoutMs: Math.max(liveSuite.timeoutMs, 180_000)
+      });
+
+      assert.equal(result.timedOut, false, "AMP CLI timed out.");
+      if (!result.ok) {
+        assert.equal(
+          isAcceptableLiveToolFailure(result.stdout + result.stderr),
+          true,
+          result.stderr || result.stdout || "AMP CLI failed."
+        );
+        return;
+      }
+      assert.match(result.stdout, /\bOK\b/i);
+    } finally {
+      await localServer?.close();
       await workspace.cleanup();
     }
   });
