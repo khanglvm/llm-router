@@ -11,6 +11,20 @@ import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server
 
 const SERVICE_NAME = "llm-router";
 const LAUNCH_AGENT_ID = "dev.llm-router";
+const STARTUP_ENV_PASSTHROUGH_KEYS = [
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+  "npm_config_cafile"
+];
 
 function resolveDarwinDomain() {
   const uid = process.getuid?.();
@@ -83,13 +97,48 @@ function isMissingServiceMessage(value) {
     || text.includes("unit llm-router.service could not be found");
 }
 
+function escapeXml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+export function buildStartupEnvironment(env = process.env) {
+  const configuredCliPath = String(env?.LLM_ROUTER_CLI_PATH || "").trim();
+  const startupEnv = {
+    LLM_ROUTER_MANAGED_BY_STARTUP: "1",
+    LLM_ROUTER_CLI_PATH: configuredCliPath || String(resolveStartupCliEntryPath({ env }) || "").trim()
+  };
+
+  for (const key of STARTUP_ENV_PASSTHROUGH_KEYS) {
+    const value = String(env?.[key] || "").trim();
+    if (!value) continue;
+    startupEnv[key] = value;
+  }
+
+  return startupEnv;
+}
+
 function buildLaunchAgentPlist({ nodePath, cliPath, configPath, host, port, watchConfig, watchBinary, requireAuth }) {
   const logDir = path.join(os.homedir(), "Library", "Logs");
   const stdoutPath = path.join(logDir, "llm-router.out.log");
   const stderrPath = path.join(logDir, "llm-router.err.log");
   const args = [nodePath, cliPath, ...makeExecArgs({ configPath, host, port, watchConfig, watchBinary, requireAuth })];
+  const environment = {
+    ...buildStartupEnvironment({
+      ...process.env,
+      LLM_ROUTER_CLI_PATH: cliPath
+    }),
+    LLM_ROUTER_CLI_PATH: cliPath
+  };
 
-  const xmlArgs = args.map((arg) => `    <string>${arg}</string>`).join("\n");
+  const xmlArgs = args.map((arg) => `    <string>${escapeXml(arg)}</string>`).join("\n");
+  const xmlEnvironment = Object.entries(environment)
+    .map(([key, value]) => `      <key>${escapeXml(key)}</key>\n      <string>${escapeXml(value)}</string>`)
+    .join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -107,17 +156,14 @@ ${xmlArgs}
     <true/>
     <key>EnvironmentVariables</key>
     <dict>
-      <key>LLM_ROUTER_MANAGED_BY_STARTUP</key>
-      <string>1</string>
-      <key>LLM_ROUTER_CLI_PATH</key>
-      <string>${cliPath}</string>
+${xmlEnvironment}
     </dict>
     <key>StandardOutPath</key>
-    <string>${stdoutPath}</string>
+    <string>${escapeXml(stdoutPath)}</string>
     <key>StandardErrorPath</key>
-    <string>${stderrPath}</string>
+    <string>${escapeXml(stderrPath)}</string>
     <key>WorkingDirectory</key>
-    <string>${process.cwd()}</string>
+    <string>${escapeXml(process.cwd())}</string>
   </dict>
 </plist>
 `;
@@ -126,6 +172,17 @@ ${xmlArgs}
 function buildSystemdService({ nodePath, cliPath, configPath, host, port, watchConfig, watchBinary, requireAuth }) {
   const execArgs = makeExecArgs({ configPath, host, port, watchConfig, watchBinary, requireAuth }).map(quoteArg).join(" ");
   const execStart = `${quoteArg(nodePath)} ${quoteArg(cliPath)} ${execArgs}`;
+  const environment = {
+    ...buildStartupEnvironment({
+      ...process.env,
+      LLM_ROUTER_CLI_PATH: cliPath
+    }),
+    LLM_ROUTER_CLI_PATH: cliPath,
+    NODE_ENV: "production"
+  };
+  const systemdEnvironment = Object.entries(environment)
+    .map(([key, value]) => `Environment=${key}=${value}`)
+    .join("\n");
 
   return `[Unit]
 Description=LLM Router local route
@@ -136,9 +193,7 @@ Type=simple
 ExecStart=${execStart}
 Restart=always
 RestartSec=2
-Environment=NODE_ENV=production
-Environment=LLM_ROUTER_MANAGED_BY_STARTUP=1
-Environment=LLM_ROUTER_CLI_PATH=${cliPath}
+${systemdEnvironment}
 WorkingDirectory=${process.cwd()}
 
 [Install]

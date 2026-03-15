@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
-import { resolveStartupCliEntryPath } from "./startup-manager.js";
+import { buildStartupEnvironment, resolveStartupCliEntryPath } from "./startup-manager.js";
 
 async function makeTempTree() {
   const dir = await mkdtemp(path.join(os.tmpdir(), "llm-router-startup-manager-"));
@@ -65,4 +65,28 @@ test("resolveStartupCliEntryPath prefers explicit LLM_ROUTER_CLI_PATH over argv 
   } finally {
     await fixture.cleanup();
   }
+});
+
+test("buildStartupEnvironment preserves TLS trust overrides for startup-managed services", () => {
+  const env = buildStartupEnvironment({
+    LLM_ROUTER_CLI_PATH: "/tmp/llr",
+    NODE_EXTRA_CA_CERTS: "/tmp/extra-ca.pem",
+    SSL_CERT_FILE: "/tmp/cert.pem",
+    SSL_CERT_DIR: "/tmp/certs",
+    HTTPS_PROXY: "http://proxy.local:8443",
+    NO_PROXY: "127.0.0.1,localhost",
+    npm_config_cafile: "/tmp/npm-ca.pem",
+    IGNORED_ENV: "nope"
+  });
+
+  assert.deepEqual(env, {
+    LLM_ROUTER_MANAGED_BY_STARTUP: "1",
+    LLM_ROUTER_CLI_PATH: "/tmp/llr",
+    NODE_EXTRA_CA_CERTS: "/tmp/extra-ca.pem",
+    SSL_CERT_FILE: "/tmp/cert.pem",
+    SSL_CERT_DIR: "/tmp/certs",
+    HTTPS_PROXY: "http://proxy.local:8443",
+    NO_PROXY: "127.0.0.1,localhost",
+    npm_config_cafile: "/tmp/npm-ca.pem"
+  });
 });
