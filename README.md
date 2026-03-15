@@ -14,22 +14,12 @@ The primary CLI command is now:
 llr
 ```
 
-## Beta Notice
-
-`2.0.0-beta.2` is the current public prerelease. It includes major operator-surface changes around the Web UI, AMP routing, and coding-tool integrations.
+`2.0.0` is the current public release. It includes the Web UI, AMP routing, and coding-tool integrations introduced in the 2.x line.
 
 ## Install
 
-Stable:
-
 ```bash
 npm i -g @khanglvm/llm-router@latest
-```
-
-Beta:
-
-```bash
-npm i -g @khanglvm/llm-router@2.0.0-beta.2
 ```
 
 ## Quick Start
