@@ -416,3 +416,59 @@ test("integration: model-specific bucket exhaustion blocks only that model", asy
   assert.ok(exhaustedPrimary);
   assert.ok(exhaustedPrimary.skipReasons.includes("quota-exhausted"));
 });
+
+test("cooldown-only routes still pick the earliest recoverable candidate", async () => {
+  const now = Date.UTC(2026, 1, 28, 15, 0, 0);
+  const store = createMemoryStateStore();
+  const first = candidate("first");
+  const second = candidate("second");
+
+  await store.setCandidateState(buildCandidateKey(first), {
+    openUntil: now + 30_000,
+    consecutiveRetryableFailures: 2
+  });
+  await store.setCandidateState(buildCandidateKey(second), {
+    openUntil: now + 10_000,
+    consecutiveRetryableFailures: 2
+  });
+
+  const ranked = await rankRouteCandidates({
+    routeKey: "route:cooldown-only",
+    strategy: "ordered",
+    candidates: [first, second],
+    stateStore: store,
+    now
+  });
+
+  assert.equal(ranked.selectedEntry?.candidate.requestModelId, "openrouter/second");
+  assert.equal(ranked.skippedEntries.length, 0);
+});
+
+test("quota-exhausted routes still return no selected candidate", async () => {
+  const store = createMemoryStateStore();
+  const candidates = [candidate("first"), candidate("second")];
+  const evaluations = new Map();
+
+  for (const row of candidates) {
+    evaluations.set(buildCandidateKey(row), {
+      candidate: row,
+      candidateKey: buildCandidateKey(row),
+      eligible: false,
+      remainingCapacityRatio: 0,
+      buckets: [],
+      exhaustedBuckets: [{ bucketKey: `bucket:${row.modelId}` }]
+    });
+  }
+
+  const ranked = await rankRouteCandidates({
+    routeKey: "route:quota-only",
+    strategy: "ordered",
+    candidates,
+    stateStore: store,
+    rateLimitEvaluations: evaluations
+  });
+
+  assert.equal(ranked.selectedEntry, null);
+  assert.equal(ranked.skippedEntries.length, 2);
+  assert.ok(ranked.skippedEntries.every((entry) => entry.skipReasons.includes("quota-exhausted")));
+});

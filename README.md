@@ -14,7 +14,7 @@ The primary CLI command is now:
 llr
 ```
 
-`2.0.0` is the current public release. It includes the Web UI, AMP routing, and coding-tool integrations introduced in the 2.x line.
+`2.0.1` is the current public release. It includes the Web UI, AMP routing, and coding-tool integrations introduced in the 2.x line.
 
 ## Install
 

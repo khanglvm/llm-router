@@ -186,6 +186,19 @@ function sortEntriesByOriginalOrder(left, right) {
   return left.originalIndex - right.originalIndex;
 }
 
+function sortCooldownEntries(left, right) {
+  if (left.openUntil !== right.openUntil) {
+    return left.openUntil - right.openUntil;
+  }
+  return sortEntriesByOriginalOrder(left, right);
+}
+
+function isCooldownOnlyEntry(entry) {
+  if (!entry || entry.eligible) return false;
+  const reasons = Array.isArray(entry.skipReasons) ? entry.skipReasons : [];
+  return reasons.length > 0 && reasons.every((reason) => reason === "cooldown");
+}
+
 async function buildCandidateEntries({
   candidates,
   stateStore,
@@ -315,6 +328,19 @@ export async function rankRouteCandidates({
   const ineligibleEntries = entries
     .filter((entry) => !entry.eligible)
     .sort(sortEntriesByOriginalOrder);
+  const fallbackCooldownEntries = eligibleEntries.length === 0
+    ? ineligibleEntries
+      .filter((entry) => isCooldownOnlyEntry(entry))
+      .sort(sortCooldownEntries)
+      .map((entry) => ({
+        ...entry,
+        eligible: true,
+        skipReasons: [...entry.skipReasons, "cooldown-overridden"]
+      }))
+    : [];
+  const skippedIneligibleEntries = fallbackCooldownEntries.length > 0
+    ? ineligibleEntries.filter((entry) => !isCooldownOnlyEntry(entry))
+    : ineligibleEntries;
   const estimatedRequiredTokens = normalizeNonNegativeInteger(
     requestContext?.estimatedRequiredTokens ??
     requestContext?.requiredTokens ??
@@ -324,10 +350,13 @@ export async function rankRouteCandidates({
   const routeCursor = stateStore
     ? await stateStore.getRouteCursor(resolvedRouteKey)
     : 0;
+  const rankableEntries = fallbackCooldownEntries.length > 0
+    ? fallbackCooldownEntries
+    : eligibleEntries;
   const contextAwareGroups = shouldApplyContextAwareOrdering(route, estimatedRequiredTokens)
-    ? partitionEligibleEntriesByContextWindow(eligibleEntries, estimatedRequiredTokens)
+    ? partitionEligibleEntriesByContextWindow(rankableEntries, estimatedRequiredTokens)
     : {
-        prioritizedEntries: eligibleEntries,
+        prioritizedEntries: rankableEntries,
         deferredEntries: []
       };
   const ranking = rankEligibleEntries(
@@ -339,7 +368,7 @@ export async function rankRouteCandidates({
   const rankedEntries = [
     ...ranking.orderedEligible,
     ...contextAwareGroups.deferredEntries,
-    ...ineligibleEntries
+    ...skippedIneligibleEntries
   ];
 
   return {
@@ -351,7 +380,7 @@ export async function rankRouteCandidates({
     shouldAdvanceCursor: ranking.shouldAdvanceCursor,
     entries: rankedEntries,
     selectedEntry: ranking.orderedEligible[0] || null,
-    skippedEntries: ineligibleEntries,
+    skippedEntries: skippedIneligibleEntries,
     rankedCandidates: rankedEntries.map((entry) => entry.candidate)
   };
 }

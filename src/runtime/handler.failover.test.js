@@ -319,6 +319,49 @@ test("terminal request failure emits an activity log entry", { concurrency: fals
   }
 });
 
+test("cooldown-only alias routes keep attempting a candidate instead of hard-failing route selection", { concurrency: false }, async () => {
+  const config = buildConfig();
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      throw new TypeError("fetch failed");
+    };
+
+    const first = await fetchHandler(makeClaudeRequest("chat.default"), {
+      LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS: "1"
+    });
+    const second = await fetchHandler(makeClaudeRequest("chat.default"), {
+      LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS: "1"
+    });
+    const third = await fetchHandler(makeClaudeRequest("chat.default"), {
+      LLM_ROUTER_ORIGIN_RETRY_ATTEMPTS: "1"
+    });
+
+    assert.equal(first.status, 503);
+    assert.equal(second.status, 503);
+    assert.equal(third.status, 503);
+
+    const firstBody = await first.json();
+    const secondBody = await second.json();
+    const thirdBody = await third.json();
+    assert.equal(firstBody?.error?.message, "Provider network error: fetch failed");
+    assert.equal(secondBody?.error?.message, "Provider network error: fetch failed");
+    assert.equal(thirdBody?.error?.message, "Provider network error: fetch failed");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
 test("invalid request short-circuits without fallback fan-out", { concurrency: false }, async () => {
   const config = buildConfig();
   const store = createMemoryStateStore();
