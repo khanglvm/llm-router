@@ -159,6 +159,26 @@ function normalizeEndpointCandidates(values = []) {
   return dedupeStrings(Array.isArray(values) ? values : [values]);
 }
 
+function rewriteProviderCredentials(provider = {}, draftProvider = {}) {
+  const nextProvider = { ...provider };
+  const hasCredentialInput = Object.prototype.hasOwnProperty.call(draftProvider || {}, "credentialInput");
+  if (!hasCredentialInput) return nextProvider;
+
+  const credentialInput = String(draftProvider?.credentialInput || "").trim();
+  delete nextProvider.apiKey;
+  delete nextProvider.apiKeyEnv;
+  delete nextProvider.credential;
+
+  if (!credentialInput) return nextProvider;
+  if (/^[A-Z][A-Z0-9_]*$/.test(credentialInput)) {
+    nextProvider.apiKeyEnv = credentialInput;
+    return nextProvider;
+  }
+
+  nextProvider.apiKey = credentialInput;
+  return nextProvider;
+}
+
 function rewriteProviderEndpoints(provider = {}, endpoints = []) {
   const nextProvider = { ...provider };
   const nextEndpoints = normalizeEndpointCandidates(endpoints);
@@ -487,6 +507,7 @@ export function applyProviderInlineEdits(config = {}, currentProviderId = "", dr
   };
 
   if (!isSubscription) {
+    nextProvider = rewriteProviderCredentials(nextProvider, draftProvider);
     nextProvider = rewriteProviderEndpoints(nextProvider, nextEndpoints);
     nextProvider = rewriteRateLimits(nextProvider, draftProvider, renamedProviderId);
   }

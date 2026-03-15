@@ -212,6 +212,38 @@ function extractToolTypes(body) {
   )];
 }
 
+function hasToolDefinitions(body) {
+  return Array.isArray(body?.tools) && body.tools.some((tool) => tool && typeof tool === "object");
+}
+
+function getProviderFormats(provider) {
+  return [...new Set(
+    [provider?.format, ...(Array.isArray(provider?.formats) ? provider.formats : [])]
+      .map((value) => String(value || "").trim())
+      .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE)
+  )];
+}
+
+function normalizeProviderRequestKind(targetFormat, requestKind) {
+  if (targetFormat === FORMATS.OPENAI && requestKind === "messages") {
+    return undefined;
+  }
+  return requestKind;
+}
+
+function shouldPreferOpenAIForClaudeToolCalls({
+  provider,
+  sourceFormat,
+  targetFormat,
+  requestKind,
+  body
+} = {}) {
+  if (sourceFormat !== FORMATS.CLAUDE || targetFormat !== FORMATS.CLAUDE) return false;
+  if (!hasToolDefinitions(body)) return false;
+  if (!getProviderFormats(provider).includes(FORMATS.OPENAI)) return false;
+  return Boolean(resolveProviderUrl(provider, FORMATS.OPENAI, normalizeProviderRequestKind(FORMATS.OPENAI, requestKind)));
+}
+
 function isOpenAIHostedWebSearchRequest(targetFormat, requestKind) {
   return targetFormat === FORMATS.OPENAI && requestKind === "responses";
 }
@@ -446,48 +478,24 @@ function logToolRouting({ env, clientType, candidate, originalBody, providerBody
   );
 }
 
-export async function makeProviderCall({
+function buildProviderRequestPlan({
   body,
   sourceFormat,
-  stream,
+  targetFormat,
   candidate,
   requestKind,
   requestHeaders,
-  env,
-  clientType,
-  runtimeConfig,
-  stateStore
+  interceptAmpWebSearch,
+  stream
 }) {
-  const provider = candidate.provider;
-  const targetFormat = candidate.targetFormat;
+  const normalizedRequestKind = normalizeProviderRequestKind(targetFormat, requestKind);
   const translate = needsTranslation(sourceFormat, targetFormat);
-  const interceptAmpWebSearch = shouldInterceptAmpWebSearch({
-    clientType,
-    originalBody: body,
-    runtimeConfig,
-    env
-  });
 
   let providerBody = { ...body };
   if (translate) {
-    try {
-      providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
-    } catch (error) {
-      return {
-        ok: false,
-        status: 400,
-        retryable: false,
-        errorKind: "translation_error",
-        response: jsonResponse({
-          type: "error",
-          error: {
-            type: "invalid_request_error",
-            message: `Request translation failed: ${error instanceof Error ? error.message : String(error)}`
-          }
-        }, 400)
-      };
-    }
+    providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
   }
+
   providerBody.model = candidate.backend;
   providerBody = applyCachingMapping({
     originalBody: body,
@@ -504,9 +512,10 @@ export async function makeProviderCall({
     targetModel: candidate.backend,
     requestHeaders
   });
-  const declaredOpenAIHostedWebSearchToolType = getProviderOpenAIHostedWebSearchToolType(provider, {
+
+  const declaredOpenAIHostedWebSearchToolType = getProviderOpenAIHostedWebSearchToolType(candidate.provider, {
     targetFormat,
-    requestKind
+    requestKind: normalizedRequestKind
   });
   const declaredOpenAIHostedWebSearchRewrite = rewriteProviderBodyForOpenAIHostedWebSearch(
     providerBody,
@@ -515,17 +524,97 @@ export async function makeProviderCall({
   if (declaredOpenAIHostedWebSearchRewrite.rewritten) {
     providerBody = declaredOpenAIHostedWebSearchRewrite.providerBody;
   }
+
   if (interceptAmpWebSearch) {
     providerBody = rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat, requestKind).providerBody;
   }
+
+  return {
+    targetFormat,
+    requestKind: normalizedRequestKind,
+    translate,
+    providerBody
+  };
+}
+
+export async function makeProviderCall({
+  body,
+  sourceFormat,
+  stream,
+  candidate,
+  requestKind,
+  requestHeaders,
+  env,
+  clientType,
+  runtimeConfig,
+  stateStore
+}) {
+  const provider = candidate.provider;
+  const targetFormat = candidate.targetFormat;
+  const interceptAmpWebSearch = shouldInterceptAmpWebSearch({
+    clientType,
+    originalBody: body,
+    runtimeConfig,
+    env
+  });
+
+  const preferOpenAIToolRouting = !isSubscriptionProvider(provider) && shouldPreferOpenAIForClaudeToolCalls({
+    provider,
+    sourceFormat,
+    targetFormat,
+    requestKind,
+    body
+  });
+
+  let activePlan;
+  let fallbackPlan = null;
+  try {
+    activePlan = buildProviderRequestPlan({
+      body,
+      sourceFormat,
+      targetFormat: preferOpenAIToolRouting ? FORMATS.OPENAI : targetFormat,
+      candidate,
+      requestKind,
+      requestHeaders,
+      interceptAmpWebSearch,
+      stream
+    });
+    if (preferOpenAIToolRouting) {
+      fallbackPlan = buildProviderRequestPlan({
+        body,
+        sourceFormat,
+        targetFormat,
+        candidate,
+        requestKind,
+        requestHeaders,
+        interceptAmpWebSearch,
+        stream
+      });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: 400,
+      retryable: false,
+      errorKind: "translation_error",
+      response: jsonResponse({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: `Request translation failed: ${error instanceof Error ? error.message : String(error)}`
+        }
+      }, 400)
+    };
+  }
+
   logToolRouting({
     env,
     clientType,
     candidate,
     originalBody: body,
-    providerBody,
+    providerBody: activePlan.providerBody,
     sourceFormat,
-    targetFormat
+    targetFormat: activePlan.targetFormat
   });
 
   if (isSubscriptionProvider(provider)) {
@@ -537,7 +626,7 @@ export async function makeProviderCall({
       stream: subscriptionType === "chatgpt-codex" ? true : Boolean(stream),
       env
     });
-    const subscriptionResult = await executeSubscriptionRequest(providerBody);
+    const subscriptionResult = await executeSubscriptionRequest(activePlan.providerBody);
 
     if (!subscriptionResult?.ok) {
       return subscriptionResult;
@@ -558,14 +647,14 @@ export async function makeProviderCall({
       };
     }
 
-    const fallbackModel = candidate?.backend || providerBody?.model || "unknown";
+    const fallbackModel = candidate?.backend || activePlan.providerBody?.model || "unknown";
     let upstreamResponse = subscriptionResult.response;
     if (interceptAmpWebSearch) {
       const intercepted = await maybeInterceptAmpWebSearch({
         response: upstreamResponse,
-        providerBody,
-        targetFormat,
-        requestKind,
+        providerBody: activePlan.providerBody,
+        targetFormat: activePlan.targetFormat,
+        requestKind: activePlan.requestKind,
         stream,
         runtimeConfig,
         env,
@@ -581,11 +670,11 @@ export async function makeProviderCall({
       return adaptProviderResponse({
         response: upstreamResponse,
         stream,
-        translate,
+        translate: activePlan.translate,
         sourceFormat,
-        targetFormat,
+        targetFormat: activePlan.targetFormat,
         fallbackModel,
-        requestKind,
+        requestKind: activePlan.requestKind,
         requestBody: body,
         clientType,
         env
@@ -722,20 +811,21 @@ export async function makeProviderCall({
     };
   }
 
-  const providerUrl = resolveProviderUrl(provider, targetFormat, requestKind);
-  const headers = mergeCachingHeaders(
-    buildProviderHeaders(provider, env, targetFormat),
-    requestHeaders,
-    targetFormat
-  );
-  const executeHttpProviderRequest = async (requestBody) => {
+  const executeHttpProviderRequest = async (plan) => {
+    const providerUrl = resolveProviderUrl(provider, plan.targetFormat, plan.requestKind);
+    if (!providerUrl) return null;
+    const headers = mergeCachingHeaders(
+      buildProviderHeaders(provider, env, plan.targetFormat),
+      requestHeaders,
+      plan.targetFormat
+    );
     const timeoutMs = resolveUpstreamTimeoutMs(env);
     const timeoutControl = buildTimeoutSignal(timeoutMs);
     try {
       const init = {
         method: "POST",
         headers,
-        body: JSON.stringify(requestBody)
+        body: JSON.stringify(plan.providerBody)
       };
       if (timeoutControl.signal) {
         init.signal = timeoutControl.signal;
@@ -747,7 +837,7 @@ export async function makeProviderCall({
     }
   };
 
-  if (!providerUrl) {
+  if (!resolveProviderUrl(provider, activePlan.targetFormat, activePlan.requestKind)) {
     return {
       ok: false,
       status: 500,
@@ -765,7 +855,7 @@ export async function makeProviderCall({
 
   let response;
   try {
-    response = await executeHttpProviderRequest(providerBody);
+    response = await executeHttpProviderRequest(activePlan);
   } catch (error) {
     return {
       ok: false,
@@ -782,22 +872,40 @@ export async function makeProviderCall({
     };
   }
 
-  if (!response.ok) {
-    const retriedOpenAIHostedWebSearch = await maybeRetryOpenAIHostedWebSearchProviderRequest({
-      response,
-      executeProviderRequest: executeHttpProviderRequest,
-      providerBody,
-      targetFormat,
-      requestKind
-    });
-    response = retriedOpenAIHostedWebSearch.response;
-    providerBody = retriedOpenAIHostedWebSearch.providerBody;
+  if ((!response || !response.ok) && fallbackPlan) {
+    try {
+      const fallbackResponse = await executeHttpProviderRequest(fallbackPlan);
+      if (fallbackResponse instanceof Response && fallbackResponse.ok) {
+        response = fallbackResponse;
+        activePlan = fallbackPlan;
+      }
+    } catch {
+      // Keep the original failure if the fallback request also fails.
+    }
   }
 
   if (!response.ok) {
-    const hostedWebSearchErrorKind = await resolveHostedWebSearchErrorKind(response, providerBody, {
-      targetFormat,
-      requestKind
+    const retriedOpenAIHostedWebSearch = await maybeRetryOpenAIHostedWebSearchProviderRequest({
+      response,
+      executeProviderRequest: async (nextProviderBody) => executeHttpProviderRequest({
+        ...activePlan,
+        providerBody: nextProviderBody
+      }),
+      providerBody: activePlan.providerBody,
+      targetFormat: activePlan.targetFormat,
+      requestKind: activePlan.requestKind
+    });
+    response = retriedOpenAIHostedWebSearch.response;
+    activePlan = {
+      ...activePlan,
+      providerBody: retriedOpenAIHostedWebSearch.providerBody
+    };
+  }
+
+  if (!response.ok) {
+    const hostedWebSearchErrorKind = await resolveHostedWebSearchErrorKind(response, activePlan.providerBody, {
+      targetFormat: activePlan.targetFormat,
+      requestKind: activePlan.requestKind
     });
     return {
       ok: false,
@@ -805,23 +913,26 @@ export async function makeProviderCall({
       retryable: shouldRetryStatus(response.status),
       ...(hostedWebSearchErrorKind ? { errorKind: hostedWebSearchErrorKind } : {}),
       upstreamResponse: response,
-      translateError: translate
+      translateError: activePlan.translate
     };
   }
 
   if (interceptAmpWebSearch) {
     const intercepted = await maybeInterceptAmpWebSearch({
       response,
-      providerBody,
-      targetFormat,
-      requestKind,
+      providerBody: activePlan.providerBody,
+      targetFormat: activePlan.targetFormat,
+      requestKind: activePlan.requestKind,
       stream,
       runtimeConfig,
       env,
       stateStore,
       executeProviderRequest: async (followUpBody) => {
         try {
-          return await executeHttpProviderRequest(followUpBody);
+          return await executeHttpProviderRequest({
+            ...activePlan,
+            providerBody: followUpBody
+          });
         } catch {
           return null;
         }
@@ -833,11 +944,11 @@ export async function makeProviderCall({
   return adaptProviderResponse({
     response,
     stream,
-    translate,
+    translate: activePlan.translate,
     sourceFormat,
-    targetFormat,
+    targetFormat: activePlan.targetFormat,
     fallbackModel: candidate.backend,
-    requestKind,
+    requestKind: activePlan.requestKind,
     requestBody: body,
     clientType,
     env

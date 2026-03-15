@@ -332,3 +332,250 @@ test("makeProviderCall intercepts native Claude web search locally for non-AMP c
     globalThis.fetch = originalFetch;
   }
 });
+
+test("makeProviderCall prefers OpenAI routing for Claude tool calls on dual-format providers", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: JSON.parse(String(init.body || "{}"))
+    });
+
+    return jsonResponse({
+      id: "chatcmpl_tool_route",
+      object: "chat.completion",
+      created: 1730000200,
+      model: "claude-sonnet-4-6",
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_fetch_1",
+            type: "function",
+            function: {
+              name: "fetch",
+              arguments: "{\"url\":\"https://example.com\"}"
+            }
+          }]
+        },
+        finish_reason: "stop"
+      }],
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 6,
+        total_tokens: 18
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "claude-sonnet-4-6",
+        max_tokens: 256,
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: "Use the fetch tool for https://example.com." }]
+        }],
+        tools: [{
+          name: "fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            },
+            required: ["url"]
+          }
+        }],
+        tool_choice: { type: "any" }
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: false,
+      candidate: buildClaudeCandidate({
+        formats: [FORMATS.CLAUDE, FORMATS.OPENAI],
+        baseUrlByFormat: {
+          claude: "https://api.anthropic.com",
+          openai: "https://api.anthropic.com"
+        }
+      }),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/chat/completions");
+    assert.equal(calls[0]?.body?.messages?.[0]?.role, "user");
+    assert.equal(calls[0]?.body?.tools?.[0]?.type, "function");
+    assert.equal(calls[0]?.body?.tool_choice, "required");
+
+    const payload = await result.response.json();
+    assert.equal(payload.type, "message");
+    assert.equal(payload.stop_reason, "tool_use");
+    assert.equal(payload.content?.[0]?.type, "tool_use");
+    assert.equal(payload.content?.[0]?.name, "fetch");
+    assert.deepEqual(payload.content?.[0]?.input, { url: "https://example.com" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("makeProviderCall translates streamed OpenAI tool calls back to Claude SSE for dual-format providers", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: JSON.parse(String(init.body || "{}"))
+    });
+
+    const sse = [
+      "data: {\"id\":\"chatcmpl_tool_stream\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-sonnet-4-6\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_fetch_1\",\"type\":\"function\",\"function\":{\"name\":\"fetch\",\"arguments\":\"{\\\"url\\\":\\\"https://example.com\\\"}\"}}]}}]}",
+      "",
+      "data: {\"id\":\"chatcmpl_tool_stream\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-sonnet-4-6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+      "",
+      "data: [DONE]",
+      ""
+    ].join("\n");
+
+    return new Response(sse, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream"
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "claude-sonnet-4-6",
+        max_tokens: 256,
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: "Use the fetch tool for https://example.com." }]
+        }],
+        tools: [{
+          name: "fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            }
+          }
+        }],
+        tool_choice: { type: "any" }
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: true,
+      candidate: buildClaudeCandidate({
+        formats: [FORMATS.CLAUDE, FORMATS.OPENAI],
+        baseUrlByFormat: {
+          claude: "https://api.anthropic.com",
+          openai: "https://api.anthropic.com"
+        }
+      }),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/chat/completions");
+
+    const sseText = await result.response.text();
+    assert.match(sseText, /"type":"tool_use"/);
+    assert.match(sseText, /"name":"fetch"/);
+    assert.match(sseText, /"stop_reason":"tool_use"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("makeProviderCall falls back to Claude routing when OpenAI tool routing fails", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: JSON.parse(String(init.body || "{}"))
+    });
+
+    if (calls.length === 1) {
+      return jsonResponse({
+        error: {
+          message: "Model not available on chat completions."
+        }
+      }, 400);
+    }
+
+    return jsonResponse({
+      id: "msg_claude_fallback",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{
+        type: "text",
+        text: "Claude fallback succeeded."
+      }],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 12,
+        output_tokens: 6
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "claude-sonnet-4-6",
+        max_tokens: 256,
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: "Use the fetch tool for https://example.com." }]
+        }],
+        tools: [{
+          name: "fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            }
+          }
+        }],
+        tool_choice: { type: "any" }
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: false,
+      candidate: buildClaudeCandidate({
+        formats: [FORMATS.CLAUDE, FORMATS.OPENAI],
+        baseUrlByFormat: {
+          claude: "https://api.anthropic.com",
+          openai: "https://api.anthropic.com"
+        }
+      }),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/chat/completions");
+    assert.equal(calls[1]?.url, "https://api.anthropic.com/v1/messages");
+
+    const payload = await result.response.json();
+    assert.equal(payload.content?.[0]?.text, "Claude fallback succeeded.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

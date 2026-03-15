@@ -2127,6 +2127,18 @@ function getStoredProviderCredentialPayload(provider = {}) {
   return apiKey ? { apiKey } : {};
 }
 
+function getDraftProviderCredentialPayload(draftProvider = {}, provider = {}) {
+  if (draftProvider && Object.prototype.hasOwnProperty.call(draftProvider, "credentialInput")) {
+    const credentialInput = String(draftProvider?.credentialInput || "").trim();
+    if (!credentialInput) return {};
+    return looksLikeEnvVarName(credentialInput)
+      ? { apiKeyEnv: credentialInput }
+      : { apiKey: credentialInput };
+  }
+
+  return getStoredProviderCredentialPayload(provider);
+}
+
 function inferQuickStartConnectionType(provider = {}) {
   if (provider?.type === "subscription") {
     return provider?.subscriptionType === "claude-code" ? "oauth-claude" : "oauth-gpt";
@@ -2141,6 +2153,9 @@ function createProviderInlineDraftState(provider = {}) {
   return {
     id: String(provider?.id || "").trim(),
     name: String(provider?.name || provider?.id || "").trim(),
+    credentialInput: connectionType === "api"
+      ? String(provider?.apiKeyEnv || provider?.apiKey || provider?.credential || "").trim()
+      : "",
     endpoints: connectionType === "api" ? endpoints : [],
     endpointDraft: "",
     rateLimitRows: connectionType === "api"
@@ -2978,6 +2993,9 @@ function Modal({
   variant = "dialog",
   headerActions = null,
   showCloseButton = true,
+  closeDisabled = false,
+  closeOnEscape = true,
+  closeOnBackdrop = true,
   footer = null,
   contentClassName = "",
   bodyClassName = "",
@@ -2987,12 +3005,12 @@ function Modal({
     if (!open || typeof window === "undefined") return undefined;
 
     function handleKeyDown(event) {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && closeOnEscape) onClose();
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose]);
+  }, [closeOnEscape, open, onClose]);
 
   if (!open) return null;
   const isPage = variant === "page";
@@ -3003,7 +3021,7 @@ function Modal({
         isPage ? "p-0" : "flex items-center justify-center p-4"
       )}
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget && closeOnBackdrop) onClose();
       }}
     >
       <div className={cn(
@@ -3024,7 +3042,7 @@ function Modal({
           <div className="flex shrink-0 items-center gap-2">
             {headerActions}
             {showCloseButton ? (
-              <Button type="button" variant="ghost" size="sm" onClick={onClose}>
+              <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={closeDisabled}>
                 Close
               </Button>
             ) : null}
@@ -3131,6 +3149,48 @@ function UnsavedChangesModal({
         {details ? (
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900">
             {details}
+          </div>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
+function FailedModelsCloseModal({
+  open = false,
+  failedModelIds = [],
+  onKeepEditing = () => {},
+  onRemoveFailedAndClose = () => {},
+  removeDisabled = false
+}) {
+  const failedLabel = failedModelIds.length > 1
+    ? `${failedModelIds.length} failed models`
+    : failedModelIds[0] || "the failed model";
+
+  return (
+    <Modal
+      open={open}
+      onClose={onKeepEditing}
+      title="Failed model tests"
+      description={`Some new models did not pass validation: ${failedLabel}.`}
+      contentClassName="max-w-lg rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
+      showCloseButton={false}
+      footer={(
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={onKeepEditing}>
+            Keep editing
+          </Button>
+          <Button type="button" variant="outline" onClick={() => void onRemoveFailedAndClose()} disabled={removeDisabled}>
+            Remove failed + close
+          </Button>
+        </div>
+      )}
+    >
+      <div className="space-y-3 text-sm leading-6 text-muted-foreground">
+        <div>Successful new models are still kept in the draft. You can continue editing, or remove only the failed rows and close the modal.</div>
+        {failedModelIds.length > 0 ? (
+          <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-rose-900">
+            {failedModelIds.join(", ")}
           </div>
         ) : null}
       </div>
@@ -3630,7 +3690,10 @@ function ProviderModelsEditor({
   onApply,
   framed = true,
   focusRequest = 0,
-  onStateChange = null
+  onStateChange = null,
+  testStateByModel = {},
+  savePhase = "",
+  saveMessage = ""
 }) {
   const initialRows = useMemo(() => createProviderModelDraftRows(provider), [provider]);
   const [rows, setRows] = useState([]);
@@ -3856,7 +3919,7 @@ function ProviderModelsEditor({
     id: row.id,
     contextWindow: row.contextWindow
   })));
-  const actionBusy = submitState !== "";
+  const actionBusy = submitState !== "" || savePhase === "testing" || savePhase === "saving";
   const locked = disabled || busy || actionBusy || contextLookupBusy;
   const lastFilledRowIndex = useMemo(() => {
     let lastIndex = -1;
@@ -4098,6 +4161,7 @@ function ProviderModelsEditor({
           const rowLookupPending = Boolean(contextLookupPendingByRowKey[row.key]);
           const showContextLookupMenu = activeContextLookupRowKey === row.key && Boolean(trimmedValue);
           const hasInvalidContextWindow = invalidContextWindowRowKeys.has(row.key);
+          const rowTestState = trimmedValue ? (testStateByModel?.[trimmedValue] || "default") : "default";
 
           return (
             <div
@@ -4120,7 +4184,10 @@ function ProviderModelsEditor({
               className={cn(
                 "space-y-2 rounded-xl border border-border/70 bg-card/90 p-3",
                 !isFilledRow ? "border-dashed bg-background/85" : null,
-                hasInvalidContextWindow ? "border-amber-200 bg-amber-50/70" : null
+                hasInvalidContextWindow ? "border-amber-200 bg-amber-50/70" : null,
+                !hasInvalidContextWindow && rowTestState === "success" ? "border-emerald-200 bg-emerald-50/70" : null,
+                !hasInvalidContextWindow && rowTestState === "error" ? "border-rose-200 bg-rose-50/70" : null,
+                !hasInvalidContextWindow && rowTestState === "pending" ? "border-sky-200 bg-sky-50/70" : null
               )}
             >
               <div className="grid grid-cols-[auto_auto_auto_minmax(0,1fr)_minmax(12rem,14rem)_5.5rem] items-center gap-2">
@@ -4337,6 +4404,18 @@ function ProviderModelsEditor({
                 <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
                   Enter a positive integer like <code>128000</code>, or leave the field blank.
                 </div>
+              ) : rowTestState === "pending" ? (
+                <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
+                  Testing this model against the provider endpoint now.
+                </div>
+              ) : rowTestState === "success" ? (
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+                  Confirmed by the latest live provider test.
+                </div>
+              ) : rowTestState === "error" ? (
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900">
+                  This model failed the latest live provider test.
+                </div>
               ) : null}
             </div>
           );
@@ -4366,8 +4445,25 @@ function ProviderModelsEditor({
         )}
       >
         <div className="flex min-h-9 items-center justify-between gap-3">
-          <div className="text-xs text-muted-foreground">
-            {newModelIds.length > 0 && inferQuickStartConnectionType(provider) === "api"
+          <div className={cn(
+            "text-xs",
+            savePhase === "testing"
+              ? "text-sky-700"
+              : savePhase === "saving"
+                ? "text-foreground"
+                : "text-muted-foreground"
+          )}>
+            {savePhase === "testing" ? (
+              <span className="inline-flex items-center gap-1.5">
+                <InlineSpinner />
+                {saveMessage || "Testing new models before save."}
+              </span>
+            ) : savePhase === "saving" ? (
+              <span className="inline-flex items-center gap-1.5">
+                <InlineSpinner />
+                {saveMessage || "Saving provider models."}
+              </span>
+            ) : newModelIds.length > 0 && inferQuickStartConnectionType(provider) === "api"
               ? `${newModelIds.length} new model${newModelIds.length === 1 ? "" : "s"} will be tested before save.`
               : "Existing models keep their current configuration metadata."}
           </div>
@@ -4394,11 +4490,11 @@ function ProviderModelsEditor({
                 Reset
               </Button>
             ) : null}
-            {!disabled && !locked && isDirty && !issue ? (
-              <Button type="button" onClick={() => void handleApply()}>
-                {submitState === "testing"
+            {!disabled && isDirty && !issue ? (
+              <Button type="button" onClick={() => void handleApply()} disabled={locked}>
+                {savePhase === "testing" || submitState === "testing"
                   ? "Testing…"
-                  : submitState === "saving" || busy
+                  : savePhase === "saving" || submitState === "saving" || busy
                     ? "Saving…"
                     : "Save models"}
               </Button>
@@ -5807,6 +5903,7 @@ function ProviderCard({
   const [draft, setDraft] = useState(initialDraft);
   const [editOpen, setEditOpen] = useState(false);
   const [confirmCloseOpen, setConfirmCloseOpen] = useState(false);
+  const [failedCloseOpen, setFailedCloseOpen] = useState(false);
   const [editTab, setEditTab] = useState("provider");
   const [editFocusTarget, setEditFocusTarget] = useState("");
   const [modelFocusRequest, setModelFocusRequest] = useState(0);
@@ -5815,6 +5912,12 @@ function ProviderCard({
     issue: "",
     locked: false,
     rows: []
+  });
+  const [modelSaveState, setModelSaveState] = useState({
+    phase: "",
+    modelStates: {},
+    failedModelIds: [],
+    message: ""
   });
   const endpointSectionRef = useRef(null);
   const endpointInputRef = useRef(null);
@@ -5837,6 +5940,7 @@ function ProviderCard({
   const draftSignature = JSON.stringify({
     id: String(draft?.id || "").trim(),
     name: String(draft?.name || "").trim(),
+    credentialInput: String(draft?.credentialInput || "").trim(),
     endpoints: resolvedEndpoints,
     endpointDraft: String(draft?.endpointDraft || "").trim(),
     rateLimitRows: serializeRateLimitDraftRows(draft?.rateLimitRows)
@@ -5844,12 +5948,16 @@ function ProviderCard({
   const initialSignature = JSON.stringify({
     id: String(initialDraft?.id || "").trim(),
     name: String(initialDraft?.name || "").trim(),
+    credentialInput: String(initialDraft?.credentialInput || "").trim(),
     endpoints: normalizeUniqueTrimmedValues(initialDraft?.endpoints),
     endpointDraft: String(initialDraft?.endpointDraft || "").trim(),
     rateLimitRows: serializeRateLimitDraftRows(initialDraft?.rateLimitRows)
   });
   const isDirty = draftSignature !== initialSignature;
   const locked = Boolean(disabledReason) || busy;
+  const activeModelIds = new Set((Array.isArray(modelEditorState.rows) ? modelEditorState.rows : []).map((row) => String(row?.id || "").trim()).filter(Boolean));
+  const activeFailedModelIds = modelSaveState.failedModelIds.filter((modelId) => activeModelIds.has(modelId));
+  const modalCloseLocked = locked || modelSaveState.phase === "testing" || modelSaveState.phase === "saving";
   const rateLimitIssue = !isSubscription
     ? validateRateLimitDraftRows(resolvedRateLimitRows, {
         knownModelIds: modelIds,
@@ -5881,6 +5989,8 @@ function ProviderCard({
     hasModelUnsavedChanges && modelEditorState.issue ? `Models: ${modelEditorState.issue}` : ""
   ].filter(Boolean).join(" ");
   const saveAndCloseDisabled = locked
+    || modelSaveState.phase === "testing"
+    || modelSaveState.phase === "saving"
     || (isDirty && Boolean(issue))
     || (hasModelUnsavedChanges && (Boolean(modelEditorState.issue) || modelEditorState.locked))
     || typeof onSaveAndCloseEditor !== "function";
@@ -5895,7 +6005,17 @@ function ProviderCard({
   }
 
   async function handleApplyModelsAndClose(rows) {
-    const saved = await onApplyProviderModels(provider.id, rows);
+    const saved = await onApplyProviderModels(provider.id, rows, {
+      providerDraft: isDirty ? providerDraftForSave : null,
+      onModelTestStateChange: (nextState) => {
+        setModelSaveState({
+          phase: String(nextState?.phase || ""),
+          modelStates: nextState?.modelStates && typeof nextState.modelStates === "object" ? nextState.modelStates : {},
+          failedModelIds: Array.isArray(nextState?.failedModelIds) ? nextState.failedModelIds : [],
+          message: String(nextState?.message || "")
+        });
+      }
+    });
     if (saved) finalizeCloseEditModal();
     return saved;
   }
@@ -5904,8 +6024,13 @@ function ProviderCard({
     setDraft(initialDraft);
   }
 
+  function handleModelEditorStateChange(nextState) {
+    setModelEditorState(nextState);
+  }
+
   function finalizeCloseEditModal() {
     setConfirmCloseOpen(false);
+    setFailedCloseOpen(false);
     setEditOpen(false);
     setEditTab("provider");
     setEditFocusTarget("");
@@ -5916,7 +6041,56 @@ function ProviderCard({
       locked: false,
       rows: []
     });
+    setModelSaveState({
+      phase: "",
+      modelStates: {},
+      failedModelIds: [],
+      message: ""
+    });
   }
+
+  async function handleRemoveFailedModelsAndClose() {
+    const remainingRows = (Array.isArray(modelEditorState.rows) ? modelEditorState.rows : [])
+      .filter((row) => !activeFailedModelIds.includes(String(row?.id || "").trim()));
+
+    if (remainingRows.length === 0 && !isDirty) {
+      finalizeCloseEditModal();
+      return true;
+    }
+
+    const saved = await onSaveAndCloseEditor(provider.id, {
+      providerDraft: isDirty ? providerDraftForSave : null,
+      modelRows: hasModelUnsavedChanges ? remainingRows : null,
+      onModelTestStateChange: (nextState) => {
+        setModelSaveState({
+          phase: String(nextState?.phase || ""),
+          modelStates: nextState?.modelStates && typeof nextState.modelStates === "object" ? nextState.modelStates : {},
+          failedModelIds: Array.isArray(nextState?.failedModelIds) ? nextState.failedModelIds : [],
+          message: String(nextState?.message || "")
+        });
+      }
+    });
+    if (!saved) {
+      setEditTab("models");
+      return false;
+    }
+    finalizeCloseEditModal();
+    return true;
+  }
+
+  useEffect(() => {
+    setModelSaveState({
+      phase: "",
+      modelStates: {},
+      failedModelIds: [],
+      message: ""
+    });
+  }, [initialDraft]);
+
+  useEffect(() => {
+    if (activeFailedModelIds.length > 0 || !failedCloseOpen) return;
+    setFailedCloseOpen(false);
+  }, [activeFailedModelIds, failedCloseOpen]);
 
   useEffect(() => {
     if (!editOpen || editTab !== "provider") return undefined;
@@ -5935,6 +6109,7 @@ function ProviderCard({
 
   function handleOpenEditModal(tab = "provider", focusTarget = "") {
     setConfirmCloseOpen(false);
+    setFailedCloseOpen(false);
     setEditTab(tab);
     setEditFocusTarget(focusTarget);
     if (tab === "models" && focusTarget === "models") {
@@ -5944,6 +6119,12 @@ function ProviderCard({
   }
 
   function handleCloseEditModal() {
+    if (modalCloseLocked) return;
+    if (activeFailedModelIds.length > 0) {
+      setConfirmCloseOpen(false);
+      setFailedCloseOpen(true);
+      return;
+    }
     if (hasUnsavedChanges) {
       setConfirmCloseOpen(true);
       return;
@@ -5955,9 +6136,23 @@ function ProviderCard({
     if (saveAndCloseDisabled) return;
     const saved = await onSaveAndCloseEditor(provider.id, {
       providerDraft: isDirty ? providerDraftForSave : null,
-      modelRows: hasModelUnsavedChanges ? modelEditorState.rows : null
+      modelRows: hasModelUnsavedChanges ? modelEditorState.rows : null,
+      onModelTestStateChange: (nextState) => {
+        setModelSaveState({
+          phase: String(nextState?.phase || ""),
+          modelStates: nextState?.modelStates && typeof nextState.modelStates === "object" ? nextState.modelStates : {},
+          failedModelIds: Array.isArray(nextState?.failedModelIds) ? nextState.failedModelIds : [],
+          message: String(nextState?.message || "")
+        });
+      }
     });
-    if (!saved) return;
+    if (!saved) {
+      if (hasModelUnsavedChanges) {
+        setConfirmCloseOpen(false);
+        setEditTab("models");
+      }
+      return;
+    }
     finalizeCloseEditModal();
   }
 
@@ -6021,7 +6216,14 @@ function ProviderCard({
         open={editOpen}
         onClose={handleCloseEditModal}
         title={`Edit · ${provider.id}`}
-        description="Switch between provider settings and model list. Each tab saves independently."
+        description={modelSaveState.phase === "testing"
+          ? (modelSaveState.message || "Testing new models before save.")
+          : modelSaveState.phase === "saving"
+            ? (modelSaveState.message || "Saving provider changes.")
+            : "Switch between provider settings and model list. Each tab saves independently."}
+        closeDisabled={modalCloseLocked}
+        closeOnBackdrop={!modalCloseLocked}
+        closeOnEscape={!modalCloseLocked}
         contentClassName="max-h-[92vh] max-w-5xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
         bodyClassName="max-h-[calc(92vh-5.5rem)] pb-0"
       >
@@ -6044,15 +6246,23 @@ function ProviderCard({
 
             <div className={cn("grid gap-3", isSubscription ? "md:grid-cols-2" : "md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]")}>
               <Field label="Provider name" stacked>
-                <Input value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} disabled={locked} />
+                <Input value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} disabled={modalCloseLocked} />
               </Field>
               <Field label="Provider id" hint="Used in direct routes like provider/model" stacked>
-                <Input value={draft.id} onChange={(event) => setDraft((current) => ({ ...current, id: slugifyProviderId(event.target.value) }))} disabled={locked} />
+                <Input value={draft.id} onChange={(event) => setDraft((current) => ({ ...current, id: slugifyProviderId(event.target.value) }))} disabled={modalCloseLocked} />
               </Field>
             </div>
 
             {!isSubscription ? (
               <div className="space-y-3">
+                <Field label="API key or env" hint="Use an env var like OPENAI_API_KEY or paste the direct key." stacked>
+                  <Input
+                    value={draft.credentialInput || ""}
+                    onChange={(event) => setDraft((current) => ({ ...current, credentialInput: event.target.value }))}
+                    disabled={modalCloseLocked}
+                    placeholder="Example: OPENAI_API_KEY or sk-..."
+                  />
+                </Field>
                 <div ref={endpointSectionRef}>
                   <Field
                     label="Endpoints"
@@ -6067,7 +6277,7 @@ function ProviderCard({
                       draftValue={draft.endpointDraft}
                       onDraftValueChange={(value) => setDraft((current) => ({ ...current, endpointDraft: value }))}
                       commitOnBlur
-                      disabled={locked}
+                      disabled={modalCloseLocked}
                       isValueValid={isLikelyHttpEndpoint}
                       inputRef={endpointInputRef}
                       inputClassName="placeholder:text-muted-foreground/55"
@@ -6087,7 +6297,7 @@ function ProviderCard({
                           size="sm"
                           variant="outline"
                           onClick={() => setDraft((current) => ({ ...current, rateLimitRows: appendRateLimitDraftRow(current.rateLimitRows) }))}
-                          disabled={locked}
+                          disabled={modalCloseLocked}
                         >
                           Add rate limit
                         </Button>
@@ -6097,7 +6307,7 @@ function ProviderCard({
                         rows={draft.rateLimitRows}
                         onChange={(value) => setDraft((current) => ({ ...current, rateLimitRows: value }))}
                         availableModelIds={modelIds}
-                        disabled={locked}
+                        disabled={modalCloseLocked}
                         inputRef={rateLimitInputRef}
                       />
                     </Field>
@@ -6109,10 +6319,10 @@ function ProviderCard({
             {issue ? <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{issue}</div> : null}
 
             <div className="flex min-h-9 items-center justify-end gap-2">
-              {!locked && isDirty ? <Button type="button" variant="ghost" onClick={handleResetProviderDraft}>Reset</Button> : null}
-              {!locked && isDirty && !issue ? (
-                <Button type="button" onClick={() => void handleApplyClick()}>
-                  {busy ? "Saving…" : "Save provider"}
+              {!modalCloseLocked && isDirty ? <Button type="button" variant="ghost" onClick={handleResetProviderDraft}>Reset</Button> : null}
+              {isDirty && !issue ? (
+                <Button type="button" onClick={() => void handleApplyClick()} disabled={modalCloseLocked}>
+                  {modelSaveState.phase === "saving" || busy ? "Saving…" : "Save provider"}
                 </Button>
               ) : null}
             </div>
@@ -6126,8 +6336,11 @@ function ProviderCard({
               busy={busy}
               framed={false}
               focusRequest={modelFocusRequest}
-              onStateChange={setModelEditorState}
+              onStateChange={handleModelEditorStateChange}
               onApply={handleApplyModelsAndClose}
+              testStateByModel={modelSaveState.modelStates}
+              savePhase={modelSaveState.phase}
+              saveMessage={modelSaveState.message}
             />
           </TabsContent>
         </Tabs>
@@ -6141,6 +6354,14 @@ function ProviderCard({
         saveDisabled={saveAndCloseDisabled}
         dirtyLabels={closeDirtyLabels}
         details={closeDetails}
+      />
+
+      <FailedModelsCloseModal
+        open={failedCloseOpen}
+        failedModelIds={activeFailedModelIds}
+        onKeepEditing={() => setFailedCloseOpen(false)}
+        onRemoveFailedAndClose={handleRemoveFailedModelsAndClose}
+        removeDisabled={modalCloseLocked || typeof onSaveAndCloseEditor !== "function"}
       />
     </>
   );
@@ -9216,6 +9437,112 @@ export function App() {
     await saveDraftText(rawText, { successMessage, ...options });
   }
 
+  async function testNewProviderModels({
+    providerId,
+    endpoints,
+    newModelIds,
+    credentialPayload,
+    headers,
+    onModelTestStateChange
+  }) {
+    if (!Array.isArray(newModelIds) || newModelIds.length === 0) {
+      onModelTestStateChange?.({
+        phase: "",
+        modelStates: {},
+        failedModelIds: [],
+        message: ""
+      });
+      return { ok: true };
+    }
+
+    const modelStates = Object.fromEntries(newModelIds.map((modelId) => [modelId, "pending"]));
+    const emitState = ({ phase = "testing", message = "", failedModelIds = [] } = {}) => {
+      onModelTestStateChange?.({
+        phase,
+        modelStates: { ...modelStates },
+        failedModelIds,
+        message
+      });
+    };
+    const buildTestingMessage = () => {
+      const completedCount = newModelIds.filter((modelId) => modelStates[modelId] === "success" || modelStates[modelId] === "error").length;
+      return `Testing ${completedCount}/${newModelIds.length} new model${newModelIds.length === 1 ? "" : "s"} for ${providerId}.`;
+    };
+
+    emitState({ phase: "testing", message: buildTestingMessage() });
+
+    try {
+      const result = await fetchJsonLineStream("/api/config/test-provider-stream", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          endpoints,
+          models: newModelIds,
+          ...credentialPayload,
+          ...(headers && typeof headers === "object" && !Array.isArray(headers) ? { headers } : {})
+        })
+      }, {
+        onMessage: (message) => {
+          if (message?.type !== "progress") return;
+          const event = message.event || {};
+          if (event.phase !== "model-done") return;
+          const modelId = String(event.model || "").trim();
+          if (!modelId || !Object.prototype.hasOwnProperty.call(modelStates, modelId)) return;
+          modelStates[modelId] = event.confirmed ? "success" : "error";
+          emitState({ phase: "testing", message: buildTestingMessage() });
+        }
+      });
+
+      const confirmedModels = new Set(Array.isArray(result?.models) ? result.models : []);
+      const unresolvedModels = newModelIds.filter((modelId) => !confirmedModels.has(modelId));
+      for (const modelId of newModelIds) {
+        modelStates[modelId] = confirmedModels.has(modelId) ? "success" : "error";
+      }
+      if (!result?.ok || unresolvedModels.length > 0) {
+        const warningMessage = unresolvedModels.length > 0
+          ? `New model test failed for ${providerId}: ${unresolvedModels.join(", ")}.`
+          : (result?.warnings || []).join(" ") || `New model test failed for ${providerId}.`;
+        emitState({
+          phase: "",
+          failedModelIds: unresolvedModels,
+          message: warningMessage
+        });
+        showNotice("warning", warningMessage);
+        return {
+          ok: false,
+          failedModelIds: unresolvedModels,
+          result
+        };
+      }
+
+      emitState({
+        phase: "saving",
+        message: `Saving ${newModelIds.length} confirmed new model${newModelIds.length === 1 ? "" : "s"} for ${providerId}.`
+      });
+      return {
+        ok: true,
+        failedModelIds: [],
+        result
+      };
+    } catch (error) {
+      for (const modelId of newModelIds) {
+        if (modelStates[modelId] !== "success") modelStates[modelId] = "error";
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const failedModelIds = newModelIds.filter((modelId) => modelStates[modelId] === "error");
+      emitState({
+        phase: "",
+        failedModelIds,
+        message: errorMessage
+      });
+      showNotice("error", errorMessage);
+      return {
+        ok: false,
+        failedModelIds
+      };
+    }
+  }
+
   async function handleApplyProviderDetails(providerId, draftProvider, { showSuccessNotice = true } = {}) {
     if (providerEditorDisabledReason) {
       showNotice("warning", providerEditorDisabledReason);
@@ -9284,7 +9611,7 @@ export function App() {
 
   async function handleSaveProviderEditorChanges(
     providerId,
-    { providerDraft = null, modelRows = null, showSuccessNotice = true } = {}
+    { providerDraft = null, modelRows = null, showSuccessNotice = true, onModelTestStateChange = null } = {}
   ) {
     if (providerEditorDisabledReason) {
       showNotice("warning", providerEditorDisabledReason);
@@ -9396,36 +9723,21 @@ export function App() {
           return false;
         }
 
-        const credentialPayload = getStoredProviderCredentialPayload(existingProvider);
+        const credentialPayload = getDraftProviderCredentialPayload(providerDraft, existingProvider);
         if (!credentialPayload.apiKey && !credentialPayload.apiKeyEnv) {
           showNotice("warning", `Provider '${resolvedProviderId}' needs an API key or env before testing new models.`);
           return false;
         }
 
-        try {
-          const result = await fetchJsonLineStream("/api/config/test-provider-stream", {
-            method: "POST",
-            headers: JSON_HEADERS,
-            body: JSON.stringify({
-              endpoints: resolvedEndpoints,
-              models: newModelIds,
-              ...credentialPayload,
-              ...(existingProvider?.headers && typeof existingProvider.headers === "object" && !Array.isArray(existingProvider.headers)
-                ? { headers: existingProvider.headers }
-                : {})
-            })
-          });
-          const confirmedModels = new Set(Array.isArray(result?.models) ? result.models : []);
-          const unresolvedModels = newModelIds.filter((modelId) => !confirmedModels.has(modelId));
-          if (!result?.ok || unresolvedModels.length > 0) {
-            const warningMessage = unresolvedModels.length > 0
-              ? `New model test failed for ${resolvedProviderId}: ${unresolvedModels.join(", ")}.`
-              : (result?.warnings || []).join(" ") || `New model test failed for ${resolvedProviderId}.`;
-            showNotice("warning", warningMessage);
-            return false;
-          }
-        } catch (error) {
-          showNotice("error", error instanceof Error ? error.message : String(error));
+        const testOutcome = await testNewProviderModels({
+          providerId: resolvedProviderId,
+          endpoints: resolvedEndpoints,
+          newModelIds,
+          credentialPayload,
+          headers: existingProvider?.headers,
+          onModelTestStateChange
+        });
+        if (!testOutcome.ok) {
           return false;
         }
       }
@@ -9459,6 +9771,12 @@ export function App() {
 
     try {
       await saveInlineConfigObject(nextConfig, successMessage, { showSuccessNotice });
+      onModelTestStateChange?.({
+        phase: "",
+        modelStates: {},
+        failedModelIds: [],
+        message: ""
+      });
       return true;
     } catch {
       return false;
@@ -9578,7 +9896,7 @@ export function App() {
     }
   }
 
-  async function handleApplyProviderModels(providerId, rows) {
+  async function handleApplyProviderModels(providerId, rows, { providerDraft = null, onModelTestStateChange = null } = {}) {
     if (providerEditorDisabledReason) {
       showNotice("warning", providerEditorDisabledReason);
       return false;
@@ -9596,6 +9914,12 @@ export function App() {
         id: String(row?.id || "").trim()
       }))
       .filter((row) => row.id);
+    const resolvedProviderId = providerDraft ? String(providerDraft?.id || "").trim() || providerId : providerId;
+    const endpoints = providerDraft
+      ? (Array.isArray(providerDraft?.endpoints)
+        ? normalizeUniqueTrimmedValues(providerDraft.endpoints)
+        : mergeChipValuesAndDraft([], providerDraft?.endpoint || ""))
+      : collectQuickStartEndpoints(existingProvider);
     const currentModelIds = (Array.isArray(existingProvider?.models) ? existingProvider.models : [])
       .map((model) => String(model?.id || "").trim())
       .filter(Boolean);
@@ -9604,42 +9928,26 @@ export function App() {
       .filter((modelId) => !currentModelIds.includes(modelId));
 
     if (inferQuickStartConnectionType(existingProvider) === "api" && newModelIds.length > 0) {
-      const endpoints = collectQuickStartEndpoints(existingProvider);
       if (endpoints.length === 0) {
-        showNotice("warning", `Provider '${providerId}' needs at least one endpoint before testing new models.`);
+        showNotice("warning", `Provider '${resolvedProviderId}' needs at least one endpoint before testing new models.`);
         return false;
       }
 
-      const credentialPayload = getStoredProviderCredentialPayload(existingProvider);
+      const credentialPayload = getDraftProviderCredentialPayload(providerDraft, existingProvider);
       if (!credentialPayload.apiKey && !credentialPayload.apiKeyEnv) {
-        showNotice("warning", `Provider '${providerId}' needs an API key or env before testing new models.`);
+        showNotice("warning", `Provider '${resolvedProviderId}' needs an API key or env before testing new models.`);
         return false;
       }
 
-      try {
-        const result = await fetchJsonLineStream("/api/config/test-provider-stream", {
-          method: "POST",
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            endpoints,
-            models: newModelIds,
-            ...credentialPayload,
-            ...(existingProvider?.headers && typeof existingProvider.headers === "object" && !Array.isArray(existingProvider.headers)
-              ? { headers: existingProvider.headers }
-              : {})
-          })
-        });
-        const confirmedModels = new Set(Array.isArray(result?.models) ? result.models : []);
-        const unresolvedModels = newModelIds.filter((modelId) => !confirmedModels.has(modelId));
-        if (!result?.ok || unresolvedModels.length > 0) {
-          const warningMessage = unresolvedModels.length > 0
-            ? `New model test failed for ${providerId}: ${unresolvedModels.join(", ")}.`
-            : (result?.warnings || []).join(" ") || `New model test failed for ${providerId}.`;
-          showNotice("warning", warningMessage);
-          return false;
-        }
-      } catch (error) {
-        showNotice("error", error instanceof Error ? error.message : String(error));
+      const testOutcome = await testNewProviderModels({
+        providerId: resolvedProviderId,
+        endpoints,
+        newModelIds,
+        credentialPayload,
+        headers: existingProvider?.headers,
+        onModelTestStateChange
+      });
+      if (!testOutcome.ok) {
         return false;
       }
     }
@@ -9650,6 +9958,12 @@ export function App() {
         ? `Tested ${newModelIds.length} new model${newModelIds.length === 1 ? "" : "s"} and updated ${providerId}.`
         : `Updated models for ${providerId}.`;
       await saveInlineConfigObject(nextConfig, successMessage);
+      onModelTestStateChange?.({
+        phase: "",
+        modelStates: {},
+        failedModelIds: [],
+        message: ""
+      });
       return true;
     } catch {
       return false;

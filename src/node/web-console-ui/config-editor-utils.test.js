@@ -283,6 +283,7 @@ test("applyProviderInlineEdits renames provider refs and updates api endpoint fi
         id: "openai",
         name: "OpenAI",
         baseUrl: "https://api.openai.com/v1",
+        apiKeyEnv: "OPENAI_API_KEY",
         baseUrlByFormat: {
           openai: "https://api.openai.com/v1",
           claude: "https://api.openai.com/v1"
@@ -327,6 +328,7 @@ test("applyProviderInlineEdits renames provider refs and updates api endpoint fi
   const next = applyProviderInlineEdits(config, "openai", {
     id: "openai-primary",
     name: "OpenAI Primary",
+    credentialInput: "sk-live-updated",
     endpoints: ["https://gateway.example.test/v1", "https://gateway.example.test/v2"],
     rateLimitRows: [
       {
@@ -341,6 +343,8 @@ test("applyProviderInlineEdits renames provider refs and updates api endpoint fi
 
   assert.equal(next.providers[0].id, "openai-primary");
   assert.equal(next.providers[0].name, "OpenAI Primary");
+  assert.equal(next.providers[0].apiKey, "sk-live-updated");
+  assert.equal(Object.prototype.hasOwnProperty.call(next.providers[0], "apiKeyEnv"), false);
   assert.equal(next.providers[0].baseUrl, "https://gateway.example.test/v1");
   assert.deepEqual(next.providers[0].baseUrlByFormat, {
     openai: "https://gateway.example.test/v1",
@@ -359,6 +363,67 @@ test("applyProviderInlineEdits renames provider refs and updates api endpoint fi
   assert.equal(next.providers[0].rateLimits[0].window.size, 2);
   assert.equal(next.providers[0].rateLimits[0].window.unit, "minute");
   assert.equal(Object.prototype.hasOwnProperty.call(next.providers[0].rateLimits[0], "name"), false);
+});
+
+test("applyProviderInlineEdits switches provider credentials between env and direct api key", () => {
+  const config = createBaseConfig({
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI",
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "sk-live-original",
+        format: "openai",
+        models: [{ id: "gpt-4o-mini" }],
+        rateLimits: [
+          {
+            id: "default",
+            models: ["all"],
+            requests: 60,
+            window: { unit: "minute", size: 1 }
+          }
+        ]
+      }
+    ]
+  });
+
+  const envNext = applyProviderInlineEdits(config, "openai", {
+    id: "openai",
+    name: "OpenAI",
+    credentialInput: "OPENAI_API_KEY",
+    endpoints: ["https://api.openai.com/v1"],
+    rateLimitRows: [
+      {
+        sourceId: "default",
+        models: ["all"],
+        requests: "60",
+        windowValue: "1",
+        windowUnit: "minute"
+      }
+    ]
+  });
+
+  assert.equal(envNext.providers[0].apiKeyEnv, "OPENAI_API_KEY");
+  assert.equal(Object.prototype.hasOwnProperty.call(envNext.providers[0], "apiKey"), false);
+
+  const clearedNext = applyProviderInlineEdits(envNext, "openai", {
+    id: "openai",
+    name: "OpenAI",
+    credentialInput: "",
+    endpoints: ["https://api.openai.com/v1"],
+    rateLimitRows: [
+      {
+        sourceId: envNext.providers[0].rateLimits[0].id,
+        models: ["all"],
+        requests: "60",
+        windowValue: "1",
+        windowUnit: "minute"
+      }
+    ]
+  });
+
+  assert.equal(Object.prototype.hasOwnProperty.call(clearedNext.providers[0], "apiKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(clearedNext.providers[0], "apiKeyEnv"), false);
 });
 
 test("applyProviderInlineEdits rewrites all rate-limit entities and preserves bucket metadata", () => {

@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.4] - 2026-03-15
+
 ### Fixed
 - Raised the default inbound JSON body limit for OpenAI `/responses` requests from `1 MiB` to `8 MiB` while keeping other JSON routes at `1 MiB`. This prevents local `413 Request body too large` failures for Codex CLI and other Responses API clients carrying larger conversation state.
+- Updated the web console provider editor so API-based providers can rotate between env-backed and direct API key credentials in place without leaving the modal.
+- Improved the web console model-save flow for API-based providers:
+  - new-model tests now stream visible progress while save is in flight
+  - successful new models stay marked as confirmed
+  - only failed new models are marked as failed
+  - the edit modal blocks backdrop/close dismissal while tests are running
+  - closing after failed tests now offers removing failed rows while keeping successful new rows
+- Improved dual-format Claude provider routing so Claude tool calls can prefer OpenAI-compatible tool execution paths when available, while falling back cleanly to native Claude routing if the OpenAI-compatible path fails.
 
 ## [2.0.1] - 2026-03-15
 
