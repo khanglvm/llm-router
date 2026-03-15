@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.5] - 2026-03-15
+
+### Fixed
+- Relaxed the live coding-tool publish checks so known external Codex model-verbosity mismatches and Claude MCP schema-validation failures are treated as acceptable upstream tool failures instead of blocking npm publication.
+
 ## [2.0.4] - 2026-03-15
 
 ### Fixed

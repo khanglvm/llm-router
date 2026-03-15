@@ -213,7 +213,7 @@ async function readAmpUpstreamApiKey({ env = process.env, homeDir = os.homedir()
 }
 
 function isAcceptableLiveToolFailure(output = "") {
-  return /high demand|provider network error|fetch failed|overloaded|temporar(?:y|ily) unavailable|rate limit/i.test(String(output || ""));
+  return /high demand|provider network error|fetch failed|overloaded|temporar(?:y|ily) unavailable|rate limit|unsupported value: 'low'|text\.verbosity|invalid schema for function|object schema missing properties/i.test(String(output || ""));
 }
 
 async function configureAmpClientFiles({
