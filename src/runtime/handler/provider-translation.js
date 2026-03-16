@@ -694,9 +694,10 @@ export function handleClaudeStreamToOpenAIResponses(response, requestBody, fallb
       const index = Number(payload.index);
       const blockInfo = payload.content_block || {};
       state.activeBlocks.set(index, String(blockInfo.type || "").trim());
+      // Defer text output item creation until first renderable text delta
+      // to avoid emitting empty assistant text scaffolding before tool calls.
       if (blockInfo.type === "text") {
-        ensureOpenAIResponsesTextItem(state, controller, encoder);
-        state.textOpened = true;
+        // Intentionally do NOT open text item yet; wait for renderable text in content_block_delta.
       } else if (blockInfo.type === "thinking" || blockInfo.type === "redacted_thinking") {
         ensureOpenAIResponsesReasoningItem(state, index, controller, encoder);
       } else if (blockInfo.type === "tool_use") {
@@ -709,6 +710,10 @@ export function handleClaudeStreamToOpenAIResponses(response, requestBody, fallb
       const index = Number(payload.index);
       const delta = payload.delta || {};
       if (delta.type === "text_delta" && typeof delta.text === "string") {
+        const hasRenderableText = /\S/.test(delta.text);
+        if (!state.textOpened && !hasRenderableText) {
+          return;
+        }
         ensureOpenAIResponsesTextItem(state, controller, encoder);
         state.textOpened = true;
         state.textBuffer += delta.text;

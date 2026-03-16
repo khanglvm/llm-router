@@ -4,6 +4,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { createFetchHandler } from "./handler.js";
 import { normalizeRuntimeConfig } from "./config.js";
 import { inferAmpContextRequirement, isAmpManagementPath, resolveApiRoute } from "./handler/request.js";
+import { maybeRewriteAmpClientResponse } from "./handler/amp-response.js";
 
 function buildConfig(overrides = {}) {
   return normalizeRuntimeConfig({
@@ -2574,4 +2575,330 @@ test("createFetchHandler falls back when AMP web search returns semantic credits
       await fetchHandler.close();
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Amp thinking block suppression edge cases
+// ---------------------------------------------------------------------------
+
+function buildSseStream(eventStrings) {
+  const encoder = new TextEncoder();
+  const combined = eventStrings.join("");
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(combined));
+      controller.close();
+    }
+  });
+}
+
+async function readSseEvents(response) {
+  const raw = await response.text();
+  return parseSseEvents(raw);
+}
+
+test("Amp thinking block suppression: non-streaming with tool_use strips thinking block", async () => {
+  const response = new Response(
+    JSON.stringify({
+      model: "claude-sonnet-4-6",
+      content: [
+        { type: "thinking", thinking: "internal chain of thought" },
+        { type: "text", text: "hello" },
+        { type: "tool_use", id: "t1", name: "bash", input: {} }
+      ]
+    }),
+    { headers: { "content-type": "application/json" } }
+  );
+
+  const result = await maybeRewriteAmpClientResponse(response, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: false
+  });
+
+  const payload = await readJson(result);
+  const types = payload.content.map((b) => b.type);
+  assert.ok(!types.includes("thinking"), "thinking block should be stripped");
+  assert.ok(types.includes("text"), "text block should remain");
+  assert.ok(types.includes("tool_use"), "tool_use block should remain");
+  assert.equal(payload.content.length, 2);
+});
+
+test("Amp thinking block suppression: non-streaming without tool_use preserves thinking block", async () => {
+  const response = new Response(
+    JSON.stringify({
+      model: "claude-sonnet-4-6",
+      content: [
+        { type: "thinking", thinking: "internal chain of thought" },
+        { type: "text", text: "hello" }
+      ]
+    }),
+    { headers: { "content-type": "application/json" } }
+  );
+
+  const result = await maybeRewriteAmpClientResponse(response, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: false
+  });
+
+  const payload = await readJson(result);
+  const types = payload.content.map((b) => b.type);
+  assert.ok(types.includes("thinking"), "thinking block should be preserved when no tool_use");
+  assert.equal(payload.content.length, 2);
+});
+
+test("Amp thinking block suppression: streaming [thinking, text, tool_use] suppresses thinking and remaps indexes", async () => {
+  const stream = buildSseStream([
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning...\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n"
+  ]);
+
+  const upstreamResponse = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+
+  const result = await maybeRewriteAmpClientResponse(upstreamResponse, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: true
+  });
+
+  const events = await readSseEvents(result);
+  const blockStarts = events.filter((e) => e.payload?.type === "content_block_start");
+  const blockDeltas = events.filter((e) => e.payload?.type === "content_block_delta");
+  const blockStops = events.filter((e) => e.payload?.type === "content_block_stop");
+
+  // Thinking block (original index 0) should be suppressed entirely
+  const thinkingStart = blockStarts.find((e) => e.payload?.content_block?.type === "thinking");
+  assert.equal(thinkingStart, undefined, "thinking content_block_start should be suppressed");
+
+  // Text block should appear with remapped index 0
+  const textStart = blockStarts.find((e) => e.payload?.content_block?.type === "text");
+  assert.ok(textStart, "text block start should be present");
+  assert.equal(textStart.payload.index, 0, "text block should be remapped to index 0");
+
+  // tool_use block should appear with remapped index 1
+  const toolStart = blockStarts.find((e) => e.payload?.content_block?.type === "tool_use");
+  assert.ok(toolStart, "tool_use block start should be present");
+  assert.equal(toolStart.payload.index, 1, "tool_use block should be remapped to index 1");
+
+  // Deltas for text (originally 1) should be at index 0
+  const textDelta = blockDeltas.find((e) => e.payload?.delta?.type === "text_delta");
+  assert.ok(textDelta, "text delta should be present");
+  assert.equal(textDelta.payload.index, 0, "text delta index should be remapped to 0");
+
+  // Stop events should only contain indexes 0 and 1
+  const stopIndexes = blockStops.map((e) => e.payload?.index);
+  assert.ok(!stopIndexes.includes(2), "original index 2 should be remapped");
+  assert.ok(stopIndexes.includes(0), "remapped index 0 stop should be present");
+  assert.ok(stopIndexes.includes(1), "remapped index 1 stop should be present");
+});
+
+test("Amp thinking block suppression: streaming [thinking, tool_use, thinking, tool_use] suppresses both thinking blocks", async () => {
+  const stream = buildSseStream([
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"bash\",\"input\":{}}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"read\",\"input\":{}}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
+  ]);
+
+  const upstreamResponse = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+
+  const result = await maybeRewriteAmpClientResponse(upstreamResponse, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: true
+  });
+
+  const events = await readSseEvents(result);
+  const blockStarts = events.filter((e) => e.payload?.type === "content_block_start");
+  const blockTypes = blockStarts.map((e) => e.payload?.content_block?.type);
+
+  assert.ok(!blockTypes.includes("thinking"), "no thinking blocks should appear");
+  assert.equal(blockTypes.filter((t) => t === "tool_use").length, 2, "both tool_use blocks should be present");
+
+  const toolStartIndexes = blockStarts.map((e) => e.payload?.index);
+  assert.deepEqual(toolStartIndexes, [0, 1], "tool_use blocks should be remapped to indexes 0 and 1");
+});
+
+test("Amp thinking block suppression: streaming [text, thinking] with no tool_use still suppresses thinking", async () => {
+  const stream = buildSseStream([
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"visible\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hidden reasoning\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+  ]);
+
+  const upstreamResponse = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+
+  const result = await maybeRewriteAmpClientResponse(upstreamResponse, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: true
+  });
+
+  const events = await readSseEvents(result);
+  const blockStarts = events.filter((e) => e.payload?.type === "content_block_start");
+  const blockTypes = blockStarts.map((e) => e.payload?.content_block?.type);
+
+  assert.ok(!blockTypes.includes("thinking"), "streaming always suppresses thinking even without tool_use");
+  assert.ok(blockTypes.includes("text"), "text block should remain");
+  assert.equal(blockStarts[0]?.payload?.index, 0, "text block keeps index 0");
+});
+
+test("Amp thinking block suppression: streaming [redacted_thinking, text] suppresses redacted_thinking", async () => {
+  const stream = buildSseStream([
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"encrypted\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+  ]);
+
+  const upstreamResponse = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+
+  const result = await maybeRewriteAmpClientResponse(upstreamResponse, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: true
+  });
+
+  const events = await readSseEvents(result);
+  const blockStarts = events.filter((e) => e.payload?.type === "content_block_start");
+  const blockTypes = blockStarts.map((e) => e.payload?.content_block?.type);
+
+  assert.ok(!blockTypes.includes("redacted_thinking"), "redacted_thinking should be suppressed");
+  assert.ok(blockTypes.includes("text"), "text block should remain");
+  assert.equal(blockStarts[0]?.payload?.index, 0, "text block remapped to index 0");
+});
+
+test("Amp thinking block suppression: streaming message_delta usage stats pass through with suppressed blocks", async () => {
+  const stream = buildSseStream([
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+  ]);
+
+  const upstreamResponse = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" }
+  });
+
+  const result = await maybeRewriteAmpClientResponse(upstreamResponse, {
+    clientType: "amp",
+    requestBody: { model: "claude-sonnet-4-6" },
+    stream: true
+  });
+
+  const events = await readSseEvents(result);
+  const messageDelta = events.find((e) => e.payload?.type === "message_delta");
+  assert.ok(messageDelta, "message_delta should not be suppressed");
+  assert.equal(messageDelta.payload.usage?.input_tokens, 10, "input_tokens should pass through");
+  assert.equal(messageDelta.payload.usage?.output_tokens, 5, "output_tokens should pass through");
+  assert.equal(messageDelta.payload.delta?.stop_reason, "end_turn", "stop_reason should pass through");
+
+  const messageStop = events.find((e) => e.payload?.type === "message_stop");
+  assert.ok(messageStop, "message_stop should not be suppressed");
+});
+
+// Helper for testing extractAmpContext
+function mockRequest(headerMap = {}) {
+  const headers = new Map(Object.entries(headerMap));
+  return {
+    headers: {
+      get: (key) => headers.get(key) || null
+    }
+  };
+}
+
+test("Amp header extraction and mode presets", async (t) => {
+  const { extractAmpContext } = await import("./handler/request.js");
+
+  await t.test("Returns all header values when all present", () => {
+    const request = mockRequest({
+      "x-amp-thread-id": "thread-123",
+      "x-amp-mode": "deep",
+      "x-amp-override-provider": "openai",
+      "x-amp-feature": "web-search",
+      "x-amp-message-id": "msg-456"
+    });
+
+    const context = extractAmpContext(request);
+    assert.equal(context.threadId, "thread-123");
+    assert.equal(context.mode, "deep");
+    assert.equal(context.overrideProvider, "openai");
+    assert.equal(context.feature, "web-search");
+    assert.equal(context.messageId, "msg-456");
+  });
+
+  await t.test("Returns empty strings for missing headers", () => {
+    const request = mockRequest({});
+
+    const context = extractAmpContext(request);
+    assert.equal(context.threadId, "");
+    assert.equal(context.mode, "");
+    assert.equal(context.overrideProvider, "");
+    assert.equal(context.feature, "");
+    assert.equal(context.messageId, "");
+  });
+
+  await t.test("Mode 'deep' → presets.reasoningEffort = 'high'", () => {
+    const request = mockRequest({ "x-amp-mode": "deep" });
+    const context = extractAmpContext(request);
+
+    assert.deepEqual(context.presets, { reasoningEffort: "high", toolChoice: "" });
+  });
+
+  await t.test("Mode 'rush' → presets.reasoningEffort = 'low'", () => {
+    const request = mockRequest({ "x-amp-mode": "rush" });
+    const context = extractAmpContext(request);
+
+    assert.deepEqual(context.presets, { reasoningEffort: "low", toolChoice: "" });
+  });
+
+  await t.test("Mode 'smart' → presets.reasoningEffort = ''", () => {
+    const request = mockRequest({ "x-amp-mode": "smart" });
+    const context = extractAmpContext(request);
+
+    assert.deepEqual(context.presets, { reasoningEffort: "", toolChoice: "" });
+  });
+
+  await t.test("Unknown mode → presets = null", () => {
+    const request = mockRequest({ "x-amp-mode": "unknown-mode" });
+    const context = extractAmpContext(request);
+
+    assert.strictEqual(context.presets, null);
+  });
+
+  await t.test("Mode is case-insensitive", () => {
+    const request = mockRequest({ "x-amp-mode": "DEEP" });
+    const context = extractAmpContext(request);
+
+    assert.deepEqual(context.presets, { reasoningEffort: "high", toolChoice: "" });
+  });
 });

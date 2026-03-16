@@ -547,7 +547,8 @@ export async function makeProviderCall({
   env,
   clientType,
   runtimeConfig,
-  stateStore
+  stateStore,
+  ampContext
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
@@ -566,11 +567,16 @@ export async function makeProviderCall({
     body
   });
 
+  let effectiveBody = body;
+  if (ampContext?.presets?.reasoningEffort && !body?.reasoning_effort && !body?.reasoning?.effort) {
+    effectiveBody = { ...body, reasoning_effort: ampContext.presets.reasoningEffort };
+  }
+
   let activePlan;
   let fallbackPlan = null;
   try {
     activePlan = buildProviderRequestPlan({
-      body,
+      body: effectiveBody,
       sourceFormat,
       targetFormat: preferOpenAIToolRouting ? FORMATS.OPENAI : targetFormat,
       candidate,
@@ -581,7 +587,7 @@ export async function makeProviderCall({
     });
     if (preferOpenAIToolRouting) {
       fallbackPlan = buildProviderRequestPlan({
-        body,
+        body: effectiveBody,
         sourceFormat,
         targetFormat,
         candidate,
@@ -619,6 +625,12 @@ export async function makeProviderCall({
 
   if (isSubscriptionProvider(provider)) {
     const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
+    if (subscriptionType === "chatgpt-codex" && ampContext?.threadId) {
+      activePlan.providerBody = {
+        ...activePlan.providerBody,
+        prompt_cache_key: activePlan.providerBody.prompt_cache_key || ampContext.threadId
+      };
+    }
     const executeSubscriptionRequest = async (requestBody) => makeSubscriptionProviderCall({
       provider,
       body: requestBody,

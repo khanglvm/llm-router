@@ -461,3 +461,28 @@ export function isStreamingEnabled(sourceFormat, body) {
   // Some clients omit `stream` on follow-up/tool turns and expect JSON responses.
   return body?.stream === true;
 }
+
+const AMP_MODE_PRESETS = new Map([
+  ["smart", { reasoningEffort: "", toolChoice: "" }],
+  ["free",  { reasoningEffort: "", toolChoice: "" }],
+  ["rush",  { reasoningEffort: "low", toolChoice: "" }],
+  ["deep",  { reasoningEffort: "high", toolChoice: "" }],
+  ["large", { reasoningEffort: "", toolChoice: "" }],
+  ["bombadil", { reasoningEffort: "", toolChoice: "" }]
+]);
+
+export function extractAmpContext(request) {
+  const headers = request?.headers;
+  if (!headers || typeof headers.get !== "function") {
+    return { threadId: "", mode: "", overrideProvider: "", feature: "", messageId: "", presets: null };
+  }
+
+  const threadId = String(headers.get("x-amp-thread-id") || "").trim();
+  const mode = String(headers.get("x-amp-mode") || "").trim().toLowerCase();
+  const overrideProvider = String(headers.get("x-amp-override-provider") || "").trim().toLowerCase();
+  const feature = String(headers.get("x-amp-feature") || "").trim();
+  const messageId = String(headers.get("x-amp-message-id") || "").trim();
+  const presets = AMP_MODE_PRESETS.get(mode) || null;
+
+  return { threadId, mode, overrideProvider, feature, messageId, presets };
+}

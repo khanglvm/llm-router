@@ -24,6 +24,7 @@ import { corsResponse, jsonResponse } from "./handler/http.js";
 import {
   detectUserRequestFormat,
   estimateRequestContextTokens,
+  extractAmpContext,
   inferAmpContextRequirement,
   isAmpManagementPath,
   isJsonRequest,
@@ -45,7 +46,7 @@ import {
   convertAmpGeminiRequestToOpenAI,
   hasGeminiWebSearchTool
 } from "./handler/amp-gemini.js";
-import { shouldInterceptAmpWebSearch } from "./handler/amp-web-search.js";
+import { shouldInterceptAmpWebSearch, maybeInterceptAmpInternalSearch } from "./handler/amp-web-search.js";
 import {
   isRequestFromAllowedIp,
   resolveAllowedOrigin,
@@ -59,6 +60,7 @@ import {
   resolveRetryPolicy
 } from "./handler/fallback.js";
 import { parseJsonSafely, sleep } from "./handler/utils.js";
+import { createThreadAffinityStore } from "./thread-affinity.js";
 import {
   applyCandidateFailureState,
   applyRuntimeRetryPolicyGuards,
@@ -457,6 +459,9 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
 
   const requestedModel = body?.model || "smart";
   const stream = isStreamingEnabled(sourceFormat, body);
+  const ampContext = options.clientType === "amp"
+    ? extractAmpContext(request)
+    : null;
 
   const interceptAmpWebSearch = shouldInterceptAmpWebSearch({
     clientType: options.clientType,
@@ -481,7 +486,7 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
 
   const resolved = resolveRequestModel(config, requestedModel, sourceFormat, {
     clientType: options.clientType,
-    providerHint: options.providerHint
+    providerHint: ampContext?.overrideProvider || options.providerHint
   });
   if (!resolved.primary) {
     if (options.clientType === "amp" && resolved.allowAmpProxy !== false && isAmpProxyEnabled(config)) {
@@ -604,6 +609,24 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     recordRouteSkip(routeDebug, skippedEntry.candidate, skippedEntry.skipReasons);
   }
 
+  // Thread affinity: reorder candidates to prefer affinity-bound candidate
+  if (ampContext?.threadId && options.threadAffinityStore) {
+    const affinityCandidateKey = options.threadAffinityStore.getAffinity(ampContext.threadId);
+    if (affinityCandidateKey) {
+      const affinityIndex = ranking.entries.findIndex(
+        (entry) => entry.eligible && entry.candidateKey === affinityCandidateKey
+      );
+      if (affinityIndex > 0) {
+        const [affinityEntry] = ranking.entries.splice(affinityIndex, 1);
+        ranking.entries.unshift(affinityEntry);
+        ranking.selectedEntry = affinityEntry;
+      }
+      if (affinityIndex < 0) {
+        options.threadAffinityStore.clearAffinity(ampContext.threadId);
+      }
+    }
+  }
+
   if (!ranking.selectedEntry) {
     return withRouteDebugHeaders(jsonResponse({
       type: "error",
@@ -652,7 +675,8 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
         env,
         clientType: options.clientType,
         runtimeConfig: config,
-        stateStore
+        stateStore,
+        ampContext
       });
 
       if (!quotaConsumed && shouldConsumeQuotaFromResult(result)) {
@@ -693,6 +717,9 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
             route: routeLabel
           });
           pendingFallbackContext = null;
+        }
+        if (ampContext?.threadId && options.threadAffinityStore) {
+          options.threadAffinityStore.setAffinity(ampContext.threadId, entry.candidateKey);
         }
         return withRouteDebugHeaders(result.response, routeDebug);
       }
@@ -784,6 +811,7 @@ export function createFetchHandler(options) {
   }
 
   let stateStoreRef = options.stateStore || null;
+  const threadAffinityStore = createThreadAffinityStore();
   let stateStorePromise = null;
 
   async function ensureStateStore(env = {}, runtimeFlags = {}) {
@@ -904,6 +932,11 @@ export function createFetchHandler(options) {
 
       if (!isAmpManagementAllowed(request, config)) {
         return respond(jsonResponse({ error: "Forbidden" }, 403));
+      }
+
+      const searchInterceptResult = await maybeInterceptAmpInternalSearch(request, url, config, env);
+      if (searchInterceptResult) {
+        return respond(searchInterceptResult);
       }
 
       return respond(await proxyAmpUpstreamRequest({ request, config }));
@@ -1051,7 +1084,8 @@ export function createFetchHandler(options) {
         providerHint: "google",
         requestKind: "chat-completions",
         stateStore,
-        runtimeFlags
+        runtimeFlags,
+        threadAffinityStore
       });
 
       if (routeResponse.status >= 400) {
@@ -1095,7 +1129,8 @@ export function createFetchHandler(options) {
         providerHint: route.providerHint,
         requestKind: route.requestKind,
         stateStore,
-        runtimeFlags
+        runtimeFlags,
+        threadAffinityStore
       });
       return respond(routeResponse);
     }

@@ -10,6 +10,7 @@ import {
   resolveRouteReference
 } from "../config.js";
 import { isSubscriptionProvider, makeSubscriptionProviderCall } from "../subscription-provider.js";
+import { jsonResponse } from "./http.js";
 
 const SEARCH_TOOL_NAME = "web_search";
 const READ_WEB_PAGE_TOOL_NAME = "read_web_page";
@@ -2176,6 +2177,135 @@ export async function testHostedWebSearchProviderRoute({
     providerId: resolvedRouteId.slice(0, resolvedRouteId.indexOf("/")),
     model: resolvedRouteId.slice(resolvedRouteId.indexOf("/") + 1)
   }, query, runtimeConfig, env);
+}
+
+async function fetchStructuredSearchResults(query, count, provider) {
+  const normalizedQuery = String(query || "").trim();
+  if (!normalizedQuery || !provider) return [];
+
+  const id = provider.id;
+
+  if (id === "brave") {
+    if (!provider.apiKey) return [];
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(normalizedQuery)}&count=${count}&text_decorations=false`;
+    const response = await runFetchWithTimeout(url, {
+      headers: { Accept: "application/json", "X-Subscription-Token": provider.apiKey }
+    });
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return (Array.isArray(payload?.web?.results) ? payload.web.results.slice(0, count) : [])
+      .map((item) => ({ title: String(item?.title || ""), url: String(item?.url || ""), snippet: String(item?.description || "") }));
+  }
+
+  if (id === "tavily") {
+    if (!provider.apiKey) return [];
+    const response = await runFetchWithTimeout("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: provider.apiKey, query: normalizedQuery, max_results: count, search_depth: "basic" })
+    });
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return (Array.isArray(payload?.results) ? payload.results.slice(0, count) : [])
+      .map((item) => ({ title: String(item?.title || ""), url: String(item?.url || ""), snippet: String(item?.content || "") }));
+  }
+
+  if (id === "exa") {
+    if (!provider.apiKey) return [];
+    const response = await runFetchWithTimeout("https://api.exa.ai/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": provider.apiKey },
+      body: JSON.stringify({ query: normalizedQuery, numResults: count, type: "auto", contents: { text: { maxCharacters: 500 } } })
+    });
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return (Array.isArray(payload?.results) ? payload.results.slice(0, count) : [])
+      .map((item) => ({ title: String(item?.title || ""), url: String(item?.url || ""), snippet: String(item?.text || item?.snippet || "") }));
+  }
+
+  if (id === "searxng") {
+    if (!provider.url) return [];
+    const url = `${provider.url}/search?q=${encodeURIComponent(normalizedQuery)}&format=json&categories=general&language=auto`;
+    const response = await runFetchWithTimeout(url, {
+      headers: { Accept: "application/json", "User-Agent": "llm-router" }
+    });
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return (Array.isArray(payload?.results) ? payload.results.slice(0, count) : [])
+      .map((item) => ({ title: String(item?.title || ""), url: String(item?.url || ""), snippet: String(item?.content || "") }));
+  }
+
+  return [];
+}
+
+export async function executeWebSearchQueries({ queries, maxResults, config, env }) {
+  const normalizedQueries = (Array.isArray(queries) ? queries : []).map((q) => String(q || "").trim()).filter(Boolean).slice(0, 10);
+  if (normalizedQueries.length === 0) return { results: [], provider: "" };
+
+  const count = Math.max(1, Math.min(20, Number(maxResults) || 5));
+  const snapshot = await buildAmpWebSearchSnapshot(config, { env });
+  const readyProviders = snapshot.providers.filter((p) => p.ready && !isHostedSearchProvider(p));
+
+  for (const providerStatus of readyProviders) {
+    try {
+      const allResults = [];
+      const batchResults = await Promise.all(
+        normalizedQueries.map((query) => fetchStructuredSearchResults(query, count, providerStatus))
+      );
+      for (const results of batchResults) allResults.push(...results);
+      if (allResults.length > 0) {
+        return { results: allResults, provider: providerStatus.id };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { results: [], provider: "" };
+}
+
+export async function maybeInterceptAmpInternalSearch(request, url, config, env) {
+  const searchParams = url.searchParams;
+  if (!searchParams.has("webSearch2")) return null;
+
+  const webSearchConfig = config?.webSearch || config?.amp?.webSearch;
+  if (!webSearchConfig?.interceptInternalSearch) return null;
+
+  const providers = Array.isArray(webSearchConfig?.providers) ? webSearchConfig.providers : [];
+  if (providers.length === 0) return null;
+
+  let body;
+  try {
+    body = await request.clone().json();
+  } catch {
+    return null;
+  }
+
+  const params = body?.params;
+  if (!params || !Array.isArray(params.searchQueries) || params.searchQueries.length === 0) return null;
+
+  try {
+    const results = await executeWebSearchQueries({
+      queries: params.searchQueries,
+      maxResults: Number(params.maxResults) || 5,
+      config,
+      env
+    });
+
+    return jsonResponse({
+      result: {
+        results: results.results.map((r) => ({
+          title: r.title || "",
+          url: r.url || "",
+          snippet: r.snippet || "",
+          content: r.snippet || ""
+        }))
+      }
+    });
+  } catch (error) {
+    console.warn(`[llm-router] webSearch2 interception failed: ${error?.message || error}`);
+    return null;
+  }
 }
 
 export async function maybeInterceptAmpWebSearch({

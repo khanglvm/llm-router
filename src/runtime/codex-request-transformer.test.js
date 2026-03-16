@@ -124,3 +124,100 @@ test("transformRequestForCodex preserves tool call history after lifting system 
     }
   ]);
 });
+
+test("transformRequestForCodex preserves image detail field in output", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image:" },
+          {
+            type: "image_url",
+            image_url: {
+              url: "https://example.com/image.jpg",
+              detail: "high"
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  const userMessage = transformed.input[0];
+  assert.equal(userMessage.role, "user");
+  const imageContent = userMessage.content.find((part) => part.type === "input_image");
+  assert.ok(imageContent, "Image content should be present");
+  assert.equal(imageContent.detail, "high", "Image detail should be preserved");
+});
+
+test("transformRequestForCodex omits image detail when not provided", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image:" },
+          {
+            type: "image_url",
+            image_url: "https://example.com/image.jpg"
+          }
+        ]
+      }
+    ]
+  });
+
+  const userMessage = transformed.input[0];
+  assert.equal(userMessage.role, "user");
+  const imageContent = userMessage.content.find((part) => part.type === "input_image");
+  assert.ok(imageContent, "Image content should be present");
+  assert.equal(imageContent.detail, undefined, "Image detail should not be present when not provided");
+});
+
+test("transformRequestForCodex transforms tool_choice with function name", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [{ role: "user", content: "Use bash tool" }],
+    tool_choice: {
+      type: "function",
+      function: {
+        name: "bash"
+      }
+    }
+  });
+
+  assert.deepEqual(transformed.tool_choice, {
+    type: "function",
+    name: "bash"
+  });
+});
+
+test("transformRequestForCodex normalizes tool_choice type from 'tool' to 'function'", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [{ role: "user", content: "Use bash tool" }],
+    tool_choice: {
+      type: "tool",
+      function: {
+        name: "bash"
+      }
+    }
+  });
+
+  assert.deepEqual(transformed.tool_choice, {
+    type: "function",
+    name: "bash"
+  });
+});
+
+test("transformRequestForCodex preserves string tool_choice values", () => {
+  const transformed = transformRequestForCodex({
+    model: "gpt-5.3-codex",
+    messages: [{ role: "user", content: "Use any tool" }],
+    tool_choice: "required"
+  });
+
+  assert.equal(transformed.tool_choice, "required");
+});

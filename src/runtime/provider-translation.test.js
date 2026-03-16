@@ -304,6 +304,92 @@ test("handleClaudeStreamToOpenAIResponses emits contiguous output indexes when t
   );
 });
 
+
+test("handleClaudeStreamToOpenAIResponses skips empty text scaffolding before tool_use", async () => {
+  const claudeStream = [
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_blank_1","model":"glm-5","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"   "}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_read_4","name":"read","input":{}}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ].join("");
+
+  const response = handleClaudeStreamToOpenAIResponses(new Response(claudeStream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream"
+    }
+  }), {
+    model: "gpt-5.3-codex"
+  }, "glm-5");
+
+  const events = parseSseEvents(await response.text());
+  const outputItemAddedEvents = events.filter((entry) => entry.event === "response.output_item.added");
+  assert.deepEqual(outputItemAddedEvents.map((entry) => entry.payload.item.type), ["function_call"]);
+  assert.equal(events.some((entry) => entry.event === "response.output_text.delta"), false);
+  assert.equal(events.some((entry) => entry.event === "response.output_text.done"), false);
+});
+
+test("handleClaudeStreamToOpenAIResponses keeps tool-only turns free of output_text scaffolding", async () => {
+  const claudeStream = [
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_tool_only","model":"glm-5","usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_read_5","name":"read","input":{}}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ].join("");
+
+  const response = handleClaudeStreamToOpenAIResponses(new Response(claudeStream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream"
+    }
+  }), {
+    model: "gpt-5.3-codex"
+  }, "glm-5");
+
+  const events = parseSseEvents(await response.text());
+  const outputItems = events
+    .filter((entry) => entry.event === "response.output_item.added")
+    .map((entry) => entry.payload.item.type);
+  assert.deepEqual(outputItems, ["function_call"]);
+
+  const completed = events.find((entry) => entry.event === "response.completed");
+  assert.deepEqual(completed?.payload?.response?.output?.map((item) => item.type), ["function_call"]);
+});
+
+test("handleOpenAIStreamToClaude defers text block for whitespace-only deltas before tool calls", async () => {
+  const openAIStream = [
+    'data: {"id":"chatcmpl_blank_tool_1","object":"chat.completion.chunk","created":1730000030,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"   "},"finish_reason":null}]}',
+    '',
+    'data: {"id":"chatcmpl_blank_tool_1","object":"chat.completion.chunk","created":1730000030,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_read_6","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}',
+    '',
+    'data: {"id":"chatcmpl_blank_tool_1","object":"chat.completion.chunk","created":1730000030,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"README.md\\"}"}}]},"finish_reason":null}]}',
+    '',
+    'data: {"id":"chatcmpl_blank_tool_1","object":"chat.completion.chunk","created":1730000030,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+    '',
+    'data: [DONE]'
+  ].join("\n");
+
+  const response = handleOpenAIStreamToClaude(new Response(openAIStream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream"
+    }
+  }));
+
+  const events = parseSseEvents(await response.text());
+  const textBlockStarts = events.filter(
+    (entry) => entry.event === "content_block_start" && entry.payload?.content_block?.type === "text"
+  );
+  assert.equal(textBlockStarts.length, 0);
+  assert.equal(events.some((entry) => entry.event === "content_block_delta" && entry.payload?.delta?.type === "text_delta"), false);
+  assert.equal(events[1]?.payload?.content_block?.type, "tool_use");
+});
+
 test("normalizeClaudePassthroughStream synthesizes terminal message_delta before message_stop", async () => {
   const claudeStream = [
     'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_3","model":"claude-haiku-4-5","usage":{"input_tokens":6,"output_tokens":0}}}\n\n',

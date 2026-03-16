@@ -2,19 +2,17 @@
 
 LLM Router is a local and Cloudflare-deployable gateway for routing one client endpoint across multiple LLM providers, models, aliases, fallbacks, and rate limits.
 
-The npm package name stays the same:
+**Current version**: `2.0.5`
 
+NPM package:
 ```bash
 @khanglvm/llm-router
 ```
 
-The primary CLI command is now:
-
+Primary CLI command:
 ```bash
 llr
 ```
-
-`2.0.1` is the current public release. It includes the Web UI, AMP routing, and coding-tool integrations introduced in the 2.x line.
 
 ## Install
 
@@ -266,7 +264,18 @@ Run the JavaScript test suite:
 node --test $(rg --files -g "*.test.js" src)
 ```
 
+## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+- **[Project Overview & PDR](./docs/project-overview-pdr.md)** — Feature matrix, target users, success metrics, constraints
+- **[Codebase Summary](./docs/codebase-summary.md)** — Directory structure, module relationships, entry points, test infrastructure
+- **[Code Standards](./docs/code-standards.md)** — Patterns, naming conventions, testing, error handling
+- **[System Architecture](./docs/system-architecture.md)** — Request lifecycle, subsystem boundaries, data flow, deployment models
+- **[Project Roadmap](./docs/project-roadmap.md)** — Current status, planned phases, timeline, success metrics
+
 ## Security and Releases
 
 - Security: [`SECURITY.md`](https://github.com/khanglvm/llm-router/blob/master/SECURITY.md)
 - Release notes: [`CHANGELOG.md`](https://github.com/khanglvm/llm-router/blob/master/CHANGELOG.md)
+- AMP routing: [`docs/amp-routing.md`](./docs/amp-routing.md)

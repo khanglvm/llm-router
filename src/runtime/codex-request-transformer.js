@@ -224,10 +224,15 @@ function normalizeInputMessageContent(content, role) {
         ? part.image_url
         : part.image_url?.url;
       if (typeof rawUrl === 'string' && rawUrl.trim()) {
-        parts.push({
+        const imageItem = {
           type: 'input_image',
           image_url: rawUrl
-        });
+        };
+        const detail = part.image_url?.detail || part.detail;
+        if (typeof detail === 'string' && detail.trim()) {
+          imageItem.detail = detail.trim();
+        }
+        parts.push(imageItem);
       }
       continue;
     }
@@ -333,6 +338,21 @@ function normalizeToolChoiceForResponses(toolChoice) {
     const normalizedType = String(toolChoice.type || '').trim().toLowerCase();
     if (normalizedType === 'none') return 'none';
     if (normalizedType === 'required' || normalizedType === 'any' || normalizedType === 'tool') {
+      const functionName = String(
+        toolChoice.function?.name || toolChoice.name || ''
+      ).trim();
+      if (functionName) {
+        return { type: 'function', name: functionName };
+      }
+      return 'required';
+    }
+    if (normalizedType === 'function') {
+      const functionName = String(
+        toolChoice.function?.name || toolChoice.name || ''
+      ).trim();
+      if (functionName) {
+        return { type: 'function', name: functionName };
+      }
       return 'required';
     }
   }

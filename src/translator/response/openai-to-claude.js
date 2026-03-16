@@ -52,7 +52,7 @@ export function openaiToClaudeResponse(chunk, state) {
 
   // Handle regular content
   const textDelta = normalizeTextDelta(delta?.content);
-  if (textDelta) {
+  if (textDelta && (state.textBlockStarted || hasRenderableText(textDelta))) {
     stopThinkingBlock(state, results);
 
     if (!state.textBlockStarted) {
@@ -117,6 +117,10 @@ export function openaiToClaudeResponse(chunk, state) {
   }
 
   return results.length > 0 ? results : null;
+}
+
+function hasRenderableText(text) {
+  return typeof text === "string" && /\S/.test(text);
 }
 
 function normalizeTextDelta(content) {
@@ -191,6 +195,7 @@ function normalizeMessageToolCalls(message) {
 
 function emitTextDelta(text, state, results) {
   if (!text) return;
+  if (!state.textBlockStarted && !hasRenderableText(text)) return;
   stopThinkingBlock(state, results);
 
   if (!state.textBlockStarted) {

@@ -882,7 +882,8 @@ test("normalizeRuntimeConfig normalizes shared web search providers and strategy
         limit: 1000,
         remaining: 1000
       }
-    ]
+    ],
+    interceptInternalSearch: false
   };
 
   assert.deepEqual(normalized.webSearch, expected);
@@ -924,7 +925,8 @@ test("normalizeRuntimeConfig preserves hosted GPT web search routes", () => {
         providerId: "rc",
         model: "gpt-5.4"
       }
-    ]
+    ],
+    interceptInternalSearch: false
   });
 });
 
@@ -970,7 +972,8 @@ test("normalizeRuntimeConfig lets top-level webSearch override legacy amp.webSea
         limit: 1000,
         remaining: 700
       }
-    ]
+    ],
+    interceptInternalSearch: false
   });
   assert.equal(Object.prototype.hasOwnProperty.call(normalized.amp || {}, "webSearch"), false);
 });

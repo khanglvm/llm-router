@@ -735,7 +735,11 @@ function normalizeAmpWebSearchConfig(rawWebSearch) {
   return {
     strategy: normalizeAmpWebSearchStrategy(rawWebSearch.strategy),
     count,
-    providers
+    providers,
+    interceptInternalSearch: normalizeBooleanValue(
+      rawWebSearch.interceptInternalSearch ?? rawWebSearch["intercept-internal-search"],
+      false
+    )
   };
 }
 
