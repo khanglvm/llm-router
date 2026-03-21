@@ -13,7 +13,7 @@ Fix the Cloudflare Worker runtime crash caused by static imports of Node.js-only
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Wrangler Configuration** - Update compatibility date, flags, and bundler settings so Worker starts without module-load crash (completed 2026-03-21)
-- [ ] **Phase 2: Import Chain Fix** - Convert tainted static imports to lazy dynamic imports with runtime guards and harden remaining edge cases
+- [x] **Phase 2: Import Chain Fix** - Convert tainted static imports to lazy dynamic imports with runtime guards and harden remaining edge cases (completed 2026-03-21)
 - [ ] **Phase 3: CI Verification** - Add wrangler dev smoke test and npm script to catch Worker-breaking regressions in CI
 
 ## Phase Details
@@ -41,7 +41,7 @@ Plans:
   3. `state-store.js` has an explicit Worker guard that prevents its file-store dynamic import from executing in Worker context
   4. All existing `node --test` tests pass with zero regressions after the import restructuring
   5. `wrangler deploy --dry-run` produces zero `node:*` warnings
-**Plans:** 2 plans
+**Plans:** 2/2 plans complete
 
 Plans:
 - [ ] 02-01-PLAN.md — Refactor provider-call.js: inline check, Worker 501 guard, lazy import, thread runtimeFlags from handler.js
@@ -68,5 +68,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Wrangler Configuration | 1/1 | Complete    | 2026-03-21 |
-| 2. Import Chain Fix | 0/2 | Not started | - |
+| 2. Import Chain Fix | 0/2 | Complete    | 2026-03-21 |
 | 3. CI Verification | 0/0 | Not started | - |
