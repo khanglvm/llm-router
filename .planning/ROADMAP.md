@@ -55,10 +55,10 @@ Plans:
   1. Running `npm run test:worker` starts a Worker via `wrangler dev`, sends a health check request, and asserts a 200 response
   2. The smoke test script exits cleanly (kills the wrangler process) and returns a non-zero exit code on failure
   3. Existing `node --test` suite passes alongside the new worker test with no interference between the two
-**Plans**: TBD
+**Plans:** 1 plan
 
 Plans:
-- [ ] 03-01: TBD
+- [ ] 03-01-PLAN.md — Create wrangler dev smoke test script and test:worker npm script, verify no regressions
 
 ## Progress
 
@@ -68,5 +68,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Wrangler Configuration | 1/1 | Complete    | 2026-03-21 |
-| 2. Import Chain Fix | 0/2 | Complete    | 2026-03-21 |
-| 3. CI Verification | 0/0 | Not started | - |
+| 2. Import Chain Fix | 2/2 | Complete    | 2026-03-21 |
+| 3. CI Verification | 0/1 | Not started | - |
