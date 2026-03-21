@@ -9,9 +9,9 @@ Requirements for this fix initiative. Each maps to roadmap phases.
 
 ### Configuration
 
-- [ ] **CONF-01**: Worker starts without module-load crash after updating `compatibility_date` to `"2025-09-23"`
-- [ ] **CONF-02**: All `node:*` static imports resolve via `nodejs_compat` compatibility flag
-- [ ] **CONF-03**: Wrangler bundler preserves dynamic import boundaries via `find_additional_modules` and `[[rules]]` config
+- [x] **CONF-01**: Worker starts without module-load crash after updating `compatibility_date` to `"2025-09-23"`
+- [x] **CONF-02**: All `node:*` static imports resolve via `nodejs_compat` compatibility flag
+- [x] **CONF-03**: Wrangler bundler preserves dynamic import boundaries via `find_additional_modules` and `[[rules]]` config
 
 ### Import Restructuring
 
@@ -65,9 +65,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CONF-01 | Phase 1 | Pending |
-| CONF-02 | Phase 1 | Pending |
-| CONF-03 | Phase 1 | Pending |
+| CONF-01 | Phase 1 | Complete |
+| CONF-02 | Phase 1 | Complete |
+| CONF-03 | Phase 1 | Complete |
 | IMPT-01 | Phase 2 | Pending |
 | IMPT-02 | Phase 2 | Pending |
 | IMPT-03 | Phase 2 | Pending |
