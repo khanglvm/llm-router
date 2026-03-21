@@ -9,6 +9,7 @@ import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./node/local-s
 import { resolveListenPort } from "./node/listen-port.js";
 import { runStartCommand } from "./node/start-command.js";
 import { runWebCommand } from "./node/web-command.js";
+import { runUpgradeCommand } from "./node/upgrade-command.js";
 
 function parseSimpleArgs(argv) {
   const positional = [];
@@ -196,6 +197,14 @@ export async function runCli(argv = process.argv.slice(2), isTTY = undefined, ov
   if (firstIsConfig && !parsed.wantsHelp && !explicitConfigOperation) {
     const configArgs = parseSimpleArgs(argv.slice(1));
     return runWebFastPath(configArgs.args, runWebCommandImpl);
+  }
+
+  if ((first === "upgrade" || first === "update") && !parsed.wantsHelp) {
+    const result = await runUpgradeCommand({
+      onLine: (msg) => console.log(msg),
+      onError: (msg) => console.error(msg)
+    });
+    return result.exitCode ?? (result.ok ? 0 : 1);
   }
 
   if (firstIsSetup && !parsed.wantsHelp) {
