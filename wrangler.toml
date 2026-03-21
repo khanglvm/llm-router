@@ -1,11 +1,20 @@
 name = "llm-router-route"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2025-09-23"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 preview_urls = false
 
-# No custom routes are defined by default.
-# Configure routes/domains per environment in your own deployment setup.
+# Preserve dynamic import boundaries for subscription modules.
+# Without this, Wrangler's esbuild inlines await import() back into the
+# main bundle, collapsing lazy-load boundaries added in Phase 2.
+# base_dir defaults to src/ (directory of main entrypoint).
+find_additional_modules = true
+
+[[rules]]
+type = "ESModule"
+globs = ["runtime/subscription-*.js"]
+fallthrough = true
 
 # Optional non-secret vars
 [vars]
