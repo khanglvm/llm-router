@@ -12,7 +12,7 @@ Fix the Cloudflare Worker runtime crash caused by static imports of Node.js-only
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Wrangler Configuration** - Update compatibility date, flags, and bundler settings so Worker starts without module-load crash
+- [x] **Phase 1: Wrangler Configuration** - Update compatibility date, flags, and bundler settings so Worker starts without module-load crash (completed 2026-03-21)
 - [ ] **Phase 2: Import Chain Fix** - Convert tainted static imports to lazy dynamic imports with runtime guards and harden remaining edge cases
 - [ ] **Phase 3: CI Verification** - Add wrangler dev smoke test and npm script to catch Worker-breaking regressions in CI
 
@@ -26,7 +26,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. Running `wrangler dev` starts the Worker without any module-resolution errors in the console
   2. All `node:*` static imports (including `node:http`, `node:crypto`, `node:path`, `node:os`) resolve without crash via `nodejs_compat` polyfills
   3. `wrangler deploy --dry-run` completes without bundler errors and respects dynamic import boundaries (subscription modules listed as additional modules, not inlined)
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
 - [ ] 01-01-PLAN.md — Update wrangler.toml with compat date, nodejs_compat flag, and bundler rules
@@ -66,6 +66,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Wrangler Configuration | 0/1 | Not started | - |
+| 1. Wrangler Configuration | 0/1 | Complete    | 2026-03-21 |
 | 2. Import Chain Fix | 0/0 | Not started | - |
 | 3. CI Verification | 0/0 | Not started | - |
