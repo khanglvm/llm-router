@@ -2176,6 +2176,14 @@ function getQuickStartRateLimitDefaults(connectionType) {
     : QUICK_START_RATE_LIMIT_DEFAULTS.oauth;
 }
 
+function deduplicateProviderId(baseId, baseName, existingProviders = []) {
+  const ids = new Set((existingProviders || []).map((p) => p?.id).filter(Boolean));
+  if (!ids.has(baseId)) return { providerId: baseId, providerName: baseName };
+  let n = 2;
+  while (ids.has(`${baseId}-${n}`)) n++;
+  return { providerId: `${baseId}-${n}`, providerName: `${baseName} ${n}` };
+}
+
 function getQuickStartConnectionDefaults(connectionType, protocol = "openai") {
   const preset = QUICK_START_CONNECTION_PRESETS[connectionType] || QUICK_START_CONNECTION_PRESETS.api;
   const rateLimitDefaults = getQuickStartRateLimitDefaults(connectionType);
@@ -8348,6 +8356,8 @@ function QuickStartWizard({
     setQuickStart((current) => {
       const currentDefaults = getQuickStartConnectionDefaults(current.connectionType);
       const nextDefaults = getQuickStartConnectionDefaults(nextConnectionType);
+      const existingProviders = Array.isArray(baseConfig?.providers) ? baseConfig.providers : [];
+      const deduped = deduplicateProviderId(nextDefaults.providerId, nextDefaults.providerName, existingProviders);
       const currentHeaderDefaults = current.connectionType === "api"
         ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
         : [];
@@ -8368,8 +8378,8 @@ function QuickStartWizard({
       return {
         ...current,
         connectionType: nextConnectionType,
-        providerName: providerNameWasAuto ? nextDefaults.providerName : current.providerName,
-        providerId: providerIdWasAuto ? nextDefaults.providerId : current.providerId,
+        providerName: providerNameWasAuto ? deduped.providerName : current.providerName,
+        providerId: providerIdWasAuto ? deduped.providerId : current.providerId,
         endpoints: nextConnectionType === "api"
           ? ((current.endpoints || []).length > 0 ? current.endpoints : nextDefaults.endpoints)
           : [],
