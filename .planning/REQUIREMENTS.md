@@ -65,25 +65,25 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CONF-01 | — | Pending |
-| CONF-02 | — | Pending |
-| CONF-03 | — | Pending |
-| IMPT-01 | — | Pending |
-| IMPT-02 | — | Pending |
-| IMPT-03 | — | Pending |
-| IMPT-04 | — | Pending |
-| IMPT-05 | — | Pending |
-| HARD-01 | — | Pending |
-| HARD-02 | — | Pending |
-| VERF-01 | — | Pending |
-| VERF-02 | — | Pending |
-| VERF-03 | — | Pending |
+| CONF-01 | Phase 1 | Pending |
+| CONF-02 | Phase 1 | Pending |
+| CONF-03 | Phase 1 | Pending |
+| IMPT-01 | Phase 2 | Pending |
+| IMPT-02 | Phase 2 | Pending |
+| IMPT-03 | Phase 2 | Pending |
+| IMPT-04 | Phase 2 | Pending |
+| IMPT-05 | Phase 2 | Pending |
+| HARD-01 | Phase 2 | Pending |
+| HARD-02 | Phase 2 | Pending |
+| VERF-01 | Phase 3 | Pending |
+| VERF-02 | Phase 3 | Pending |
+| VERF-03 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 13 total
-- Mapped to phases: 0
-- Unmapped: 13 ⚠️
+- Mapped to phases: 13
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-21*
-*Last updated: 2026-03-21 after initial definition*
+*Last updated: 2026-03-21 after roadmap creation*
