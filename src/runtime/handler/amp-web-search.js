@@ -9,8 +9,11 @@ import {
   resolveProviderUrl,
   resolveRouteReference
 } from "../config.js";
-import { isSubscriptionProvider, makeSubscriptionProviderCall } from "../subscription-provider.js";
 import { jsonResponse } from "./http.js";
+
+function isSubscriptionProvider(provider) {
+  return provider?.type === "subscription";
+}
 
 const SEARCH_TOOL_NAME = "web_search";
 const READ_WEB_PAGE_TOOL_NAME = "read_web_page";
@@ -1164,10 +1167,10 @@ async function searchDuckDuckGoLite(query, count) {
   return formatSearchResults(results);
 }
 
-async function searchHostedProviderRoute(query, count, provider, runtimeConfig = {}, env = {}) {
+async function searchHostedProviderRoute(query, count, provider, runtimeConfig = {}, env = {}, runtimeFlags) {
   void count;
   if (!isHostedSearchProvider(provider)) return null;
-  const result = await runHostedSearchProviderQuery(provider, query, runtimeConfig, env);
+  const result = await runHostedSearchProviderQuery(provider, query, runtimeConfig, env, runtimeFlags);
   return String(result?.text || "").trim() || null;
 }
 
@@ -1214,7 +1217,7 @@ export async function executeAmpWebSearch(query, runtimeConfig = {}, env = {}, o
       if (typeof searcher !== "function") continue;
       const providerCount = resolveSearchProviderCount(providerStatus, snapshot.count);
       const result = isHostedSearchProvider(providerStatus)
-        ? await searcher(normalizedQuery, providerCount, providerStatus, runtimeConfig, env)
+        ? await searcher(normalizedQuery, providerCount, providerStatus, runtimeConfig, env, options.runtimeFlags)
         : await searcher(normalizedQuery, providerCount, providerStatus);
       if (!result || !String(result).trim()) continue;
       await consumeCandidateRateLimits(stateStore, providerStatus.evaluation, {
@@ -2084,13 +2087,17 @@ async function collectAmpWebSearchProbePayload(response, { targetFormat, request
   return null;
 }
 
-async function executeHostedSearchProviderRequest(resolvedRoute, body, env = {}) {
+async function executeHostedSearchProviderRequest(resolvedRoute, body, env = {}, runtimeFlags) {
   const provider = resolvedRoute?.provider;
   if (!provider || typeof provider !== "object") {
     throw new Error("Hosted web search provider is not configured.");
   }
 
   if (isSubscriptionProvider(provider)) {
+    if (runtimeFlags?.workerRuntime) {
+      throw new Error("Subscription-based hosted web search providers are not available in Worker mode.");
+    }
+    const { makeSubscriptionProviderCall } = await import("../subscription-provider.js");
     const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
     const subscriptionResult = await makeSubscriptionProviderCall({
       provider,
@@ -2121,7 +2128,7 @@ async function executeHostedSearchProviderRequest(resolvedRoute, body, env = {})
   return response;
 }
 
-async function runHostedSearchProviderQuery(providerEntry, query, runtimeConfig = {}, env = {}) {
+async function runHostedSearchProviderQuery(providerEntry, query, runtimeConfig = {}, env = {}, runtimeFlags) {
   const resolvedRoute = getResolvedHostedSearchRoute(runtimeConfig, providerEntry);
   if (!resolvedRoute?.provider || !resolvedRoute?.model) {
     throw new Error(`Hosted web search route '${providerEntry?.id || providerEntry?.providerId || "unknown"}' is not configured.`);
@@ -2136,7 +2143,7 @@ async function runHostedSearchProviderQuery(providerEntry, query, runtimeConfig 
     tools: [{ type: "web_search" }],
     tool_choice: "auto"
   };
-  const response = await executeHostedSearchProviderRequest(resolvedRoute, requestBody, env);
+  const response = await executeHostedSearchProviderRequest(resolvedRoute, requestBody, env, runtimeFlags);
   const payload = await collectAmpWebSearchProbePayload(response, {
     targetFormat: FORMATS.OPENAI,
     requestKind: "responses"
