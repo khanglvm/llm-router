@@ -70,4 +70,4 @@ OAuth-backed subscription login is supported for ChatGPT.
 
 - [Changelog](https://github.com/khanglvm/llm-router/blob/master/CHANGELOG.md)
 - [Security](https://github.com/khanglvm/llm-router/blob/master/SECURITY.md)
-- [AMP Routing Docs](./docs/amp-routing.md)
+- [AMP Routing Docs](https://github.com/khanglvm/llm-router/blob/master/docs/amp-routing.md)
