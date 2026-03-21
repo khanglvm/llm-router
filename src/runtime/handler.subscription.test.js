@@ -928,3 +928,31 @@ test("makeProviderCall converts Claude OAuth streaming response to OpenAI SSE", 
   assert.match(streamPayload, /pong/);
   assert.match(streamPayload, /\[DONE\]/);
 });
+
+test("makeProviderCall returns 501 for subscription provider in Worker mode", async () => {
+  const candidate = buildSubscriptionCandidate();
+  const result = await makeProviderCall({
+    body: { model: "gpt-5.3-codex", messages: [{ role: "user", content: "test" }] },
+    sourceFormat: FORMATS.OPENAI,
+    stream: false,
+    candidate,
+    requestKind: "chat",
+    requestHeaders: new Headers(),
+    env: {},
+    clientType: "openai",
+    runtimeConfig: {},
+    stateStore: null,
+    ampContext: null,
+    runtimeFlags: { workerRuntime: true }
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 501);
+  assert.equal(result.retryable, false);
+  assert.equal(result.errorKind, "not_supported");
+  assert.ok(result.response instanceof Response);
+  assert.equal(result.response.status, 501);
+  const body = await result.response.json();
+  assert.equal(body.error.type, "not_supported_error");
+  assert.match(body.error.message, /Worker mode/);
+});

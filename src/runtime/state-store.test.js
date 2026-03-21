@@ -5,6 +5,7 @@ import os from "node:os";
 import { promises as fs } from "node:fs";
 import { createMemoryStateStore } from "./state-store.memory.js";
 import { createFileStateStore } from "./state-store.file.js";
+import { createStateStore } from "./state-store.js";
 
 function buildTempPath(name) {
   const unique = `llm-router-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -90,5 +91,23 @@ test("file store gracefully recovers from corrupt JSON", async () => {
   assert.equal(await store.getRouteCursor("route:any"), 2);
   await store.close();
 
+  await fs.unlink(filePath).catch(() => {});
+});
+
+test("createStateStore returns memory store when backend is file and workerRuntime is true", async () => {
+  const store = await createStateStore({ backend: "file", workerRuntime: true });
+  await store.setRouteCursor("route:test", 1);
+  assert.equal(await store.getRouteCursor("route:test"), 1);
+  if (typeof store.close === "function") {
+    await store.close();
+  }
+});
+
+test("createStateStore returns file store when backend is file and workerRuntime is absent", async () => {
+  const filePath = buildTempPath("state-store-guard");
+  const store = await createStateStore({ backend: "file", filePath });
+  await store.setRouteCursor("route:test", 5);
+  assert.equal(await store.getRouteCursor("route:test"), 5);
+  await store.close();
   await fs.unlink(filePath).catch(() => {});
 });

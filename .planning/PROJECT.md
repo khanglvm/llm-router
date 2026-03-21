@@ -26,16 +26,16 @@ The Cloudflare Worker deployment must start and handle requests without runtime 
 - ✓ Gzip decompression — DecompressionStream (Web API) — existing
 - ✓ Wrangler config enables Worker startup — `nodejs_compat` + compat date 2025-09-23 — Phase 1
 - ✓ Bundler preserves dynamic import boundaries — `find_additional_modules` + `[[rules]]` — Phase 1
+- ✓ Static import chain broken — lazy `await import()` in provider-call.js and amp-web-search.js — Phase 2
+- ✓ Worker 501 guard for subscription providers — clean error instead of crash — Phase 2
+- ✓ State-store Worker guard — file backend never loaded in Worker context — Phase 2
+- ✓ Worker smoke test — `npm run test:worker` validates Worker starts and responds — Phase 3
 
 ### Active
 
-- [ ] Fix static import chain crashing Worker at module load time
-- [ ] Lazy-load or build-time exclude subscription provider modules in Worker context
-- [ ] Add `nodejs_compat_v2` compatibility flag to `wrangler.toml`
-- [ ] Update `compatibility_date` to current date
-- [ ] Guard `state-store.js` dynamic import for Worker safety
-- [ ] Add `wrangler dev` smoke test to CI
-- [ ] Ensure Worker bundle stays under free tier limits after changes
+(None — all v1 requirements complete)
+
+
 
 ### Out of Scope
 
@@ -67,9 +67,9 @@ The audit recommends Option B combined with `nodejs_compat_v2` for modules that 
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Lazy-load subscription modules (Option B) | Least invasive, no build pipeline changes, subscription features are Node-only by design | — Pending |
+| Lazy-load subscription modules (Option B) | Least invasive, no build pipeline changes, subscription features are Node-only by design | ✓ Good — Phase 2 |
 | Add `nodejs_compat` flag + compat date 2025-09-23 | Polyfills all `node:*` modules, enables v2 auto-behavior | ✓ Good — Phase 1 |
 | Keep subscription features Node-only | Fundamentally require `node:http`/`node:child_process` which Workers cannot provide | — Pending |
 
 ---
-*Last updated: 2026-03-21 after Phase 1 completion*
+*Last updated: 2026-03-21 after Phase 3 completion — all phases complete*

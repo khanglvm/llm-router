@@ -156,6 +156,7 @@ export function resolveStateStoreOptions(options = {}, env = {}, runtimeFlags = 
     ...baseOptions,
     backend: effectiveBackend,
     ...(candidateStateTtlMs !== undefined ? { candidateStateTtlMs } : {}),
-    ...(effectiveBackend === "file" && filePath ? { filePath } : {})
+    ...(effectiveBackend === "file" && filePath ? { filePath } : {}),
+    ...(runtimeFlags?.workerRuntime ? { workerRuntime: true } : {})
   };
 }

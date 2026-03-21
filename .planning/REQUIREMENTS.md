@@ -15,22 +15,22 @@ Requirements for this fix initiative. Each maps to roadmap phases.
 
 ### Import Restructuring
 
-- [ ] **IMPT-01**: `isSubscriptionProvider()` check is inlined or extracted to a side-effect-free module with zero Node.js imports
-- [ ] **IMPT-02**: `provider-call.js` uses lazy `await import()` for subscription-provider module instead of static import
-- [ ] **IMPT-03**: `amp-web-search.js` uses lazy `await import()` for subscription-provider module instead of static import
-- [ ] **IMPT-04**: Worker returns clean 501 error when a subscription provider is encountered in Worker mode
-- [ ] **IMPT-05**: Node.js local mode continues to work identically — all existing tests pass
+- [x] **IMPT-01**: `isSubscriptionProvider()` check is inlined or extracted to a side-effect-free module with zero Node.js imports
+- [x] **IMPT-02**: `provider-call.js` uses lazy `await import()` for subscription-provider module instead of static import
+- [x] **IMPT-03**: `amp-web-search.js` uses lazy `await import()` for subscription-provider module instead of static import
+- [x] **IMPT-04**: Worker returns clean 501 error when a subscription provider is encountered in Worker mode
+- [x] **IMPT-05**: Node.js local mode continues to work identically — all existing tests pass
 
 ### Hardening
 
-- [ ] **HARD-01**: `state-store.js` has explicit Worker guard on its dynamic file-store import
-- [ ] **HARD-02**: `wrangler deploy --dry-run` produces zero `node:*` warnings after all fixes applied
+- [x] **HARD-01**: `state-store.js` has explicit Worker guard on its dynamic file-store import
+- [x] **HARD-02**: `wrangler deploy --dry-run` produces zero `node:*` warnings after all fixes applied
 
 ### Verification
 
-- [ ] **VERF-01**: `wrangler dev` smoke test script starts Worker, sends health check request, asserts 200 response
-- [ ] **VERF-02**: `test:worker` npm script added for CI integration
-- [ ] **VERF-03**: Existing `node --test` suite passes with no regressions
+- [x] **VERF-01**: `wrangler dev` smoke test script starts Worker, sends health check request, asserts 200 response
+- [x] **VERF-02**: `test:worker` npm script added for CI integration
+- [x] **VERF-03**: Existing `node --test` suite passes with no regressions
 
 ## v2 Requirements
 
@@ -68,16 +68,16 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
-| IMPT-01 | Phase 2 | Pending |
-| IMPT-02 | Phase 2 | Pending |
-| IMPT-03 | Phase 2 | Pending |
-| IMPT-04 | Phase 2 | Pending |
-| IMPT-05 | Phase 2 | Pending |
-| HARD-01 | Phase 2 | Pending |
-| HARD-02 | Phase 2 | Pending |
-| VERF-01 | Phase 3 | Pending |
-| VERF-02 | Phase 3 | Pending |
-| VERF-03 | Phase 3 | Pending |
+| IMPT-01 | Phase 2 | Complete |
+| IMPT-02 | Phase 2 | Complete |
+| IMPT-03 | Phase 2 | Complete |
+| IMPT-04 | Phase 2 | Complete |
+| IMPT-05 | Phase 2 | Complete |
+| HARD-01 | Phase 2 | Complete |
+| HARD-02 | Phase 2 | Complete |
+| VERF-01 | Phase 3 | Complete |
+| VERF-02 | Phase 3 | Complete |
+| VERF-03 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 13 total

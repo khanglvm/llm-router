@@ -32,6 +32,7 @@
     "test:provider-live": "node --test --test-concurrency=1 ./test/live-provider-suite.test.js",
     "test:provider-smoke": "npm run test:provider-live",
     "test:amp-smoke": "node ./scripts/amp-smoke-suite.mjs",
+    "test:worker": "node ./scripts/test-worker.mjs",
     "prepublishOnly": "npm run test:provider-live"
   },
   "dependencies": {
