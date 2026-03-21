@@ -1,0 +1,89 @@
+# Requirements: LLM Router — Cloudflare Worker Compatibility Fix
+
+**Defined:** 2026-03-21
+**Core Value:** Cloudflare Worker deployment must start and handle requests without runtime errors
+
+## v1 Requirements
+
+Requirements for this fix initiative. Each maps to roadmap phases.
+
+### Configuration
+
+- [ ] **CONF-01**: Worker starts without module-load crash after updating `compatibility_date` to `"2025-09-23"`
+- [ ] **CONF-02**: All `node:*` static imports resolve via `nodejs_compat` compatibility flag
+- [ ] **CONF-03**: Wrangler bundler preserves dynamic import boundaries via `find_additional_modules` and `[[rules]]` config
+
+### Import Restructuring
+
+- [ ] **IMPT-01**: `isSubscriptionProvider()` check is inlined or extracted to a side-effect-free module with zero Node.js imports
+- [ ] **IMPT-02**: `provider-call.js` uses lazy `await import()` for subscription-provider module instead of static import
+- [ ] **IMPT-03**: `amp-web-search.js` uses lazy `await import()` for subscription-provider module instead of static import
+- [ ] **IMPT-04**: Worker returns clean 501 error when a subscription provider is encountered in Worker mode
+- [ ] **IMPT-05**: Node.js local mode continues to work identically — all existing tests pass
+
+### Hardening
+
+- [ ] **HARD-01**: `state-store.js` has explicit Worker guard on its dynamic file-store import
+- [ ] **HARD-02**: `wrangler deploy --dry-run` produces zero `node:*` warnings after all fixes applied
+
+### Verification
+
+- [ ] **VERF-01**: `wrangler dev` smoke test script starts Worker, sends health check request, asserts 200 response
+- [ ] **VERF-02**: `test:worker` npm script added for CI integration
+- [ ] **VERF-03**: Existing `node --test` suite passes with no regressions
+
+## v2 Requirements
+
+Deferred to future release. Tracked but not in current roadmap.
+
+### State Persistence
+
+- **STAT-01**: Worker mode uses Durable Objects or KV for cross-request state persistence (round-robin, rate limits)
+
+### Testing
+
+- **TEST-01**: Vitest Cloudflare pool integration tests for Worker-specific code paths
+- **TEST-02**: Automated config secret size (32 KB) validation during deploy
+
+## Out of Scope
+
+Explicitly excluded. Documented to prevent scope creep.
+
+| Feature | Reason |
+|---------|--------|
+| Subscription provider OAuth in Workers | Requires `node:child_process` `spawn()` which is non-functional stub in Workers |
+| File-based state store in Workers | `node:fs` virtual FS has no cross-request persistence |
+| File-based activity log in Workers | Node-only, already properly isolated in `src/node/` |
+| Web Console UI in Workers | Node-only, already properly isolated in `src/node/` |
+| Stateful round-robin in Workers | Global `Map` doesn't persist across Worker requests; `workerSafeMode` disables correctly |
+| Build-time module exclusion pipeline | `nodejs_compat` + lazy imports solve the problem without build changes |
+| Custom worker-stub module | Dynamic `await import()` is simpler and zero-maintenance |
+
+## Traceability
+
+Which phases cover which requirements. Updated during roadmap creation.
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| CONF-01 | — | Pending |
+| CONF-02 | — | Pending |
+| CONF-03 | — | Pending |
+| IMPT-01 | — | Pending |
+| IMPT-02 | — | Pending |
+| IMPT-03 | — | Pending |
+| IMPT-04 | — | Pending |
+| IMPT-05 | — | Pending |
+| HARD-01 | — | Pending |
+| HARD-02 | — | Pending |
+| VERF-01 | — | Pending |
+| VERF-02 | — | Pending |
+| VERF-03 | — | Pending |
+
+**Coverage:**
+- v1 requirements: 13 total
+- Mapped to phases: 0
+- Unmapped: 13 ⚠️
+
+---
+*Requirements defined: 2026-03-21*
+*Last updated: 2026-03-21 after initial definition*
