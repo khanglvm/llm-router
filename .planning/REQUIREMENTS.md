@@ -28,9 +28,9 @@ Requirements for this fix initiative. Each maps to roadmap phases.
 
 ### Verification
 
-- [ ] **VERF-01**: `wrangler dev` smoke test script starts Worker, sends health check request, asserts 200 response
-- [ ] **VERF-02**: `test:worker` npm script added for CI integration
-- [ ] **VERF-03**: Existing `node --test` suite passes with no regressions
+- [x] **VERF-01**: `wrangler dev` smoke test script starts Worker, sends health check request, asserts 200 response
+- [x] **VERF-02**: `test:worker` npm script added for CI integration
+- [x] **VERF-03**: Existing `node --test` suite passes with no regressions
 
 ## v2 Requirements
 
@@ -75,9 +75,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | IMPT-05 | Phase 2 | Complete |
 | HARD-01 | Phase 2 | Complete |
 | HARD-02 | Phase 2 | Complete |
-| VERF-01 | Phase 3 | Pending |
-| VERF-02 | Phase 3 | Pending |
-| VERF-03 | Phase 3 | Pending |
+| VERF-01 | Phase 3 | Complete |
+| VERF-02 | Phase 3 | Complete |
+| VERF-03 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 13 total
