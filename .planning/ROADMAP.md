@@ -26,10 +26,10 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. Running `wrangler dev` starts the Worker without any module-resolution errors in the console
   2. All `node:*` static imports (including `node:http`, `node:crypto`, `node:path`, `node:os`) resolve without crash via `nodejs_compat` polyfills
   3. `wrangler deploy --dry-run` completes without bundler errors and respects dynamic import boundaries (subscription modules listed as additional modules, not inlined)
-**Plans**: TBD
+**Plans:** 1 plan
 
 Plans:
-- [ ] 01-01: TBD
+- [ ] 01-01-PLAN.md — Update wrangler.toml with compat date, nodejs_compat flag, and bundler rules
 
 ### Phase 2: Import Chain Fix
 **Goal**: Subscription-provider code never loads in Worker mode; Node.js local mode continues working identically
@@ -66,6 +66,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Wrangler Configuration | 0/0 | Not started | - |
+| 1. Wrangler Configuration | 0/1 | Not started | - |
 | 2. Import Chain Fix | 0/0 | Not started | - |
 | 3. CI Verification | 0/0 | Not started | - |
