@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Badge } from "./components/ui/badge.jsx";
 import { Button } from "./components/ui/button.jsx";
@@ -6023,9 +6023,9 @@ function ProviderCard({
     setDraft(initialDraft);
   }
 
-  function handleModelEditorStateChange(nextState) {
+  const handleModelEditorStateChange = useCallback((nextState) => {
     setModelEditorState(nextState);
-  }
+  }, []);
 
   function finalizeCloseEditModal() {
     setConfirmCloseOpen(false);
