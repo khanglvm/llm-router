@@ -676,7 +676,8 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
         clientType: options.clientType,
         runtimeConfig: config,
         stateStore,
-        ampContext
+        ampContext,
+        runtimeFlags
       });
 
       if (!quotaConsumed && shouldConsumeQuotaFromResult(result)) {

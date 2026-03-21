@@ -24,7 +24,6 @@ import { applyReasoningEffortMapping } from "./reasoning-effort.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
 import { buildTimeoutSignal } from "../../shared/timeout-signal.js";
-import { isSubscriptionProvider, makeSubscriptionProviderCall } from "../subscription-provider.js";
 import {
   convertCodexResponseToOpenAIChatCompletion,
   extractCodexFinalResponse,
@@ -36,6 +35,10 @@ import {
   rewriteProviderBodyForAmpWebSearch,
   shouldInterceptAmpWebSearch
 } from "./amp-web-search.js";
+
+function isSubscriptionProvider(provider) {
+  return provider?.type === "subscription";
+}
 
 async function toProviderError(response) {
   const raw = await response.text();
@@ -548,7 +551,8 @@ export async function makeProviderCall({
   clientType,
   runtimeConfig,
   stateStore,
-  ampContext
+  ampContext,
+  runtimeFlags
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
@@ -624,6 +628,22 @@ export async function makeProviderCall({
   });
 
   if (isSubscriptionProvider(provider)) {
+    if (runtimeFlags?.workerRuntime) {
+      return {
+        ok: false,
+        status: 501,
+        retryable: false,
+        errorKind: "not_supported",
+        response: jsonResponse({
+          type: "error",
+          error: {
+            type: "not_supported_error",
+            message: "Subscription providers are not available in Worker mode."
+          }
+        }, 501)
+      };
+    }
+    const { makeSubscriptionProviderCall } = await import("../subscription-provider.js");
     const subscriptionType = String(provider?.subscriptionType || provider?.subscription_type || "").trim().toLowerCase();
     if (subscriptionType === "chatgpt-codex" && ampContext?.threadId) {
       activePlan.providerBody = {
