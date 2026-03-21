@@ -2,6 +2,8 @@
 
 LLM Router is a local and Cloudflare-deployable gateway for routing one client endpoint across multiple LLM providers, models, aliases, fallbacks, and rate limits.
 
+![LLM Router Web Console](./assets/screenshots/web-ui-dashboard.png)
+
 **Current version**: `2.2.0`
 
 NPM package:
@@ -111,13 +113,13 @@ The Web UI is localhost-only by default because it can expose secrets and live c
 
 ### Screenshots
 
-**Dashboard — Providers & Alias Management**
-
-![Web UI Dashboard](./assets/screenshots/web-ui-dashboard.png)
-
-**Alias & Fallback Configuration**
+**Alias & Fallback**
 
 ![Alias & Fallback](./assets/screenshots/web-ui-aliases.png)
+
+**AMP Configuration**
+
+![AMP Configuration](./assets/screenshots/web-ui-amp.png)
 
 **Claude Code Routing**
 
@@ -127,9 +129,9 @@ The Web UI is localhost-only by default because it can expose secrets and live c
 
 ![Codex CLI Routing](./assets/screenshots/web-ui-codex-cli.png)
 
-**AMP Configuration**
+**Web Search**
 
-![AMP Configuration](./assets/screenshots/web-ui-amp.png)
+![Web Search](./assets/screenshots/web-ui-web-search.png)
 
 ## CLI Parity
 
