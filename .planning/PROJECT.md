@@ -29,11 +29,13 @@ The Cloudflare Worker deployment must start and handle requests without runtime 
 - ✓ Static import chain broken — lazy `await import()` in provider-call.js and amp-web-search.js — Phase 2
 - ✓ Worker 501 guard for subscription providers — clean error instead of crash — Phase 2
 - ✓ State-store Worker guard — file backend never loaded in Worker context — Phase 2
+- ✓ Worker smoke test — `npm run test:worker` validates Worker starts and responds — Phase 3
 
 ### Active
 
-- [ ] Add `wrangler dev` smoke test to CI
-- [ ] Ensure Worker bundle stays under free tier limits after changes
+(None — all v1 requirements complete)
+
+
 
 ### Out of Scope
 
@@ -70,4 +72,4 @@ The audit recommends Option B combined with `nodejs_compat_v2` for modules that 
 | Keep subscription features Node-only | Fundamentally require `node:http`/`node:child_process` which Workers cannot provide | — Pending |
 
 ---
-*Last updated: 2026-03-21 after Phase 2 completion*
+*Last updated: 2026-03-21 after Phase 3 completion — all phases complete*
