@@ -3164,6 +3164,10 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       if (method === "POST" && requestUrl.pathname === "/api/claude-code/effort-level") {
         const body = await readJsonBody(req);
         const effortLevel = String(body?.effortLevel || body?.thinkingLevel || "").trim();
+        if (effortLevel && !normalizeClaudeCodeEffortLevel(effortLevel)) {
+          sendJson(res, 400, { error: `Invalid effort level '${effortLevel}'. Valid values: low, medium, high, max.` });
+          return;
+        }
         const result = await patchClaudeCodeEffortLevel({
           effortLevel,
           env: claudeCodeEnv

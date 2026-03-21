@@ -6538,6 +6538,15 @@ async function doSetClaudeCodeEffortLevel(context) {
   const settingsFilePath = String(readArg(args, ["claude-code-settings-file", "claudeCodeSettingsFile", "claude-settings-file", "claudeSettingsFile"], "") || "").trim();
   const effortLevel = String(readArg(args, ["thinking-level", "thinkingLevel", "effort-level", "effortLevel"], "") || "").trim();
 
+  if (effortLevel && !normalizeClaudeCodeEffortLevel(effortLevel)) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `Invalid effort level '${effortLevel}'. Valid values: low, medium, high, max.`
+    };
+  }
+
   const result = await patchClaudeCodeEffortLevel({
     settingsFilePath,
     effortLevel,
