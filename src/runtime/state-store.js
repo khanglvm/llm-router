@@ -65,6 +65,9 @@ export async function createStateStore(options = {}) {
 
   const backend = normalizeStateStoreBackend(options.backend || options.type);
   if (backend === "file") {
+    if (options.workerRuntime) {
+      return createMemoryStateStore(options);
+    }
     const { createFileStateStore } = await import("./state-store.file.js");
     return createFileStateStore(options);
   }
