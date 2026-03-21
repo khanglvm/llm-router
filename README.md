@@ -109,6 +109,28 @@ What it covers:
 
 The Web UI is localhost-only by default because it can expose secrets and live configuration.
 
+### Screenshots
+
+**Dashboard — Providers & Alias Management**
+
+![Web UI Dashboard](./assets/screenshots/web-ui-dashboard.png)
+
+**Alias & Fallback Configuration**
+
+![Alias & Fallback](./assets/screenshots/web-ui-aliases.png)
+
+**Claude Code Routing**
+
+![Claude Code Routing](./assets/screenshots/web-ui-claude-code.png)
+
+**Codex CLI Routing**
+
+![Codex CLI Routing](./assets/screenshots/web-ui-codex-cli.png)
+
+**AMP Configuration**
+
+![AMP Configuration](./assets/screenshots/web-ui-amp.png)
+
 ## CLI Parity
 
 The browser UI still gives the best interactive overview, but the CLI now exposes the main management flows an agent needs without relying on private web endpoints.
