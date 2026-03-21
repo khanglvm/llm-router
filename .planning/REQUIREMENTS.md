@@ -17,14 +17,14 @@ Requirements for this fix initiative. Each maps to roadmap phases.
 
 - [x] **IMPT-01**: `isSubscriptionProvider()` check is inlined or extracted to a side-effect-free module with zero Node.js imports
 - [x] **IMPT-02**: `provider-call.js` uses lazy `await import()` for subscription-provider module instead of static import
-- [ ] **IMPT-03**: `amp-web-search.js` uses lazy `await import()` for subscription-provider module instead of static import
+- [x] **IMPT-03**: `amp-web-search.js` uses lazy `await import()` for subscription-provider module instead of static import
 - [x] **IMPT-04**: Worker returns clean 501 error when a subscription provider is encountered in Worker mode
 - [x] **IMPT-05**: Node.js local mode continues to work identically — all existing tests pass
 
 ### Hardening
 
-- [ ] **HARD-01**: `state-store.js` has explicit Worker guard on its dynamic file-store import
-- [ ] **HARD-02**: `wrangler deploy --dry-run` produces zero `node:*` warnings after all fixes applied
+- [x] **HARD-01**: `state-store.js` has explicit Worker guard on its dynamic file-store import
+- [x] **HARD-02**: `wrangler deploy --dry-run` produces zero `node:*` warnings after all fixes applied
 
 ### Verification
 
@@ -70,11 +70,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONF-03 | Phase 1 | Complete |
 | IMPT-01 | Phase 2 | Complete |
 | IMPT-02 | Phase 2 | Complete |
-| IMPT-03 | Phase 2 | Pending |
+| IMPT-03 | Phase 2 | Complete |
 | IMPT-04 | Phase 2 | Complete |
 | IMPT-05 | Phase 2 | Complete |
-| HARD-01 | Phase 2 | Pending |
-| HARD-02 | Phase 2 | Pending |
+| HARD-01 | Phase 2 | Complete |
+| HARD-02 | Phase 2 | Complete |
 | VERF-01 | Phase 3 | Pending |
 | VERF-02 | Phase 3 | Pending |
 | VERF-03 | Phase 3 | Pending |
