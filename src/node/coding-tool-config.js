@@ -918,3 +918,48 @@ export async function unpatchClaudeCodeSettingsFile({
     backupRestored: backupHasData(backup)
   };
 }
+
+export async function patchClaudeCodeEffortLevel({
+  settingsFilePath = "",
+  effortLevel = "",
+  env = process.env,
+  homeDir = os.homedir()
+} = {}) {
+  const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveClaudeCodeSettingsFilePath({ env, homeDir })).trim());
+  const normalizedLevel = normalizeClaudeCodeEffortLevel(effortLevel);
+
+  const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Claude Code settings file '${resolvedSettingsPath}'`);
+  const nextSettings = settingsState.data && typeof settingsState.data === "object" && !Array.isArray(settingsState.data)
+    ? structuredClone(settingsState.data)
+    : {};
+
+  if (!nextSettings.env || typeof nextSettings.env !== "object" || Array.isArray(nextSettings.env)) {
+    nextSettings.env = {};
+  }
+
+  let shellProfileUpdated = false;
+  if (normalizedLevel) {
+    nextSettings.env.CLAUDE_CODE_EFFORT_LEVEL = normalizedLevel;
+    if (normalizedLevel === CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE) {
+      nextSettings.effortLevel = normalizedLevel;
+    } else {
+      delete nextSettings.effortLevel;
+    }
+    shellProfileUpdated = await patchShellProfileEffortLevel(normalizedLevel, homeDir);
+    if (!shellProfileUpdated) {
+      nextSettings.effortLevel = CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE;
+    }
+  } else {
+    delete nextSettings.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete nextSettings.effortLevel;
+    shellProfileUpdated = await patchShellProfileEffortLevel("", homeDir);
+  }
+
+  if (Object.keys(nextSettings.env).length === 0) delete nextSettings.env;
+  await writeJsonObjectFile(resolvedSettingsPath, nextSettings);
+  return {
+    settingsFilePath: resolvedSettingsPath,
+    effortLevel: normalizedLevel,
+    shellProfileUpdated
+  };
+}

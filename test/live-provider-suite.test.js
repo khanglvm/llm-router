@@ -8,9 +8,7 @@ import { JSDOM, VirtualConsole } from "jsdom";
 import { readConfigFile, writeConfigFile } from "../src/node/config-store.js";
 import { buildProviderFromConfigInput, applyConfigChanges } from "../src/node/config-workflows.js";
 import {
-  patchClaudeCodeSettingsFile,
   patchCodexCliConfigFile,
-  unpatchClaudeCodeSettingsFile,
   unpatchCodexCliConfigFile
 } from "../src/node/coding-tool-config.js";
 import { CODEX_CLI_INHERIT_MODEL_VALUE } from "../src/shared/coding-tool-bindings.js";
@@ -732,14 +730,12 @@ test("real-provider flows cover CLI and Web UI", {
         watchConfig: false
       });
 
-      await patchClaudeCodeSettingsFile({
-        endpointUrl: baseUrl,
-        apiKey: "gw_live_suite_master_key_1234567890abcdefghijklmnop",
-        bindings: {
-          primaryModel: "normal"
-        },
-        env
-      });
+      const claudeEnv = {
+        ...env,
+        ANTHROPIC_BASE_URL: `${baseUrl}/anthropic`,
+        ANTHROPIC_AUTH_TOKEN: "gw_live_suite_master_key_1234567890abcdefghijklmnop",
+        ANTHROPIC_MODEL: "normal"
+      };
 
       const result = await runCommandCapture("claude", [
         "-p",
@@ -748,7 +744,7 @@ test("real-provider flows cover CLI and Web UI", {
         "Reply with exactly OK"
       ], {
         cwd: workspace.cwd,
-        env,
+        env: claudeEnv,
         label: "claude-live",
         timeoutMs: liveSuite.timeoutMs
       });
@@ -765,7 +761,6 @@ test("real-provider flows cover CLI and Web UI", {
       const payload = JSON.parse(result.stdout.trim());
       assert.match(String(payload?.result || payload?.content?.[0]?.text || ""), /\bOK\b/i);
     } finally {
-      await unpatchClaudeCodeSettingsFile({ env }).catch(() => {});
       await localServer?.close();
       await workspace.cleanup();
     }

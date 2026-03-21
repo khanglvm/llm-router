@@ -7184,7 +7184,7 @@ function CodingToolSettingsPanel({
                     <BindingValueSelect
                       field={field}
                       routeOptions={resolvedRouteOptions}
-                      disabled={!routingEnabled || bindingBusy}
+                      disabled={field.standaloneWhenDisconnected ? bindingBusy : (!routingEnabled || bindingBusy)}
                       onValueChange={(value) => onBindingChange(field.id, value === "__unset__" ? "" : value)}
                     />
                   </div>
@@ -10444,6 +10444,26 @@ export function App() {
   }
 
   async function handleClaudeBindingChange(fieldId, value) {
+    const isRoutedViaRouter = claudeCodeState?.routedViaRouter === true;
+
+    if (fieldId === "thinkingLevel" && !isRoutedViaRouter) {
+      setClaudeBindingsBusy(true);
+      try {
+        await fetchJson("/api/claude-code/effort-level", {
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ effortLevel: value })
+        });
+        await loadState({ preserveDraft: true });
+        showNotice("success", value ? `Effort level set to ${value}.` : "Effort level cleared.");
+      } catch (error) {
+        showNotice("error", error instanceof Error ? error.message : String(error));
+      } finally {
+        setClaudeBindingsBusy(false);
+      }
+      return;
+    }
+
     const nextBindings = {
       primaryModel: claudeCodeState?.bindings?.primaryModel || "",
       defaultOpusModel: claudeCodeState?.bindings?.defaultOpusModel || "",
@@ -10941,6 +10961,7 @@ export function App() {
                   value: claudeCodeState?.bindings?.thinkingLevel || "",
                   allowUnset: true,
                   usesRouteOptions: false,
+                  standaloneWhenDisconnected: true,
                   placeholder: "Inherit Claude Code adaptive default",
                   options: CLAUDE_THINKING_LEVEL_OPTIONS
                 }

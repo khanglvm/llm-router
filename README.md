@@ -2,7 +2,7 @@
 
 LLM Router is a local and Cloudflare-deployable gateway for routing one client endpoint across multiple LLM providers, models, aliases, fallbacks, and rate limits.
 
-**Current version**: `2.0.5`
+**Current version**: `2.2.0`
 
 NPM package:
 ```bash

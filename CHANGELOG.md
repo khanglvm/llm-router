@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-03-21
+
+### Added
+- Standalone `set-claude-code-effort-level` CLI operation sets `CLAUDE_CODE_EFFORT_LEVEL` in Claude Code settings and shell profile without requiring a router connection.
+- Web console effort level dropdown now works independently of routing — no need to connect Claude Code to LLM Router just to change thinking effort.
+
+### Changed
+- Claude Code live test uses process env vars (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`) instead of patching settings.json, keeping the config file untouched during tests.
+
 ## [2.0.5] - 2026-03-15
 
 ### Fixed

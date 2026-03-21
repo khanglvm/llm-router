@@ -28,6 +28,7 @@ import {
   unpatchAmpClientConfigFiles as unpatchAmpClientConfigFilesFile
 } from "../node/amp-client-config.js";
 import {
+  patchClaudeCodeEffortLevel,
   patchClaudeCodeSettingsFile,
   patchCodexCliConfigFile,
   readClaudeCodeRoutingState,
@@ -6532,6 +6533,32 @@ async function doSetClaudeCodeRouting(context) {
   };
 }
 
+async function doSetClaudeCodeEffortLevel(context) {
+  const args = context.args || {};
+  const settingsFilePath = String(readArg(args, ["claude-code-settings-file", "claudeCodeSettingsFile", "claude-settings-file", "claudeSettingsFile"], "") || "").trim();
+  const effortLevel = String(readArg(args, ["thinking-level", "thinkingLevel", "effort-level", "effortLevel"], "") || "").trim();
+
+  const result = await patchClaudeCodeEffortLevel({
+    settingsFilePath,
+    effortLevel,
+    env: process.env
+  });
+
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      result.effortLevel ? "Claude Code Effort Level Set" : "Claude Code Effort Level Cleared",
+      [
+        ["Settings File", result.settingsFilePath],
+        ["Effort Level", result.effortLevel || "(cleared)"],
+        ["Shell Profile Updated", formatYesNo(result.shellProfileUpdated)]
+      ]
+    )
+  };
+}
+
 async function doDiscoverProviderModels(context) {
   const args = context.args || {};
   let headers;
@@ -8395,6 +8422,8 @@ async function runConfigAction(context) {
     case "set-claude-code-routing":
     case "set-claude-code":
       return doSetClaudeCodeRouting(context);
+    case "set-claude-code-effort-level":
+      return doSetClaudeCodeEffortLevel(context);
     case "discover-provider-models":
       return doDiscoverProviderModels(context);
     case "test-provider":
@@ -9266,6 +9295,7 @@ async function runAiHelpAction(context) {
     `- enable/update route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=<target_model_or_group>`,
     `- optional bindings: --default-opus-model=<route> --default-sonnet-model=<route> --default-haiku-model=<route> --subagent-model=<route> --thinking-level=low|medium|high|max (sets CLAUDE_CODE_EFFORT_LEVEL in shell profile)`,
     `- disable route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=false`,
+    `- standalone effort level (no router needed): ${CLI_COMMAND} config --operation=set-claude-code-effort-level --thinking-level=low|medium|high|max`,
     "",
     "### Codex CLI",
     "- required_gate=patch_gate_codex_cli=ready",
@@ -10535,7 +10565,7 @@ const routerModule = {
           { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
           { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
           { name: "default-model", required: false, description: `For set-codex-cli-routing: managed route binding, or ${CODEX_CLI_INHERIT_MODEL_VALUE} to keep Codex's own model selection.`, example: "--default-model=chat.default" },
-          { name: "thinking-level", required: false, description: "For set-codex-cli-routing / set-claude-code-routing: reasoning level.", example: "--thinking-level=medium" },
+          { name: "thinking-level", required: false, description: "For set-codex-cli-routing / set-claude-code-routing / set-claude-code-effort-level: reasoning level.", example: "--thinking-level=medium" },
           { name: "primary-model", required: false, description: "For set-claude-code-routing: primary ANTHROPIC_MODEL route.", example: "--primary-model=chat.default" },
           { name: "default-opus-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_OPUS_MODEL route.", example: "--default-opus-model=chat.deep" },
           { name: "default-sonnet-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_SONNET_MODEL route.", example: "--default-sonnet-model=chat.default" },
@@ -10606,6 +10636,7 @@ const routerModule = {
           `${CLI_COMMAND} config --operation=set-amp-config --amp-subagent-mappings="oracle => rc/gpt-5.3-codex, librarian => rc/gpt-5.3-codex, search => rc/gpt-5.3-codex, look-at => rc/gpt-5.3-codex"`,
           `${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=true --default-model=chat.default`,
           `${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=chat.default --default-haiku-model=chat.fast`,
+          `${CLI_COMMAND} config --operation=set-claude-code-effort-level --thinking-level=high`,
           `${CLI_COMMAND} config --operation=set-amp-client-routing --enabled=true --amp-client-settings-scope=workspace`,
           `${CLI_COMMAND} config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN} --amp-client-api-key=gw_...`,
           `${CLI_COMMAND} config --operation=list-routing`,

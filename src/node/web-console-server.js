@@ -32,6 +32,7 @@ import {
 import {
   ensureClaudeCodeSettingsFileExists,
   ensureCodexCliConfigFileExists,
+  patchClaudeCodeEffortLevel,
   patchClaudeCodeSettingsFile,
   patchCodexCliConfigFile,
   readClaudeCodeRoutingState,
@@ -3156,6 +3157,22 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         sendJson(res, 200, {
           ...snapshot,
           message: "Claude Code model bindings updated."
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/claude-code/effort-level") {
+        const body = await readJsonBody(req);
+        const effortLevel = String(body?.effortLevel || body?.thinkingLevel || "").trim();
+        const result = await patchClaudeCodeEffortLevel({
+          effortLevel,
+          env: claudeCodeEnv
+        });
+        addLog("success", result.effortLevel ? `Claude Code effort level set to ${result.effortLevel}.` : "Claude Code effort level cleared.");
+        const snapshot = await broadcastState();
+        sendJson(res, 200, {
+          ...snapshot,
+          message: result.effortLevel ? `Effort level set to ${result.effortLevel}.` : "Effort level cleared."
         });
         return;
       }
