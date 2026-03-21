@@ -24,6 +24,8 @@ The Cloudflare Worker deployment must start and handle requests without runtime 
 - ✓ AMP proxy routing — uses fetch() — existing
 - ✓ AMP Gemini web search — uses fetch() — existing
 - ✓ Gzip decompression — DecompressionStream (Web API) — existing
+- ✓ Wrangler config enables Worker startup — `nodejs_compat` + compat date 2025-09-23 — Phase 1
+- ✓ Bundler preserves dynamic import boundaries — `find_additional_modules` + `[[rules]]` — Phase 1
 
 ### Active
 
@@ -66,8 +68,8 @@ The audit recommends Option B combined with `nodejs_compat_v2` for modules that 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | Lazy-load subscription modules (Option B) | Least invasive, no build pipeline changes, subscription features are Node-only by design | — Pending |
-| Add `nodejs_compat_v2` flag | Polyfills `node:crypto` and `node:path` used elsewhere in the codebase | — Pending |
+| Add `nodejs_compat` flag + compat date 2025-09-23 | Polyfills all `node:*` modules, enables v2 auto-behavior | ✓ Good — Phase 1 |
 | Keep subscription features Node-only | Fundamentally require `node:http`/`node:child_process` which Workers cannot provide | — Pending |
 
 ---
-*Last updated: 2026-03-21 after initialization*
+*Last updated: 2026-03-21 after Phase 1 completion*
