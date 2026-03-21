@@ -462,6 +462,70 @@ function FolderIcon({ className = "" }) {
   );
 }
 
+function EyeIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M2.5 10s3-5.5 7.5-5.5S17.5 10 17.5 10s-3 5.5-7.5 5.5S2.5 10 2.5 10Z" />
+      <circle cx="10" cy="10" r="2.5" />
+    </svg>
+  );
+}
+
+function EyeOffIcon({ className = "" }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M8.15 4.85A8.5 8.5 0 0 1 10 4.5c4.5 0 7.5 5.5 7.5 5.5a12.4 12.4 0 0 1-1.67 2.28" />
+      <path d="M5.6 5.6A12.2 12.2 0 0 0 2.5 10s3 5.5 7.5 5.5a8.3 8.3 0 0 0 4.4-1.6" />
+      <path d="M8.23 8.23a2.5 2.5 0 0 0 3.54 3.54" />
+      <path d="M3 3l14 14" />
+    </svg>
+  );
+}
+
+function CredentialInput({ value, onChange, onValueChange, placeholder, disabled, isEnvVar, buffered, commitOnBlur, onValueCommit, className }) {
+  const [visible, setVisible] = useState(false);
+  const shouldMask = !isEnvVar && !visible;
+  const inputProps = buffered
+    ? {
+        value: value || "",
+        onValueChange,
+        onValueCommit,
+        commitOnBlur,
+        type: shouldMask ? "password" : "text",
+        autoComplete: "off",
+        placeholder,
+        disabled,
+        className: cn("flex h-9 w-full rounded-lg rounded-r-none border border-r-0 border-input bg-background/80 px-3 py-2 text-sm text-foreground shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40", className)
+      }
+    : {
+        value: value || "",
+        onChange,
+        type: shouldMask ? "password" : "text",
+        autoComplete: "off",
+        placeholder,
+        disabled,
+        className: cn("flex h-9 w-full rounded-lg rounded-r-none border border-r-0 border-input bg-background/80 px-3 py-2 text-sm text-foreground shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40", className)
+      };
+
+  return (
+    <div className="flex">
+      {buffered
+        ? <BufferedTextInput {...inputProps} />
+        : <input {...inputProps} />}
+      <button
+        type="button"
+        tabIndex={-1}
+        onClick={() => setVisible((v) => !v)}
+        disabled={disabled}
+        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg rounded-l-none border border-l-0 border-input bg-background/80 text-muted-foreground transition hover:text-foreground focus:outline-none disabled:pointer-events-none disabled:opacity-50"
+        aria-label={visible ? "Hide credential" : "Show credential"}
+      >
+        {visible ? <EyeOffIcon className="h-4 w-4" /> : <EyeIcon className="h-4 w-4" />}
+      </button>
+    </div>
+  );
+}
+
 function PowerIcon({ className = "" }) {
   return (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={className}>
@@ -6255,11 +6319,12 @@ function ProviderCard({
             {!isSubscription ? (
               <div className="space-y-3">
                 <Field label="API key or env" hint="Use an env var like OPENAI_API_KEY or paste the direct key." stacked>
-                  <Input
+                  <CredentialInput
                     value={draft.credentialInput || ""}
                     onChange={(event) => setDraft((current) => ({ ...current, credentialInput: event.target.value }))}
                     disabled={modalCloseLocked}
                     placeholder="Example: OPENAI_API_KEY or sk-..."
+                    isEnvVar={looksLikeEnvVarName(draft.credentialInput)}
                   />
                 </Field>
                 <div ref={endpointSectionRef}>
@@ -6991,13 +7056,13 @@ function WebSearchSettingsPanel({
                         headerClassName="min-h-0"
                         hintClassName="leading-4"
                       >
-                        <BufferedTextInput
-                          type={provider.credentialField === "url" ? "text" : "password"}
-                          autoComplete="off"
+                        <CredentialInput
+                          buffered
                           value={credentialValue}
                           placeholder={provider.credentialPlaceholder}
                           onValueChange={(value) => onWebSearchProviderChange(provider.id, credentialField, value)}
                           disabled={Boolean(disabledReason)}
+                          isEnvVar={provider.credentialField === "url"}
                         />
                       </Field>
 
@@ -8745,10 +8810,11 @@ function QuickStartWizard({
                 />
               </Field>
               <Field label="API key or env">
-                <Input
+                <CredentialInput
                   value={quickStart.apiKeyEnv}
                   onChange={(event) => updateQuickStart("apiKeyEnv", event.target.value)}
                   placeholder="Example: OPENAI_API_KEY or sk-..."
+                  isEnvVar={looksLikeEnvVarName(quickStart.apiKeyEnv)}
                 />
               </Field>
               <Field label="Custom headers" hint="User-Agent included by default">
