@@ -8481,6 +8481,11 @@ async function runWebAction(context) {
     routerRequireAuth: toBoolean(readArg(args, ["router-require-auth", "routerRequireAuth"], false), false),
     allowRemoteClients: toBoolean(readArg(args, ["allow-remote-clients", "allowRemoteClients"], false), false),
     cliPathForRouter: process.argv[1],
+    onPortConflict: canPrompt() && typeof context?.prompts?.confirm === "function"
+      ? ({ port }) => context.prompts.confirm({
+        message: `Port ${port} is already in use. Kill the existing listener and reclaim the port?`
+      })
+      : undefined,
     onLine: (line) => context.terminal.line(line),
     onError: (line) => context.terminal.error(line)
   });

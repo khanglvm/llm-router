@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { getDefaultConfigPath } from "./config-store.js";
 import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
+import { reclaimPort } from "./port-reclaim.js";
 import { startWebConsoleServer } from "./web-console-server.js";
 
 function toBoolean(value, fallback) {
@@ -49,26 +50,76 @@ export async function runWebCommand(options = {}) {
   const line = typeof options.onLine === "function" ? options.onLine : console.log;
   const error = typeof options.onError === "function" ? options.onError : console.error;
 
+  const onPortConflict = typeof options.onPortConflict === "function" ? options.onPortConflict : null;
+  const reclaimPortFn = typeof options.reclaimPort === "function" ? options.reclaimPort : (args) => reclaimPort(args, options);
+
+  const buildServerOptions = () => ({
+    host,
+    port,
+    configPath,
+    routerHost: FIXED_LOCAL_ROUTER_HOST,
+    routerPort: FIXED_LOCAL_ROUTER_PORT,
+    routerWatchConfig: toBoolean(options.routerWatchConfig ?? options["router-watch-config"], true),
+    routerWatchBinary: toBoolean(options.routerWatchBinary ?? options["router-watch-binary"], true),
+    routerRequireAuth: toBoolean(options.routerRequireAuth ?? options["router-require-auth"], false),
+    allowRemoteClients: toBoolean(options.allowRemoteClients ?? options["allow-remote-clients"], false),
+    cliPathForRouter: String(options.cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim()
+  });
+
   let server;
   try {
-    server = await startWebConsoleServer({
-      host,
-      port,
-      configPath,
-      routerHost: FIXED_LOCAL_ROUTER_HOST,
-      routerPort: FIXED_LOCAL_ROUTER_PORT,
-      routerWatchConfig: toBoolean(options.routerWatchConfig ?? options["router-watch-config"], true),
-      routerWatchBinary: toBoolean(options.routerWatchBinary ?? options["router-watch-binary"], true),
-      routerRequireAuth: toBoolean(options.routerRequireAuth ?? options["router-require-auth"], false),
-      allowRemoteClients: toBoolean(options.allowRemoteClients ?? options["allow-remote-clients"], false),
-      cliPathForRouter: String(options.cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim()
-    });
+    server = await startWebConsoleServer(buildServerOptions());
   } catch (startError) {
-    return {
-      ok: false,
-      exitCode: 1,
-      errorMessage: `Failed to start the LLM Router web console: ${startError instanceof Error ? startError.message : String(startError)}`
-    };
+    if (startError?.code !== "EADDRINUSE") {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: `Failed to start the LLM Router web console: ${startError instanceof Error ? startError.message : String(startError)}`
+      };
+    }
+
+    if (!onPortConflict) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: `Port ${port} is already in use. Stop the existing listener or use a different port (--port=<number> or LLM_ROUTER_WEB_PORT env).`
+      };
+    }
+
+    let userChoice;
+    try {
+      userChoice = await onPortConflict({ port, host });
+    } catch {
+      userChoice = false;
+    }
+
+    if (!userChoice) {
+      return {
+        ok: true,
+        exitCode: 0,
+        data: `Port ${port} is in use. Web console launch cancelled.`
+      };
+    }
+
+    const reclaimed = await reclaimPortFn({ port, line, error });
+    if (!reclaimed.ok) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: reclaimed.errorMessage
+      };
+    }
+
+    try {
+      server = await startWebConsoleServer(buildServerOptions());
+      line(`Port ${port} reclaimed successfully.`);
+    } catch (retryError) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: `Failed to start the LLM Router web console after reclaiming port ${port}: ${retryError instanceof Error ? retryError.message : String(retryError)}`
+      };
+    }
   }
 
   line(`LLM Router web console started on ${server.url}`);
