@@ -35,20 +35,35 @@ llr ai-help  # agent-oriented setup brief
 
 ## Web UI
 
+### Alias & Fallback
+
+Create stable route names across multiple providers with balancing and failover.
+
 ![Alias & Fallback](./assets/screenshots/web-ui-aliases.png)
-*Alias & Fallback — create stable route names across multiple providers with balancing and failover*
+
+### AMP (Beta)
+
+Route AMP-compatible requests through LLM Router with custom model mapping.
 
 ![AMP Configuration](./assets/screenshots/web-ui-amp.png)
-*AMP (Beta) — route AMP-compatible requests through LLM Router with custom model mapping*
+
+### Codex CLI
+
+Route Codex CLI requests through the gateway with model override and thinking level.
 
 ![Codex CLI Routing](./assets/screenshots/web-ui-codex-cli.png)
-*Codex CLI — route Codex CLI requests through the gateway with model override and thinking level*
+
+### Claude Code
+
+Route Claude Code through the gateway with per-tier model bindings.
 
 ![Claude Code Routing](./assets/screenshots/web-ui-claude-code.png)
-*Claude Code — route Claude Code through the gateway with per-tier model bindings*
+
+### Web Search
+
+Configure search providers for AMP and other router-managed tools.
 
 ![Web Search](./assets/screenshots/web-ui-web-search.png)
-*Web Search — configure search providers for AMP and other router-managed tools*
 
 ## AMP (Beta)
 
