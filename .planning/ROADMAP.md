@@ -29,7 +29,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans:** 1/1 plans complete
 
 Plans:
-- [ ] 01-01-PLAN.md — Update wrangler.toml with compat date, nodejs_compat flag, and bundler rules
+- [x] 01-01-PLAN.md — Update wrangler.toml with compat date, nodejs_compat flag, and bundler rules
 
 ### Phase 2: Import Chain Fix
 **Goal**: Subscription-provider code never loads in Worker mode; Node.js local mode continues working identically
@@ -41,10 +41,11 @@ Plans:
   3. `state-store.js` has an explicit Worker guard that prevents its file-store dynamic import from executing in Worker context
   4. All existing `node --test` tests pass with zero regressions after the import restructuring
   5. `wrangler deploy --dry-run` produces zero `node:*` warnings
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 02-01: TBD
+- [ ] 02-01-PLAN.md — Refactor provider-call.js: inline check, Worker 501 guard, lazy import, thread runtimeFlags from handler.js
+- [ ] 02-02-PLAN.md — Refactor amp-web-search.js: inline check, thread runtimeFlags, lazy import; harden state-store.js with Worker guard
 
 ### Phase 3: CI Verification
 **Goal**: Worker compatibility is continuously validated -- regressions are caught automatically before merge
@@ -66,6 +67,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Wrangler Configuration | 0/1 | Complete    | 2026-03-21 |
-| 2. Import Chain Fix | 0/0 | Not started | - |
+| 1. Wrangler Configuration | 1/1 | Complete    | 2026-03-21 |
+| 2. Import Chain Fix | 0/2 | Not started | - |
 | 3. CI Verification | 0/0 | Not started | - |
