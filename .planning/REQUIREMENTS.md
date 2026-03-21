@@ -15,11 +15,11 @@ Requirements for this fix initiative. Each maps to roadmap phases.
 
 ### Import Restructuring
 
-- [ ] **IMPT-01**: `isSubscriptionProvider()` check is inlined or extracted to a side-effect-free module with zero Node.js imports
-- [ ] **IMPT-02**: `provider-call.js` uses lazy `await import()` for subscription-provider module instead of static import
+- [x] **IMPT-01**: `isSubscriptionProvider()` check is inlined or extracted to a side-effect-free module with zero Node.js imports
+- [x] **IMPT-02**: `provider-call.js` uses lazy `await import()` for subscription-provider module instead of static import
 - [ ] **IMPT-03**: `amp-web-search.js` uses lazy `await import()` for subscription-provider module instead of static import
-- [ ] **IMPT-04**: Worker returns clean 501 error when a subscription provider is encountered in Worker mode
-- [ ] **IMPT-05**: Node.js local mode continues to work identically — all existing tests pass
+- [x] **IMPT-04**: Worker returns clean 501 error when a subscription provider is encountered in Worker mode
+- [x] **IMPT-05**: Node.js local mode continues to work identically — all existing tests pass
 
 ### Hardening
 
@@ -68,11 +68,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
-| IMPT-01 | Phase 2 | Pending |
-| IMPT-02 | Phase 2 | Pending |
+| IMPT-01 | Phase 2 | Complete |
+| IMPT-02 | Phase 2 | Complete |
 | IMPT-03 | Phase 2 | Pending |
-| IMPT-04 | Phase 2 | Pending |
-| IMPT-05 | Phase 2 | Pending |
+| IMPT-04 | Phase 2 | Complete |
+| IMPT-05 | Phase 2 | Complete |
 | HARD-01 | Phase 2 | Pending |
 | HARD-02 | Phase 2 | Pending |
 | VERF-01 | Phase 3 | Pending |
