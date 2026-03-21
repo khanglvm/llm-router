@@ -10760,6 +10760,7 @@ export function App() {
               <TabsTrigger value="amp">
                 <span className="inline-flex items-center gap-2">
                   <span>AMP</span>
+                  <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-amber-700 dark:bg-amber-900/50 dark:text-amber-300">Beta</span>
                   <ConnectedIndicatorDot connected={ampTabConnected} srLabel="AMP connected" />
                 </span>
               </TabsTrigger>
