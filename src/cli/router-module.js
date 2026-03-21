@@ -73,7 +73,7 @@ import {
 import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   isCodexCliInheritModelBinding,
-  normalizeClaudeCodeThinkingLevel,
+  normalizeClaudeCodeEffortLevel,
   normalizeCodexCliReasoningEffort
 } from "../shared/coding-tool-bindings.js";
 import { FORMATS } from "../translator/index.js";
@@ -3609,7 +3609,7 @@ function normalizeClaudeBindingState(bindings = {}) {
     defaultSonnetModel: String(source.defaultSonnetModel || "").trim(),
     defaultHaikuModel: String(source.defaultHaikuModel || "").trim(),
     subagentModel: String(source.subagentModel || "").trim(),
-    thinkingLevel: normalizeClaudeCodeThinkingLevel(source.thinkingLevel)
+    thinkingLevel: normalizeClaudeCodeEffortLevel(source.thinkingLevel)
   };
 }
 
@@ -9264,7 +9264,7 @@ async function runAiHelpAction(context) {
     "### Claude Code",
     "- required_gate=patch_gate_claude_code=ready",
     `- enable/update route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=<target_model_or_group>`,
-    `- optional bindings: --default-opus-model=<route> --default-sonnet-model=<route> --default-haiku-model=<route> --subagent-model=<route> --thinking-level=low|medium|high|max`,
+    `- optional bindings: --default-opus-model=<route> --default-sonnet-model=<route> --default-haiku-model=<route> --subagent-model=<route> --thinking-level=low|medium|high|max (sets CLAUDE_CODE_EFFORT_LEVEL in shell profile)`,
     `- disable route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=false`,
     "",
     "### Codex CLI",

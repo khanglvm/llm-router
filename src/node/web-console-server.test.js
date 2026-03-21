@@ -15,7 +15,6 @@ import { DEFAULT_MODEL_ALIAS_ID } from "../runtime/config.js";
 import { createFileStateStore } from "../runtime/state-store.file.js";
 import { resolveWindowRange } from "../runtime/rate-limits.js";
 import {
-  CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL,
   CODEX_CLI_INHERIT_MODEL_VALUE
 } from "../shared/coding-tool-bindings.js";
 
@@ -3560,7 +3559,7 @@ test("web console treats Claude Code as connected when the endpoint matches and 
     const settings = await readJsonFileOrNull(settingsPath);
     settings.env.ANTHROPIC_AUTH_TOKEN = "gw_replaced_secret_value";
     settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "coding.default";
-    settings.env.MAX_THINKING_TOKENS = String(CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high);
+    settings.env.CLAUDE_CODE_EFFORT_LEVEL = "high";
     await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
 
     const refreshed = await fetchJson(`${server.url}/api/state`);
@@ -3589,7 +3588,7 @@ test("web console restores deprecated Claude Code small/fast bindings from backu
       ANTHROPIC_MODEL: "old/primary",
       ANTHROPIC_SMALL_FAST_MODEL: "old/small-fast",
       CLAUDE_CODE_SUBAGENT_MODEL: "old/subagent",
-      MAX_THINKING_TOKENS: "4096"
+      CLAUDE_CODE_EFFORT_LEVEL: "low"
     }
   };
   await mkdir(path.dirname(getClaudeSettingsPath(claudeCode.env)), { recursive: true });
@@ -3618,7 +3617,7 @@ test("web console restores deprecated Claude Code small/fast bindings from backu
 
     const routedSettings = await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env));
     assert.equal(routedSettings.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
-    assert.equal(routedSettings.env.MAX_THINKING_TOKENS, undefined);
+    assert.equal(routedSettings.env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
 
     const disabled = await fetchJson(`${server.url}/api/claude-code/global-route`, {
       method: "POST",
@@ -3697,7 +3696,8 @@ test("web console updates Claude Code model bindings while routed through llm-ro
     assert.equal(settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "demo/gpt-4o-mini");
     assert.equal(settings.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
     assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, "coding.default");
-    assert.equal(settings.env.MAX_THINKING_TOKENS, String(CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high));
+    assert.equal(settings.env.CLAUDE_CODE_EFFORT_LEVEL, "high");
+    assert.equal(settings.env.MAX_THINKING_TOKENS, undefined);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();

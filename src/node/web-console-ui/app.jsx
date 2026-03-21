@@ -41,9 +41,8 @@ import { CODEX_SUBSCRIPTION_MODELS, CLAUDE_CODE_SUBSCRIPTION_MODELS } from "../.
 import { DEFAULT_AMP_ENTITY_DEFINITIONS, DEFAULT_AMP_SIGNATURE_DEFINITIONS, DEFAULT_MODEL_ALIAS_ID } from "../../runtime/config.js";
 import { LOCAL_ROUTER_ORIGIN, LOCAL_ROUTER_PORT } from "../../shared/local-router-defaults.js";
 import {
-  CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL,
   CODEX_CLI_INHERIT_MODEL_VALUE,
-  normalizeClaudeCodeThinkingLevel,
+  normalizeClaudeCodeEffortLevel,
   isCodexCliInheritModelBinding
 } from "../../shared/coding-tool-bindings.js";
 import { classifyTransientIntegerInput } from "./transient-integer-input-utils.js";
@@ -115,10 +114,10 @@ const CODEX_THINKING_LEVEL_OPTIONS = Object.freeze([
   { value: "xhigh", label: "XHigh", hint: "Model-dependent extra depth" }
 ]);
 const CLAUDE_THINKING_LEVEL_OPTIONS = Object.freeze([
-  { value: "low", label: "Low", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.low}` },
-  { value: "medium", label: "Medium", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.medium}` },
-  { value: "high", label: "High", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high}` },
-  { value: "max", label: "Max", hint: `Maps to MAX_THINKING_TOKENS=${CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.max}` }
+  { value: "low", label: "Low", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=low" },
+  { value: "medium", label: "Medium", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=medium" },
+  { value: "high", label: "High", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=high" },
+  { value: "max", label: "Max", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=max" }
 ]);
 const QUICK_START_WINDOW_OPTIONS = RATE_LIMIT_WINDOW_OPTIONS;
 const QUICK_START_API_ENV_BY_CONNECTION = {
@@ -1730,10 +1729,7 @@ function buildClaudeCodeGuideContent({
   const defaultSonnetModel = String(bindings?.defaultSonnetModel || "").trim();
   const defaultHaikuModel = String(bindings?.defaultHaikuModel || "").trim();
   const subagentModel = String(bindings?.subagentModel || "").trim();
-  const normalizedLevel = normalizeClaudeCodeThinkingLevel(bindings?.thinkingLevel);
-  const selectedBudget = normalizedLevel
-    ? CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL[normalizedLevel]
-    : "";
+  const normalizedLevel = normalizeClaudeCodeEffortLevel(bindings?.thinkingLevel);
   const normalizedSettingsFilePath = String(settingsFilePath || "").trim();
   const normalizedEndpointUrl = String(endpointUrl || "").trim();
   const activeOverrideCount = [
@@ -1761,7 +1757,7 @@ function buildClaudeCodeGuideContent({
           title: "Only filled fields are overridden.",
           body: (
             <>
-              Claude Code continues to inherit its normal defaults for every blank field. This is useful when you only want to steer alias models, subagents, or thinking budget through LLM Router.
+              Claude Code continues to inherit its normal defaults for every blank field. This is useful when you only want to steer alias models, subagents, or effort level through LLM Router.
             </>
           )
         }
@@ -1777,10 +1773,10 @@ function buildClaudeCodeGuideContent({
 
   return {
     title: "Claude Code guide",
-    description: "Quick setup for routing Claude Code through LLM Router while keeping only the model and thinking overrides you actually want.",
+    description: "Quick setup for routing Claude Code through LLM Router while keeping only the model and effort level overrides you actually want.",
     badges: [
       { label: activeOverrideCount > 0 ? `${activeOverrideCount} override${activeOverrideCount === 1 ? "" : "s"} active` : "No router overrides", variant: activeOverrideCount > 0 ? "info" : "outline" },
-      { label: normalizedLevel ? `Thinking: ${normalizedLevel} (${selectedBudget})` : "Thinking: Claude adaptive default", variant: "outline" },
+      { label: normalizedLevel ? `Effort: ${normalizedLevel}` : "Effort: Claude adaptive default", variant: "outline" },
       { label: normalizedSettingsFilePath ? "Settings file detected" : "Settings scope: local/project/user", variant: "outline" }
     ],
     callout,
@@ -1810,11 +1806,11 @@ function buildClaudeCodeGuideContent({
         )
       },
       {
-        eyebrow: "3. Think",
-        title: "Use a stable thinking selector",
+        eyebrow: "3. Effort",
+        title: "Set thinking effort level",
         body: (
           <>
-            The <span className="font-medium">Thinking level</span> dropdown is an LLM Router convenience layer that writes <code>MAX_THINKING_TOKENS</code> using stable budgets instead of making you remember raw numbers.
+            The <span className="font-medium">Effort level</span> dropdown writes <code>CLAUDE_CODE_EFFORT_LEVEL</code> to your shell profile. If the shell profile cannot be updated, <code>effortLevel</code> is set in <code>settings.json</code> as a fallback (only &quot;high&quot; is supported there).
           </>
         )
       }
@@ -1827,7 +1823,7 @@ function buildClaudeCodeGuideContent({
           <>Leave <span className="font-medium">Current model override</span> empty unless you explicitly want to replace Claude Code&apos;s own main model selection.</>,
           <>Use <span className="font-medium">Default Opus</span>, <span className="font-medium">Default Sonnet</span>, and <span className="font-medium">Default Haiku</span> when you want Claude Code&apos;s built-in alias names to resolve to managed routes or aliases.</>,
           <>Use <span className="font-medium">Sub-agent model</span> when background workers or helper agents should run on a different route than the main session.</>,
-          <>Use <span className="font-medium">Thinking level</span> only when you want a fixed <code>MAX_THINKING_TOKENS</code> budget; leave it unset to keep Claude Code&apos;s adaptive/default behavior.</>
+          <>Use <span className="font-medium">Effort level</span> to set <code>CLAUDE_CODE_EFFORT_LEVEL</code> in your shell profile; leave it unset to keep Claude Code&apos;s adaptive default. The <code>effortLevel</code> key in <code>settings.json</code> (only &quot;high&quot;) acts as a fallback when the shell profile cannot be updated.</>
         ]
       },
       {
@@ -1837,8 +1833,8 @@ function buildClaudeCodeGuideContent({
           <><code>ANTHROPIC_DEFAULT_OPUS_MODEL</code>, <code>ANTHROPIC_DEFAULT_SONNET_MODEL</code>, and <code>ANTHROPIC_DEFAULT_HAIKU_MODEL</code>: remap Claude Code&apos;s built-in alias names to managed routes or aliases.</>,
           <><code>CLAUDE_CODE_SUBAGENT_MODEL</code>: routes subagents and background workers to a specific managed model.</>,
           normalizedLevel
-            ? <><code>MAX_THINKING_TOKENS</code>: currently mapped from <span className="font-medium">{normalizedLevel}</span> to <code>{selectedBudget}</code>.</>
-            : <><code>MAX_THINKING_TOKENS</code>: stays unset here unless you choose a thinking level.</>
+            ? <><code>CLAUDE_CODE_EFFORT_LEVEL</code>: currently set to <span className="font-medium">{normalizedLevel}</span> in your shell profile.</>
+            : <><code>CLAUDE_CODE_EFFORT_LEVEL</code>: stays unset unless you choose an effort level.</>
         ]
       },
       {
@@ -1856,7 +1852,7 @@ function buildClaudeCodeGuideContent({
         items: [
           <>Open the settings file from this page and confirm the <code>env</code> block contains only the overrides you meant to set.</>,
           <>Launch Claude Code and test both the main session and any subagents if you changed <code>CLAUDE_CODE_SUBAGENT_MODEL</code>.</>,
-          <>If thinking behavior is not what you expected, remember this UI maps levels to <code>MAX_THINKING_TOKENS</code>; clearing the field returns control to Claude Code&apos;s own default behavior.</>
+          <>If thinking behavior is not what you expected, remember this UI writes <code>CLAUDE_CODE_EFFORT_LEVEL</code> to your shell profile; clearing the field returns control to Claude Code&apos;s own default behavior.</>
         ]
       }
     ]
@@ -10939,9 +10935,9 @@ export function App() {
                 },
                 {
                   id: "thinkingLevel",
-                  label: "Thinking level",
-                  description: "Claude Code documents `MAX_THINKING_TOKENS`, not a fixed effort enum. This LLM Router control maps stable levels to that setting.",
-                  envKey: "MAX_THINKING_TOKENS",
+                  label: "Effort level",
+                  description: "Sets `CLAUDE_CODE_EFFORT_LEVEL` in your shell profile (~/.zshrc or ~/.bashrc). Falls back to `effortLevel` in settings.json (only \"high\") if shell profile cannot be updated.",
+                  envKey: "CLAUDE_CODE_EFFORT_LEVEL",
                   value: claudeCodeState?.bindings?.thinkingLevel || "",
                   allowUnset: true,
                   usesRouteOptions: false,

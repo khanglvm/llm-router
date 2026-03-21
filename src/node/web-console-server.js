@@ -60,7 +60,7 @@ import { createStateStore } from "../runtime/state-store.js";
 import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   isCodexCliInheritModelBinding,
-  normalizeClaudeCodeThinkingLevel,
+  normalizeClaudeCodeEffortLevel,
   normalizeCodexCliReasoningEffort
 } from "../shared/coding-tool-bindings.js";
 import { applyActivityLogSettings, readActivityLogSettings } from "../shared/local-router-defaults.js";
@@ -1134,7 +1134,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       defaultSonnetModel: String(source.defaultSonnetModel || "").trim(),
       defaultHaikuModel: String(source.defaultHaikuModel || "").trim(),
       subagentModel: String(source.subagentModel || "").trim(),
-      thinkingLevel: normalizeClaudeCodeThinkingLevel(source.thinkingLevel)
+      thinkingLevel: normalizeClaudeCodeEffortLevel(source.thinkingLevel)
     };
   }
 
@@ -1158,7 +1158,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       && String(left?.defaultSonnetModel || "").trim() === String(right?.defaultSonnetModel || "").trim()
       && String(left?.defaultHaikuModel || "").trim() === String(right?.defaultHaikuModel || "").trim()
       && String(left?.subagentModel || "").trim() === String(right?.subagentModel || "").trim()
-      && normalizeClaudeCodeThinkingLevel(left?.thinkingLevel) === normalizeClaudeCodeThinkingLevel(right?.thinkingLevel)
+      && normalizeClaudeCodeEffortLevel(left?.thinkingLevel) === normalizeClaudeCodeEffortLevel(right?.thinkingLevel)
     );
   }
 

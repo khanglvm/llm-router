@@ -18,6 +18,8 @@ export const CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL = Object.freeze({
   high: 24000,
   max: 31999
 });
+export const CLAUDE_CODE_EFFORT_LEVEL_VALUES = CLAUDE_CODE_THINKING_LEVEL_VALUES;
+export const CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE = "high";
 
 export function isCodexCliInheritModelBinding(value) {
   return String(value || "").trim() === CODEX_CLI_INHERIT_MODEL_VALUE;
@@ -47,3 +49,6 @@ export function mapClaudeCodeThinkingTokensToLevel(value) {
   if (parsed >= 6000) return "medium";
   return "low";
 }
+
+export const normalizeClaudeCodeEffortLevel = normalizeClaudeCodeThinkingLevel;
+export const migrateLegacyThinkingTokensToEffortLevel = mapClaudeCodeThinkingTokensToLevel;

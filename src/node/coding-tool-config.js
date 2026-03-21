@@ -3,10 +3,13 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
+  CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE,
   isCodexCliInheritModelBinding,
   mapClaudeCodeThinkingLevelToTokens,
   mapClaudeCodeThinkingTokensToLevel,
   normalizeClaudeCodeThinkingLevel,
+  normalizeClaudeCodeEffortLevel,
+  migrateLegacyThinkingTokensToEffortLevel,
   normalizeCodexCliReasoningEffort
 } from "../shared/coding-tool-bindings.js";
 
@@ -21,7 +24,7 @@ const CLAUDE_MANAGED_ENV_KEYS = Object.freeze([
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
   "CLAUDE_CODE_SUBAGENT_MODEL",
-  "MAX_THINKING_TOKENS"
+  "CLAUDE_CODE_EFFORT_LEVEL"
 ]);
 const CLAUDE_BACKUP_ENV_KEYS = Object.freeze([
   ...CLAUDE_MANAGED_ENV_KEYS,
@@ -338,7 +341,7 @@ function normalizeClaudeBindings(bindings = {}) {
     defaultSonnetModel: normalizeModelBinding(source.defaultSonnetModel),
     defaultHaikuModel: normalizeModelBinding(source.defaultHaikuModel),
     subagentModel: normalizeModelBinding(source.subagentModel),
-    thinkingLevel: normalizeClaudeCodeThinkingLevel(source.thinkingLevel)
+    thinkingLevel: normalizeClaudeCodeEffortLevel(source.thinkingLevel)
   };
 }
 
@@ -392,16 +395,20 @@ function applyCodexBackup(document, backup = {}) {
 function captureClaudeBackup(config) {
   const env = config?.env && typeof config.env === "object" && !Array.isArray(config.env) ? config.env : {};
   const backupEnv = {};
-  for (const key of CLAUDE_BACKUP_ENV_KEYS) {
+  for (const key of [...CLAUDE_BACKUP_ENV_KEYS, "MAX_THINKING_TOKENS"]) {
     if (Object.prototype.hasOwnProperty.call(env, key)) {
       backupEnv[key] = getBackupValue(env[key]);
     }
   }
-  return {
+  const backup = {
     tool: "claude-code",
     version: 1,
     env: backupEnv
   };
+  if (config && typeof config === "object" && config.effortLevel !== undefined) {
+    backup.effortLevel = getBackupValue(config.effortLevel);
+  }
+  return backup;
 }
 
 function applyClaudeBackup(config, backup = {}) {
@@ -412,7 +419,7 @@ function applyClaudeBackup(config, backup = {}) {
     ? { ...next.env }
     : {};
 
-  for (const key of CLAUDE_BACKUP_ENV_KEYS) {
+  for (const key of [...CLAUDE_BACKUP_ENV_KEYS, "MAX_THINKING_TOKENS"]) {
     if (backup?.env && Object.prototype.hasOwnProperty.call(backup.env, key)) {
       applyBackupValue(env, key, backup.env[key]);
     } else {
@@ -420,9 +427,63 @@ function applyClaudeBackup(config, backup = {}) {
     }
   }
 
+  if (backup?.effortLevel?.exists) {
+    next.effortLevel = backup.effortLevel.value;
+  } else {
+    delete next.effortLevel;
+  }
+
   if (Object.keys(env).length > 0) next.env = env;
   else delete next.env;
   return next;
+}
+
+const SHELL_EFFORT_MARKER_START = "# >>> llm-router effort-level >>>";
+const SHELL_EFFORT_MARKER_END = "# <<< llm-router effort-level <<<";
+
+function resolveShellProfilePath(homeDir) {
+  const shell = String(process.env.SHELL || "").trim();
+  const profileName = shell.endsWith("/zsh") || shell.endsWith("/zsh5") ? ".zshrc" : ".bashrc";
+  return path.join(homeDir, profileName);
+}
+
+async function patchShellProfileEffortLevel(effortLevel, homeDir) {
+  const profilePath = resolveShellProfilePath(homeDir);
+  const markerPattern = new RegExp(
+    `${escapeRegex(SHELL_EFFORT_MARKER_START)}[\\s\\S]*?${escapeRegex(SHELL_EFFORT_MARKER_END)}\\n?`,
+    "g"
+  );
+
+  let text;
+  try {
+    text = await fs.readFile(profilePath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      if (!effortLevel) return false;
+      text = "";
+    } else {
+      return false;
+    }
+  }
+
+  const cleaned = text.replace(markerPattern, "");
+  if (!effortLevel) {
+    if (cleaned !== text) {
+      await fs.writeFile(profilePath, cleaned, "utf8");
+    }
+    return true;
+  }
+
+  const block = [
+    SHELL_EFFORT_MARKER_START,
+    `export CLAUDE_CODE_EFFORT_LEVEL="${effortLevel}"`,
+    SHELL_EFFORT_MARKER_END,
+    ""
+  ].join("\n");
+
+  const separator = cleaned.length > 0 && !cleaned.endsWith("\n") ? "\n" : "";
+  await fs.writeFile(profilePath, `${cleaned}${separator}${block}`, "utf8");
+  return true;
 }
 
 async function ensureToolBackupFileExists(backupFilePath) {
@@ -733,7 +794,9 @@ export async function readClaudeCodeRoutingState({
       defaultSonnetModel: envConfig.ANTHROPIC_DEFAULT_SONNET_MODEL,
       defaultHaikuModel: envConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL,
       subagentModel: envConfig.CLAUDE_CODE_SUBAGENT_MODEL,
-      thinkingLevel: mapClaudeCodeThinkingTokensToLevel(envConfig.MAX_THINKING_TOKENS)
+      thinkingLevel: normalizeClaudeCodeEffortLevel(envConfig.CLAUDE_CODE_EFFORT_LEVEL)
+        || normalizeClaudeCodeEffortLevel(settingsState.data?.effortLevel)
+        || migrateLegacyThinkingTokensToEffortLevel(envConfig.MAX_THINKING_TOKENS)
     })
   };
 }
@@ -798,15 +861,33 @@ export async function patchClaudeCodeSettingsFile({
   if (normalizedBindings.subagentModel) nextSettings.env.CLAUDE_CODE_SUBAGENT_MODEL = normalizedBindings.subagentModel;
   else delete nextSettings.env.CLAUDE_CODE_SUBAGENT_MODEL;
 
-  const maxThinkingTokens = mapClaudeCodeThinkingLevelToTokens(normalizedBindings.thinkingLevel);
-  if (maxThinkingTokens) nextSettings.env.MAX_THINKING_TOKENS = maxThinkingTokens;
-  else delete nextSettings.env.MAX_THINKING_TOKENS;
+  delete nextSettings.env.MAX_THINKING_TOKENS;
+
+  const effortLevel = normalizeClaudeCodeEffortLevel(normalizedBindings.thinkingLevel);
+  let shellProfileUpdated = false;
+  if (effortLevel) {
+    nextSettings.env.CLAUDE_CODE_EFFORT_LEVEL = effortLevel;
+    if (effortLevel === CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE) {
+      nextSettings.effortLevel = effortLevel;
+    } else {
+      delete nextSettings.effortLevel;
+    }
+    shellProfileUpdated = await patchShellProfileEffortLevel(effortLevel, homeDir);
+    if (!shellProfileUpdated) {
+      nextSettings.effortLevel = CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE;
+    }
+  } else {
+    delete nextSettings.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete nextSettings.effortLevel;
+    shellProfileUpdated = await patchShellProfileEffortLevel("", homeDir);
+  }
 
   await writeJsonObjectFile(resolvedSettingsPath, nextSettings);
   return {
     settingsFilePath: resolvedSettingsPath,
     backupFilePath: resolvedBackupPath,
     settingsCreated: !settingsState.existed,
+    shellProfileUpdated,
     baseUrl,
     bindings: normalizedBindings
   };
@@ -824,9 +905,11 @@ export async function unpatchClaudeCodeSettingsFile({
   const backupState = await readJsonObjectFile(resolvedBackupPath, `Backup file '${resolvedBackupPath}'`);
   const backup = sanitizeBackup(backupState.data, "claude-code");
   const restoredSettings = applyClaudeBackup(settingsState.data, backup);
+  delete restoredSettings.effortLevel;
 
   await writeJsonObjectFile(resolvedSettingsPath, restoredSettings);
   await writeJsonObjectFile(resolvedBackupPath, {});
+  await patchShellProfileEffortLevel("", homeDir);
 
   return {
     settingsFilePath: resolvedSettingsPath,
