@@ -91,11 +91,6 @@ const QUICK_START_CONNECTION_OPTIONS = [
     value: "oauth-gpt",
     label: "OAuth · GPT",
     description: "Use ChatGPT subscription login with GPT models."
-  },
-  {
-    value: "oauth-claude",
-    label: "OAuth · Claude",
-    description: "Use Claude subscription login with Claude models."
   }
 ];
 const MODEL_ALIAS_STRATEGY_OPTIONS = [
@@ -8755,10 +8750,13 @@ function QuickStartWizard({
 
             </>
           ) : (
-            <div className="rounded-2xl border border-border/70 bg-secondary/45 px-4 py-3 text-sm leading-6 text-muted-foreground">
-              {quickStart.connectionType === "oauth-claude"
-                ? "Continue opens the Claude sign-in page in your browser and stores the login for this provider automatically."
-                : "Continue opens the ChatGPT sign-in page in your browser and stores the login for this provider automatically."}
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-border/70 bg-secondary/45 px-4 py-3 text-sm leading-6 text-muted-foreground">
+                Continue opens the ChatGPT sign-in page in your browser and stores the login for this provider automatically.
+              </div>
+              <div className="rounded-2xl border border-amber-300/60 bg-amber-50/80 px-4 py-3 text-xs leading-5 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-300">
+                <span className="font-medium">Heads up:</span> ChatGPT subscriptions (Plus / Pro / Team) are separate from the OpenAI API and are intended for use within OpenAI&apos;s own apps. Routing requests through your subscription here may violate OpenAI&apos;s terms of service and could result in account restrictions.
+              </div>
             </div>
           )}
         </div>
