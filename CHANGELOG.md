@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-03-24
+
+### Added
+- **Factory Droid routing** — one-click routing config for Factory Droid via Web UI, CLI (`set-factory-droid-routing`), and automatic sync. Injects a managed `customModels` entry into `~/.factory/settings.json` with backup/restore support, default model binding, and reasoning effort control (off, none, low, medium, high).
+
 ## [2.2.0] - 2026-03-21
 
 ### Added

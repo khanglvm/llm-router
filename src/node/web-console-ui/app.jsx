@@ -43,6 +43,7 @@ import { LOCAL_ROUTER_ORIGIN, LOCAL_ROUTER_PORT } from "../../shared/local-route
 import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   normalizeClaudeCodeEffortLevel,
+  normalizeFactoryDroidReasoningEffort,
   isCodexCliInheritModelBinding
 } from "../../shared/coding-tool-bindings.js";
 import { classifyTransientIntegerInput } from "./transient-integer-input-utils.js";
@@ -113,6 +114,13 @@ const CLAUDE_THINKING_LEVEL_OPTIONS = Object.freeze([
   { value: "medium", label: "Medium", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=medium" },
   { value: "high", label: "High", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=high" },
   { value: "max", label: "Max", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=max" }
+]);
+const FACTORY_DROID_REASONING_EFFORT_OPTIONS = Object.freeze([
+  { value: "off", label: "Off", hint: "Disable reasoning" },
+  { value: "none", label: "None", hint: "No extended reasoning" },
+  { value: "low", label: "Low", hint: "Lighter reasoning" },
+  { value: "medium", label: "Medium", hint: "Balanced depth" },
+  { value: "high", label: "High", hint: "Maximum reasoning depth" }
 ]);
 const QUICK_START_WINDOW_OPTIONS = RATE_LIMIT_WINDOW_OPTIONS;
 const QUICK_START_API_ENV_BY_CONNECTION = {
@@ -1912,6 +1920,122 @@ function buildClaudeCodeGuideContent({
           <>Open the settings file from this page and confirm the <code>env</code> block contains only the overrides you meant to set.</>,
           <>Launch Claude Code and test both the main session and any subagents if you changed <code>CLAUDE_CODE_SUBAGENT_MODEL</code>.</>,
           <>If thinking behavior is not what you expected, remember this UI writes <code>CLAUDE_CODE_EFFORT_LEVEL</code> to your shell profile; clearing the field returns control to Claude Code&apos;s own default behavior.</>
+        ]
+      }
+    ]
+  };
+}
+
+function buildFactoryDroidGuideContent({
+  bindings = {},
+  settingsFilePath = "",
+  endpointUrl = ""
+} = {}) {
+  const defaultModel = String(bindings?.defaultModel || "").trim();
+  const reasoningEffort = normalizeFactoryDroidReasoningEffort(bindings?.reasoningEffort);
+  const normalizedSettingsFilePath = String(settingsFilePath || "").trim();
+  const normalizedEndpointUrl = String(endpointUrl || "").trim();
+
+  const callout = defaultModel
+    ? {
+        variant: "info",
+        title: "Default model is set.",
+        body: (
+          <>
+            LLM Router is writing <code>model={defaultModel}</code> and injecting a <code>customModels</code> entry into your Factory Droid settings. All requests route through the gateway.
+          </>
+        )
+      }
+    : {
+        variant: "success",
+        title: "Factory Droid connected via custom model entry.",
+        body: (
+          <>
+            LLM Router injects a managed <code>customModels</code> entry pointing at the gateway. Select a default model below or use Factory Droid&apos;s <code>/model</code> command to pick the routed model at runtime.
+          </>
+        )
+      };
+
+  return {
+    title: "Factory Droid guide",
+    description: "Quick setup for routing Factory Droid through LLM Router via a managed custom model entry.",
+    badges: [
+      { label: defaultModel ? `Model: ${defaultModel}` : "No model override", variant: defaultModel ? "info" : "outline" },
+      { label: reasoningEffort ? `Reasoning: ${reasoningEffort}` : "Reasoning: Droid default", variant: "outline" },
+      { label: normalizedSettingsFilePath ? "Settings file detected" : "User config: ~/.factory/settings.json", variant: "outline" }
+    ],
+    callout,
+    highlights: [
+      {
+        eyebrow: "1. Connect",
+        title: "Point Factory Droid at LLM Router",
+        body: normalizedEndpointUrl
+          ? (
+              <>
+                When connected, Factory Droid sends requests to <code>{normalizedEndpointUrl}</code>. LLM Router handles upstream auth, alias resolution, and failover.
+              </>
+            )
+          : (
+              <>
+                Click <span className="font-medium">Connect</span> to inject a managed custom model entry into Factory Droid settings.
+              </>
+            )
+      },
+      {
+        eyebrow: "2. Route",
+        title: "Set the default model",
+        body: (
+          <>
+            Pick a managed route or alias in <span className="font-medium">Default model</span> to control which upstream model Factory Droid uses.
+          </>
+        )
+      },
+      {
+        eyebrow: "3. Tune",
+        title: "Optional reasoning control",
+        body: (
+          <>
+            <span className="font-medium">Reasoning effort</span> writes Factory Droid <code>reasoningEffort</code>. Values: <code>off</code>, <code>none</code>, <code>low</code>, <code>medium</code>, or <code>high</code>.
+          </>
+        )
+      }
+    ],
+    sections: [
+      {
+        title: "Quick start",
+        items: [
+          <>Set a <code>masterKey</code> in LLM Router first. The <span className="font-medium">Connect</span> button stays disabled until gateway auth is ready.</>,
+          <>Click <span className="font-medium">Connect</span> to inject a managed <code>customModels</code> entry into <code>~/.factory/settings.json</code>.</>,
+          defaultModel
+            ? <>Your default model is set to <code>{defaultModel}</code>. Change it any time from this panel.</>
+            : <>Choose a managed route or alias in <span className="font-medium">Default model</span> to route all Factory Droid requests.</>,
+          <>Set <span className="font-medium">Reasoning effort</span> only when you want LLM Router to write <code>reasoningEffort</code>; leave it unset to keep Factory Droid defaults.</>
+        ]
+      },
+      {
+        title: "How it works",
+        items: [
+          <>LLM Router adds a <code>customModels</code> entry with <code>provider: &quot;openai&quot;</code> and the gateway base URL. Factory Droid treats it as a standard OpenAI-compatible endpoint.</>,
+          <>The injected entry has a <code>_llmRouterManaged</code> marker so it can be cleanly updated or removed without touching your other custom models.</>,
+          <>Disconnecting removes only the managed entry and restores any backed-up model or reasoning settings.</>
+        ]
+      },
+      {
+        title: "Where these settings land",
+        items: [
+          normalizedSettingsFilePath
+            ? <>This page is managing <code>{normalizedSettingsFilePath}</code>.</>
+            : <>Factory Droid stores user settings in <code>~/.factory/settings.json</code>.</>,
+          <>The router-managed bindings map to Factory Droid <code>model</code> and <code>reasoningEffort</code> fields.</>,
+          <>Use <span className="font-medium">Open Config File</span> to inspect the generated settings.</>
+        ]
+      },
+      {
+        title: "Quick verify",
+        items: [
+          <>Open the settings file from this page and confirm the <code>customModels</code> array contains the LLM Router entry.</>,
+          <>Launch Factory Droid and run a small prompt. Use <code>/model</code> to confirm the routed model is available.</>,
+          <>If requests fail, check the <span className="font-medium">Alias &amp; Fallback</span> tab first to ensure the alias behind your model exists.</>
         ]
       }
     ]
@@ -9058,8 +9182,10 @@ export function App() {
   const [ampRoutingBusy, setAmpRoutingBusy] = useState("");
   const [codexRoutingBusy, setCodexRoutingBusy] = useState("");
   const [claudeRoutingBusy, setClaudeRoutingBusy] = useState("");
+  const [factoryDroidRoutingBusy, setFactoryDroidRoutingBusy] = useState("");
   const [codexBindingsBusy, setCodexBindingsBusy] = useState(false);
   const [claudeBindingsBusy, setClaudeBindingsBusy] = useState(false);
+  const [factoryDroidBindingsBusy, setFactoryDroidBindingsBusy] = useState(false);
   const [activityLogBusy, setActivityLogBusy] = useState("");
   const [activityFilter, setActivityFilter] = useState("usage");
   const [ampAutosaveRequest, setAmpAutosaveRequest] = useState(null);
@@ -9119,9 +9245,11 @@ export function App() {
   const webSearchSnapshot = snapshot?.webSearch || snapshot?.ampWebSearch || null;
   const codexCliState = snapshot?.codingTools?.codexCli || {};
   const claudeCodeState = snapshot?.codingTools?.claudeCode || {};
+  const factoryDroidState = snapshot?.codingTools?.factoryDroid || {};
   const ampTabConnected = ampClientGlobal?.routedViaRouter === true;
   const codexTabConnected = codexCliState?.routedViaRouter === true;
   const claudeTabConnected = claudeCodeState?.routedViaRouter === true;
+  const factoryDroidTabConnected = factoryDroidState?.routedViaRouter === true;
   const activityLogState = snapshot?.activityLog || { enabled: true };
   const activityLogEnabled = activityLogState?.enabled !== false;
   const ampRouteOptions = useMemo(() => buildManagedRouteOptions(ampEditableConfig), [ampEditableConfig]);
@@ -9174,6 +9302,12 @@ export function App() {
       claudeCodeState?.bindings?.defaultHaikuModel,
       claudeCodeState?.bindings?.subagentModel
     ]
+  );
+  const factoryDroidRouteOptions = useMemo(
+    () => withCurrentManagedRouteOptions(managedRouteOptions, [
+      factoryDroidState?.bindings?.defaultModel
+    ]),
+    [managedRouteOptions, factoryDroidState?.bindings?.defaultModel]
   );
   const ampDefaultRoute = String(ampEditableConfig?.amp?.defaultRoute || ampEditableConfig?.defaultModel || pickFallbackDefaultModel(ampEditableConfig) || "").trim();
   const effectiveMasterKey = String(ampEditableConfig?.masterKey || snapshot?.config?.document?.masterKey || "").trim();
@@ -10566,6 +10700,74 @@ export function App() {
     }
   }
 
+  async function handleToggleFactoryDroidRouting() {
+    const routingEnabled = factoryDroidState?.routedViaRouter === true;
+    const shouldEnable = !routingEnabled;
+
+    if (shouldEnable) {
+      if (codingToolDisabledReason) {
+        showNotice("warning", codingToolDisabledReason);
+        return;
+      }
+      if (!effectiveMasterKey) {
+        showNotice("warning", "Gateway key is still generating. Try again in a second.");
+        return;
+      }
+      if (!ampClientUrl) {
+        showNotice("warning", "API endpoint is not ready yet.");
+        return;
+      }
+    }
+
+    setFactoryDroidRoutingBusy(shouldEnable ? "enable" : "disable");
+    try {
+      await fetchJson("/api/factory-droid/global-route", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          enabled: shouldEnable,
+          rawText: shouldEnable ? draftText : undefined,
+          endpointUrl: ampClientUrl,
+          bindings: shouldEnable ? {
+            defaultModel: factoryDroidState?.bindings?.defaultModel || "",
+            reasoningEffort: factoryDroidState?.bindings?.reasoningEffort || ""
+          } : undefined
+        })
+      });
+      await loadState({ preserveDraft: !shouldEnable });
+      showNotice("success", shouldEnable ? "Factory Droid connected." : "Factory Droid disconnected.");
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setFactoryDroidRoutingBusy("");
+    }
+  }
+
+  async function handleFactoryDroidBindingChange(fieldId, value) {
+    const nextBindings = {
+      defaultModel: factoryDroidState?.bindings?.defaultModel || "",
+      reasoningEffort: factoryDroidState?.bindings?.reasoningEffort || ""
+    };
+    nextBindings[fieldId] = value;
+
+    setFactoryDroidBindingsBusy(true);
+    try {
+      await fetchJson("/api/factory-droid/model-bindings", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          bindings: nextBindings
+        })
+      });
+      await loadState({ preserveDraft: true });
+      showNotice("success", "Factory Droid model bindings updated.");
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setFactoryDroidBindingsBusy(false);
+    }
+  }
+
   async function runRouterAction(action) {
     setRouterBusy(action);
     try {
@@ -10852,6 +11054,12 @@ export function App() {
                   <ConnectedIndicatorDot connected={claudeTabConnected} srLabel="Claude Code connected" />
                 </span>
               </TabsTrigger>
+              <TabsTrigger value="factory-droid">
+                <span className="inline-flex items-center gap-2">
+                  <span>Factory Droid</span>
+                  <ConnectedIndicatorDot connected={factoryDroidTabConnected} srLabel="Factory Droid connected" />
+                </span>
+              </TabsTrigger>
               <TabsTrigger value="web-search">Web Search</TabsTrigger>
               <TabsTrigger value="activity">Activity</TabsTrigger>
             </TabsList>
@@ -11039,6 +11247,56 @@ export function App() {
                   standaloneWhenDisconnected: true,
                   placeholder: "Inherit Claude Code adaptive default",
                   options: CLAUDE_THINKING_LEVEL_OPTIONS
+                }
+              ]}
+            />
+          </TabsContent>
+
+          <TabsContent value="factory-droid" className="space-y-4">
+            <CodingToolSettingsPanel
+              toolName="Factory Droid"
+              toolState={factoryDroidState}
+              endpointUrl={factoryDroidState?.configuredBaseUrl || `${ampClientUrl ? `${ampClientUrl}/openai/v1` : ""}`}
+              routeOptions={factoryDroidRouteOptions}
+              connectionBusy={factoryDroidRoutingBusy}
+              bindingBusy={factoryDroidBindingsBusy}
+              onToggleRouting={handleToggleFactoryDroidRouting}
+              onBindingChange={handleFactoryDroidBindingChange}
+              hasMasterKey={Boolean(effectiveMasterKey)}
+              disabledReason={codingToolDisabledReason}
+              onOpenPrimaryPath={() => handleOpenFilePath(factoryDroidState?.settingsFilePath, "Factory Droid config file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened Factory Droid config file in the default app."
+              })}
+              onOpenSecondaryPath={() => handleOpenFilePath(factoryDroidState?.backupFilePath, "Factory Droid backup file", {
+                ensureMode: "jsonObject",
+                successMessage: "Opened Factory Droid backup file in the default app."
+              })}
+              guideContent={buildFactoryDroidGuideContent({
+                bindings: factoryDroidState?.bindings,
+                settingsFilePath: factoryDroidState?.settingsFilePath,
+                endpointUrl: factoryDroidState?.configuredBaseUrl || `${ampClientUrl ? `${ampClientUrl}/openai/v1` : ""}`
+              })}
+              bindingFields={[
+                {
+                  id: "defaultModel",
+                  label: "Default model",
+                  description: "Choose a managed route/alias to set Factory Droid `model`. This controls which upstream model Factory Droid uses by default.",
+                  envKey: "model",
+                  value: factoryDroidState?.bindings?.defaultModel || "",
+                  allowUnset: true,
+                  placeholder: "Select a default route"
+                },
+                {
+                  id: "reasoningEffort",
+                  label: "Reasoning effort",
+                  description: "Maps to Factory Droid `reasoningEffort` setting. Controls the depth of extended thinking for supported models.",
+                  envKey: "reasoningEffort",
+                  value: factoryDroidState?.bindings?.reasoningEffort || "",
+                  allowUnset: true,
+                  usesRouteOptions: false,
+                  placeholder: "Inherit Factory Droid default",
+                  options: FACTORY_DROID_REASONING_EFFORT_OPTIONS
                 }
               ]}
             />

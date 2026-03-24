@@ -28,7 +28,7 @@ llr ai-help  # agent-oriented setup brief
 - **Unified endpoint** — one local gateway that accepts both OpenAI and Anthropic request formats
 - **Model aliases with routing** — group models into stable alias names with weighted round-robin, quota-aware balancing, and automatic fallback
 - **Rate limiting** — set request caps per model or across all models over configurable time windows
-- **Coding tool routing** — one-click routing config for Codex CLI, Claude Code, and AMP
+- **Coding tool routing** — one-click routing config for Codex CLI, Claude Code, Factory Droid, and AMP
 - **Web search** — built-in web search for AMP and other router-managed tools
 - **Deployable** — run locally or deploy to Cloudflare Workers
 - **AI-agent friendly** — full CLI parity with `llr config --operation=...` so agents can configure everything programmatically
@@ -58,6 +58,10 @@ Route Codex CLI requests through the gateway with model override and thinking le
 Route Claude Code through the gateway with per-tier model bindings.
 
 ![Claude Code Routing](./assets/screenshots/web-ui-claude-code.png)
+
+### Factory Droid
+
+Route Factory Droid through the gateway via a managed custom model entry with reasoning effort control.
 
 ### Web Search
 

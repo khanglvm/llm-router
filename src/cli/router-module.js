@@ -31,13 +31,17 @@ import {
   patchClaudeCodeEffortLevel,
   patchClaudeCodeSettingsFile,
   patchCodexCliConfigFile,
+  patchFactoryDroidSettingsFile,
   readClaudeCodeRoutingState,
   readCodexCliRoutingState,
+  readFactoryDroidRoutingState,
   resolveClaudeCodeSettingsFilePath,
   resolveCodexCliConfigFilePath,
   resolveCodexCliModelCatalogFilePath,
+  resolveFactoryDroidSettingsFilePath,
   unpatchClaudeCodeSettingsFile,
-  unpatchCodexCliConfigFile
+  unpatchCodexCliConfigFile,
+  unpatchFactoryDroidSettingsFile
 } from "../node/coding-tool-config.js";
 import { installStartup, restartStartup, startupStatus, stopStartup, uninstallStartup } from "../node/startup-manager.js";
 import {
@@ -75,7 +79,8 @@ import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   isCodexCliInheritModelBinding,
   normalizeClaudeCodeEffortLevel,
-  normalizeCodexCliReasoningEffort
+  normalizeCodexCliReasoningEffort,
+  normalizeFactoryDroidReasoningEffort
 } from "../shared/coding-tool-bindings.js";
 import { FORMATS } from "../translator/index.js";
 import {
@@ -3846,11 +3851,27 @@ async function buildCodingToolRoutingSnapshot({
     routedViaRouter: false,
     error: error instanceof Error ? error.message : String(error)
   }));
+  const factoryDroid = await readFactoryDroidRoutingState({
+    settingsFilePath: readArg(args, ["factory-droid-settings-file", "factoryDroidSettingsFile"], ""),
+    endpointUrl
+  }).catch((error) => ({
+    tool: "factory-droid",
+    settingsFilePath: resolveFactoryDroidSettingsFilePath({}),
+    backupFilePath: "",
+    configuredBaseUrl: "",
+    bindings: {
+      defaultModel: "",
+      reasoningEffort: ""
+    },
+    routedViaRouter: false,
+    error: error instanceof Error ? error.message : String(error)
+  }));
   return {
     endpointUrl,
     ampStates,
     codexCli,
     claudeCode,
+    factoryDroid,
     masterKeyConfigured: Boolean(String(config?.masterKey || "").trim())
   };
 }
@@ -3900,6 +3921,18 @@ function buildClaudeCodeStatusSection(state = {}) {
     ["Default Haiku", state.bindings?.defaultHaikuModel || "(not set)"],
     ["Subagent Model", state.bindings?.subagentModel || "(not set)"],
     ["Thinking Level", state.bindings?.thinkingLevel || "(not set)"],
+    ["Error", state.error || "(none)"]
+  ]);
+}
+
+function buildFactoryDroidStatusSection(state = {}) {
+  return renderKeyValueSection("Factory Droid", [
+    ["Routed Via Router", formatYesNo(state.routedViaRouter === true)],
+    ["Settings File", state.settingsFilePath || resolveFactoryDroidSettingsFilePath({})],
+    ["Backup File", state.backupFilePath || "(not created)"],
+    ["Base URL", state.configuredBaseUrl || "(not set)"],
+    ["Default Model", state.bindings?.defaultModel || "(not set)"],
+    ["Reasoning Effort", state.bindings?.reasoningEffort || "(not set)"],
     ["Error", state.error || "(none)"]
   ]);
 }
@@ -6234,7 +6267,8 @@ async function doToolStatus(context) {
       [
         buildAmpClientStatusSection(snapshot.ampStates),
         buildCodexCliStatusSection(snapshot.codexCli),
-        buildClaudeCodeStatusSection(snapshot.claudeCode)
+        buildClaudeCodeStatusSection(snapshot.claudeCode),
+        buildFactoryDroidStatusSection(snapshot.factoryDroid)
       ]
     )
   };
@@ -6563,6 +6597,85 @@ async function doSetClaudeCodeEffortLevel(context) {
         ["Settings File", result.settingsFilePath],
         ["Effort Level", result.effortLevel || "(cleared)"],
         ["Shell Profile Updated", formatYesNo(result.shellProfileUpdated)]
+      ]
+    )
+  };
+}
+
+async function doSetFactoryDroidRouting(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const endpointUrl = String(readArg(args, ["endpoint-url", "endpointUrl"], LOCAL_ROUTER_ORIGIN) || LOCAL_ROUTER_ORIGIN).trim();
+  const settingsFilePath = String(readArg(args, ["factory-droid-settings-file", "factoryDroidSettingsFile"], "") || "").trim();
+  const enabled = parseOptionalBoolean(readArg(args, ["enabled"], undefined)) !== false;
+
+  if (!enabled) {
+    const unpatchResult = await unpatchFactoryDroidSettingsFile({
+      settingsFilePath
+    });
+    return {
+      ok: true,
+      mode: context.mode,
+      exitCode: EXIT_SUCCESS,
+      data: buildOperationReport(
+        "Factory Droid Routing Disabled",
+        [
+          ["Settings File", unpatchResult.settingsFilePath],
+          ["Backup File", unpatchResult.backupFilePath],
+          ["Backup Restored", formatYesNo(unpatchResult.backupRestored === true)]
+        ]
+      )
+    };
+  }
+
+  const existingState = await readFactoryDroidRoutingState({
+    settingsFilePath,
+    endpointUrl
+  });
+  const apiKey = String(
+    readArg(args, ["master-key", "masterKey", "api-key", "apiKey"], config?.masterKey || "") || ""
+  ).trim();
+  if (!apiKey) {
+    return {
+      ok: false,
+      mode: context.mode,
+      exitCode: EXIT_VALIDATION,
+      errorMessage: `master-key (or config.masterKey) is required before routing Factory Droid through ${APP_NAME}.`
+    };
+  }
+
+  const existingBindings = existingState.bindings || {};
+  const bindings = {
+    defaultModel: String(readArg(args, ["default-model", "defaultModel"], undefined) !== undefined
+      ? readArg(args, ["default-model", "defaultModel"], "")
+      : (existingBindings.defaultModel || pickDefaultManagedRoute(config) || "")).trim(),
+    reasoningEffort: normalizeFactoryDroidReasoningEffort(
+      readArg(args, ["reasoning-effort", "reasoningEffort"], undefined) !== undefined
+        ? readArg(args, ["reasoning-effort", "reasoningEffort"], "")
+        : (existingBindings.reasoningEffort || "")
+    )
+  };
+
+  const patchResult = await patchFactoryDroidSettingsFile({
+    settingsFilePath,
+    endpointUrl,
+    apiKey,
+    bindings,
+    captureBackup: true
+  });
+  return {
+    ok: true,
+    mode: context.mode,
+    exitCode: EXIT_SUCCESS,
+    data: buildOperationReport(
+      "Factory Droid Routing Enabled",
+      [
+        ["Settings File", patchResult.settingsFilePath],
+        ["Backup File", patchResult.backupFilePath],
+        ["Base URL", patchResult.baseUrl],
+        ["Default Model", patchResult.bindings?.defaultModel || "(not set)"],
+        ["Reasoning Effort", patchResult.bindings?.reasoningEffort || "(not set)"]
       ]
     )
   };
@@ -8433,6 +8546,9 @@ async function runConfigAction(context) {
       return doSetClaudeCodeRouting(context);
     case "set-claude-code-effort-level":
       return doSetClaudeCodeEffortLevel(context);
+    case "set-factory-droid-routing":
+    case "set-factory-droid":
+      return doSetFactoryDroidRouting(context);
     case "discover-provider-models":
       return doDiscoverProviderModels(context);
     case "test-provider":
@@ -9310,6 +9426,12 @@ async function runAiHelpAction(context) {
     `- optional bindings: --default-opus-model=<route> --default-sonnet-model=<route> --default-haiku-model=<route> --subagent-model=<route> --thinking-level=low|medium|high|max (sets CLAUDE_CODE_EFFORT_LEVEL in shell profile)`,
     `- disable route: ${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=false`,
     `- standalone effort level (no router needed): ${CLI_COMMAND} config --operation=set-claude-code-effort-level --thinking-level=low|medium|high|max`,
+    "",
+    "### Factory Droid",
+    "- required_gate=patch_gate_factory_droid=ready",
+    `- enable/update route: ${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=true --default-model=<target_model_or_group>`,
+    `- optional reasoning: --reasoning-effort=off|none|low|medium|high`,
+    `- disable route: ${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=false`,
     "",
     "### Codex CLI",
     "- required_gate=patch_gate_codex_cli=ready",
@@ -10578,8 +10700,10 @@ const routerModule = {
           { name: "generate-master-key", required: false, description: "Generate a strong master key automatically (set-master-key flow).", example: "--generate-master-key=true" },
           { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
           { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
-          { name: "default-model", required: false, description: `For set-codex-cli-routing: managed route binding, or ${CODEX_CLI_INHERIT_MODEL_VALUE} to keep Codex's own model selection.`, example: "--default-model=chat.default" },
+          { name: "default-model", required: false, description: `For set-codex-cli-routing / set-factory-droid-routing: managed route binding, or ${CODEX_CLI_INHERIT_MODEL_VALUE} to keep Codex's own model selection.`, example: "--default-model=chat.default" },
           { name: "thinking-level", required: false, description: "For set-codex-cli-routing / set-claude-code-routing / set-claude-code-effort-level: reasoning level.", example: "--thinking-level=medium" },
+          { name: "reasoning-effort", required: false, description: "For set-factory-droid-routing: reasoning effort level (off, none, low, medium, high).", example: "--reasoning-effort=medium" },
+          { name: "factory-droid-settings-file", required: false, description: "Explicit Factory Droid settings.json path for routing/status operations.", example: "--factory-droid-settings-file=~/.factory/settings.json" },
           { name: "primary-model", required: false, description: "For set-claude-code-routing: primary ANTHROPIC_MODEL route.", example: "--primary-model=chat.default" },
           { name: "default-opus-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_OPUS_MODEL route.", example: "--default-opus-model=chat.deep" },
           { name: "default-sonnet-model", required: false, description: "For set-claude-code-routing: ANTHROPIC_DEFAULT_SONNET_MODEL route.", example: "--default-sonnet-model=chat.default" },
@@ -10651,6 +10775,7 @@ const routerModule = {
           `${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=true --default-model=chat.default`,
           `${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=chat.default --default-haiku-model=chat.fast`,
           `${CLI_COMMAND} config --operation=set-claude-code-effort-level --thinking-level=high`,
+          `${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=true --default-model=chat.default --reasoning-effort=medium`,
           `${CLI_COMMAND} config --operation=set-amp-client-routing --enabled=true --amp-client-settings-scope=workspace`,
           `${CLI_COMMAND} config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN} --amp-client-api-key=gw_...`,
           `${CLI_COMMAND} config --operation=list-routing`,

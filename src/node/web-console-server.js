@@ -32,15 +32,20 @@ import {
 import {
   ensureClaudeCodeSettingsFileExists,
   ensureCodexCliConfigFileExists,
+  ensureFactoryDroidSettingsFileExists,
   patchClaudeCodeEffortLevel,
   patchClaudeCodeSettingsFile,
   patchCodexCliConfigFile,
+  patchFactoryDroidSettingsFile,
   readClaudeCodeRoutingState,
   readCodexCliRoutingState,
+  readFactoryDroidRoutingState,
   resolveClaudeCodeSettingsFilePath,
   resolveCodexCliConfigFilePath,
+  resolveFactoryDroidSettingsFilePath,
   unpatchClaudeCodeSettingsFile,
-  unpatchCodexCliConfigFile
+  unpatchCodexCliConfigFile,
+  unpatchFactoryDroidSettingsFile
 } from "./coding-tool-config.js";
 import { loginSubscription } from "../runtime/subscription-provider.js";
 import {
@@ -62,7 +67,8 @@ import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   isCodexCliInheritModelBinding,
   normalizeClaudeCodeEffortLevel,
-  normalizeCodexCliReasoningEffort
+  normalizeCodexCliReasoningEffort,
+  normalizeFactoryDroidReasoningEffort
 } from "../shared/coding-tool-bindings.js";
 import { applyActivityLogSettings, readActivityLogSettings } from "../shared/local-router-defaults.js";
 import {
@@ -433,6 +439,11 @@ function buildCodexCliEndpointUrl(settings = {}) {
 function buildClaudeCodeEndpointUrl(settings = {}) {
   const origin = buildAmpClientEndpointUrl(settings);
   return origin ? `${origin}/anthropic` : "";
+}
+
+function buildFactoryDroidEndpointUrl(settings = {}) {
+  const origin = buildAmpClientEndpointUrl(settings);
+  return origin ? `${origin}/openai/v1` : "";
 }
 
 function buildRouterEndpoints({ host, port, running }) {
@@ -1414,6 +1425,76 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     }
   }
 
+  async function readFactoryDroidGlobalRoutingState(settings = {}, config = null) {
+    const endpointUrl = buildAmpClientEndpointUrl(settings);
+    try {
+      const state = await readFactoryDroidRoutingState({
+        endpointUrl
+      });
+      return {
+        ...state,
+        endpointUrl,
+        error: ""
+      };
+    } catch (error) {
+      return {
+        tool: "factory-droid",
+        settingsFilePath: resolveFactoryDroidSettingsFilePath({}),
+        backupFilePath: "",
+        settingsExists: false,
+        backupExists: false,
+        routedViaRouter: false,
+        configuredBaseUrl: "",
+        bindings: {
+          defaultModel: "",
+          reasoningEffort: ""
+        },
+        endpointUrl,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async function syncFactoryDroidRoutingIfNeeded({
+    previousConfig = null,
+    nextConfig = null,
+    previousSettings = {},
+    nextSettings = {}
+  } = {}) {
+    const previousEndpointUrl = buildAmpClientEndpointUrl(previousSettings);
+    const nextEndpointUrl = buildAmpClientEndpointUrl(nextSettings);
+    const previousMasterKey = String(previousConfig?.masterKey || "").trim();
+    const nextMasterKey = String(nextConfig?.masterKey || "").trim();
+    const endpointOrKeyChanged = Boolean(
+      previousEndpointUrl
+      && nextEndpointUrl
+      && (previousEndpointUrl !== nextEndpointUrl || previousMasterKey !== nextMasterKey)
+    );
+
+    if (!endpointOrKeyChanged) return false;
+
+    const routingState = await readFactoryDroidGlobalRoutingState(previousSettings, previousConfig);
+    if (routingState.error) {
+      addLog("warn", "Factory Droid route check failed.", routingState.error);
+      return false;
+    }
+    if (!routingState.routedViaRouter) return false;
+
+    try {
+      await patchFactoryDroidSettingsFile({
+        endpointUrl: nextEndpointUrl,
+        apiKey: nextMasterKey,
+        bindings: routingState.bindings,
+        captureBackup: false
+      });
+      addLog("info", "Updated Factory Droid route to match the local router.", buildFactoryDroidEndpointUrl(nextSettings));
+      return true;
+    } catch (error) {
+      addLog("warn", "Factory Droid route update failed.", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   async function resolveProbeApiKey(apiKeyEnv, apiKey, { context = "testing config" } = {}) {
     const resolvedApiKeyEnv = String(apiKeyEnv || "").trim();
     const resolvedApiKey = String(apiKey || "").trim();
@@ -2056,6 +2137,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       previousSettings: previousLocalServer,
       nextSettings: nextLocalServer
     });
+    await syncFactoryDroidRoutingIfNeeded({
+      previousConfig,
+      nextConfig: savedConfig,
+      previousSettings: previousLocalServer,
+      nextSettings: nextLocalServer
+    });
 
     const snapshot = await broadcastState();
     return {
@@ -2112,6 +2199,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const ampClientGlobal = await readAmpGlobalRoutingState(configLocalServer);
     const codexCliGlobal = await readCodexCliGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const claudeCodeGlobal = await readClaudeCodeGlobalRoutingState(configLocalServer, configState.normalizedConfig);
+    const factoryDroidGlobal = await readFactoryDroidGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const webSearch = await readWebSearchState(configState.normalizedConfig).catch(() => null);
 
     return {
@@ -2140,7 +2228,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       ampWebSearch: webSearch,
       codingTools: {
         codexCli: codexCliGlobal,
-        claudeCode: claudeCodeGlobal
+        claudeCode: claudeCodeGlobal,
+        factoryDroid: factoryDroidGlobal
       },
       defaults: {
         providerUserAgent: DEFAULT_PROVIDER_USER_AGENT
@@ -2343,6 +2432,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
             previousSettings: persistedLocalServer.previousSettings,
             nextSettings: persistedLocalServer.savedSettings
           });
+          await syncFactoryDroidRoutingIfNeeded({
+            previousConfig: persistedLocalServer.previousConfig,
+            nextConfig: persistedLocalServer.savedConfig,
+            previousSettings: persistedLocalServer.previousSettings,
+            nextSettings: persistedLocalServer.savedSettings
+          });
           result.snapshot = await buildSnapshot();
         }
         return result;
@@ -2382,6 +2477,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           nextSettings: persistedLocalServer.savedSettings
         });
         await syncClaudeCodeRoutingIfNeeded({
+          previousConfig: persistedLocalServer.previousConfig,
+          nextConfig: persistedLocalServer.savedConfig,
+          previousSettings: persistedLocalServer.previousSettings,
+          nextSettings: persistedLocalServer.savedSettings
+        });
+        await syncFactoryDroidRoutingIfNeeded({
           previousConfig: persistedLocalServer.previousConfig,
           nextConfig: persistedLocalServer.savedConfig,
           previousSettings: persistedLocalServer.previousSettings,
@@ -3181,6 +3282,119 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      if (method === "POST" && requestUrl.pathname === "/api/factory-droid/global-route") {
+        const body = await readJsonBody(req);
+        const enabled = body?.enabled !== false;
+        if (!enabled) {
+          const unpatchResult = await unpatchFactoryDroidSettingsFile({});
+          addLog("info", "Factory Droid routing disabled.");
+          const snapshot = await broadcastState();
+          sendJson(res, 200, {
+            ...snapshot,
+            message: "Factory Droid now routes directly.",
+            codingTools: {
+              ...(snapshot.codingTools || {}),
+              factoryDroid: {
+                ...(snapshot.codingTools?.factoryDroid || {}),
+                unpatchResult
+              }
+            }
+          });
+          return;
+        }
+
+        let parsed;
+        try {
+          if (body?.config && typeof body.config === "object" && !Array.isArray(body.config)) {
+            parsed = body.config;
+          } else {
+            const rawText = String(body?.rawText || "");
+            parsed = rawText.trim() ? JSON.parse(rawText) : {};
+          }
+        } catch (error) {
+          sendJson(res, 400, {
+            error: `Config JSON parse failed: ${error instanceof Error ? error.message : String(error)}`
+          });
+          return;
+        }
+
+        const nextConfig = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        const endpointUrl = String(body?.endpointUrl || buildAmpClientEndpointUrl(getConfigLocalServer({
+          normalizedConfig: nextConfig,
+          parseError: ""
+        }))).trim();
+        const apiKey = String(body?.apiKey || nextConfig?.masterKey || "").trim();
+        if (!endpointUrl || !apiKey) {
+          sendJson(res, 400, { error: "Factory Droid routing needs a valid local router URL and gateway key." });
+          return;
+        }
+
+        const bindings = {
+          defaultModel: String(body?.bindings?.defaultModel || "").trim(),
+          reasoningEffort: normalizeFactoryDroidReasoningEffort(body?.bindings?.reasoningEffort)
+        };
+        const patchResult = await patchFactoryDroidSettingsFile({
+          endpointUrl,
+          apiKey,
+          bindings,
+          captureBackup: true
+        });
+        addLog("success", "Factory Droid routing enabled.", patchResult.baseUrl);
+        const snapshot = await broadcastState();
+        sendJson(res, 200, {
+          ...snapshot,
+          message: "Factory Droid now routes via LLM Router.",
+          codingTools: {
+            ...(snapshot.codingTools || {}),
+            factoryDroid: {
+              ...(snapshot.codingTools?.factoryDroid || {}),
+              patchResult
+            }
+          }
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/factory-droid/model-bindings") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const configLocalServer = getConfigLocalServer(configState);
+        const endpointUrl = buildAmpClientEndpointUrl(configLocalServer);
+        const apiKey = String(configState.normalizedConfig?.masterKey || "").trim();
+        if (!endpointUrl || !apiKey) {
+          sendJson(res, 400, { error: "Factory Droid bindings need a running local router URL and gateway key." });
+          return;
+        }
+
+        const routingState = await readFactoryDroidGlobalRoutingState(configLocalServer, configState.normalizedConfig);
+        if (routingState.error) {
+          sendJson(res, 400, { error: routingState.error });
+          return;
+        }
+        if (!routingState.routedViaRouter) {
+          sendJson(res, 400, { error: "Connect Factory Droid to LLM Router before updating model bindings." });
+          return;
+        }
+
+        const bindings = {
+          defaultModel: String(body?.bindings?.defaultModel || "").trim(),
+          reasoningEffort: normalizeFactoryDroidReasoningEffort(body?.bindings?.reasoningEffort)
+        };
+        const patchResult = await patchFactoryDroidSettingsFile({
+          endpointUrl,
+          apiKey,
+          bindings,
+          captureBackup: false
+        });
+        addLog("success", "Factory Droid model bindings updated.", patchResult.bindings.defaultModel || "Default");
+        const snapshot = await broadcastState();
+        sendJson(res, 200, {
+          ...snapshot,
+          message: "Factory Droid model bindings updated."
+        });
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/config/open") {
         const body = await readJsonBody(req);
         const editorId = String(body?.editorId || "default").trim() || "default";
@@ -3279,6 +3493,21 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         });
         await openFileInEditorFn(editorId, ensured.settingsFilePath);
         addLog("info", `Opened Claude Code config file in ${editorId}.`, ensured.settingsFilePath);
+        sendJson(res, 200, {
+          ok: true,
+          editorId,
+          filePath: ensured.settingsFilePath,
+          backupFilePath: ensured.backupFilePath
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/factory-droid/config/open") {
+        const body = await readJsonBody(req);
+        const editorId = String(body?.editorId || "default").trim() || "default";
+        const ensured = await ensureFactoryDroidSettingsFileExists({});
+        await openFileInEditorFn(editorId, ensured.settingsFilePath);
+        addLog("info", `Opened Factory Droid config file in ${editorId}.`, ensured.settingsFilePath);
         sendJson(res, 200, {
           ok: true,
           editorId,

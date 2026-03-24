@@ -52,3 +52,16 @@ export function mapClaudeCodeThinkingTokensToLevel(value) {
 
 export const normalizeClaudeCodeEffortLevel = normalizeClaudeCodeThinkingLevel;
 export const migrateLegacyThinkingTokensToEffortLevel = mapClaudeCodeThinkingTokensToLevel;
+
+export const FACTORY_DROID_REASONING_EFFORT_VALUES = Object.freeze([
+  "off",
+  "none",
+  "low",
+  "medium",
+  "high"
+]);
+
+export function normalizeFactoryDroidReasoningEffort(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return FACTORY_DROID_REASONING_EFFORT_VALUES.includes(normalized) ? normalized : "";
+}

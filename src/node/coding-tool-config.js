@@ -10,7 +10,8 @@ import {
   normalizeClaudeCodeThinkingLevel,
   normalizeClaudeCodeEffortLevel,
   migrateLegacyThinkingTokensToEffortLevel,
-  normalizeCodexCliReasoningEffort
+  normalizeCodexCliReasoningEffort,
+  normalizeFactoryDroidReasoningEffort
 } from "../shared/coding-tool-bindings.js";
 
 const BACKUP_SUFFIX = ".llm_router_backup";
@@ -961,5 +962,219 @@ export async function patchClaudeCodeEffortLevel({
     settingsFilePath: resolvedSettingsPath,
     effortLevel: normalizedLevel,
     shellProfileUpdated
+  };
+}
+
+const FACTORY_DROID_ROUTER_MARKER = "_llmRouterManaged";
+
+function normalizeFactoryDroidBindings(bindings = {}) {
+  const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+  return {
+    defaultModel: normalizeModelBinding(source.defaultModel),
+    reasoningEffort: normalizeFactoryDroidReasoningEffort(source.reasoningEffort)
+  };
+}
+
+function buildFactoryDroidBaseUrl(endpointUrl) {
+  const normalized = normalizeHttpUrl(endpointUrl);
+  return normalized ? `${normalized}/openai/v1` : "";
+}
+
+function findRouterManagedCustomModelIndex(customModels) {
+  if (!Array.isArray(customModels)) return -1;
+  return customModels.findIndex(
+    (entry) => entry && typeof entry === "object" && entry[FACTORY_DROID_ROUTER_MARKER] === true
+  );
+}
+
+function captureFactoryDroidBackup(config) {
+  const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
+  const model = String(config?.model || "").trim();
+  const reasoningEffort = String(config?.reasoningEffort || "").trim();
+  return {
+    tool: "factory-droid",
+    version: 1,
+    model: { exists: Boolean(model), value: model },
+    reasoningEffort: { exists: Boolean(reasoningEffort), value: reasoningEffort },
+    hadCustomModels: customModels.length > 0
+  };
+}
+
+function applyFactoryDroidBackup(config, backup = {}) {
+  const next = config && typeof config === "object" && !Array.isArray(config)
+    ? structuredClone(config)
+    : {};
+
+  const customModels = Array.isArray(next.customModels) ? [...next.customModels] : [];
+  const routerIndex = findRouterManagedCustomModelIndex(customModels);
+  if (routerIndex >= 0) customModels.splice(routerIndex, 1);
+  if (customModels.length > 0) next.customModels = customModels;
+  else delete next.customModels;
+
+  if (backup?.model?.exists) next.model = backup.model.value;
+  else delete next.model;
+
+  if (backup?.reasoningEffort?.exists) next.reasoningEffort = backup.reasoningEffort.value;
+  else delete next.reasoningEffort;
+
+  return next;
+}
+
+export function resolveFactoryDroidSettingsFilePath({
+  explicitPath = "",
+  homeDir = os.homedir()
+} = {}) {
+  const direct = String(explicitPath || "").trim();
+  if (direct) return path.resolve(direct);
+  return path.join(homeDir, ".factory", "settings.json");
+}
+
+export async function ensureFactoryDroidSettingsFileExists({
+  settingsFilePath = "",
+  backupFilePath = "",
+  homeDir = os.homedir()
+} = {}) {
+  const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveFactoryDroidSettingsFilePath({ homeDir })).trim());
+  const resolvedBackupPath = path.resolve(String(backupFilePath || resolveCodingToolBackupFilePath(resolvedSettingsPath)).trim());
+  const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Factory Droid settings file '${resolvedSettingsPath}'`);
+  if (!settingsState.existed) {
+    await writeJsonObjectFile(resolvedSettingsPath, {});
+  }
+  await ensureToolBackupFileExists(resolvedBackupPath);
+  return {
+    settingsFilePath: resolvedSettingsPath,
+    backupFilePath: resolvedBackupPath,
+    settingsCreated: !settingsState.existed
+  };
+}
+
+export async function readFactoryDroidRoutingState({
+  settingsFilePath = "",
+  backupFilePath = "",
+  endpointUrl = "",
+  homeDir = os.homedir()
+} = {}) {
+  const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveFactoryDroidSettingsFilePath({ homeDir })).trim());
+  const resolvedBackupPath = path.resolve(String(backupFilePath || resolveCodingToolBackupFilePath(resolvedSettingsPath)).trim());
+  const expectedBaseUrl = buildFactoryDroidBaseUrl(endpointUrl);
+  const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Factory Droid settings file '${resolvedSettingsPath}'`);
+  const backupState = await readJsonObjectFile(resolvedBackupPath, `Backup file '${resolvedBackupPath}'`);
+  const customModels = Array.isArray(settingsState.data?.customModels) ? settingsState.data.customModels : [];
+  const routerIndex = findRouterManagedCustomModelIndex(customModels);
+  const routerEntry = routerIndex >= 0 ? customModels[routerIndex] : null;
+  const configuredBaseUrl = routerEntry ? String(routerEntry.baseUrl || "").trim() : "";
+  const routedViaRouter = Boolean(
+    expectedBaseUrl
+      && routerEntry
+      && configuredBaseUrl === expectedBaseUrl
+  );
+
+  return {
+    tool: "factory-droid",
+    settingsFilePath: resolvedSettingsPath,
+    backupFilePath: resolvedBackupPath,
+    settingsExists: settingsState.existed,
+    backupExists: backupState.existed,
+    routedViaRouter,
+    configuredBaseUrl,
+    bindings: normalizeFactoryDroidBindings({
+      defaultModel: routerEntry?.model || settingsState.data?.model || "",
+      reasoningEffort: normalizeFactoryDroidReasoningEffort(settingsState.data?.reasoningEffort)
+    })
+  };
+}
+
+export async function patchFactoryDroidSettingsFile({
+  settingsFilePath = "",
+  backupFilePath = "",
+  endpointUrl = "",
+  apiKey = "",
+  bindings = {},
+  captureBackup = true,
+  homeDir = os.homedir()
+} = {}) {
+  const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveFactoryDroidSettingsFilePath({ homeDir })).trim());
+  const resolvedBackupPath = path.resolve(String(backupFilePath || resolveCodingToolBackupFilePath(resolvedSettingsPath)).trim());
+  const baseUrl = buildFactoryDroidBaseUrl(endpointUrl);
+  const normalizedApiKey = String(apiKey || "").trim();
+  const normalizedBindings = normalizeFactoryDroidBindings(bindings);
+
+  if (!baseUrl) {
+    throw new Error("Factory Droid endpoint URL must be a valid http:// or https:// URL.");
+  }
+  if (!normalizedApiKey) {
+    throw new Error("Factory Droid API key is required.");
+  }
+
+  const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Factory Droid settings file '${resolvedSettingsPath}'`);
+  const backupState = await ensureToolBackupFileExists(resolvedBackupPath);
+  const existingBackup = sanitizeBackup(backupState.data, "factory-droid");
+  const nextSettings = settingsState.data && typeof settingsState.data === "object" && !Array.isArray(settingsState.data)
+    ? structuredClone(settingsState.data)
+    : {};
+
+  if (captureBackup && !backupHasData(existingBackup)) {
+    const backup = settingsState.existed ? captureFactoryDroidBackup(nextSettings) : {};
+    await writeJsonObjectFile(resolvedBackupPath, backup);
+  }
+
+  const customModels = Array.isArray(nextSettings.customModels) ? [...nextSettings.customModels] : [];
+  const routerIndex = findRouterManagedCustomModelIndex(customModels);
+  const routerEntry = {
+    [FACTORY_DROID_ROUTER_MARKER]: true,
+    model: normalizedBindings.defaultModel || "llm-router",
+    displayName: "LLM Router",
+    baseUrl,
+    apiKey: normalizedApiKey,
+    provider: "openai"
+  };
+
+  if (routerIndex >= 0) {
+    customModels[routerIndex] = routerEntry;
+  } else {
+    customModels.push(routerEntry);
+  }
+  nextSettings.customModels = customModels;
+
+  if (normalizedBindings.defaultModel) {
+    nextSettings.model = normalizedBindings.defaultModel;
+  }
+
+  if (normalizedBindings.reasoningEffort) {
+    nextSettings.reasoningEffort = normalizedBindings.reasoningEffort;
+  } else {
+    delete nextSettings.reasoningEffort;
+  }
+
+  await writeJsonObjectFile(resolvedSettingsPath, nextSettings);
+  return {
+    settingsFilePath: resolvedSettingsPath,
+    backupFilePath: resolvedBackupPath,
+    settingsCreated: !settingsState.existed,
+    baseUrl,
+    bindings: normalizedBindings
+  };
+}
+
+export async function unpatchFactoryDroidSettingsFile({
+  settingsFilePath = "",
+  backupFilePath = "",
+  homeDir = os.homedir()
+} = {}) {
+  const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveFactoryDroidSettingsFilePath({ homeDir })).trim());
+  const resolvedBackupPath = path.resolve(String(backupFilePath || resolveCodingToolBackupFilePath(resolvedSettingsPath)).trim());
+  const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Factory Droid settings file '${resolvedSettingsPath}'`);
+  const backupState = await readJsonObjectFile(resolvedBackupPath, `Backup file '${resolvedBackupPath}'`);
+  const backup = sanitizeBackup(backupState.data, "factory-droid");
+  const restoredSettings = applyFactoryDroidBackup(settingsState.data, backup);
+
+  await writeJsonObjectFile(resolvedSettingsPath, restoredSettings);
+  await writeJsonObjectFile(resolvedBackupPath, {});
+
+  return {
+    settingsFilePath: resolvedSettingsPath,
+    backupFilePath: resolvedBackupPath,
+    settingsExisted: settingsState.existed,
+    backupRestored: backupHasData(backup)
   };
 }
