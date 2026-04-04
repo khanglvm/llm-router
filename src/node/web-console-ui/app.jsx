@@ -92,6 +92,11 @@ const QUICK_START_CONNECTION_OPTIONS = [
     value: "oauth-gpt",
     label: "OAuth · GPT",
     description: "Use ChatGPT subscription login with GPT models."
+  },
+  {
+    value: "oauth-claude",
+    label: "OAuth · Claude",
+    description: "Use Claude Code subscription login with Claude models."
   }
 ];
 const MODEL_ALIAS_STRATEGY_OPTIONS = [
@@ -8900,6 +8905,13 @@ function QuickStartWizard({
               </button>
             ))}
           </div>
+
+          {quickStart.connectionType === "oauth-claude" && (
+            <div className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-600 dark:border-amber-400/30 dark:bg-amber-950/30 dark:text-amber-400">
+              <span className="mt-0.5 shrink-0">⚠️</span>
+              <span>Claude Code OAuth routes through Anthropic's API with your subscription credentials. Usage will count against your Claude Max/Pro plan's extra usage quota, not the included subscription messages. Make sure you have extra usage enabled on your Claude plan to avoid request failures.</span>
+            </div>
+          )}
 
           <div className="grid gap-3 md:grid-cols-2">
             <Field label="Provider name">
