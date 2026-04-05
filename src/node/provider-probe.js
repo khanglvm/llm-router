@@ -84,6 +84,9 @@ function resolveModelsUrl(baseUrl, format) {
       return clean.replace(/\/chat\/completions$/, "/models");
     }
     if (clean.endsWith("/v1") || isVersionedApiRoot) return `${clean}/models`;
+    // Handle base URLs with a versioned segment followed by a sub-path,
+    // e.g. https://generativelanguage.googleapis.com/v1beta/openai
+    if (/\/v\d+[a-z]*\/(?!chat\b)\w+$/i.test(clean)) return `${clean}/models`;
     return `${clean}/v1/models`;
   }
 
@@ -191,8 +194,12 @@ function extractModelIds(result) {
   const ids = [];
   for (const item of body.data) {
     if (!item || typeof item !== "object") continue;
-    const id = typeof item.id === "string" ? item.id : (typeof item.name === "string" ? item.name : null);
-    if (id) ids.push(id);
+    let id = typeof item.id === "string" ? item.id : (typeof item.name === "string" ? item.name : null);
+    if (id) {
+      // Strip provider-specific prefixes (e.g., Gemini "models/gemini-*")
+      if (id.startsWith("models/")) id = id.slice(7);
+      ids.push(id);
+    }
   }
   return [...new Set(ids)];
 }
@@ -553,12 +560,14 @@ async function probeOpenAI(baseUrl, apiKey, timeoutMs, extraHeaders = {}) {
     }, timeoutMs);
     details.checks.push({ step: "chat", auth: variant.type, status: chatResult.status, error: chatResult.error || null });
 
-    if (looksOpenAI(chatResult)) {
+    const modelsLooksValid = looksOpenAI(modelsResult) && authLooksValid(modelsResult);
+
+    if (looksOpenAI(chatResult) || modelsLooksValid) {
       details.supported = true;
-      if (authLooksValid(chatResult)) {
+      if (looksOpenAI(chatResult) ? authLooksValid(chatResult) : modelsLooksValid) {
         details.working = true;
         details.auth = { type: variant.type === "x-api-key" ? "x-api-key" : "bearer" };
-        if (looksOpenAI(modelsResult) && authLooksValid(modelsResult)) {
+        if (modelsLooksValid) {
           details.models = extractModelIds(modelsResult);
         }
         return details;

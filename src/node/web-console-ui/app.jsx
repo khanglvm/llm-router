@@ -89,6 +89,16 @@ const QUICK_START_CONNECTION_OPTIONS = [
     description: "Test endpoint + model candidates with an API key env before saving."
   },
   {
+    value: "groq",
+    label: "Groq",
+    description: "Groq cloud inference with Llama, Qwen, and GPT-OSS models."
+  },
+  {
+    value: "gemini",
+    label: "Google Gemini",
+    description: "Google Gemini models via OpenAI-compatible endpoint."
+  },
+  {
     value: "oauth-gpt",
     label: "OAuth · GPT",
     description: "Use ChatGPT subscription login with GPT models."
@@ -130,23 +140,62 @@ const FACTORY_DROID_REASONING_EFFORT_OPTIONS = Object.freeze([
 const QUICK_START_WINDOW_OPTIONS = RATE_LIMIT_WINDOW_OPTIONS;
 const QUICK_START_API_ENV_BY_CONNECTION = {
   openai: "OPENAI_API_KEY",
-  claude: "ANTHROPIC_API_KEY"
+  claude: "ANTHROPIC_API_KEY",
+  groq: "GROQ_API_KEY",
+  gemini: "GEMINI_API_KEY"
 };
 const QUICK_START_DEFAULT_ENDPOINT_BY_PROTOCOL = {
   openai: "https://api.openai.com/v1",
   claude: "https://api.anthropic.com"
 };
+const QUICK_START_PRESET_ENDPOINTS = Object.freeze({
+  groq: "https://api.groq.com/openai/v1",
+  gemini: "https://generativelanguage.googleapis.com/v1beta/openai"
+});
+const QUICK_START_PROVIDER_PRESET_KEYS = new Set(["groq", "gemini"]);
+const QUICK_START_PRESET_FREE_TIER_RPM = Object.freeze({
+  "api.groq.com": Object.freeze({
+    "llama-3.1-8b-instant": 30,
+    "llama-3.3-70b-versatile": 30,
+    "openai/gpt-oss-20b": 30,
+    "openai/gpt-oss-120b": 15,
+    "qwen/qwen3-32b": 30,
+    "meta-llama/llama-4-scout-17b-16e-instruct": 15,
+    "moonshotai/kimi-k2-instruct": 15,
+    "_default": 30
+  }),
+  "generativelanguage.googleapis.com": Object.freeze({
+    "gemini-2.5-flash": 15,
+    "gemini-2.5-flash-lite": 15,
+    "gemini-2.5-pro": 5,
+    "gemini-2.0-flash": 10,
+    "gemini-2.0-flash-lite": 15,
+    "_default": 10
+  })
+});
 const QUICK_START_DEFAULT_MODELS = Object.freeze({
   api: Object.freeze({
     openai: Object.freeze(["gpt-4o-mini", "gpt-4.1-mini"]),
     claude: Object.freeze(["claude-3-5-sonnet", "claude-3-5-haiku"])
   }),
+  groq: Object.freeze(["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]),
+  gemini: Object.freeze(["gemini-2.5-flash", "gemini-2.5-pro"]),
   "oauth-gpt": CODEX_SUBSCRIPTION_MODELS,
   "oauth-claude": CLAUDE_CODE_SUBSCRIPTION_MODELS
 });
 const QUICK_START_RATE_LIMIT_DEFAULTS = Object.freeze({
   api: Object.freeze({
     limit: 60,
+    windowValue: 1,
+    windowUnit: "minute"
+  }),
+  groq: Object.freeze({
+    limit: 30,
+    windowValue: 1,
+    windowUnit: "minute"
+  }),
+  gemini: Object.freeze({
+    limit: 10,
     windowValue: 1,
     windowUnit: "minute"
   }),
@@ -160,6 +209,16 @@ const QUICK_START_CONNECTION_PRESETS = Object.freeze({
   api: Object.freeze({
     providerName: "My Provider",
     providerId: "my-provider",
+    subscriptionProfile: ""
+  }),
+  groq: Object.freeze({
+    providerName: "Groq",
+    providerId: "groq",
+    subscriptionProfile: ""
+  }),
+  gemini: Object.freeze({
+    providerName: "Google Gemini",
+    providerId: "gemini",
     subscriptionProfile: ""
   }),
   "oauth-gpt": Object.freeze({
@@ -2354,6 +2413,27 @@ function createProviderInlineDraftState(provider = {}) {
 
 function getQuickStartConnectionLabel(connectionType) {
   return QUICK_START_CONNECTION_OPTIONS.find((option) => option.value === connectionType)?.label || "API Key";
+}
+
+function detectPresetHostFromEndpoints(endpoints) {
+  for (const ep of (endpoints || [])) {
+    try {
+      const host = new URL(String(ep || "")).hostname;
+      if (QUICK_START_PRESET_FREE_TIER_RPM[host]) return host;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+function buildPresetFreeTierRateLimitRows(presetHost, modelIds) {
+  const limits = QUICK_START_PRESET_FREE_TIER_RPM[presetHost];
+  if (!limits || !Array.isArray(modelIds) || modelIds.length === 0) return null;
+  const defaultLimit = limits._default || 30;
+  return modelIds.map((modelId, index) => createRateLimitDraftRow({
+    models: [String(modelId)],
+    requests: limits[modelId] || defaultLimit,
+    window: { size: 1, unit: "minute" }
+  }, { keyPrefix: `preset-rl`, index }));
 }
 
 function getQuickStartSuggestedModelIds(connectionType, protocol = "openai") {
@@ -8547,6 +8627,37 @@ function QuickStartWizard({
     setModelTestStates({});
     setModelDiscovery(null);
     setModelDiscoveryError("");
+
+    if (QUICK_START_PROVIDER_PRESET_KEYS.has(nextConnectionType)) {
+      const preset = QUICK_START_CONNECTION_PRESETS[nextConnectionType] || QUICK_START_CONNECTION_PRESETS.api;
+      const presetEndpoint = QUICK_START_PRESET_ENDPOINTS[nextConnectionType] || "";
+      const presetEnv = QUICK_START_API_ENV_BY_CONNECTION[nextConnectionType] || "";
+      const presetModels = QUICK_START_DEFAULT_MODELS[nextConnectionType] || [];
+      const presetRateLimits = QUICK_START_RATE_LIMIT_DEFAULTS[nextConnectionType] || QUICK_START_RATE_LIMIT_DEFAULTS.api;
+      const existingProviders = Array.isArray(baseConfig?.providers) ? baseConfig.providers : [];
+      const deduped = deduplicateProviderId(preset.providerId, preset.providerName, existingProviders);
+      setQuickStart((current) => ({
+        ...current,
+        connectionType: "api",
+        providerName: deduped.providerName,
+        providerId: deduped.providerId,
+        endpoints: presetEndpoint ? [presetEndpoint] : [],
+        endpointDraft: "",
+        apiKeyEnv: presetEnv,
+        subscriptionProfile: "",
+        modelIds: Array.isArray(presetModels) ? [...presetModels] : [],
+        modelContextWindows: {},
+        modelDraft: "",
+        rateLimitRows: createRateLimitDraftRows([], {
+          keyPrefix: `quick-start-${nextConnectionType}-rate-limit`,
+          defaults: presetRateLimits,
+          includeDefault: true
+        }),
+        headerRows: getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
+      }));
+      return;
+    }
+
     setQuickStart((current) => {
       const currentDefaults = getQuickStartConnectionDefaults(current.connectionType);
       const nextDefaults = getQuickStartConnectionDefaults(nextConnectionType);
@@ -8656,16 +8767,22 @@ function QuickStartWizard({
             ...(current.modelContextWindows && typeof current.modelContextWindows === "object" ? current.modelContextWindows : {}),
             ...discoveredModelContextWindows
           };
+          const presetHost = detectPresetHostFromEndpoints(current.endpoints);
+          const presetRateLimitRows = presetHost
+            ? buildPresetFreeTierRateLimitRows(presetHost, nextModelIds)
+            : null;
           if (
             JSON.stringify(nextModelIds) === JSON.stringify(currentModelIds)
             && JSON.stringify(nextModelContextWindows) === JSON.stringify(current.modelContextWindows || {})
+            && !presetRateLimitRows
           ) {
             return current;
           }
           return {
             ...current,
             modelIds: nextModelIds,
-            modelContextWindows: nextModelContextWindows
+            modelContextWindows: nextModelContextWindows,
+            ...(presetRateLimitRows ? { rateLimitRows: presetRateLimitRows } : {})
           };
         });
         setModelDiscoveryError("");
