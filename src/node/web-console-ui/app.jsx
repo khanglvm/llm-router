@@ -165,11 +165,12 @@ const QUICK_START_PRESET_FREE_TIER_RPM = Object.freeze({
     "_default": 30
   }),
   "generativelanguage.googleapis.com": Object.freeze({
+    "gemini-3-flash-preview": 15,
+    "gemini-3.1-flash-lite-preview": 15,
+    "gemini-3.1-pro-preview": 5,
     "gemini-2.5-flash": 15,
     "gemini-2.5-flash-lite": 15,
     "gemini-2.5-pro": 5,
-    "gemini-2.0-flash": 10,
-    "gemini-2.0-flash-lite": 15,
     "_default": 10
   })
 });
@@ -179,7 +180,7 @@ const QUICK_START_DEFAULT_MODELS = Object.freeze({
     claude: Object.freeze(["claude-3-5-sonnet", "claude-3-5-haiku"])
   }),
   groq: Object.freeze(["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]),
-  gemini: Object.freeze(["gemini-2.5-flash", "gemini-2.5-pro"]),
+  gemini: Object.freeze(["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"]),
   "oauth-gpt": CODEX_SUBSCRIPTION_MODELS,
   "oauth-claude": CLAUDE_CODE_SUBSCRIPTION_MODELS
 });
