@@ -82,31 +82,16 @@ const TOAST_STATUS_TICK_MS = 100;
 const CONTEXT_LOOKUP_SUGGESTION_LIMIT = 6;
 const QUICK_START_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 const QUICK_START_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
-const QUICK_START_CONNECTION_OPTIONS = [
+const QUICK_START_CONNECTION_CATEGORIES = [
   {
     value: "api",
     label: "API Key",
     description: "Test endpoint + model candidates with an API key env before saving."
   },
   {
-    value: "groq",
-    label: "Groq",
-    description: "Groq cloud inference with Llama, Qwen, and GPT-OSS models."
-  },
-  {
-    value: "gemini",
-    label: "Google Gemini",
-    description: "Google Gemini models via OpenAI-compatible endpoint."
-  },
-  {
-    value: "oauth-gpt",
-    label: "OAuth · GPT",
-    description: "Use ChatGPT subscription login with GPT models."
-  },
-  {
-    value: "oauth-claude",
-    label: "OAuth · Claude",
-    description: "Use Claude Code subscription login with Claude models."
+    value: "subscription",
+    label: "Subscription",
+    description: "Use an OAuth subscription login with ChatGPT or Claude models."
   }
 ];
 const MODEL_ALIAS_STRATEGY_OPTIONS = [
@@ -138,101 +123,210 @@ const FACTORY_DROID_REASONING_EFFORT_OPTIONS = Object.freeze([
   { value: "high", label: "High", hint: "Maximum reasoning depth" }
 ]);
 const QUICK_START_WINDOW_OPTIONS = RATE_LIMIT_WINDOW_OPTIONS;
-const QUICK_START_API_ENV_BY_CONNECTION = {
-  openai: "OPENAI_API_KEY",
-  claude: "ANTHROPIC_API_KEY",
-  groq: "GROQ_API_KEY",
-  gemini: "GEMINI_API_KEY"
-};
 const QUICK_START_DEFAULT_ENDPOINT_BY_PROTOCOL = {
   openai: "https://api.openai.com/v1",
   claude: "https://api.anthropic.com"
 };
-const QUICK_START_PRESET_ENDPOINTS = Object.freeze({
-  groq: "https://api.groq.com/openai/v1",
-  gemini: "https://generativelanguage.googleapis.com/v1beta/openai"
-});
-const QUICK_START_PROVIDER_PRESET_KEYS = new Set(["groq", "gemini"]);
-const QUICK_START_PRESET_FREE_TIER_RPM = Object.freeze({
-  "api.groq.com": Object.freeze({
-    "llama-3.1-8b-instant": 30,
-    "llama-3.3-70b-versatile": 30,
-    "openai/gpt-oss-20b": 30,
-    "openai/gpt-oss-120b": 15,
-    "qwen/qwen3-32b": 30,
-    "meta-llama/llama-4-scout-17b-16e-instruct": 15,
-    "moonshotai/kimi-k2-instruct": 15,
-    "_default": 30
-  }),
-  "generativelanguage.googleapis.com": Object.freeze({
-    "gemini-3-flash-preview": 15,
-    "gemini-3.1-flash-lite-preview": 15,
-    "gemini-3.1-pro-preview": 5,
-    "gemini-2.5-flash": 15,
-    "gemini-2.5-flash-lite": 15,
-    "gemini-2.5-pro": 5,
-    "_default": 10
-  })
-});
-const QUICK_START_DEFAULT_MODELS = Object.freeze({
-  api: Object.freeze({
-    openai: Object.freeze(["gpt-4o-mini", "gpt-4.1-mini"]),
-    claude: Object.freeze(["claude-3-5-sonnet", "claude-3-5-haiku"])
-  }),
-  groq: Object.freeze(["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]),
-  gemini: Object.freeze(["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"]),
-  "oauth-gpt": CODEX_SUBSCRIPTION_MODELS,
-  "oauth-claude": CLAUDE_CODE_SUBSCRIPTION_MODELS
-});
-const QUICK_START_RATE_LIMIT_DEFAULTS = Object.freeze({
-  api: Object.freeze({
-    limit: 60,
-    windowValue: 1,
-    windowUnit: "minute"
-  }),
-  groq: Object.freeze({
-    limit: 30,
-    windowValue: 1,
-    windowUnit: "minute"
-  }),
-  gemini: Object.freeze({
-    limit: 10,
-    windowValue: 1,
-    windowUnit: "minute"
-  }),
-  oauth: Object.freeze({
-    limit: 999999,
-    windowValue: 1,
-    windowUnit: "month"
-  })
-});
-const QUICK_START_CONNECTION_PRESETS = Object.freeze({
-  api: Object.freeze({
+
+// ── Preset discovery ──
+
+/** Factory for OpenAI-compatible model discovery via /models endpoint. */
+function createOpenAICompatDiscover(endpoint, { requiresAuth = true } = {}) {
+  return Object.freeze({
+    requiresAuth,
+    fetchModels: async ({ apiKey, apiKeyEnv } = {}) => {
+      const body = { endpoints: [endpoint] };
+      if (apiKey) body.apiKey = apiKey;
+      if (apiKeyEnv) body.apiKeyEnv = apiKeyEnv;
+      const res = await fetchJson("/api/config/discover-provider-models", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify(body)
+      });
+      return (res.result?.models || []).map((id) => String(id || "").trim()).filter(Boolean);
+    }
+  });
+}
+
+/** Unified provider preset registry — single source of truth for all presets. */
+const PROVIDER_PRESETS = Object.freeze([
+  // ── API presets ──
+  Object.freeze({
+    key: "custom",
+    category: "api",
+    label: "Custom",
+    description: "Generic OpenAI-compatible API provider.",
     providerName: "My Provider",
     providerId: "my-provider",
-    subscriptionProfile: ""
+    endpoint: "",
+    apiKeyEnv: "",
+    defaultModels: Object.freeze({ openai: Object.freeze(["gpt-4o-mini", "gpt-4.1-mini"]), claude: Object.freeze(["claude-3-5-sonnet", "claude-3-5-haiku"]) }),
+    rateLimitDefaults: Object.freeze({ limit: 60, windowValue: 1, windowUnit: "minute" })
   }),
-  groq: Object.freeze({
+  Object.freeze({
+    key: "groq",
+    category: "api",
+    label: "Groq",
+    description: "Groq cloud inference with Llama, Qwen, and GPT-OSS models.",
     providerName: "Groq",
     providerId: "groq",
-    subscriptionProfile: ""
+    endpoint: "https://api.groq.com/openai/v1",
+    apiKeyEnv: "GROQ_API_KEY",
+    defaultModels: Object.freeze(["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]),
+    rateLimitDefaults: Object.freeze({ limit: 30, windowValue: 1, windowUnit: "minute" }),
+    freeTierRpm: Object.freeze({
+      host: "api.groq.com",
+      models: Object.freeze({
+        "llama-3.1-8b-instant": 30,
+        "llama-3.3-70b-versatile": 30,
+        "openai/gpt-oss-20b": 30,
+        "openai/gpt-oss-120b": 15,
+        "qwen/qwen3-32b": 30,
+        "meta-llama/llama-4-scout-17b-16e-instruct": 15,
+        "moonshotai/kimi-k2-instruct": 15,
+        "_default": 30
+      })
+    }),
+    discover: createOpenAICompatDiscover("https://api.groq.com/openai/v1")
   }),
-  gemini: Object.freeze({
+  Object.freeze({
+    key: "gemini",
+    category: "api",
+    label: "Google Gemini",
+    description: "Google Gemini models via OpenAI-compatible endpoint.",
     providerName: "Google Gemini",
     providerId: "gemini",
-    subscriptionProfile: ""
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
+    apiKeyEnv: "GEMINI_API_KEY",
+    defaultModels: Object.freeze(["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"]),
+    rateLimitDefaults: Object.freeze({ limit: 10, windowValue: 1, windowUnit: "minute" }),
+    freeTierRpm: Object.freeze({
+      host: "generativelanguage.googleapis.com",
+      models: Object.freeze({
+        "gemini-3-flash-preview": 15,
+        "gemini-3.1-flash-lite-preview": 15,
+        "gemini-3.1-pro-preview": 5,
+        "gemini-2.5-flash": 15,
+        "gemini-2.5-flash-lite": 15,
+        "gemini-2.5-pro": 5,
+        "_default": 10
+      })
+    }),
+    discover: createOpenAICompatDiscover("https://generativelanguage.googleapis.com/v1beta/openai")
   }),
-  "oauth-gpt": Object.freeze({
+  Object.freeze({
+    key: "zai-global",
+    category: "api",
+    label: "Z.AI Coding (Global)",
+    description: "Zhipu AI coding models (GLM-4.7, GLM-5) via global endpoint.",
+    providerName: "Z.AI Coding",
+    providerId: "zai-coding",
+    endpoint: "https://api.z.ai/api/coding/paas/v4",
+    apiKeyEnv: "ZAI_API_KEY",
+    defaultModels: Object.freeze(["glm-4.7", "glm-4.7-flash"]),
+    rateLimitDefaults: Object.freeze({ limit: 60, windowValue: 1, windowUnit: "minute" }),
+    discover: createOpenAICompatDiscover("https://api.z.ai/api/coding/paas/v4")
+  }),
+  Object.freeze({
+    key: "zai-china",
+    category: "api",
+    label: "Z.AI Coding (China)",
+    description: "Zhipu AI coding models via China mainland endpoint.",
+    providerName: "Z.AI Coding CN",
+    providerId: "zai-coding-cn",
+    endpoint: "https://open.bigmodel.cn/api/coding/paas/v4",
+    apiKeyEnv: "ZAI_API_KEY",
+    defaultModels: Object.freeze(["glm-4.7", "glm-4.7-flash"]),
+    rateLimitDefaults: Object.freeze({ limit: 60, windowValue: 1, windowUnit: "minute" }),
+    discover: createOpenAICompatDiscover("https://open.bigmodel.cn/api/coding/paas/v4")
+  }),
+  Object.freeze({
+    key: "openrouter",
+    category: "api",
+    label: "OpenRouter",
+    description: "300+ models from multiple providers, including free tier models.",
+    providerName: "OpenRouter",
+    providerId: "openrouter",
+    endpoint: "https://openrouter.ai/api/v1",
+    apiKeyEnv: "OPENROUTER_API_KEY",
+    defaultModels: Object.freeze(["qwen/qwen3.6-plus:free", "google/gemma-4-26b-a4b-it"]),
+    rateLimitDefaults: Object.freeze({ limit: 200, windowValue: 1, windowUnit: "minute" }),
+    discover: createOpenAICompatDiscover("https://openrouter.ai/api/v1", { requiresAuth: false })
+  }),
+
+  // ── Subscription (OAuth) presets ──
+  Object.freeze({
+    key: "oauth-gpt",
+    category: "subscription",
+    label: "ChatGPT",
+    description: "Use ChatGPT subscription login with GPT models.",
     providerName: "ChatGPT Subscription",
     providerId: "chatgpt-sub",
-    subscriptionProfile: ""
+    subscriptionType: "chatgpt-codex",
+    format: "openai",
+    defaultModels: CODEX_SUBSCRIPTION_MODELS,
+    rateLimitDefaults: Object.freeze({ limit: 999999, windowValue: 1, windowUnit: "month" }),
+    warning: "chatgpt-tos"
   }),
-  "oauth-claude": Object.freeze({
+  Object.freeze({
+    key: "oauth-claude",
+    category: "subscription",
+    label: "Claude",
+    description: "Use Claude Code subscription login with Claude models.",
     providerName: "Claude Subscription",
     providerId: "claude-sub",
-    subscriptionProfile: ""
+    subscriptionType: "claude-code",
+    format: "claude",
+    defaultModels: CLAUDE_CODE_SUBSCRIPTION_MODELS,
+    rateLimitDefaults: Object.freeze({ limit: 999999, windowValue: 1, windowUnit: "month" }),
+    warning: "claude-extra-usage"
   })
-});
+]);
+
+/** Index helpers for PROVIDER_PRESETS registry. */
+const PROVIDER_PRESET_BY_KEY = Object.freeze(Object.fromEntries(PROVIDER_PRESETS.map((p) => [p.key, p])));
+
+function findPresetByKey(key) {
+  return PROVIDER_PRESET_BY_KEY[key] || PROVIDER_PRESET_BY_KEY.custom;
+}
+
+function findPresetByHost(hostname) {
+  return PROVIDER_PRESETS.find((p) => p.freeTierRpm?.host === hostname) || null;
+}
+
+function getPresetOptionsByCategory(category) {
+  return PROVIDER_PRESETS.filter((p) => p.category === category);
+}
+
+/** Build the free-tier RPM lookup map keyed by hostname (used by detectPresetHostFromEndpoints). */
+const PROVIDER_PRESET_FREE_TIER_RPM_BY_HOST = Object.freeze(
+  Object.fromEntries(
+    PROVIDER_PRESETS
+      .filter((p) => p.freeTierRpm?.host && p.freeTierRpm?.models)
+      .map((p) => [p.freeTierRpm.host, p.freeTierRpm.models])
+  )
+);
+
+/** Module-level cache for preset model discovery — survives React re-renders. */
+const presetModelCache = new Map();
+let _presetInitPromise = null;
+
+/** Non-blocking background init: fetches models for presets that don't require auth. */
+function initPresetModels() {
+  if (_presetInitPromise) return _presetInitPromise;
+  _presetInitPromise = Promise.allSettled(
+    PROVIDER_PRESETS
+      .filter((p) => p.discover && !p.discover.requiresAuth)
+      .map(async (preset) => {
+        try {
+          const models = await preset.discover.fetchModels();
+          if (models.length) presetModelCache.set(preset.key, models);
+        } catch { /* background — swallow errors */ }
+      })
+  );
+  return _presetInitPromise;
+}
+
 const AMP_WEB_SEARCH_STRATEGY_OPTIONS = Object.freeze([
   { value: "ordered", label: "Ordered" },
   { value: "quota-balance", label: "Quota balance" }
@@ -742,7 +836,7 @@ function collectProviderModelIds(provider = {}) {
 function createRateLimitDraftRow(row = {}, {
   keyPrefix = "rate-limit",
   index = 0,
-  defaults = QUICK_START_RATE_LIMIT_DEFAULTS.api,
+  defaults = PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults,
   useDefaults = true
 } = {}) {
   const sourceId = String(row?.sourceId || row?.id || "").trim();
@@ -771,7 +865,7 @@ function createRateLimitDraftRow(row = {}, {
 
 function createRateLimitDraftRows(rateLimits = [], {
   keyPrefix = "rate-limit",
-  defaults = QUICK_START_RATE_LIMIT_DEFAULTS.api,
+  defaults = PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults,
   includeDefault = true
 } = {}) {
   const sourceRows = Array.isArray(rateLimits) && rateLimits.length > 0
@@ -2385,15 +2479,31 @@ function getDraftProviderCredentialPayload(draftProvider = {}, provider = {}) {
 
 function inferQuickStartConnectionType(provider = {}) {
   if (provider?.type === "subscription") {
-    return provider?.subscriptionType === "claude-code" ? "oauth-claude" : "oauth-gpt";
+    return "subscription";
   }
   return "api";
+}
+
+function inferQuickStartPresetKey(provider = {}) {
+  if (provider?.type === "subscription") {
+    return provider?.subscriptionType === "claude-code" ? "oauth-claude" : "oauth-gpt";
+  }
+  const endpoints = collectQuickStartEndpoints(provider);
+  for (const ep of endpoints) {
+    try {
+      const host = new URL(String(ep || "")).hostname;
+      const preset = findPresetByHost(host);
+      if (preset) return preset.key;
+    } catch { /* ignore */ }
+  }
+  return "custom";
 }
 
 function createProviderInlineDraftState(provider = {}) {
   const endpoints = collectQuickStartEndpoints(provider);
   const connectionType = inferQuickStartConnectionType(provider);
-  const rateLimitDefaults = getQuickStartRateLimitDefaults(connectionType);
+  const presetKey = inferQuickStartPresetKey(provider);
+  const rateLimitDefaults = getQuickStartRateLimitDefaults(presetKey);
   return {
     id: String(provider?.id || "").trim(),
     name: String(provider?.name || provider?.id || "").trim(),
@@ -2412,22 +2522,23 @@ function createProviderInlineDraftState(provider = {}) {
   };
 }
 
-function getQuickStartConnectionLabel(connectionType) {
-  return QUICK_START_CONNECTION_OPTIONS.find((option) => option.value === connectionType)?.label || "API Key";
+function getQuickStartConnectionLabel(presetKey) {
+  const preset = findPresetByKey(presetKey);
+  return preset.label || "API Key";
 }
 
 function detectPresetHostFromEndpoints(endpoints) {
   for (const ep of (endpoints || [])) {
     try {
       const host = new URL(String(ep || "")).hostname;
-      if (QUICK_START_PRESET_FREE_TIER_RPM[host]) return host;
+      if (PROVIDER_PRESET_FREE_TIER_RPM_BY_HOST[host]) return host;
     } catch { /* ignore */ }
   }
   return null;
 }
 
 function buildPresetFreeTierRateLimitRows(presetHost, modelIds) {
-  const limits = QUICK_START_PRESET_FREE_TIER_RPM[presetHost];
+  const limits = PROVIDER_PRESET_FREE_TIER_RPM_BY_HOST[presetHost];
   if (!limits || !Array.isArray(modelIds) || modelIds.length === 0) return null;
   const defaultLimit = limits._default || 30;
   return modelIds.map((modelId, index) => createRateLimitDraftRow({
@@ -2490,17 +2601,20 @@ async function probeFreeTierModels(baseUrl, credential, modelIds) {
   }
 }
 
-function getQuickStartSuggestedModelIds(connectionType, protocol = "openai") {
-  if (connectionType === "api") {
-    return [...(QUICK_START_DEFAULT_MODELS.api[protocol] || QUICK_START_DEFAULT_MODELS.api.openai)];
+function getQuickStartSuggestedModelIds(presetKey, protocol = "openai") {
+  const cached = presetModelCache.get(presetKey);
+  if (cached?.length) return [...cached];
+  const preset = findPresetByKey(presetKey);
+  const models = preset.defaultModels;
+  if (models && typeof models === "object" && !Array.isArray(models)) {
+    return [...(models[protocol] || models.openai || [])];
   }
-  return [...(QUICK_START_DEFAULT_MODELS[connectionType] || QUICK_START_DEFAULT_MODELS["oauth-gpt"])];
+  return Array.isArray(models) ? [...models] : [];
 }
 
-function getQuickStartRateLimitDefaults(connectionType) {
-  return connectionType === "api"
-    ? QUICK_START_RATE_LIMIT_DEFAULTS.api
-    : QUICK_START_RATE_LIMIT_DEFAULTS.oauth;
+function getQuickStartRateLimitDefaults(presetKey) {
+  const preset = findPresetByKey(presetKey);
+  return preset.rateLimitDefaults || PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults;
 }
 
 function deduplicateProviderId(baseId, baseName, existingProviders = []) {
@@ -2511,20 +2625,21 @@ function deduplicateProviderId(baseId, baseName, existingProviders = []) {
   return { providerId: `${baseId}-${n}`, providerName: `${baseName} ${n}` };
 }
 
-function getQuickStartConnectionDefaults(connectionType, protocol = "openai") {
-  const preset = QUICK_START_CONNECTION_PRESETS[connectionType] || QUICK_START_CONNECTION_PRESETS.api;
-  const rateLimitDefaults = getQuickStartRateLimitDefaults(connectionType);
+function getQuickStartConnectionDefaults(presetKey, protocol = "openai") {
+  const preset = findPresetByKey(presetKey);
+  const rateLimitDefaults = getQuickStartRateLimitDefaults(presetKey);
+  const isApi = preset.category === "api";
 
   return {
     providerName: preset.providerName,
     providerId: preset.providerId,
-    endpoints: connectionType === "api" ? [] : [],
-    apiKeyEnv: connectionType === "api" ? "" : "",
-    subscriptionProfile: connectionType === "api" ? "" : preset.subscriptionProfile,
-    modelIds: connectionType === "api" ? [] : getQuickStartSuggestedModelIds(connectionType, protocol),
-    rateLimitRows: connectionType === "api"
+    endpoints: isApi && preset.endpoint ? [preset.endpoint] : [],
+    apiKeyEnv: isApi ? (preset.apiKeyEnv || "") : "",
+    subscriptionProfile: isApi ? "" : "",
+    modelIds: presetKey === "custom" ? [] : getQuickStartSuggestedModelIds(presetKey, protocol),
+    rateLimitRows: isApi
       ? createRateLimitDraftRows([], {
-          keyPrefix: `quick-start-${connectionType}-rate-limit`,
+          keyPrefix: `quick-start-${presetKey}-rate-limit`,
           defaults: rateLimitDefaults,
           includeDefault: true
         })
@@ -2644,9 +2759,10 @@ function createQuickStartState(baseConfig = {}, { seedMode = "blank", targetProv
   const useExistingProvider = seedMode === "existing" || Boolean(targetedProvider);
   const provider = useExistingProvider ? (targetedProvider || providerList[0] || {}) : {};
   const connectionType = useExistingProvider ? inferQuickStartConnectionType(provider) : "api";
+  const presetKey = useExistingProvider ? inferQuickStartPresetKey(provider) : "custom";
   const protocol = provider?.format === "claude" ? "claude" : "openai";
-  const defaults = getQuickStartConnectionDefaults(connectionType, protocol);
-  const rateLimitDefaults = getQuickStartRateLimitDefaults(connectionType);
+  const defaults = getQuickStartConnectionDefaults(presetKey, protocol);
+  const rateLimitDefaults = getQuickStartRateLimitDefaults(presetKey);
   const providerModels = Array.isArray(provider?.models)
     ? provider.models.map((model) => model?.id).filter(Boolean)
     : [];
@@ -2671,6 +2787,7 @@ function createQuickStartState(baseConfig = {}, { seedMode = "blank", targetProv
 
   return {
     connectionType,
+    selectedConnection: presetKey,
     providerName: String(provider?.name || defaults.providerName),
     providerId: resolvedProviderId,
     endpoints: collectQuickStartEndpoints(provider).length > 0 ? collectQuickStartEndpoints(provider) : defaults.endpoints,
@@ -2719,7 +2836,7 @@ function buildQuickStartConfig(baseConfig = {}, quickStart, testedProviderConfig
   const providerName = String(quickStart?.providerName || providerId).trim() || providerId;
   const modelIds = Array.isArray(quickStart?.modelIds) ? quickStart.modelIds.map((id) => String(id || "").trim()).filter(Boolean) : [];
   const orderedModelIds = syncQuickStartAliasModelIds(quickStart?.aliasModelIds, modelIds);
-  const effectiveRateLimitDefaults = getQuickStartRateLimitDefaults(quickStart?.connectionType);
+  const effectiveRateLimitDefaults = getQuickStartRateLimitDefaults(quickStart?.selectedConnection || quickStart?.connectionType);
   const resolvedRateLimitRows = Array.isArray(quickStart?.rateLimitRows)
     ? quickStart.rateLimitRows
     : [];
@@ -2779,8 +2896,9 @@ function buildQuickStartConfig(baseConfig = {}, quickStart, testedProviderConfig
       ...(providerMetadata ? { metadata: providerMetadata } : {})
     };
   } else {
-    const subscriptionType = quickStart?.connectionType === "oauth-claude" ? "claude-code" : "chatgpt-codex";
-    const providerFormat = quickStart?.connectionType === "oauth-claude" ? "claude" : "openai";
+    const preset = findPresetByKey(quickStart?.selectedConnection || "oauth-gpt");
+    const subscriptionType = preset.subscriptionType || "chatgpt-codex";
+    const providerFormat = preset.format || "openai";
 
     provider = {
       id: providerId,
@@ -6769,6 +6887,222 @@ function ProviderModelsSection({
   );
 }
 
+const OLLAMA_KEEP_ALIVE_OPTIONS = [
+  { value: "5m", label: "5 minutes" },
+  { value: "10m", label: "10 minutes" },
+  { value: "30m", label: "30 minutes" },
+  { value: "1h", label: "1 hour" },
+  { value: "24h", label: "24 hours" },
+  { value: "-1", label: "Forever (blocks eviction)" },
+  { value: "0", label: "Disabled (unload immediately)" }
+];
+
+function OllamaSettingsPanel({
+  connected, snapshot, models, busy, refreshing, config,
+  onRefresh, onLoad, onUnload, onPin, onKeepAlive, onContextLength,
+  onAddToRouter, onRemoveFromRouter, onAutoLoad, onSaveSettings,
+  onInstall, onStartServer, onStopServer, onSyncRouter
+}) {
+  const ollamaConfig = config?.ollama || {};
+  const [settingsBaseUrl, setSettingsBaseUrl] = useState(ollamaConfig.baseUrl || "http://localhost:11434");
+  const [settingsAutoConnect, setSettingsAutoConnect] = useState(ollamaConfig.autoConnect !== false);
+  const [settingsDefaultKeepAlive, setSettingsDefaultKeepAlive] = useState(ollamaConfig.defaultKeepAlive || "5m");
+
+  const isInstalled = snapshot?.installed === true;
+
+  return (
+    <div className="space-y-4">
+      {/* Connection Section */}
+      <Card>
+        <CardContent className="p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium">Ollama Connection</h3>
+              {connected ? (
+                <Badge variant="success">Connected</Badge>
+              ) : (
+                <Badge variant="outline">Disconnected</Badge>
+              )}
+            </div>
+            <div className="flex gap-2">
+              {!isInstalled && (
+                <Button size="sm" onClick={onInstall} disabled={busy._install}>
+                  {busy._install ? "Installing…" : "Install Ollama"}
+                </Button>
+              )}
+              {isInstalled && !connected && (
+                <Button size="sm" onClick={onStartServer} disabled={busy._startServer}>
+                  {busy._startServer ? "Starting…" : "Start Server"}
+                </Button>
+              )}
+              {connected && (
+                <Button size="sm" variant="outline" onClick={onStopServer}>Stop Server</Button>
+              )}
+            </div>
+          </div>
+          {snapshot?.version && <p className="text-xs text-muted-foreground">Version: {snapshot.version}</p>}
+        </CardContent>
+      </Card>
+
+      {/* Model List Section */}
+      {connected && (
+        <Card>
+          <CardContent className="p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="font-medium">Models</h3>
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" onClick={onSyncRouter} disabled={busy._syncRouter}>
+                  {busy._syncRouter ? "Syncing…" : "Sync All to Router"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={onRefresh} disabled={refreshing}>
+                  {refreshing ? "Refreshing…" : "Reload Models"}
+                </Button>
+              </div>
+            </div>
+            {models.length === 0 && !refreshing && (
+              <p className="text-sm text-muted-foreground">No models found. Pull models with <code className="text-xs bg-muted px-1 py-0.5 rounded">ollama pull &lt;model&gt;</code></p>
+            )}
+            <div className="space-y-2">
+              {models.map((model) => (
+                <OllamaModelRow
+                  key={model.name}
+                  model={model}
+                  busy={busy[model.name] || {}}
+                  onLoad={onLoad}
+                  onUnload={onUnload}
+                  onPin={onPin}
+                  onKeepAlive={onKeepAlive}
+                  onContextLength={onContextLength}
+                  onAddToRouter={onAddToRouter}
+                  onRemoveFromRouter={onRemoveFromRouter}
+                  onAutoLoad={onAutoLoad}
+                />
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Settings Section */}
+      <Card>
+        <CardContent className="p-4 space-y-3">
+          <h3 className="font-medium">Settings</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">Base URL</label>
+              <Input
+                value={settingsBaseUrl}
+                onChange={(e) => setSettingsBaseUrl(e.target.value)}
+                placeholder="http://localhost:11434"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">Default Keep Alive</label>
+              <Select value={settingsDefaultKeepAlive} onValueChange={setSettingsDefaultKeepAlive}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {OLLAMA_KEEP_ALIVE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <label className="text-sm text-foreground">Auto-connect on startup</label>
+            <Switch checked={settingsAutoConnect} onCheckedChange={setSettingsAutoConnect} />
+          </div>
+          <Button
+            size="sm"
+            onClick={() => onSaveSettings({ baseUrl: settingsBaseUrl, autoConnect: settingsAutoConnect, defaultKeepAlive: settingsDefaultKeepAlive })}
+          >Save Settings</Button>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function OllamaModelRow({ model, busy, onLoad, onUnload, onPin, onKeepAlive, onContextLength, onAddToRouter, onRemoveFromRouter, onAutoLoad }) {
+  const [localContextLength, setLocalContextLength] = useState(model.contextLength || 0);
+
+  return (
+    <div className="rounded-lg border border-border p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-mono text-sm font-medium">{model.name}</span>
+          <Badge variant="outline">{model.parameterSize || "?"}</Badge>
+          <Badge variant="outline">{model.quantizationLevel || "?"}</Badge>
+          {model.loaded ? (
+            <Badge variant="success">Loaded{model.sizeVramFormatted ? ` (${model.sizeVramFormatted})` : ""}</Badge>
+          ) : (
+            <Badge variant="default">Available</Badge>
+          )}
+          {model.isPinned && <Badge variant="warning">Pinned</Badge>}
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {!model.loaded ? (
+            <Button size="sm" variant="outline" onClick={() => onLoad(model.name)} disabled={busy.loading}>
+              {busy.loading ? "Loading…" : "Load"}
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={() => onUnload(model.name)} disabled={busy.unloading}>
+              {busy.unloading ? "Unloading…" : "Unload"}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant={model.isPinned ? "default" : "outline"}
+            onClick={() => onPin(model.name, !model.isPinned)}
+            disabled={busy.pinning}
+            title={model.isPinned ? "Unpin (allow auto-unload)" : "Pin in memory (blocks eviction)"}
+          >
+            {model.isPinned ? "Unpin" : "Pin"}
+          </Button>
+          {model.inRouter ? (
+            <Button size="sm" variant="outline" onClick={() => onRemoveFromRouter(model.name)} className="text-red-600 hover:text-red-700">Remove from Router</Button>
+          ) : (
+            <Button size="sm" variant="default" onClick={() => onAddToRouter(model.name)}>Add to Router</Button>
+          )}
+        </div>
+      </div>
+      <div className="flex items-center gap-4 flex-wrap text-xs">
+        <div className="flex items-center gap-1.5">
+          <label className="text-muted-foreground whitespace-nowrap">Keep Alive:</label>
+          <Select value={model.keepAlive || "5m"} onValueChange={(v) => onKeepAlive(model.name, v)}>
+            <SelectTrigger className="h-7 w-[160px] text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {OLLAMA_KEEP_ALIVE_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <label className="text-muted-foreground whitespace-nowrap">Context:</label>
+          <Input
+            type="number"
+            className="h-7 w-24 text-xs"
+            value={localContextLength}
+            onChange={(e) => setLocalContextLength(Number(e.target.value))}
+            onBlur={() => { if (localContextLength !== model.contextLength) onContextLength(model.name, localContextLength); }}
+            min={0}
+            step={1024}
+          />
+          {model.contextLength > 0 && <span className="text-muted-foreground">max: {model.contextLength.toLocaleString()}</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          <Switch
+            checked={model.autoLoad}
+            onCheckedChange={(checked) => onAutoLoad(model.name, checked)}
+          />
+          <label className="text-muted-foreground">Auto-load on start</label>
+        </div>
+        {model.estimatedVram && <span className="text-muted-foreground">Est. VRAM: {model.estimatedVram}</span>}
+      </div>
+    </div>
+  );
+}
+
 function AmpSettingsPanel({
   rows,
   routeOptions,
@@ -8042,10 +8376,10 @@ function createBlankRateLimitEditorRow(key = "rate-limit-draft-row") {
     models: [],
     requests: "",
     windowValue: "",
-    windowUnit: QUICK_START_RATE_LIMIT_DEFAULTS.api.windowUnit
+    windowUnit: PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults.windowUnit
   }, {
     keyPrefix: "rate-limit-draft",
-    defaults: QUICK_START_RATE_LIMIT_DEFAULTS.api,
+    defaults: PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults,
     useDefaults: false
   });
 }
@@ -8611,11 +8945,12 @@ function QuickStartWizard({
   const activeDiscoveryResult = modelDiscovery?.signature === apiConnectionSignature ? modelDiscovery.result : null;
   const suggestedModelIds = activeDiscoveryResult?.models?.length > 0
     ? activeDiscoveryResult.models
-    : getQuickStartSuggestedModelIds(quickStart.connectionType);
+    : getQuickStartSuggestedModelIds(quickStart.selectedConnection || "custom");
   const normalizedProviderId = slugifyProviderId(quickStart.providerId || quickStart.providerName || "my-provider") || "my-provider";
   const resolvedSubscriptionProfile = resolveQuickStartSubscriptionProfile(quickStart);
   const subscriptionLoginSignature = JSON.stringify({
     connectionType: quickStart.connectionType,
+    selectedConnection: quickStart.selectedConnection,
     subscriptionProfile: resolvedSubscriptionProfile
   });
   const testSignature = JSON.stringify({
@@ -8633,6 +8968,8 @@ function QuickStartWizard({
   const defaultRoute = DEFAULT_MODEL_ALIAS_ID;
   const activeStep = steps[stepIndex];
   const stepError = getQuickStartStepError(stepIndex, resolvedQuickStart, baseConfig, { targetProviderId });
+
+  useEffect(() => { initPresetModels(); }, []);
 
   useEffect(() => {
     if (lastRenderedTestSignatureRef.current !== testSignature) {
@@ -8675,87 +9012,91 @@ function QuickStartWizard({
     });
   }
 
-  function handleConnectionChange(nextConnectionType) {
+  function handleConnectionChange(nextCategory) {
     setTestError("");
     setTestedConfig(null);
     setModelTestStates({});
     setModelDiscovery(null);
     setModelDiscoveryError("");
 
-    if (QUICK_START_PROVIDER_PRESET_KEYS.has(nextConnectionType)) {
-      const preset = QUICK_START_CONNECTION_PRESETS[nextConnectionType] || QUICK_START_CONNECTION_PRESETS.api;
-      const presetEndpoint = QUICK_START_PRESET_ENDPOINTS[nextConnectionType] || "";
-      const presetEnv = QUICK_START_API_ENV_BY_CONNECTION[nextConnectionType] || "";
-      const presetModels = QUICK_START_DEFAULT_MODELS[nextConnectionType] || [];
-      const presetRateLimits = QUICK_START_RATE_LIMIT_DEFAULTS[nextConnectionType] || QUICK_START_RATE_LIMIT_DEFAULTS.api;
-      const existingProviders = Array.isArray(baseConfig?.providers) ? baseConfig.providers : [];
-      const deduped = deduplicateProviderId(preset.providerId, preset.providerName, existingProviders);
-      setQuickStart((current) => ({
-        ...current,
-        connectionType: "api",
-        providerName: deduped.providerName,
-        providerId: deduped.providerId,
-        endpoints: presetEndpoint ? [presetEndpoint] : [],
-        endpointDraft: "",
-        apiKeyEnv: presetEnv,
-        subscriptionProfile: "",
-        modelIds: Array.isArray(presetModels) ? [...presetModels] : [],
-        modelContextWindows: {},
-        modelDraft: "",
-        rateLimitRows: createRateLimitDraftRows([], {
-          keyPrefix: `quick-start-${nextConnectionType}-rate-limit`,
-          defaults: presetRateLimits,
-          includeDefault: true
-        }),
-        headerRows: getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
-      }));
-      return;
-    }
+    const defaultPresetKey = nextCategory === "api" ? "custom" : "oauth-gpt";
+    applyPreset(nextCategory, defaultPresetKey);
+  }
+
+  function handlePresetChange(nextPresetKey) {
+    setTestError("");
+    setTestedConfig(null);
+    setModelTestStates({});
+    setModelDiscovery(null);
+    setModelDiscoveryError("");
+
+    const preset = findPresetByKey(nextPresetKey);
+    applyPreset(preset.category, nextPresetKey);
+  }
+
+  function applyPreset(nextCategory, nextPresetKey) {
+    const preset = findPresetByKey(nextPresetKey);
+    const isApi = nextCategory === "api";
 
     setQuickStart((current) => {
-      const currentDefaults = getQuickStartConnectionDefaults(current.connectionType);
-      const nextDefaults = getQuickStartConnectionDefaults(nextConnectionType);
+      const currentPreset = findPresetByKey(current.selectedConnection || "custom");
+      const currentDefaults = getQuickStartConnectionDefaults(current.selectedConnection || "custom");
       const existingProviders = Array.isArray(baseConfig?.providers) ? baseConfig.providers : [];
-      const deduped = deduplicateProviderId(nextDefaults.providerId, nextDefaults.providerName, existingProviders);
+      const deduped = deduplicateProviderId(preset.providerId, preset.providerName, existingProviders);
       const currentHeaderDefaults = current.connectionType === "api"
         ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
         : [];
-      const nextHeaderDefaults = nextConnectionType === "api"
+      const nextHeaderDefaults = isApi
         ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
         : [];
       const currentHeaderRows = normalizeQuickStartHeaderRows(current.headerRows || []);
       const providerIdWasAuto = !current.providerId
+        || current.providerId === currentPreset.providerId
         || current.providerId === currentDefaults.providerId
         || current.providerId === slugifyProviderId(current.providerName || "");
-      const providerNameWasAuto = !current.providerName || current.providerName === currentDefaults.providerName;
-      const apiKeyEnvWasAuto = !current.apiKeyEnv || current.apiKeyEnv === currentDefaults.apiKeyEnv;
+      const providerNameWasAuto = !current.providerName
+        || current.providerName === currentPreset.providerName
+        || current.providerName === currentDefaults.providerName;
+      const apiKeyEnvWasAuto = !current.apiKeyEnv || current.apiKeyEnv === (currentPreset.apiKeyEnv || "") || current.apiKeyEnv === currentDefaults.apiKeyEnv;
       const profileWasAuto = !current.subscriptionProfile || current.subscriptionProfile === currentDefaults.subscriptionProfile;
+      const currentDefaultModels = Array.isArray(currentPreset.defaultModels) ? currentPreset.defaultModels : [];
       const modelsWereDefault = (current.modelIds || []).length === 0
+        || JSON.stringify(current.modelIds || []) === JSON.stringify(currentDefaultModels)
         || JSON.stringify(current.modelIds || []) === JSON.stringify(currentDefaults.modelIds || []);
       const headerRowsWereDefault = JSON.stringify(currentHeaderRows) === JSON.stringify(currentHeaderDefaults);
 
+      const presetModels = Array.isArray(preset.defaultModels)
+        ? [...preset.defaultModels]
+        : [];
+      const nextDefaults = getQuickStartConnectionDefaults(nextPresetKey);
+
       return {
         ...current,
-        connectionType: nextConnectionType,
+        connectionType: nextCategory,
+        selectedConnection: nextPresetKey,
         providerName: providerNameWasAuto ? deduped.providerName : current.providerName,
         providerId: providerIdWasAuto ? deduped.providerId : current.providerId,
-        endpoints: nextConnectionType === "api"
-          ? ((current.endpoints || []).length > 0 ? current.endpoints : nextDefaults.endpoints)
+        endpoints: isApi
+          ? (preset.endpoint ? [preset.endpoint] : [])
           : [],
-        endpointDraft: nextConnectionType === "api" ? String(current.endpointDraft || "") : "",
-        apiKeyEnv: nextConnectionType === "api"
-          ? (apiKeyEnvWasAuto ? nextDefaults.apiKeyEnv : current.apiKeyEnv)
+        endpointDraft: isApi ? String(current.endpointDraft || "") : "",
+        apiKeyEnv: isApi
+          ? (apiKeyEnvWasAuto ? (preset.apiKeyEnv || "") : current.apiKeyEnv)
           : "",
-        subscriptionProfile: nextConnectionType === "api"
+        subscriptionProfile: isApi
           ? ""
           : (profileWasAuto ? nextDefaults.subscriptionProfile : current.subscriptionProfile),
-        modelIds: modelsWereDefault ? nextDefaults.modelIds : current.modelIds,
+        modelIds: modelsWereDefault ? (presetModels.length > 0 ? presetModels : nextDefaults.modelIds) : current.modelIds,
         modelContextWindows: modelsWereDefault ? {} : (current.modelContextWindows || {}),
         modelDraft: "",
-        rateLimitRows: nextConnectionType === "api"
-          ? nextDefaults.rateLimitRows
+        rateLimitRows: isApi
+          ? createRateLimitDraftRows([], {
+              keyPrefix: `quick-start-${nextPresetKey}-rate-limit`,
+              defaults: preset.rateLimitDefaults || PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults,
+              includeDefault: true
+            })
           : [],
-        headerRows: nextConnectionType === "api"
+        headerRows: isApi
           ? ((currentHeaderRows.length === 0 || headerRowsWereDefault) ? nextHeaderDefaults : currentHeaderRows)
           : []
       };
@@ -8794,6 +9135,8 @@ function QuickStartWizard({
       let discoveredModelContextWindows = {};
 
       if (discoveredModelIds.length > 0) {
+        const activePresetKey = quickStart.selectedConnection;
+        if (activePresetKey) presetModelCache.set(activePresetKey, discoveredModelIds);
         const presetHost = detectPresetHostFromEndpoints(endpoints);
         if (presetHost) {
           const freeTierModels = await probeFreeTierModels(
@@ -8933,6 +9276,7 @@ function QuickStartWizard({
     if (quickStart.connectionType === "api") return true;
     if (!force && completedOAuthSignature === subscriptionLoginSignature) return true;
 
+    const activePreset = findPresetByKey(quickStart.selectedConnection || "oauth-gpt");
     setBusyAction("oauth-login");
     setTestError("");
     try {
@@ -8942,7 +9286,7 @@ function QuickStartWizard({
         body: JSON.stringify({
           profileId: resolvedSubscriptionProfile,
           providerId: normalizedProviderId,
-          subscriptionType: quickStart.connectionType === "oauth-claude" ? "claude-code" : "chatgpt-codex"
+          subscriptionType: activePreset.subscriptionType || "chatgpt-codex"
         })
       });
       setCompletedOAuthSignature(subscriptionLoginSignature);
@@ -8956,7 +9300,7 @@ function QuickStartWizard({
   }
 
   async function handleContinue() {
-    if (stepIndex === 0 && quickStart.connectionType !== "api") {
+    if (stepIndex === 0 && quickStart.connectionType === "subscription") {
       const ok = await runSubscriptionLogin();
       if (!ok) return;
     }
@@ -8997,14 +9341,14 @@ function QuickStartWizard({
 
   const footerMessage = testError
     || stepError
-    || (stepIndex === 0 && quickStart.connectionType !== "api" && completedOAuthSignature !== subscriptionLoginSignature
+    || (stepIndex === 0 && quickStart.connectionType === "subscription" && completedOAuthSignature !== subscriptionLoginSignature
       ? "Continue opens the browser sign-in flow for this provider."
       : stepIndex === 1 && quickStart.connectionType === "api" && !hasFreshApiTest
         ? "Continue will test this provider against the entered endpoints and model ids using your API key or env."
         : steps[stepIndex].detail);
-  const modelHelperText = quickStart.connectionType === "oauth-claude"
+  const modelHelperText = quickStart.selectedConnection === "oauth-claude"
     ? "Examples: claude-opus-4-6 claude-sonnet-4-6 claude-haiku-4-5"
-    : quickStart.connectionType === "oauth-gpt"
+    : quickStart.selectedConnection === "oauth-gpt"
       ? "Examples: gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex-mini"
       : (
         <>
@@ -9061,46 +9405,54 @@ function QuickStartWizard({
             </div>
           ))}
         </div>
-        <div className="mt-3 flex flex-col gap-1 border-t border-border/60 px-1 pt-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-          <div className="text-sm font-medium text-foreground">{activeStep.title}</div>
-          <div className="max-w-2xl text-xs leading-5 text-muted-foreground">{activeStep.detail}</div>
-        </div>
       </div>
 
       {stepIndex === 0 ? (
         <div className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-3">
-            {QUICK_START_CONNECTION_OPTIONS.map((option) => (
+          <div className="grid gap-3 md:grid-cols-2">
+            {QUICK_START_CONNECTION_CATEGORIES.map((cat) => (
               <button
-                key={option.value}
+                key={cat.value}
                 type="button"
                 className={cn(
                   "rounded-2xl border px-4 py-3 text-left transition",
-                  quickStart.connectionType === option.value
+                  quickStart.connectionType === cat.value
                     ? "border-ring bg-background shadow-sm"
                     : "border-border/70 bg-background/70 hover:border-border"
                 )}
-                onClick={() => handleConnectionChange(option.value)}
+                onClick={() => handleConnectionChange(cat.value)}
               >
-                <div className="text-sm font-medium text-foreground">{option.label}</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">{option.description}</div>
+                <div className="text-sm font-medium text-foreground">{cat.label}</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">{cat.description}</div>
               </button>
             ))}
           </div>
 
-          {quickStart.connectionType === "oauth-claude" && (
-            <div className="flex gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-600 dark:border-amber-400/30 dark:bg-amber-950/30 dark:text-amber-400">
-              <span className="mt-0.5 shrink-0">⚠️</span>
-              <span>Claude Code OAuth routes through Anthropic's API with your subscription credentials. Usage will count against your Claude Max/Pro plan's extra usage quota, not the included subscription messages. Make sure you have extra usage enabled on your Claude plan to avoid request failures.</span>
-            </div>
-          )}
+          <Field label="Provider preset">
+            <Select
+              value={quickStart.selectedConnection || (quickStart.connectionType === "api" ? "custom" : "oauth-gpt")}
+              onValueChange={handlePresetChange}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {getPresetOptionsByCategory(quickStart.connectionType === "subscription" ? "subscription" : "api").map((preset) => (
+                  <SelectItem key={preset.key} value={preset.key}>
+                    {preset.label}
+                    <span className="ml-2 text-muted-foreground">{preset.description}</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
 
           <div className="grid gap-3 md:grid-cols-2">
             <Field label="Provider name">
               <Input
                 value={quickStart.providerName}
                 onChange={(event) => handleProviderNameChange(event.target.value)}
-                placeholder={getQuickStartConnectionDefaults(quickStart.connectionType).providerName}
+                placeholder={findPresetByKey(quickStart.selectedConnection || "custom").providerName}
               />
             </Field>
             <Field label="Provider id" hint="lowercase-hyphenated">
@@ -9108,7 +9460,7 @@ function QuickStartWizard({
                 value={quickStart.providerId}
                 onChange={(event) => updateQuickStart("providerId", event.target.value)}
                 onBlur={() => updateQuickStart("providerId", slugifyProviderId(quickStart.providerId || quickStart.providerName || "my-provider") || "my-provider")}
-                placeholder={getQuickStartConnectionDefaults(quickStart.connectionType).providerId}
+                placeholder={findPresetByKey(quickStart.selectedConnection || "custom").providerId}
               />
             </Field>
           </div>
@@ -9141,16 +9493,23 @@ function QuickStartWizard({
                   onChange={(value) => updateQuickStart("headerRows", value)}
                 />
               </Field>
-
             </>
           ) : (
             <div className="space-y-3">
               <div className="rounded-2xl border border-border/70 bg-secondary/45 px-4 py-3 text-sm leading-6 text-muted-foreground">
-                Continue opens the ChatGPT sign-in page in your browser and stores the login for this provider automatically.
+                {quickStart.selectedConnection === "oauth-claude"
+                  ? "Continue opens the Claude sign-in page in your browser and stores the login for this provider automatically."
+                  : "Continue opens the ChatGPT sign-in page in your browser and stores the login for this provider automatically."}
               </div>
-              <div className="rounded-2xl border border-amber-300/60 bg-amber-50/80 px-4 py-3 text-xs leading-5 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-300">
-                <span className="font-medium">Heads up:</span> ChatGPT subscriptions (Plus / Pro / Team) are separate from the OpenAI API and are intended for use within OpenAI&apos;s own apps. Routing requests through your subscription here may violate OpenAI&apos;s terms of service and could result in account restrictions.
-              </div>
+              {quickStart.selectedConnection === "oauth-claude" ? (
+                <div className="rounded-2xl border border-amber-300/60 bg-amber-50/80 px-4 py-3 text-xs leading-5 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-300">
+                  <span className="font-medium">Heads up:</span> Claude Code OAuth routes through Anthropic&apos;s API with your subscription credentials. Usage will count against your Claude Max/Pro plan&apos;s extra usage quota, not the included subscription messages. Make sure you have extra usage enabled on your Claude plan to avoid request failures.
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-amber-300/60 bg-amber-50/80 px-4 py-3 text-xs leading-5 text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-300">
+                  <span className="font-medium">Heads up:</span> ChatGPT subscriptions (Plus / Pro / Team) are separate from the OpenAI API and are intended for use within OpenAI&apos;s own apps. Routing requests through your subscription here may violate OpenAI&apos;s terms of service and could result in account restrictions.
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -9268,7 +9627,7 @@ function QuickStartWizard({
             </div>
             <div className="rounded-2xl border border-border/70 bg-background/80 px-4 py-3">
               <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Connection</div>
-              <div className="mt-2 text-sm font-medium text-foreground">{getQuickStartConnectionLabel(quickStart.connectionType)}</div>
+              <div className="mt-2 text-sm font-medium text-foreground">{getQuickStartConnectionLabel(quickStart.selectedConnection || "custom")}</div>
               <div className="mt-1 text-xs text-muted-foreground break-all">
                 {quickStart.connectionType === "api"
                   ? `${endpoints.length} endpoint candidate(s)`
@@ -9444,6 +9803,11 @@ export function App() {
   const codexTabConnected = codexCliState?.routedViaRouter === true;
   const claudeTabConnected = claudeCodeState?.routedViaRouter === true;
   const factoryDroidTabConnected = factoryDroidState?.routedViaRouter === true;
+  const ollamaSnapshot = snapshot?.ollama || null;
+  const ollamaTabConnected = ollamaSnapshot?.connected === true;
+  const [ollamaModels, setOllamaModels] = useState([]);
+  const [ollamaBusy, setOllamaBusy] = useState({});
+  const [ollamaRefreshing, setOllamaRefreshing] = useState(false);
   const activityLogState = snapshot?.activityLog || { enabled: true };
   const activityLogEnabled = activityLogState?.enabled !== false;
   const ampRouteOptions = useMemo(() => buildManagedRouteOptions(ampEditableConfig), [ampEditableConfig]);
@@ -9529,8 +9893,9 @@ export function App() {
       || `Port ${LOCAL_ROUTER_PORT} is occupied${snapshot?.router?.listenerPids?.length > 0 ? ` by PID${snapshot.router.listenerPids.length === 1 ? "" : "s"} ${snapshot.router.listenerPids.join(", ")}` : ""}.`)
     : String(snapshot?.router?.lastError || "").trim();
   const showOnboarding = !hasCompletedProviderSetup(editableConfig);
-  const onboardingSeedMode = providers.length > 0 ? "existing" : "blank";
-  const onboardingTargetProviderId = providers[0]?.id || "";
+  const wizardEligibleProviders = providers.filter((p) => p?.type !== "ollama");
+  const onboardingSeedMode = wizardEligibleProviders.length > 0 ? "existing" : "blank";
+  const onboardingTargetProviderId = wizardEligibleProviders[0]?.id || "";
   const defaultProviderUserAgent = snapshot?.defaults?.providerUserAgent || QUICK_START_FALLBACK_USER_AGENT;
 
   useEffect(() => {
@@ -11056,6 +11421,70 @@ export function App() {
     }
   }
 
+  // ── Ollama handlers ──────────────────────────────────────────────
+  async function refreshOllamaModels() {
+    setOllamaRefreshing(true);
+    try {
+      const res = await fetch("/api/ollama/models", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const data = await res.json();
+      if (data?.models) setOllamaModels(data.models);
+    } catch { /* ignore */ } finally { setOllamaRefreshing(false); }
+  }
+  useEffect(() => { if (activeTab === "ollama" && ollamaTabConnected) refreshOllamaModels(); }, [activeTab, ollamaTabConnected]);
+
+  function setOllamaBusyKey(model, key, value) {
+    setOllamaBusy((prev) => ({ ...prev, [model]: { ...(prev[model] || {}), [key]: value } }));
+  }
+  async function handleOllamaLoad(model) {
+    setOllamaBusyKey(model, "loading", true);
+    try { await fetch("/api/ollama/load", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model }) }); await refreshOllamaModels(); } finally { setOllamaBusyKey(model, "loading", false); }
+  }
+  async function handleOllamaUnload(model) {
+    setOllamaBusyKey(model, "unloading", true);
+    try { await fetch("/api/ollama/unload", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model }) }); await refreshOllamaModels(); } finally { setOllamaBusyKey(model, "unloading", false); }
+  }
+  async function handleOllamaPin(model, pinned) {
+    setOllamaBusyKey(model, "pinning", true);
+    try { await fetch("/api/ollama/pin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, pinned }) }); await refreshOllamaModels(); } finally { setOllamaBusyKey(model, "pinning", false); }
+  }
+  async function handleOllamaKeepAlive(model, keepAlive) {
+    await fetch("/api/ollama/keep-alive", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, keepAlive }) });
+    await refreshOllamaModels();
+  }
+  async function handleOllamaContextLength(model, contextLength) {
+    await fetch("/api/ollama/context-length", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, contextLength }) });
+    await refreshOllamaModels();
+  }
+  async function handleOllamaAddToRouter(model) {
+    await fetch("/api/ollama/add-model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model }) });
+    await refreshOllamaModels();
+  }
+  async function handleOllamaRemoveFromRouter(model) {
+    await fetch("/api/ollama/remove-model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model }) });
+    await refreshOllamaModels();
+  }
+  async function handleOllamaAutoLoad(model, autoLoad) {
+    await fetch("/api/ollama/auto-load", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, autoLoad }) });
+  }
+  async function handleOllamaSaveSettings(settings) {
+    await fetch("/api/ollama/save-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(settings) });
+  }
+  async function handleOllamaInstall() {
+    setOllamaBusy((prev) => ({ ...prev, _install: true }));
+    try { await fetch("/api/ollama/install", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); } finally { setOllamaBusy((prev) => ({ ...prev, _install: false })); }
+  }
+  async function handleOllamaStartServer() {
+    setOllamaBusy((prev) => ({ ...prev, _startServer: true }));
+    try { await fetch("/api/ollama/start-server", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); } finally { setOllamaBusy((prev) => ({ ...prev, _startServer: false })); }
+  }
+  async function handleOllamaStopServer() {
+    await fetch("/api/ollama/stop-server", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  }
+  async function handleOllamaSyncRouter() {
+    setOllamaBusy((prev) => ({ ...prev, _syncRouter: true }));
+    try { await fetch("/api/ollama/sync-router", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); await refreshOllamaModels(); } finally { setOllamaBusy((prev) => ({ ...prev, _syncRouter: false })); }
+  }
+
   if (loading) {
     return (
       <div className="console-shell flex min-h-screen items-center justify-center px-6 py-10">
@@ -11213,7 +11642,7 @@ export function App() {
 
         <div className="space-y-4">
           <ProviderModelsSection
-            providers={providers}
+            providers={providers.filter((p) => p?.type !== "ollama")}
             onAddProvider={handleOpenQuickStart}
             onRemove={handleRemoveProvider}
             onCopyModelId={handleCopyProviderModelId}
@@ -11232,7 +11661,7 @@ export function App() {
               <TabsTrigger value="amp">
                 <span className="inline-flex items-center gap-2">
                   <span>AMP</span>
-                  <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-amber-700 dark:bg-amber-900/50 dark:text-amber-300">Beta</span>
+                  <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-amber-700 dark:bg-amber-900/50 dark:text-amber-300">Exp</span>
                   <ConnectedIndicatorDot connected={ampTabConnected} srLabel="AMP connected" />
                 </span>
               </TabsTrigger>
@@ -11252,6 +11681,12 @@ export function App() {
                 <span className="inline-flex items-center gap-2">
                   <span>Factory Droid</span>
                   <ConnectedIndicatorDot connected={factoryDroidTabConnected} srLabel="Factory Droid connected" />
+                </span>
+              </TabsTrigger>
+              <TabsTrigger value="ollama">
+                <span className="inline-flex items-center gap-2">
+                  <span>Ollama</span>
+                  <ConnectedIndicatorDot connected={ollamaTabConnected} srLabel="Ollama connected" />
                 </span>
               </TabsTrigger>
               <TabsTrigger value="web-search">Web Search</TabsTrigger>
@@ -11496,6 +11931,31 @@ export function App() {
             />
           </TabsContent>
 
+          <TabsContent value="ollama" className="space-y-4">
+            <OllamaSettingsPanel
+              connected={ollamaTabConnected}
+              snapshot={ollamaSnapshot}
+              models={ollamaModels}
+              busy={ollamaBusy}
+              refreshing={ollamaRefreshing}
+              config={editableConfig}
+              onRefresh={refreshOllamaModels}
+              onLoad={handleOllamaLoad}
+              onUnload={handleOllamaUnload}
+              onPin={handleOllamaPin}
+              onKeepAlive={handleOllamaKeepAlive}
+              onContextLength={handleOllamaContextLength}
+              onAddToRouter={handleOllamaAddToRouter}
+              onRemoveFromRouter={handleOllamaRemoveFromRouter}
+              onAutoLoad={handleOllamaAutoLoad}
+              onSaveSettings={handleOllamaSaveSettings}
+              onInstall={handleOllamaInstall}
+              onStartServer={handleOllamaStartServer}
+              onStopServer={handleOllamaStopServer}
+              onSyncRouter={handleOllamaSyncRouter}
+            />
+          </TabsContent>
+
           <TabsContent value="web-search" className="space-y-4">
             <WebSearchSettingsPanel
               webSearchConfig={webSearchConfig}
@@ -11528,8 +11988,8 @@ export function App() {
           open={showProviderWizardModal}
           onClose={handleHideQuickStart}
           title="Add provider"
-          description="Add another provider with endpoints, model ids, rate limits, and a stable alias. API Key providers are auto-tested before save."
           contentClassName="max-h-[92vh] max-w-5xl rounded-2xl border border-border/70 bg-background/98 shadow-[0_32px_120px_rgba(15,23,42,0.48)]"
+          closeOnBackdrop={false}
           bodyClassName="max-h-[calc(92vh-5.5rem)]"
         >
           <QuickStartWizard

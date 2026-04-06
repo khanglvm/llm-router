@@ -2100,6 +2100,19 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const previousConfigState = await readConfigState(configPath);
     const previousConfig = previousConfigState.normalizedConfig || buildDefaultConfigObject();
     const previousLocalServer = getConfigLocalServer(previousConfigState);
+
+    // Safeguard: preserve existing top-level keys absent from the incoming config.
+    // This prevents partial writes (e.g. from scoped Ollama endpoints) from wiping
+    // unrelated config sections like masterKey, modelAliases, amp, metadata, etc.
+    const previousRaw = previousConfigState.rawConfig;
+    if (previousRaw && typeof previousRaw === "object" && parsed && typeof parsed === "object") {
+      for (const key of Object.keys(previousRaw)) {
+        if (!(key in parsed)) {
+          parsed[key] = previousRaw[key];
+        }
+      }
+    }
+
     ignoreConfigWatchUntil = Date.now() + 800;
     const savedConfig = await writeConfigFile(parsed, configPath, { migrateToVersion: CONFIG_VERSION });
     resolveActivityLogSnapshot(savedConfig);
