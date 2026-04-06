@@ -49,10 +49,27 @@ import {
 } from "./coding-tool-config.js";
 import { loginSubscription } from "../runtime/subscription-provider.js";
 import {
+  ollamaCheckConnection,
+  ollamaListModels,
+  ollamaListRunning,
+  ollamaShowModel,
+  ollamaLoadModel,
+  ollamaUnloadModel,
+  ollamaPinModel,
+  ollamaSetKeepAlive,
+  ollamaPullModel,
+  ollamaDeleteModel
+} from "./ollama-client.js";
+import { estimateMaxContext, estimateModelVram, formatBytes } from "./ollama-hardware.js";
+import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaServer, isOllamaRunning } from "./ollama-install.js";
+import {
   CONFIG_VERSION,
   DEFAULT_MODEL_ALIAS_ID,
   DEFAULT_PROVIDER_USER_AGENT,
+  OLLAMA_KEEP_ALIVE_PATTERN,
+  OLLAMA_PROVIDER_TYPE,
   configHasProvider,
+  normalizeOllamaConfig,
   normalizeRuntimeConfig,
   resolveProviderApiKey,
   validateRuntimeConfig
@@ -710,10 +727,11 @@ async function readConfigState(configPath) {
   if (!rawText.trim()) rawText = buildDefaultConfigRawText();
 
   let parseError = "";
+  let rawConfig = null;
   let normalizedConfig = null;
   try {
-    const parsed = rawText.trim() ? JSON.parse(rawText) : {};
-    normalizedConfig = normalizeRuntimeConfig(parsed, { migrateToVersion: CONFIG_VERSION });
+    rawConfig = rawText.trim() ? JSON.parse(rawText) : {};
+    normalizedConfig = normalizeRuntimeConfig(rawConfig, { migrateToVersion: CONFIG_VERSION });
   } catch (error) {
     parseError = error instanceof Error ? error.message : String(error);
   }
@@ -728,6 +746,7 @@ async function readConfigState(configPath) {
 
   return {
     rawText,
+    rawConfig,
     normalizedConfig,
     parseError,
     summary
@@ -2201,6 +2220,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const claudeCodeGlobal = await readClaudeCodeGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const factoryDroidGlobal = await readFactoryDroidGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const webSearch = await readWebSearchState(configState.normalizedConfig).catch(() => null);
+    const ollamaConfig = configState.normalizedConfig?.ollama;
+    const ollamaBaseUrl = ollamaConfig?.baseUrl || "http://localhost:11434";
+    const ollamaInstallation = detectOllamaInstallation();
+    const ollamaState = ollamaInstallation.installed
+      ? await ollamaCheckConnection(ollamaBaseUrl).catch(() => ({ ok: false }))
+      : { ok: false };
 
     return {
       web: {
@@ -2230,6 +2255,14 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         codexCli: codexCliGlobal,
         claudeCode: claudeCodeGlobal,
         factoryDroid: factoryDroidGlobal
+      },
+      ollama: {
+        installed: ollamaInstallation.installed,
+        connected: ollamaState.ok === true,
+        baseUrl: ollamaBaseUrl,
+        enabled: ollamaConfig?.enabled === true,
+        version: ollamaInstallation.version || null,
+        path: ollamaInstallation.path || null
       },
       defaults: {
         providerUserAgent: DEFAULT_PROVIDER_USER_AGENT
@@ -2489,6 +2522,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           nextSettings: persistedLocalServer.savedSettings
         });
       }
+      // Non-blocking: preload Ollama models after router start
+      preloadOllamaModels(configState.normalizedConfig).catch(() => {});
       return {
         message: restart ? "Router restarted." : "Router started.",
         snapshot: await buildSnapshot()
@@ -2498,6 +2533,29 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       addLog("error", "Failed to start router.", routerState.lastError);
       await broadcastState().catch(() => {});
       throw error;
+    }
+  }
+
+  async function preloadOllamaModels(config) {
+    const ollamaConfig = config?.ollama;
+    if (!ollamaConfig?.enabled) return;
+    const autoLoadModels = ollamaConfig.autoLoadModels || [];
+    if (!autoLoadModels.length) return;
+    const baseUrl = ollamaConfig.baseUrl || "http://localhost:11434";
+    const connected = await ollamaCheckConnection(baseUrl);
+    if (!connected.ok) {
+      addLog("info", "Ollama not reachable, skipping model preload.");
+      return;
+    }
+    for (const modelId of autoLoadModels) {
+      const keepAlive = ollamaConfig.managedModels?.[modelId]?.keepAlive
+        || ollamaConfig.defaultKeepAlive || "5m";
+      const result = await ollamaLoadModel(baseUrl, modelId, keepAlive).catch(() => ({ ok: false }));
+      if (result.ok) {
+        addLog("info", `Ollama: Preloaded ${modelId} (${Math.round(result.loadDurationMs || 0)}ms).`);
+      } else {
+        addLog("warn", `Ollama: Failed to preload ${modelId}.`);
+      }
     }
   }
 
@@ -3755,6 +3813,323 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         });
         addLog(result.ok ? "success" : "warn", `Probe finished for ${providerId}.`, result.workingFormats?.join(", ") || "No working formats detected.");
         sendJson(res, 200, { result });
+        return;
+      }
+
+      // ── Ollama API routes ──────────────────────────────────────────────
+      function resolveOllamaBaseUrl(bodyBaseUrl, configBaseUrl) {
+        const raw = String(bodyBaseUrl || configBaseUrl || "http://localhost:11434").trim().replace(/\/+$/, "");
+        try { const u = new URL(raw); if (u.protocol !== "http:" && u.protocol !== "https:") return null; if (u.hostname !== "localhost" && u.hostname !== "127.0.0.1" && u.hostname !== "::1" && !u.hostname.endsWith(".local")) return null; return u.origin; } catch { return null; }
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/status") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const installation = detectOllamaInstallation();
+        const connection = installation.installed
+          ? await ollamaCheckConnection(baseUrl)
+          : { ok: false, error: "Ollama not installed" };
+        const running = connection.ok ? await ollamaListRunning(baseUrl) : { ok: false, models: [] };
+        sendJson(res, 200, {
+          installed: installation.installed,
+          version: installation.version,
+          path: installation.path,
+          connected: connection.ok,
+          running: running.models || [],
+          baseUrl
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/models") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const modelsResult = await ollamaListModels(baseUrl);
+        if (!modelsResult.ok) {
+          sendJson(res, 502, { error: modelsResult.error || "Failed to list Ollama models" });
+          return;
+        }
+        const runningResult = await ollamaListRunning(baseUrl);
+        const runningMap = new Map((runningResult.models || []).map((m) => [m.name, m]));
+        const ollamaProvider = (configState.normalizedConfig?.providers || []).find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        const routedModelIds = new Set((ollamaProvider?.models || []).map((m) => m.id));
+        const enriched = modelsResult.models.map((model) => {
+          const running = runningMap.get(model.name);
+          const managed = ollamaConfig.managedModels?.[model.name];
+          const hwEstimate = model.contextLength && model.parameterSize
+            ? estimateModelVram(model.parameterSize, model.quantizationLevel, model.contextLength)
+            : null;
+          return {
+            ...model,
+            loaded: !!running,
+            sizeVram: running?.sizeVram || 0,
+            sizeVramFormatted: running?.sizeVram ? formatBytes(running.sizeVram) : "",
+            expiresAt: running?.expiresAt || "",
+            isPinned: running?.isPinned || managed?.pinned || false,
+            processor: running?.processor || "",
+            keepAlive: managed?.keepAlive || ollamaConfig.defaultKeepAlive || "5m",
+            autoLoad: managed?.autoLoad || false,
+            inRouter: routedModelIds.has(model.name),
+            estimatedVram: hwEstimate ? formatBytes(hwEstimate.totalBytes) : "",
+            estimatedVramBytes: hwEstimate?.totalBytes || 0
+          };
+        });
+        sendJson(res, 200, { models: enriched });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/load") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const keepAlive = body?.keepAlive || ollamaConfig.managedModels?.[model]?.keepAlive || ollamaConfig.defaultKeepAlive || "5m";
+        addLog("info", `Ollama: Loading ${model}…`);
+        const result = await ollamaLoadModel(baseUrl, model, keepAlive);
+        if (result.ok) addLog("success", `Ollama: Loaded ${model} (${Math.round(result.loadDurationMs || 0)}ms).`);
+        else addLog("warn", `Ollama: Failed to load ${model}.`, result.error || "");
+        sendJson(res, result.ok ? 200 : 502, result);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/unload") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        addLog("info", `Ollama: Unloading ${model}…`);
+        const result = await ollamaUnloadModel(baseUrl, model);
+        if (result.ok) addLog("success", `Ollama: Unloaded ${model}.`);
+        sendJson(res, result.ok ? 200 : 502, result);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/pin") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const pinned = body?.pinned === true;
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const pinResult = pinned
+          ? await ollamaPinModel(baseUrl, model)
+          : await ollamaSetKeepAlive(baseUrl, model, ollamaConfig.managedModels?.[model]?.keepAlive || ollamaConfig.defaultKeepAlive || "5m");
+        if (!pinResult.ok) { sendJson(res, 502, { error: pinResult.error || "Failed to update model pin state" }); return; }
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), pinned };
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-pin" });
+        sendJson(res, 200, { ok: true, pinned });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/keep-alive") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        const keepAlive = String(body?.keepAlive || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        if (!OLLAMA_KEEP_ALIVE_PATTERN.test(keepAlive)) { sendJson(res, 400, { error: "Invalid keep_alive value" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const kaResult = await ollamaSetKeepAlive(baseUrl, model, keepAlive);
+        if (!kaResult.ok) { sendJson(res, 502, { error: kaResult.error || "Failed to update keep-alive" }); return; }
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), keepAlive };
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-keep-alive" });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/sync-router") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const modelsResult = await ollamaListModels(baseUrl);
+        if (!modelsResult.ok) { sendJson(res, 502, { error: modelsResult.error || "Failed to list Ollama models" }); return; }
+        const modelIds = modelsResult.models.map((m) => m.name);
+        const providers = [...(rawConfig.providers || [])];
+        let ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        const previousModelIds = new Set((ollamaProvider?.models || []).map((m) => typeof m === "string" ? m : m?.id));
+        if (!ollamaProvider) {
+          ollamaProvider = { id: "ollama", name: "Ollama", type: OLLAMA_PROVIDER_TYPE, baseUrl: baseUrl + "/v1", models: [] };
+          providers.push(ollamaProvider);
+        }
+        ollamaProvider.baseUrl = baseUrl + "/v1";
+        ollamaProvider.models = modelIds.map((id) => {
+          const existing = (ollamaProvider.models || []).find((m) => (typeof m === "string" ? m : m?.id) === id);
+          if (existing && typeof existing === "object") return existing;
+          const details = modelsResult.models.find((m) => m.name === id);
+          return { id, contextWindow: details?.contextLength || undefined };
+        });
+        const nextConfig = { ...rawConfig, providers };
+        const { snapshot } = await writeAndBroadcastConfig(nextConfig, { source: "ollama-sync" });
+        const addedCount = modelIds.filter((id) => !previousModelIds.has(id)).length;
+        const removedCount = [...previousModelIds].filter((id) => !modelIds.includes(id)).length;
+        addLog("info", `Ollama: Synced ${modelIds.length} models (${addedCount} added, ${removedCount} removed).`);
+        sendJson(res, 200, { ok: true, modelCount: modelIds.length, addedCount, removedCount });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/add-model") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = (ollamaConfig.baseUrl || "http://localhost:11434").replace(/\/+$/, "");
+        const providers = [...(rawConfig.providers || [])];
+        let ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        if (!ollamaProvider) {
+          ollamaProvider = { id: "ollama", name: "Ollama", type: OLLAMA_PROVIDER_TYPE, baseUrl: baseUrl + "/v1", models: [] };
+          providers.push(ollamaProvider);
+        }
+        const existing = (ollamaProvider.models || []).find((m) => (typeof m === "string" ? m : m?.id) === model);
+        if (existing) { sendJson(res, 200, { ok: true, added: false, reason: "already exists" }); return; }
+        const contextLength = body?.contextLength || undefined;
+        ollamaProvider.models = [...(ollamaProvider.models || []), { id: model, ...(contextLength ? { contextWindow: contextLength } : {}) }];
+        await writeAndBroadcastConfig({ ...rawConfig, providers }, { source: "ollama-add-model" });
+        addLog("info", `Ollama: Added ${model} to router.`);
+        sendJson(res, 200, { ok: true, added: true });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/remove-model") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const providers = [...(rawConfig.providers || [])];
+        const ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        if (!ollamaProvider) { sendJson(res, 200, { ok: true, removed: false }); return; }
+        const before = (ollamaProvider.models || []).length;
+        ollamaProvider.models = (ollamaProvider.models || []).filter((m) => (typeof m === "string" ? m : m?.id) !== model);
+        const removed = ollamaProvider.models.length < before;
+        if (removed) {
+          await writeAndBroadcastConfig({ ...rawConfig, providers }, { source: "ollama-remove-model" });
+          addLog("info", `Ollama: Removed ${model} from router.`);
+        }
+        sendJson(res, 200, { ok: true, removed });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/save-settings") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const nextOllama = { ...(rawConfig.ollama || {}) };
+        if (body?.baseUrl !== undefined) nextOllama.baseUrl = String(body.baseUrl).trim();
+        if (body?.enabled !== undefined) nextOllama.enabled = body.enabled !== false;
+        if (body?.autoConnect !== undefined) nextOllama.autoConnect = body.autoConnect !== false;
+        if (body?.defaultKeepAlive !== undefined && OLLAMA_KEEP_ALIVE_PATTERN.test(String(body.defaultKeepAlive))) {
+          nextOllama.defaultKeepAlive = String(body.defaultKeepAlive);
+        }
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-settings" });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/auto-load") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        const autoLoad = body?.autoLoad === true;
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), autoLoad };
+        const autoLoadModels = Object.entries(nextOllama.managedModels)
+          .filter(([, v]) => v?.autoLoad).map(([k]) => k);
+        nextOllama.autoLoadModels = autoLoadModels;
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-auto-load" });
+        sendJson(res, 200, { ok: true, autoLoad });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/install") {
+        const installation = detectOllamaInstallation();
+        if (installation.installed) {
+          sendJson(res, 200, { ok: true, alreadyInstalled: true, version: installation.version });
+          return;
+        }
+        addLog("info", "Ollama: Starting installation…");
+        const result = await installOllama({
+          onProgress: (event) => pushEvent("ollama-install-progress", event)
+        });
+        if (result.ok && !result.alreadyInstalled) {
+          addLog("success", `Ollama: Installed (${result.version || "unknown"}).`);
+          const started = await startOllamaServer();
+          sendJson(res, 200, { ...result, serverStarted: started.ok });
+          broadcastState();
+        } else if (result.ok) {
+          sendJson(res, 200, result);
+        } else {
+          addLog("error", "Ollama: Installation failed.", result.error || "");
+          sendJson(res, 500, result);
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/start-server") {
+        const result = await startOllamaServer();
+        if (result.ok) addLog("success", "Ollama: Server started.");
+        else addLog("warn", "Ollama: Failed to start server.", result.error || "");
+        sendJson(res, result.ok ? 200 : 502, result);
+        broadcastState();
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/stop-server") {
+        const result = stopOllamaServer();
+        if (result.ok) addLog("info", "Ollama: Server stopped.");
+        sendJson(res, 200, result);
+        broadcastState();
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/context-length") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        const contextLength = Number(body?.contextLength);
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        if (!Number.isFinite(contextLength) || contextLength <= 0) { sendJson(res, 400, { error: "contextLength must be a positive number" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), contextLength: Math.round(contextLength) };
+        // Also update the provider model entry contextWindow
+        const providers = [...(rawConfig.providers || [])];
+        const ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        if (ollamaProvider) {
+          ollamaProvider.models = (ollamaProvider.models || []).map((m) => {
+            const mid = typeof m === "string" ? m : m?.id;
+            if (mid === model) return { ...(typeof m === "object" ? m : { id: m }), contextWindow: Math.round(contextLength) };
+            return m;
+          });
+        }
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama, providers }, { source: "ollama-context-length" });
+        sendJson(res, 200, { ok: true });
         return;
       }
 
