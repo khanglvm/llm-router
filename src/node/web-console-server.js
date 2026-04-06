@@ -17,7 +17,7 @@ import {
 } from "./local-server-settings.js";
 import { appendActivityLogEntry, clearActivityLogFile, createActivityLogEntry, readActivityLogEntries, resolveActivityLogPath } from "./activity-log.js";
 import { listListeningPids, reclaimPort } from "./port-reclaim.js";
-import { probeProvider, probeProviderEndpointMatrix } from "./provider-probe.js";
+import { probeProvider, probeProviderEndpointMatrix, probeFreeTierModels } from "./provider-probe.js";
 import { installStartup, startupStatus, stopStartup, uninstallStartup } from "./startup-manager.js";
 import { WEB_CONSOLE_CSS, renderWebConsoleHtml } from "./web-console-assets.js";
 import {
@@ -2809,6 +2809,31 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           ? `${(result.models || []).length} model(s) discovered`
           : (result.warnings || []).join(" ") || "Could not discover models from the provider model list API.");
         sendJson(res, 200, { result });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/config/probe-free-tier-models") {
+        const body = await readJsonBody(req);
+        const baseUrl = String(body?.baseUrl || "").trim();
+        const apiKeyEnv = String(body?.apiKeyEnv || "").trim();
+        const apiKey = String(body?.apiKey || "").trim();
+        const modelIds = Array.isArray(body?.modelIds) ? body.modelIds.map((id) => String(id || "").trim()).filter(Boolean) : [];
+
+        if (!baseUrl || modelIds.length === 0) {
+          sendJson(res, 400, { error: "baseUrl and at least one modelId are required." });
+          return;
+        }
+
+        try {
+          const finalApiKey = await resolveProbeApiKey(apiKeyEnv, apiKey, { context: "probing free-tier models" });
+          addLog("info", "Probing free-tier model availability.", `${modelIds.length} model(s)`);
+          const result = await probeFreeTierModels({ baseUrl, apiKey: finalApiKey, modelIds, timeoutMs: 6000 });
+          const freeCount = Object.values(result).filter((r) => r?.freeTier === true).length;
+          addLog("success", "Free-tier probe finished.", `${freeCount}/${modelIds.length} model(s) on free tier`);
+          sendJson(res, 200, { result });
+        } catch (error) {
+          sendJson(res, error?.statusCode || 500, { error: error instanceof Error ? error.message : String(error) });
+        }
         return;
       }
 

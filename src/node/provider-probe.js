@@ -808,6 +808,61 @@ function pickPreferredFormatForModel(modelId, formats, { providerPreferredFormat
   return supported[0];
 }
 
+/**
+ * Probes a list of models against an OpenAI-compatible endpoint to detect
+ * free-tier availability. Returns a map of modelId -> { freeTier, rpm }.
+ * A model is considered not-free-tier if the response contains "limit: 0"
+ * in a free-tier quota metric.
+ */
+export async function probeFreeTierModels(options) {
+  const baseUrl = String(options?.baseUrl || "").trim().replace(/\/+$/, "");
+  const apiKey = String(options?.apiKey || "").trim();
+  const modelIds = (options?.modelIds || []).map((id) => String(id || "").trim()).filter(Boolean);
+  const timeoutMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 6000;
+
+  if (!baseUrl || !apiKey || modelIds.length === 0) return {};
+
+  const chatUrl = `${baseUrl}/chat/completions`;
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`
+  };
+  const result = {};
+
+  for (const modelId of modelIds) {
+    try {
+      const response = await safeFetchJson(chatUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: modelId,
+          messages: [{ role: "user", content: "hi" }],
+          max_tokens: 1,
+          stream: false
+        })
+      }, timeoutMs);
+
+      const text = response.text || "";
+      const isZeroQuota = /limit:\s*0[,\s]/i.test(text) || text.includes('"limit": 0') || text.includes('"limit":0');
+      const isFreeTierQuota = text.includes("free_tier");
+
+      if (isZeroQuota && isFreeTierQuota) {
+        result[modelId] = { freeTier: false };
+      } else if (response.ok || response.status === 400 || response.status === 404) {
+        result[modelId] = { freeTier: true };
+      } else if (response.status === 429 && !isZeroQuota) {
+        result[modelId] = { freeTier: true };
+      } else {
+        result[modelId] = { freeTier: false };
+      }
+    } catch {
+      result[modelId] = { freeTier: null };
+    }
+  }
+
+  return result;
+}
+
 export async function probeProviderEndpointMatrix(options) {
   const emitProgress = makeProgressEmitter(options?.onProgress);
   const apiKey = String(options?.apiKey || "").trim();

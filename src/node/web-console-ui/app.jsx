@@ -2437,6 +2437,59 @@ function buildPresetFreeTierRateLimitRows(presetHost, modelIds) {
   }, { keyPrefix: `preset-rl`, index }));
 }
 
+function pickFreeTierProbeModels(modelIds) {
+  const tiers = new Map();
+  for (const id of modelIds) {
+    const lower = id.toLowerCase();
+    const tier = lower.includes("flash-lite") ? "flash-lite"
+      : lower.includes("flash") ? "flash"
+      : lower.includes("pro") ? "pro"
+      : lower;
+    if (!tiers.has(tier)) tiers.set(tier, id);
+  }
+  return [...tiers.values()];
+}
+
+async function probeFreeTierModels(baseUrl, credential, modelIds) {
+  const sampleIds = pickFreeTierProbeModels(modelIds);
+  if (sampleIds.length === 0) return null;
+  try {
+    const payload = await fetchJson("/api/config/probe-free-tier-models", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        baseUrl,
+        ...(looksLikeEnvVarName(credential) ? { apiKeyEnv: credential } : { apiKey: credential }),
+        modelIds: sampleIds
+      })
+    });
+    if (!payload?.result) return null;
+    const freeTiers = new Set();
+    const paidTiers = new Set();
+    for (const [id, info] of Object.entries(payload.result)) {
+      const lower = id.toLowerCase();
+      const tier = lower.includes("flash-lite") ? "flash-lite"
+        : lower.includes("flash") ? "flash"
+        : lower.includes("pro") ? "pro"
+        : lower;
+      if (info?.freeTier) freeTiers.add(tier);
+      else paidTiers.add(tier);
+    }
+    return modelIds.filter((id) => {
+      const lower = id.toLowerCase();
+      const tier = lower.includes("flash-lite") ? "flash-lite"
+        : lower.includes("flash") ? "flash"
+        : lower.includes("pro") ? "pro"
+        : lower;
+      if (freeTiers.has(tier)) return true;
+      if (paidTiers.has(tier)) return false;
+      return true;
+    });
+  } catch {
+    return null;
+  }
+}
+
 function getQuickStartSuggestedModelIds(connectionType, protocol = "openai") {
   if (connectionType === "api") {
     return [...(QUICK_START_DEFAULT_MODELS.api[protocol] || QUICK_START_DEFAULT_MODELS.api.openai)];
@@ -8735,12 +8788,23 @@ function QuickStartWizard({
           ...(Object.keys(customHeaders).length > 0 ? { headers: customHeaders } : {})
         })
       });
-      const discoveredModelIds = (payload.result?.models || [])
+      let discoveredModelIds = (payload.result?.models || [])
         .map((modelId) => String(modelId || "").trim())
         .filter(Boolean);
       let discoveredModelContextWindows = {};
 
       if (discoveredModelIds.length > 0) {
+        const presetHost = detectPresetHostFromEndpoints(endpoints);
+        if (presetHost) {
+          const freeTierModels = await probeFreeTierModels(
+            endpoints[0] || "",
+            credentialInput,
+            discoveredModelIds.filter((id) => !id.includes("embed") && !id.includes("tts") && !id.includes("image") && !id.includes("lyria") && !id.includes("veo"))
+          );
+          if (freeTierModels) {
+            discoveredModelIds = freeTierModels;
+          }
+        }
         try {
           const contextResults = await lookupLiteLlmContextWindow(discoveredModelIds);
           discoveredModelContextWindows = buildLiteLlmModelContextWindowMap(contextResults);
