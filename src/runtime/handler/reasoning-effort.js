@@ -295,8 +295,18 @@ export function applyReasoningEffortMapping({
   sourceFormat,
   targetFormat,
   targetModel,
-  requestHeaders
+  requestHeaders,
+  capabilities
 }) {
+  if (capabilities) {
+    if (targetFormat === FORMATS.OPENAI && capabilities.supportsReasoning === false) {
+      return providerBody;
+    }
+    if (targetFormat === FORMATS.CLAUDE && capabilities.supportsThinking === false) {
+      return providerBody;
+    }
+  }
+
   const effort = resolveRequestedEffort(originalBody, requestHeaders);
   if (!effort) return providerBody;
 

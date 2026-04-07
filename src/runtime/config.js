@@ -42,6 +42,13 @@ const SUBSCRIPTION_PROVIDER_TYPES = Object.freeze({
   CHATGPT_CODEX: "chatgpt-codex",
   CLAUDE_CODE: "claude-code"
 });
+export const OLLAMA_PROVIDER_TYPE = "ollama";
+export const OLLAMA_KEEP_ALIVE_PATTERN = /^(-1|0|\d+(s|m|h))$/;
+export const OLLAMA_KEEP_ALIVE_OPTIONS = Object.freeze([
+  "5m", "10m", "30m", "1h", "24h", "-1", "0"
+]);
+const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434";
+const OLLAMA_DEFAULT_KEEP_ALIVE = "5m";
 let runtimeEnvCache = null;
 
 function readNodeRuntimeInfo() {
@@ -1208,6 +1215,26 @@ function normalizeAuthConfig(rawAuth) {
   };
 }
 
+// Keep in sync with CAPABILITY_DEFINITIONS in src/node/web-console-ui/capability-utils.js
+const MODEL_CAPABILITY_KEYS = [
+  "supportsReasoning", "supportsThinking", "supportsResponseFormat",
+  "supportsLogprobs", "supportsServiceTier", "supportsPrediction",
+  "supportsStreamOptions"
+];
+
+function normalizeModelCapabilities(raw) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const result = {};
+  let hasAny = false;
+  for (const key of MODEL_CAPABILITY_KEYS) {
+    if (typeof raw[key] === "boolean") {
+      result[key] = raw[key];
+      hasAny = true;
+    }
+  }
+  return hasAny ? result : undefined;
+}
+
 function normalizeModelEntry(model) {
   if (typeof model === "string") {
     return { id: model };
@@ -1222,6 +1249,7 @@ function normalizeModelEntry(model) {
     model["silent-fallbacks"] ??
     model.fallbacks;
   const fallbackModels = dedupeStrings(toArray(rawFallbacks));
+  const capabilities = normalizeModelCapabilities(model.capabilities);
   return {
     id,
     aliases: dedupeStrings(model.aliases || model.alias || []),
@@ -1232,7 +1260,8 @@ function normalizeModelEntry(model) {
     contextWindow: Number.isFinite(model.contextWindow) ? Number(model.contextWindow) : undefined,
     cost: model.cost,
     metadata: model.metadata && typeof model.metadata === "object" ? model.metadata : undefined,
-    ...(rawFallbacks !== undefined ? { fallbackModels } : {})
+    ...(rawFallbacks !== undefined ? { fallbackModels } : {}),
+    ...(capabilities ? { capabilities } : {})
   };
 }
 
@@ -1295,6 +1324,47 @@ function normalizeBaseUrlByFormat(value) {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function normalizeOllamaManagedModel(entry) {
+  if (!entry || typeof entry !== "object") return { keepAlive: OLLAMA_DEFAULT_KEEP_ALIVE, pinned: false, autoLoad: false };
+  const keepAlive = typeof entry.keepAlive === "string" && OLLAMA_KEEP_ALIVE_PATTERN.test(entry.keepAlive)
+    ? entry.keepAlive : OLLAMA_DEFAULT_KEEP_ALIVE;
+  const contextLength = Number.isFinite(entry.contextLength) && entry.contextLength > 0
+    ? Math.round(entry.contextLength) : undefined;
+  return {
+    keepAlive,
+    contextLength,
+    pinned: entry.pinned === true,
+    autoLoad: entry.autoLoad === true
+  };
+}
+
+export function normalizeOllamaConfig(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { enabled: false, baseUrl: OLLAMA_DEFAULT_BASE_URL, autoConnect: true, defaultKeepAlive: OLLAMA_DEFAULT_KEEP_ALIVE, managedModels: {}, autoLoadModels: [] };
+  }
+  const baseUrl = sanitizeEndpointUrl(raw.baseUrl || raw["base-url"] || OLLAMA_DEFAULT_BASE_URL)
+    || OLLAMA_DEFAULT_BASE_URL;
+  const defaultKeepAlive = typeof raw.defaultKeepAlive === "string" && OLLAMA_KEEP_ALIVE_PATTERN.test(raw.defaultKeepAlive)
+    ? raw.defaultKeepAlive : OLLAMA_DEFAULT_KEEP_ALIVE;
+  const managedModels = {};
+  if (raw.managedModels && typeof raw.managedModels === "object" && !Array.isArray(raw.managedModels)) {
+    for (const [modelId, entry] of Object.entries(raw.managedModels)) {
+      if (typeof modelId === "string" && modelId.trim()) {
+        managedModels[modelId.trim()] = normalizeOllamaManagedModel(entry);
+      }
+    }
+  }
+  const autoLoadModels = dedupeStrings(toArray(raw.autoLoadModels || raw["auto-load-models"]));
+  return {
+    enabled: raw.enabled !== false,
+    baseUrl,
+    autoConnect: raw.autoConnect !== false,
+    defaultKeepAlive,
+    managedModels,
+    autoLoadModels
+  };
+}
+
 function normalizeProvider(provider, index = 0) {
   if (!provider || typeof provider !== "object") return null;
 
@@ -1302,7 +1372,8 @@ function normalizeProvider(provider, index = 0) {
   const id = slugifyId(provider.id || provider.name || `provider-${index + 1}`);
   const providerType = provider.type || null;
   const isSubscription = providerType === "subscription";
-  
+  const isOllama = providerType === OLLAMA_PROVIDER_TYPE;
+
   // Subscription-specific fields
   const subscriptionType = isSubscription ? (provider.subscriptionType || provider.subscription_type || null) : null;
   const subscriptionProfile = isSubscription ? (provider.subscriptionProfile || provider.subscription_profile || id) : null;
@@ -1316,9 +1387,11 @@ function normalizeProvider(provider, index = 0) {
   );
   
   // Subscription providers have a fixed endpoint, so baseUrl is optional
-  const explicitBaseUrl = !isSubscription 
-    ? sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "")
-    : sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "");
+  // Ollama defaults to localhost:11434/v1 for OpenAI compat
+  const ollamaDefaultUrl = OLLAMA_DEFAULT_BASE_URL + "/v1";
+  const explicitBaseUrl = sanitizeEndpointUrl(
+    provider.baseUrl || provider["base-url"] || provider.endpoint || (isOllama ? ollamaDefaultUrl : "")
+  );
     
   const rawFormat = provider.format || provider.responseFormat || provider["response-format"];
   const preferredFormat = [FORMATS.OPENAI, FORMATS.CLAUDE].includes(rawFormat) ? rawFormat : undefined;
@@ -1336,7 +1409,9 @@ function normalizeProvider(provider, index = 0) {
   const defaultSubscriptionFormat = subscriptionType === SUBSCRIPTION_PROVIDER_TYPES.CLAUDE_CODE
     ? FORMATS.CLAUDE
     : FORMATS.OPENAI;
-  const defaultFormat = isSubscription ? defaultSubscriptionFormat : (orderedFormats[0] || FORMATS.OPENAI);
+  const defaultFormat = isSubscription ? defaultSubscriptionFormat
+    : isOllama ? FORMATS.OPENAI
+    : (orderedFormats[0] || FORMATS.OPENAI);
   
   const baseUrl = explicitBaseUrl
     || (preferredFormat && baseUrlByFormat?.[preferredFormat])
@@ -1374,7 +1449,8 @@ function normalizeProvider(provider, index = 0) {
     enabled: provider.enabled !== false,
     baseUrl,
     baseUrlByFormat,
-    apiKey: typeof provider.apiKey === "string" ? provider.apiKey : (typeof provider.credential === "string" ? provider.credential : undefined),
+    apiKey: isOllama ? (typeof provider.apiKey === "string" ? provider.apiKey : "ollama")
+      : (typeof provider.apiKey === "string" ? provider.apiKey : (typeof provider.credential === "string" ? provider.credential : undefined)),
     apiKeyEnv: typeof provider.apiKeyEnv === "string" ? provider.apiKeyEnv : undefined,
     format: preferredFormat || defaultFormat,
     formats: orderedFormats.length > 0 ? orderedFormats : [defaultFormat],
@@ -1694,6 +1770,8 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
       )
     : amp;
 
+  const ollama = normalizeOllamaConfig(raw.ollama);
+
   const normalized = {
     version: inferNormalizedConfigVersion(raw, providers, modelAliases),
     masterKey,
@@ -1702,6 +1780,7 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     modelAliases,
     amp: normalizedAmp,
     ...(webSearch ? { webSearch } : {}),
+    ollama,
     metadata: sanitizeRuntimeMetadata(raw.metadata)
   };
   Object.defineProperty(normalized, NORMALIZATION_ISSUES_SYMBOL, {

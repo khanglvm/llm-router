@@ -354,10 +354,15 @@ function normalizeProviderModelRows(rows = []) {
     if (!id || seenIds.has(id)) continue;
     seenIds.add(id);
     const parsedContextWindow = Number.parseInt(String(row?.contextWindow || "").trim(), 10);
+    const capabilities = row?.capabilities && typeof row.capabilities === "object"
+      && Object.keys(row.capabilities).length > 0
+      ? row.capabilities
+      : undefined;
     normalizedRows.push({
       id,
       sourceId,
-      contextWindow: Number.isFinite(parsedContextWindow) && parsedContextWindow > 0 ? parsedContextWindow : null
+      contextWindow: Number.isFinite(parsedContextWindow) && parsedContextWindow > 0 ? parsedContextWindow : null,
+      ...(capabilities ? { capabilities } : {})
     });
   }
 
@@ -413,16 +418,22 @@ export function applyProviderModelEdits(config = {}, providerId, rows = []) {
       if (matchedSourceId !== row.id) {
         renameMap.set(matchedSourceId, row.id);
       }
-      nextModels.push({
+      const matchedModel = {
         ...existingModelMap.get(matchedSourceId),
         id: row.id,
         ...(row.contextWindow
           ? { contextWindow: row.contextWindow }
           : {})
-      });
+      };
       if (!row.contextWindow) {
-        delete nextModels[nextModels.length - 1].contextWindow;
+        delete matchedModel.contextWindow;
       }
+      if (row.capabilities && typeof row.capabilities === "object" && Object.keys(row.capabilities).length > 0) {
+        matchedModel.capabilities = row.capabilities;
+      } else {
+        delete matchedModel.capabilities;
+      }
+      nextModels.push(matchedModel);
       continue;
     }
 
@@ -430,6 +441,9 @@ export function applyProviderModelEdits(config = {}, providerId, rows = []) {
       id: row.id,
       ...(row.contextWindow
         ? { contextWindow: row.contextWindow }
+        : {}),
+      ...(row.capabilities && typeof row.capabilities === "object" && Object.keys(row.capabilities).length > 0
+        ? { capabilities: row.capabilities }
         : {})
     });
   }
@@ -685,6 +699,7 @@ export function createProviderModelDraftRows(provider = {}) {
     key: `model-${provider?.id || "provider"}-${index}-${String(model?.id || "").trim() || "empty"}`,
     id: String(model?.id || "").trim(),
     sourceId: String(model?.id || "").trim(),
-    contextWindow: Number.isFinite(model?.contextWindow) ? String(Math.floor(Number(model.contextWindow))) : ""
+    contextWindow: Number.isFinite(model?.contextWindow) ? String(Math.floor(Number(model.contextWindow))) : "",
+    ...(model?.capabilities ? { capabilities: { ...model.capabilities } } : {})
   }));
 }

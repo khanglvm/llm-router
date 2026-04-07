@@ -21,6 +21,7 @@ import {
 import { maybeRewriteAmpClientResponse } from "./amp-response.js";
 import { applyCachingMapping, mergeCachingHeaders } from "./cache-mapping.js";
 import { applyReasoningEffortMapping } from "./reasoning-effort.js";
+import { stripUnsupportedFields } from "./field-filter.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
 import { buildTimeoutSignal } from "../../shared/timeout-signal.js";
@@ -97,7 +98,8 @@ async function adaptProviderResponse({
   requestKind,
   requestBody,
   clientType,
-  env
+  env,
+  responsesDowngraded
 }) {
   const buildSuccessResponse = async (resultResponse) => ({
     ok: true,
@@ -110,6 +112,30 @@ async function adaptProviderResponse({
       env
     })
   });
+
+  // Responses API was downgraded to Chat Completions for provider compatibility.
+  // Convert response back: Chat Completions → Claude → Responses API.
+  if (responsesDowngraded) {
+    if (stream) {
+      const claudeStream = handleOpenAIStreamToClaude(response);
+      return buildSuccessResponse(handleClaudeStreamToOpenAIResponses(claudeStream, requestBody, fallbackModel));
+    }
+    const raw = await response.text();
+    const parsed = parseJsonSafely(raw);
+    if (!parsed) {
+      return {
+        ok: false,
+        status: 502,
+        retryable: true,
+        response: jsonResponse({
+          type: "error",
+          error: { type: "api_error", message: "Provider returned invalid JSON." }
+        }, 502)
+      };
+    }
+    const claudeMessage = convertOpenAINonStreamToClaude(parsed, fallbackModel);
+    return buildSuccessResponse(jsonResponse(convertClaudeNonStreamToOpenAIResponses(claudeMessage, requestBody, fallbackModel)));
+  }
 
   if (stream) {
     if (!translate) {
@@ -495,8 +521,15 @@ function buildProviderRequestPlan({
   const translate = needsTranslation(sourceFormat, targetFormat);
 
   let providerBody = { ...body };
+  let responsesDowngraded = false;
   if (translate) {
     providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
+  } else if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.OPENAI && requestKind === "responses") {
+    // Most OpenAI-compatible providers (Groq, Together, etc.) only support Chat Completions,
+    // not the Responses API. Downgrade via double-hop: Responses API → Claude → Chat Completions.
+    const intermediateBody = translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, candidate.backend, body, stream);
+    providerBody = translateRequest(FORMATS.CLAUDE, FORMATS.OPENAI, candidate.backend, intermediateBody, stream);
+    responsesDowngraded = true;
   }
 
   providerBody.model = candidate.backend;
@@ -513,8 +546,18 @@ function buildProviderRequestPlan({
     sourceFormat,
     targetFormat,
     targetModel: candidate.backend,
-    requestHeaders
+    requestHeaders,
+    capabilities: candidate.model?.capabilities
   });
+
+  if (responsesDowngraded) {
+    // Strip Responses-API-only fields that Chat Completions providers reject.
+    delete providerBody.prompt_cache_key;
+    delete providerBody.store;
+    delete providerBody.include;
+    delete providerBody.text;
+    delete providerBody.service_tier;
+  }
 
   const declaredOpenAIHostedWebSearchToolType = getProviderOpenAIHostedWebSearchToolType(candidate.provider, {
     targetFormat,
@@ -532,11 +575,14 @@ function buildProviderRequestPlan({
     providerBody = rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat, requestKind).providerBody;
   }
 
+  providerBody = stripUnsupportedFields(providerBody, candidate.model?.capabilities);
+
   return {
     targetFormat,
-    requestKind: normalizedRequestKind,
+    requestKind: responsesDowngraded ? undefined : normalizedRequestKind,
     translate,
-    providerBody
+    providerBody,
+    responsesDowngraded
   };
 }
 
@@ -983,6 +1029,7 @@ export async function makeProviderCall({
     requestKind: activePlan.requestKind,
     requestBody: body,
     clientType,
-    env
+    env,
+    responsesDowngraded: activePlan.responsesDowngraded
   });
 }
