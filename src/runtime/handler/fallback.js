@@ -44,6 +44,18 @@ const POLICY_HINTS = [
   "unsafe",
   "flagged"
 ];
+const MODEL_NOT_FOUND_HINTS = [
+  "model not found",
+  "model does not exist",
+  "model_not_found"
+];
+const VRAM_EXHAUSTION_HINTS = [
+  "insufficient vram",
+  "out of memory",
+  "failed to load model",
+  "insufficient memory"
+];
+const DEFAULT_ORIGIN_MODEL_NOT_FOUND_COOLDOWN_MS = 60 * 60_000;
 const CONTEXT_WINDOW_HINTS = [
   "context window",
   "maximum context length",
@@ -55,6 +67,17 @@ const CONTEXT_WINDOW_HINTS = [
   "request is too long",
   "too many tokens",
   "ran out of room in the model's context window"
+];
+const RATE_LIMIT_HINTS = [
+  "tokens per minute",
+  "requests per minute",
+  "rate limit",
+  "rate_limit",
+  "tpm",
+  "rpm",
+  "quota exceeded",
+  "quota_exceeded",
+  "limit exceeded"
 ];
 const fallbackCircuitState = new Map();
 
@@ -392,6 +415,16 @@ export async function classifyFailureResult(result, retryPolicy) {
   }
 
   if (status === 404 || status === 410) {
+    const hintText404 = await readProviderErrorHint(result);
+    if (hasAnyHint(hintText404, MODEL_NOT_FOUND_HINTS)) {
+      return {
+        category: "model_not_found",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: DEFAULT_ORIGIN_MODEL_NOT_FOUND_COOLDOWN_MS
+      };
+    }
     return {
       category: "not_found",
       retryable: false,
@@ -412,9 +445,47 @@ export async function classifyFailureResult(result, retryPolicy) {
         originCooldownMs: 0
       };
     }
+    if (hasAnyHint(hintText, VRAM_EXHAUSTION_HINTS)) {
+      return {
+        category: "vram_exhaustion",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: retryPolicy.originFallbackCooldownMs
+      };
+    }
+    if (status === 413 && hasAnyHint(hintText, RATE_LIMIT_HINTS)) {
+      const rateLimitCooldown = retryAfterMs > 0 ? retryAfterMs : retryPolicy.originRateLimitCooldownMs;
+      return {
+        category: "rate_limited",
+        retryable: true,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: rateLimitCooldown
+      };
+    }
   }
 
   if (status === 408 || status === 409 || status >= 500) {
+    const hintText5xx = await readProviderErrorHint(result);
+    if (hasAnyHint(hintText5xx, VRAM_EXHAUSTION_HINTS)) {
+      return {
+        category: "vram_exhaustion",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: retryPolicy.originFallbackCooldownMs
+      };
+    }
+    if (hasAnyHint(hintText5xx, MODEL_NOT_FOUND_HINTS)) {
+      return {
+        category: "model_not_found",
+        retryable: false,
+        retryOrigin: false,
+        allowFallback: true,
+        originCooldownMs: DEFAULT_ORIGIN_MODEL_NOT_FOUND_COOLDOWN_MS
+      };
+    }
     return {
       category: "temporary_error",
       retryable: true,
