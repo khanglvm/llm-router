@@ -515,7 +515,8 @@ function buildProviderRequestPlan({
   requestKind,
   requestHeaders,
   interceptAmpWebSearch,
-  stream
+  stream,
+  forceResponsesDowngrade = false
 }) {
   const normalizedRequestKind = normalizeProviderRequestKind(targetFormat, requestKind);
   const translate = needsTranslation(sourceFormat, targetFormat);
@@ -524,9 +525,9 @@ function buildProviderRequestPlan({
   let responsesDowngraded = false;
   if (translate) {
     providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
-  } else if (sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.OPENAI && requestKind === "responses") {
-    // Most OpenAI-compatible providers (Groq, Together, etc.) only support Chat Completions,
-    // not the Responses API. Downgrade via double-hop: Responses API → Claude → Chat Completions.
+  } else if (forceResponsesDowngrade) {
+    // Provider confirmed to not support Responses API — downgrade to Chat Completions
+    // via double-hop: Responses API → Claude → Chat Completions.
     const intermediateBody = translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, candidate.backend, body, stream);
     providerBody = translateRequest(FORMATS.CLAUDE, FORMATS.OPENAI, candidate.backend, intermediateBody, stream);
     responsesDowngraded = true;
@@ -622,8 +623,17 @@ export async function makeProviderCall({
     effectiveBody = { ...body, reasoning_effort: ampContext.presets.reasoningEffort };
   }
 
+  // For Responses API requests to OpenAI-format providers, try the native endpoint first.
+  // If the provider doesn't support /v1/responses (returns 404/400), fall back to a
+  // downgraded Chat Completions plan with double-hop translation.
+  const needsResponsesDowngradeFallback = !isSubscriptionProvider(provider)
+    && sourceFormat === FORMATS.OPENAI
+    && targetFormat === FORMATS.OPENAI
+    && requestKind === "responses";
+
   let activePlan;
   let fallbackPlan = null;
+  let responsesDowngradedPlan = null;
   try {
     activePlan = buildProviderRequestPlan({
       body: effectiveBody,
@@ -645,6 +655,19 @@ export async function makeProviderCall({
         requestHeaders,
         interceptAmpWebSearch,
         stream
+      });
+    }
+    if (needsResponsesDowngradeFallback) {
+      responsesDowngradedPlan = buildProviderRequestPlan({
+        body: effectiveBody,
+        sourceFormat,
+        targetFormat,
+        candidate,
+        requestKind,
+        requestHeaders,
+        interceptAmpWebSearch,
+        stream,
+        forceResponsesDowngrade: true
       });
     }
   } catch (error) {
@@ -959,6 +982,19 @@ export async function makeProviderCall({
       }
     } catch {
       // Keep the original failure if the fallback request also fails.
+    }
+  }
+
+  // Provider doesn't support native /v1/responses — retry with Chat Completions downgrade.
+  if ((!response || !response.ok) && responsesDowngradedPlan) {
+    try {
+      const downgradedResponse = await executeHttpProviderRequest(responsesDowngradedPlan);
+      if (downgradedResponse instanceof Response && downgradedResponse.ok) {
+        response = downgradedResponse;
+        activePlan = responsesDowngradedPlan;
+      }
+    } catch {
+      // Keep the original failure if the downgraded request also fails.
     }
   }
 

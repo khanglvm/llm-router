@@ -3353,7 +3353,15 @@ export function resolveRequestedRoute(config, requestedModel, sourceFormat = FOR
     return resolvedAmpRoute;
   }
 
-  const resolvedRoute = resolveRequestedRouteCore(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex);
+  let resolvedRoute = resolveRequestedRouteCore(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex);
+
+  if (!resolvedRoute?.primary && !String(effectiveRequested || "").includes("/")) {
+    const bareRoute = resolveBareModelRoutePlan(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex, {});
+    if (bareRoute?.primary) {
+      resolvedRoute = bareRoute;
+    }
+  }
+
   if (!resolvedRoute?.primary && effectiveRequested === DEFAULT_MODEL_ALIAS_ID) {
     return {
       ...resolvedRoute,
