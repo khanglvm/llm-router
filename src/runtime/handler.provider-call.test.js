@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { FORMATS } from "../translator/index.js";
-import { makeProviderCall } from "./handler/provider-call.js";
+import {
+  makeProviderCall,
+  resetOpenAIToolRoutingLearningState
+} from "./handler/provider-call.js";
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -13,6 +16,7 @@ function jsonResponse(payload, status = 200) {
 }
 
 function buildOpenAICandidate(providerOverrides = {}) {
+  const model = { id: "gpt-5.4" };
   return {
     provider: {
       id: "rc",
@@ -20,11 +24,12 @@ function buildOpenAICandidate(providerOverrides = {}) {
       baseUrl: "https://ramclouds.me",
       format: FORMATS.OPENAI,
       formats: [FORMATS.OPENAI],
-      models: [{ id: "gpt-5.4" }],
+      models: [model],
       ...providerOverrides
     },
     providerId: "rc",
     modelId: "gpt-5.4",
+    model,
     requestModelId: "rc/gpt-5.4",
     targetFormat: FORMATS.OPENAI,
     backend: "gpt-5.4"
@@ -32,6 +37,7 @@ function buildOpenAICandidate(providerOverrides = {}) {
 }
 
 function buildClaudeCandidate(providerOverrides = {}) {
+  const model = { id: "claude-sonnet-4-6" };
   return {
     provider: {
       id: "anthropic",
@@ -39,11 +45,12 @@ function buildClaudeCandidate(providerOverrides = {}) {
       baseUrl: "https://api.anthropic.com",
       format: FORMATS.CLAUDE,
       formats: [FORMATS.CLAUDE],
-      models: [{ id: "claude-sonnet-4-6" }],
+      models: [model],
       ...providerOverrides
     },
     providerId: "anthropic",
     modelId: "claude-sonnet-4-6",
+    model,
     requestModelId: "anthropic/claude-sonnet-4-6",
     targetFormat: FORMATS.CLAUDE,
     backend: "claude-sonnet-4-6"
@@ -334,6 +341,7 @@ test("makeProviderCall intercepts native Claude web search locally for non-AMP c
 });
 
 test("makeProviderCall prefers OpenAI routing for Claude tool calls on dual-format providers", { concurrency: false }, async () => {
+  resetOpenAIToolRoutingLearningState();
   const calls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
@@ -422,10 +430,12 @@ test("makeProviderCall prefers OpenAI routing for Claude tool calls on dual-form
     assert.deepEqual(payload.content?.[0]?.input, { url: "https://example.com" });
   } finally {
     globalThis.fetch = originalFetch;
+    resetOpenAIToolRoutingLearningState();
   }
 });
 
 test("makeProviderCall translates streamed OpenAI tool calls back to Claude SSE for dual-format providers", { concurrency: false }, async () => {
+  resetOpenAIToolRoutingLearningState();
   const calls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
@@ -496,10 +506,12 @@ test("makeProviderCall translates streamed OpenAI tool calls back to Claude SSE 
     assert.match(sseText, /"stop_reason":"tool_use"/);
   } finally {
     globalThis.fetch = originalFetch;
+    resetOpenAIToolRoutingLearningState();
   }
 });
 
 test("makeProviderCall falls back to Claude routing when OpenAI tool routing fails", { concurrency: false }, async () => {
+  resetOpenAIToolRoutingLearningState();
   const calls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
@@ -577,6 +589,171 @@ test("makeProviderCall falls back to Claude routing when OpenAI tool routing fai
     assert.equal(payload.content?.[0]?.text, "Claude fallback succeeded.");
   } finally {
     globalThis.fetch = originalFetch;
+    resetOpenAIToolRoutingLearningState();
+  }
+});
+
+test("makeProviderCall learns to skip repeated OpenAI tool-routing failures for the same Claude route", { concurrency: false }, async () => {
+  resetOpenAIToolRoutingLearningState();
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: JSON.parse(String(init.body || "{}"))
+    });
+
+    if (calls.length === 1) {
+      return jsonResponse({
+        error: {
+          message: "Model not available on chat completions."
+        }
+      }, 400);
+    }
+
+    return jsonResponse({
+      id: `msg_claude_${calls.length}`,
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{
+        type: "text",
+        text: "Claude fallback succeeded."
+      }],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 12,
+        output_tokens: 6
+      }
+    });
+  };
+
+  const request = {
+    body: {
+      model: "claude-sonnet-4-6",
+      max_tokens: 256,
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: "Use the fetch tool for https://example.com." }]
+      }],
+      tools: [{
+        name: "fetch",
+        description: "Fetch a URL",
+        input_schema: {
+          type: "object",
+          properties: {
+            url: { type: "string" }
+          }
+        }
+      }],
+      tool_choice: { type: "any" }
+    },
+    sourceFormat: FORMATS.CLAUDE,
+    stream: false,
+    candidate: buildClaudeCandidate({
+      formats: [FORMATS.CLAUDE, FORMATS.OPENAI],
+      baseUrlByFormat: {
+        claude: "https://api.anthropic.com",
+        openai: "https://api.anthropic.com"
+      }
+    }),
+    requestKind: "messages",
+    requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+    env: {}
+  };
+
+  try {
+    const firstResult = await makeProviderCall(request);
+    assert.equal(firstResult.ok, true);
+
+    const secondResult = await makeProviderCall(request);
+    assert.equal(secondResult.ok, true);
+
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/chat/completions");
+    assert.equal(calls[1]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls[2]?.url, "https://api.anthropic.com/v1/messages");
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetOpenAIToolRoutingLearningState();
+  }
+});
+
+test("makeProviderCall skips OpenAI tool routing when probe data prefers Claude for the model", { concurrency: false }, async () => {
+  resetOpenAIToolRoutingLearningState();
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: JSON.parse(String(init.body || "{}"))
+    });
+    return jsonResponse({
+      id: "msg_claude_preferred",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{
+        type: "text",
+        text: "Claude route selected directly."
+      }],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 12,
+        output_tokens: 6
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "claude-sonnet-4-6",
+        max_tokens: 256,
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: "Use the fetch tool for https://example.com." }]
+        }],
+        tools: [{
+          name: "fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            }
+          }
+        }],
+        tool_choice: { type: "any" }
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: false,
+      candidate: buildClaudeCandidate({
+        formats: [FORMATS.CLAUDE, FORMATS.OPENAI],
+        baseUrlByFormat: {
+          claude: "https://api.anthropic.com",
+          openai: "https://api.anthropic.com"
+        },
+        lastProbe: {
+          modelSupport: {
+            "claude-sonnet-4-6": [FORMATS.CLAUDE, FORMATS.OPENAI]
+          },
+          modelPreferredFormat: {
+            "claude-sonnet-4-6": FORMATS.CLAUDE
+          }
+        }
+      }),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/messages");
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetOpenAIToolRoutingLearningState();
   }
 });
 

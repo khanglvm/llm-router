@@ -43,8 +43,85 @@ import {
   resolveLargeRequestLogThresholdBytes
 } from "./large-request-log.js";
 
+const OPENAI_TOOL_ROUTING_SUPPRESSION_TTL_MS = 30 * 60 * 1000;
+const openAIToolRoutingSuppressionUntil = new Map();
+
 function isSubscriptionProvider(provider) {
   return provider?.type === "subscription";
+}
+
+function normalizeFormatList(values) {
+  return [...new Set(
+    (Array.isArray(values) ? values : [values])
+      .map((value) => String(value || "").trim())
+      .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE)
+  )];
+}
+
+function resolveCandidateModel(provider, model, modelId) {
+  if (model && typeof model === "object" && !Array.isArray(model)) {
+    return model;
+  }
+  const normalizedModelId = String(modelId || "").trim();
+  if (!normalizedModelId || !Array.isArray(provider?.models)) return null;
+  return provider.models.find((entry) => String(entry?.id || "").trim() === normalizedModelId) || null;
+}
+
+function getProviderModelSupportedFormats(provider, model, modelId) {
+  const resolvedModel = resolveCandidateModel(provider, model, modelId);
+  const configuredFormats = normalizeFormatList(resolvedModel?.formats || resolvedModel?.format);
+  const resolvedModelId = String(resolvedModel?.id || modelId || "").trim();
+  if (!resolvedModelId) return configuredFormats;
+
+  const preferredFormat = provider?.lastProbe?.modelPreferredFormat?.[resolvedModelId];
+  if (preferredFormat === FORMATS.OPENAI || preferredFormat === FORMATS.CLAUDE) {
+    return [preferredFormat];
+  }
+
+  const probedFormats = normalizeFormatList(provider?.lastProbe?.modelSupport?.[resolvedModelId]);
+  return probedFormats.length > 0 ? probedFormats : configuredFormats;
+}
+
+function getProviderModelPreferredFormat(provider, model, modelId) {
+  const resolvedModel = resolveCandidateModel(provider, model, modelId);
+  const resolvedModelId = String(resolvedModel?.id || modelId || "").trim();
+  if (!resolvedModelId) return "";
+  const preferredFormat = String(provider?.lastProbe?.modelPreferredFormat?.[resolvedModelId] || "").trim();
+  return preferredFormat === FORMATS.OPENAI || preferredFormat === FORMATS.CLAUDE
+    ? preferredFormat
+    : "";
+}
+
+function buildOpenAIToolRoutingSuppressionKey(candidate) {
+  const providerId = String(candidate?.providerId || candidate?.provider?.id || "").trim();
+  const modelId = String(candidate?.modelId || candidate?.model?.id || candidate?.backend || "").trim();
+  if (!providerId || !modelId) return "";
+  return `${providerId}/${modelId}`;
+}
+
+function pruneOpenAIToolRoutingSuppressions(now = Date.now()) {
+  for (const [key, expiresAt] of openAIToolRoutingSuppressionUntil.entries()) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+      openAIToolRoutingSuppressionUntil.delete(key);
+    }
+  }
+}
+
+function isOpenAIToolRoutingSuppressed(candidate, now = Date.now()) {
+  const key = buildOpenAIToolRoutingSuppressionKey(candidate);
+  if (!key) return false;
+  pruneOpenAIToolRoutingSuppressions(now);
+  return Number(openAIToolRoutingSuppressionUntil.get(key)) > now;
+}
+
+function suppressOpenAIToolRouting(candidate, now = Date.now()) {
+  const key = buildOpenAIToolRoutingSuppressionKey(candidate);
+  if (!key) return;
+  openAIToolRoutingSuppressionUntil.set(key, now + OPENAI_TOOL_ROUTING_SUPPRESSION_TTL_MS);
+}
+
+export function resetOpenAIToolRoutingLearningState() {
+  openAIToolRoutingSuppressionUntil.clear();
 }
 
 function queueLargeRequestEvent(onLargeRequestLog, payload) {
@@ -313,6 +390,9 @@ function normalizeProviderRequestKind(targetFormat, requestKind) {
 
 function shouldPreferOpenAIForClaudeToolCalls({
   provider,
+  model,
+  modelId,
+  candidate,
   sourceFormat,
   targetFormat,
   requestKind,
@@ -320,6 +400,11 @@ function shouldPreferOpenAIForClaudeToolCalls({
 } = {}) {
   if (sourceFormat !== FORMATS.CLAUDE || targetFormat !== FORMATS.CLAUDE) return false;
   if (!hasToolDefinitions(body)) return false;
+  if (candidate && isOpenAIToolRoutingSuppressed(candidate)) return false;
+  const preferredFormat = getProviderModelPreferredFormat(provider, model, modelId);
+  if (preferredFormat === FORMATS.CLAUDE) return false;
+  const modelFormats = getProviderModelSupportedFormats(provider, model, modelId);
+  if (modelFormats.length > 0 && !modelFormats.includes(FORMATS.OPENAI)) return false;
   if (!getProviderFormats(provider).includes(FORMATS.OPENAI)) return false;
   return Boolean(resolveProviderUrl(provider, FORMATS.OPENAI, normalizeProviderRequestKind(FORMATS.OPENAI, requestKind)));
 }
@@ -664,6 +749,9 @@ export async function makeProviderCall({
 
   const preferOpenAIToolRouting = !isSubscriptionProvider(provider) && shouldPreferOpenAIForClaudeToolCalls({
     provider,
+    model: candidate?.model,
+    modelId: candidate?.modelId,
+    candidate,
     sourceFormat,
     targetFormat,
     requestKind,
@@ -1064,6 +1152,9 @@ export async function makeProviderCall({
     try {
       const fallbackResponse = await executeHttpProviderRequest(fallbackPlan);
       if (fallbackResponse instanceof Response && fallbackResponse.ok) {
+        if (preferOpenAIToolRouting) {
+          suppressOpenAIToolRouting(candidate);
+        }
         response = fallbackResponse;
         activePlan = fallbackPlan;
       }

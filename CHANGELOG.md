@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-04-17
+
+### Fixed
+- Prevented repeated failed OpenAI `/v1/chat/completions` tool-routing attempts for Claude Code requests on dual-format Claude routes by respecting model format preferences and suppressing noisy re-tries after a successful Claude fallback.
+
 ## [2.3.2] - 2026-04-17
 
 ### Fixed
