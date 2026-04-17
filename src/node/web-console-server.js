@@ -1173,6 +1173,17 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     return normalizeClaudeBindingsInput(bindings);
   }
 
+  function normalizeFactoryDroidBindingState(bindings = {}) {
+    const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+    return {
+      defaultModel: String(source.defaultModel || "").trim(),
+      missionOrchestratorModel: String(source.missionOrchestratorModel || source.missionModel || "").trim(),
+      missionWorkerModel: String(source.missionWorkerModel || source.missionModel || "").trim(),
+      missionValidatorModel: String(source.missionValidatorModel || source.missionModel || "").trim(),
+      reasoningEffort: normalizeFactoryDroidReasoningEffort(source.reasoningEffort)
+    };
+  }
+
   function areCodexBindingsEqual(left = {}, right = {}) {
     const normalizedLeft = normalizeCodexBindingState(left);
     const normalizedRight = normalizeCodexBindingState(right);
@@ -1190,6 +1201,18 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       && String(left?.defaultHaikuModel || "").trim() === String(right?.defaultHaikuModel || "").trim()
       && String(left?.subagentModel || "").trim() === String(right?.subagentModel || "").trim()
       && normalizeClaudeCodeEffortLevel(left?.thinkingLevel) === normalizeClaudeCodeEffortLevel(right?.thinkingLevel)
+    );
+  }
+
+  function areFactoryDroidBindingsEqual(left = {}, right = {}) {
+    const normalizedLeft = normalizeFactoryDroidBindingState(left);
+    const normalizedRight = normalizeFactoryDroidBindingState(right);
+    return (
+      normalizedLeft.defaultModel === normalizedRight.defaultModel
+      && normalizedLeft.missionOrchestratorModel === normalizedRight.missionOrchestratorModel
+      && normalizedLeft.missionWorkerModel === normalizedRight.missionWorkerModel
+      && normalizedLeft.missionValidatorModel === normalizedRight.missionValidatorModel
+      && normalizedLeft.reasoningEffort === normalizedRight.reasoningEffort
     );
   }
 
@@ -1229,6 +1252,23 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       defaultHaikuModel: reconcileManagedRouteBinding(currentBindings.defaultHaikuModel, rewriteContext),
       subagentModel: reconcileManagedRouteBinding(currentBindings.subagentModel, rewriteContext),
       thinkingLevel: currentBindings.thinkingLevel
+    };
+  }
+
+  function reconcileFactoryDroidBindingsForConfig(bindings = {}, previousConfig = {}, nextConfig = {}) {
+    const currentBindings = normalizeFactoryDroidBindingState(bindings);
+    const rewriteContext = buildManagedRouteRewriteContext(previousConfig, nextConfig);
+    const nextDefaultModel = reconcileManagedRouteBinding(currentBindings.defaultModel, rewriteContext)
+      || pickDefaultManagedRoute(nextConfig);
+    return {
+      defaultModel: nextDefaultModel,
+      missionOrchestratorModel: reconcileManagedRouteBinding(currentBindings.missionOrchestratorModel, rewriteContext)
+        || nextDefaultModel,
+      missionWorkerModel: reconcileManagedRouteBinding(currentBindings.missionWorkerModel, rewriteContext)
+        || nextDefaultModel,
+      missionValidatorModel: reconcileManagedRouteBinding(currentBindings.missionValidatorModel, rewriteContext)
+        || nextDefaultModel,
+      reasoningEffort: currentBindings.reasoningEffort
     };
   }
 
@@ -1464,8 +1504,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         backupExists: false,
         routedViaRouter: false,
         configuredBaseUrl: "",
+        configuredProvider: "",
         bindings: {
           defaultModel: "",
+          missionOrchestratorModel: "",
+          missionWorkerModel: "",
+          missionValidatorModel: "",
           reasoningEffort: ""
         },
         endpointUrl,
@@ -1490,8 +1534,6 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       && (previousEndpointUrl !== nextEndpointUrl || previousMasterKey !== nextMasterKey)
     );
 
-    if (!endpointOrKeyChanged) return false;
-
     const routingState = await readFactoryDroidGlobalRoutingState(previousSettings, previousConfig);
     if (routingState.error) {
       addLog("warn", "Factory Droid route check failed.", routingState.error);
@@ -1500,13 +1542,22 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     if (!routingState.routedViaRouter) return false;
 
     try {
+      const currentBindings = normalizeFactoryDroidBindingState(routingState.bindings);
+      const bindings = reconcileFactoryDroidBindingsForConfig(currentBindings, previousConfig, nextConfig);
+      const bindingsChanged = !areFactoryDroidBindingsEqual(currentBindings, bindings);
+      if (!endpointOrKeyChanged && !bindingsChanged) return false;
+
       await patchFactoryDroidSettingsFile({
         endpointUrl: nextEndpointUrl,
         apiKey: nextMasterKey,
-        bindings: routingState.bindings,
+        bindings,
         captureBackup: false
       });
-      addLog("info", "Updated Factory Droid route to match the local router.", buildFactoryDroidEndpointUrl(nextSettings));
+      if (endpointOrKeyChanged) {
+        addLog("info", "Updated Factory Droid route to match the local router.", buildFactoryDroidEndpointUrl(nextSettings));
+      } else {
+        addLog("info", "Updated Factory Droid bindings to match the saved router config.", bindings.defaultModel || "Default");
+      }
       return true;
     } catch (error) {
       addLog("warn", "Factory Droid route update failed.", error instanceof Error ? error.message : String(error));
@@ -3362,7 +3413,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const body = await readJsonBody(req);
         const effortLevel = String(body?.effortLevel || body?.thinkingLevel || "").trim();
         if (effortLevel && !normalizeClaudeCodeEffortLevel(effortLevel)) {
-          sendJson(res, 400, { error: `Invalid effort level '${effortLevel}'. Valid values: low, medium, high, max.` });
+          sendJson(res, 400, { error: `Invalid effort level '${effortLevel}'. Valid values: low, medium, high, xhigh, max.` });
           return;
         }
         const result = await patchClaudeCodeEffortLevel({
@@ -3427,6 +3478,9 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
         const bindings = {
           defaultModel: String(body?.bindings?.defaultModel || "").trim(),
+          missionOrchestratorModel: String(body?.bindings?.missionOrchestratorModel || body?.bindings?.missionModel || "").trim(),
+          missionWorkerModel: String(body?.bindings?.missionWorkerModel || body?.bindings?.missionModel || "").trim(),
+          missionValidatorModel: String(body?.bindings?.missionValidatorModel || body?.bindings?.missionModel || "").trim(),
           reasoningEffort: normalizeFactoryDroidReasoningEffort(body?.bindings?.reasoningEffort)
         };
         const patchResult = await patchFactoryDroidSettingsFile({
@@ -3474,6 +3528,9 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
         const bindings = {
           defaultModel: String(body?.bindings?.defaultModel || "").trim(),
+          missionOrchestratorModel: String(body?.bindings?.missionOrchestratorModel || body?.bindings?.missionModel || "").trim(),
+          missionWorkerModel: String(body?.bindings?.missionWorkerModel || body?.bindings?.missionModel || "").trim(),
+          missionValidatorModel: String(body?.bindings?.missionValidatorModel || body?.bindings?.missionModel || "").trim(),
           reasoningEffort: normalizeFactoryDroidReasoningEffort(body?.bindings?.reasoningEffort)
         };
         const patchResult = await patchFactoryDroidSettingsFile({

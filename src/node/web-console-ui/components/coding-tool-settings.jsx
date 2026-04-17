@@ -416,17 +416,20 @@ export function buildFactoryDroidGuideContent({
   endpointUrl = ""
 } = {}) {
   const defaultModel = String(bindings?.defaultModel || "").trim();
+  const missionOrchestratorModel = String(bindings?.missionOrchestratorModel || "").trim();
+  const missionWorkerModel = String(bindings?.missionWorkerModel || "").trim();
+  const missionValidatorModel = String(bindings?.missionValidatorModel || "").trim();
   const reasoningEffort = normalizeFactoryDroidReasoningEffort(bindings?.reasoningEffort);
   const normalizedSettingsFilePath = String(settingsFilePath || "").trim();
   const normalizedEndpointUrl = String(endpointUrl || "").trim();
 
-  const callout = defaultModel
+  const callout = defaultModel || missionOrchestratorModel || missionWorkerModel || missionValidatorModel
     ? {
         variant: "info",
-        title: "Default model is set.",
+        title: "Factory defaults are set.",
         body: (
           <>
-            LLM Router is writing <code>model={defaultModel}</code> and injecting a <code>customModels</code> entry into your Factory Droid settings. All requests route through the gateway.
+            LLM Router injects a managed <code>customModels</code> entry, registers it as <code>generic-chat-completion-api</code>, and writes separate defaults for normal sessions and Missions.
           </>
         )
       }
@@ -435,7 +438,7 @@ export function buildFactoryDroidGuideContent({
         title: "Factory Droid connected via custom model entry.",
         body: (
           <>
-            LLM Router injects a managed <code>customModels</code> entry pointing at the gateway. Select a default model below or use Factory Droid&apos;s <code>/model</code> command to pick the routed model at runtime.
+            LLM Router injects a managed <code>customModels</code> entry pointing at the gateway. Set normal or Mission defaults below, or use Factory Droid&apos;s <code>/model</code> command to pick the routed model at runtime.
           </>
         )
       };
@@ -444,7 +447,10 @@ export function buildFactoryDroidGuideContent({
     title: "Factory Droid guide",
     description: "Quick setup for routing Factory Droid through LLM Router via a managed custom model entry.",
     badges: [
-      { label: defaultModel ? `Model: ${defaultModel}` : "No model override", variant: defaultModel ? "info" : "outline" },
+      { label: defaultModel ? `Normal: ${defaultModel}` : "Normal: Factory default", variant: defaultModel ? "info" : "outline" },
+      { label: missionOrchestratorModel ? `Orchestrator: ${missionOrchestratorModel}` : "Orchestrator: Factory default", variant: missionOrchestratorModel ? "info" : "outline" },
+      { label: missionWorkerModel ? `Worker: ${missionWorkerModel}` : "Worker: Factory default", variant: missionWorkerModel ? "info" : "outline" },
+      { label: missionValidatorModel ? `Validator: ${missionValidatorModel}` : "Validator: Factory default", variant: missionValidatorModel ? "info" : "outline" },
       { label: reasoningEffort ? `Reasoning: ${reasoningEffort}` : "Reasoning: Droid default", variant: "outline" },
       { label: normalizedSettingsFilePath ? "Settings file detected" : "User config: ~/.factory/settings.json", variant: "outline" }
     ],
@@ -467,10 +473,10 @@ export function buildFactoryDroidGuideContent({
       },
       {
         eyebrow: "2. Route",
-        title: "Set the default model",
+        title: "Set normal and Mission defaults",
         body: (
           <>
-            Pick a managed route or alias in <span className="font-medium">Default model</span> to control which upstream model Factory Droid uses.
+            Use <span className="font-medium">Normal mode model</span> for regular sessions, then set separate Mission bindings for the orchestrator, worker, and validator roles.
           </>
         )
       },
@@ -491,17 +497,27 @@ export function buildFactoryDroidGuideContent({
           <>Set a <code>masterKey</code> in LLM Router first. The <span className="font-medium">Connect</span> button stays disabled until gateway auth is ready.</>,
           <>Click <span className="font-medium">Connect</span> to inject a managed <code>customModels</code> entry into <code>~/.factory/settings.json</code>.</>,
           defaultModel
-            ? <>Your default model is set to <code>{defaultModel}</code>. Change it any time from this panel.</>
-            : <>Choose a managed route or alias in <span className="font-medium">Default model</span> to route all Factory Droid requests.</>,
+            ? <>Your normal-session default is <code>{defaultModel}</code>. Change it any time from this panel.</>
+            : <>Choose a managed route or alias in <span className="font-medium">Normal mode model</span> to set the default Factory session route.</>,
+          missionOrchestratorModel
+            ? <>Your Mission orchestrator default is <code>{missionOrchestratorModel}</code>.</>
+            : <>Set <span className="font-medium">Mission orchestrator</span> when mission planning should use a specific route.</>,
+          missionWorkerModel
+            ? <>Your Mission worker default is <code>{missionWorkerModel}</code>.</>
+            : <>Set <span className="font-medium">Mission worker</span> when implementation workers should use a specific route.</>,
+          missionValidatorModel
+            ? <>Your Mission validator default is <code>{missionValidatorModel}</code>.</>
+            : <>Set <span className="font-medium">Mission validator</span> when validation workers should use a specific route.</>,
           <>Set <span className="font-medium">Reasoning effort</span> only when you want LLM Router to write <code>reasoningEffort</code>; leave it unset to keep Factory Droid defaults.</>
         ]
       },
       {
         title: "How it works",
         items: [
-          <>LLM Router adds a <code>customModels</code> entry with <code>provider: &quot;openai&quot;</code> and the gateway base URL. Factory Droid treats it as a standard OpenAI-compatible endpoint.</>,
+          <>LLM Router adds a <code>customModels</code> entry with <code>provider: &quot;generic-chat-completion-api&quot;</code> and the gateway base URL.</>,
           <>The injected entry has a <code>_llmRouterManaged</code> marker so it can be cleanly updated or removed without touching your other custom models.</>,
-          <>Disconnecting removes only the managed entry and restores any backed-up model or reasoning settings.</>
+          <>The router-managed bindings map to both the legacy root <code>model</code> field and current Factory settings such as <code>sessionDefaultSettings.model</code>, <code>missionOrchestratorModel</code>, and <code>missionModelSettings</code>.</>,
+          <>Disconnecting removes only the managed entry and restores any backed-up session, Mission, or reasoning settings.</>
         ]
       },
       {
@@ -510,7 +526,10 @@ export function buildFactoryDroidGuideContent({
           normalizedSettingsFilePath
             ? <>This page is managing <code>{normalizedSettingsFilePath}</code>.</>
             : <>Factory Droid stores user settings in <code>~/.factory/settings.json</code>.</>,
-          <>The router-managed bindings map to Factory Droid <code>model</code> and <code>reasoningEffort</code> fields.</>,
+          <>The normal-session binding maps to <code>sessionDefaultSettings.model</code> and the legacy root <code>model</code> field.</>,
+          <>The Mission orchestrator binding maps to <code>missionOrchestratorModel</code>.</>,
+          <>The Mission worker binding maps to <code>missionModelSettings.workerModel</code>.</>,
+          <>The Mission validator binding maps to <code>missionModelSettings.validationWorkerModel</code>.</>,
           <>Use <span className="font-medium">Open Config File</span> to inspect the generated settings.</>
         ]
       },

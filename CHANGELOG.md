@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-04-17
+
+### Fixed
+- Web UI provider presets now correctly populate the Endpoints field during add-provider setup when the current value is still empty or still on a prior preset default, while preserving any manually entered endpoint or API key values.
+
 ## [2.3.0] - 2026-03-24
 
 ### Added

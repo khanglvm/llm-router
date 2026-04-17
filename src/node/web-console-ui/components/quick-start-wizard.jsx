@@ -26,26 +26,22 @@ import {
 import { QUICK_START_CONNECTION_CATEGORIES, QUICK_START_FALLBACK_USER_AGENT } from "../constants.js";
 import {
   createQuickStartState,
+  applyQuickStartConnectionPreset,
   buildQuickStartConfig,
   buildQuickStartApiSignature,
   getQuickStartStepError,
-  normalizeQuickStartHeaderRows,
   headerRowsToObject,
-  getQuickStartDefaultHeaderRows,
   syncQuickStartAliasModelIds,
   resolveQuickStartSubscriptionProfile,
   hasCompletedProviderSetup,
   getQuickStartConnectionLabel,
-  deduplicateProviderId,
   findQuickStartAliasEntry,
-  getQuickStartConnectionDefaults,
   detectPresetHostFromEndpoints,
   buildPresetFreeTierRateLimitRows,
   getQuickStartSuggestedModelIds
 } from "../quick-start-utils.js";
 import { buildLiteLlmModelContextWindowMap } from "../context-window-utils.js";
-import { createRateLimitDraftRows } from "../utils.js";
-import { PROVIDER_PRESET_BY_KEY, findPresetByKey, getPresetOptionsByCategory, initPresetModels, presetModelCache } from "../provider-presets.js";
+import { findPresetByKey, getPresetOptionsByCategory, initPresetModels, presetModelCache } from "../provider-presets.js";
 import { DEFAULT_MODEL_ALIAS_ID } from "../../../runtime/config.js";
 import { ChipInput } from "./chip-input.jsx";
 import { appendRateLimitDraftRow, RateLimitBucketsEditor } from "./rate-limit-editor.jsx";
@@ -85,8 +81,13 @@ export function QuickStartWizard({
   const [completedOAuthSignature, setCompletedOAuthSignature] = useState("");
   const isFirstTestRef = useRef(true);
   const prevApiSigRef = useRef("");
+  const autofillNonceRef = useRef(Math.random().toString(36).slice(2, 10));
   const isEditMode = mode === "edit";
   const isAdditionalProviderFlow = !isEditMode && seedMode === "blank" && hasCompletedProviderSetup(baseConfig);
+  const endpointInputName = `llr-qs-endpoint-${autofillNonceRef.current}`;
+  const endpointInputId = `llr-qs-endpoint-input-${autofillNonceRef.current}`;
+  const credentialInputName = `llr-qs-credential-${autofillNonceRef.current}`;
+  const credentialInputId = `llr-qs-credential-input-${autofillNonceRef.current}`;
 
   const steps = [
     { title: "Provider", detail: "Choose API Key or OAuth first, then enter the provider details needed for that connection type." },
@@ -209,72 +210,12 @@ export function QuickStartWizard({
   }
 
   function applyPreset(nextCategory, nextPresetKey) {
-    const preset = findPresetByKey(nextPresetKey);
-    const isApi = nextCategory === "api";
-
-    setQuickStart((current) => {
-      const currentPreset = findPresetByKey(current.selectedConnection || "custom");
-      const currentDefaults = getQuickStartConnectionDefaults(current.selectedConnection || "custom");
-      const existingProviders = Array.isArray(baseConfig?.providers) ? baseConfig.providers : [];
-      const deduped = deduplicateProviderId(preset.providerId, preset.providerName, existingProviders);
-      const currentHeaderDefaults = current.connectionType === "api"
-        ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
-        : [];
-      const nextHeaderDefaults = isApi
-        ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
-        : [];
-      const currentHeaderRows = normalizeQuickStartHeaderRows(current.headerRows || []);
-      const providerIdWasAuto = !current.providerId
-        || current.providerId === currentPreset.providerId
-        || current.providerId === currentDefaults.providerId
-        || current.providerId === slugifyProviderId(current.providerName || "");
-      const providerNameWasAuto = !current.providerName
-        || current.providerName === currentPreset.providerName
-        || current.providerName === currentDefaults.providerName;
-      const apiKeyEnvWasAuto = !current.apiKeyEnv || current.apiKeyEnv === (currentPreset.apiKeyEnv || "") || current.apiKeyEnv === currentDefaults.apiKeyEnv;
-      const profileWasAuto = !current.subscriptionProfile || current.subscriptionProfile === currentDefaults.subscriptionProfile;
-      const currentDefaultModels = Array.isArray(currentPreset.defaultModels) ? currentPreset.defaultModels : [];
-      const modelsWereDefault = (current.modelIds || []).length === 0
-        || JSON.stringify(current.modelIds || []) === JSON.stringify(currentDefaultModels)
-        || JSON.stringify(current.modelIds || []) === JSON.stringify(currentDefaults.modelIds || []);
-      const headerRowsWereDefault = JSON.stringify(currentHeaderRows) === JSON.stringify(currentHeaderDefaults);
-
-      const presetModels = Array.isArray(preset.defaultModels)
-        ? [...preset.defaultModels]
-        : [];
-      const nextDefaults = getQuickStartConnectionDefaults(nextPresetKey);
-
-      return {
-        ...current,
-        connectionType: nextCategory,
-        selectedConnection: nextPresetKey,
-        providerName: providerNameWasAuto ? deduped.providerName : current.providerName,
-        providerId: providerIdWasAuto ? deduped.providerId : current.providerId,
-        endpoints: isApi
-          ? (preset.endpoint ? [preset.endpoint] : [])
-          : [],
-        endpointDraft: isApi ? String(current.endpointDraft || "") : "",
-        apiKeyEnv: isApi
-          ? (apiKeyEnvWasAuto ? (preset.apiKeyEnv || "") : current.apiKeyEnv)
-          : "",
-        subscriptionProfile: isApi
-          ? ""
-          : (profileWasAuto ? nextDefaults.subscriptionProfile : current.subscriptionProfile),
-        modelIds: modelsWereDefault ? (presetModels.length > 0 ? presetModels : nextDefaults.modelIds) : current.modelIds,
-        modelContextWindows: modelsWereDefault ? {} : (current.modelContextWindows || {}),
-        modelDraft: "",
-        rateLimitRows: isApi
-          ? createRateLimitDraftRows([], {
-              keyPrefix: `quick-start-${nextPresetKey}-rate-limit`,
-              defaults: preset.rateLimitDefaults || PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults,
-              includeDefault: true
-            })
-          : [],
-        headerRows: isApi
-          ? ((currentHeaderRows.length === 0 || headerRowsWereDefault) ? nextHeaderDefaults : currentHeaderRows)
-          : []
-      };
-    });
+    setQuickStart((current) => applyQuickStartConnectionPreset(current, {
+      baseConfig,
+      nextCategory,
+      nextPresetKey,
+      defaultProviderUserAgent
+    }));
   }
 
   async function runModelDiscovery({ force = false, silent = false } = {}) {
@@ -708,6 +649,16 @@ export function QuickStartWizard({
                   isValueValid={isLikelyHttpEndpoint}
                   placeholder="Example: https://api.openai.com/v1"
                   helperText="Paste one or more endpoints"
+                  inputProps={{
+                    id: endpointInputId,
+                    name: endpointInputName,
+                    autoComplete: "off",
+                    autoCapitalize: "none",
+                    autoCorrect: "off",
+                    spellCheck: false,
+                    inputMode: "url",
+                    "data-form-type": "other"
+                  }}
                 />
               </Field>
               <Field label="API key or env">
@@ -716,6 +667,18 @@ export function QuickStartWizard({
                   onChange={(event) => updateQuickStart("apiKeyEnv", event.target.value)}
                   placeholder="Example: OPENAI_API_KEY or sk-..."
                   isEnvVar={looksLikeEnvVarName(quickStart.apiKeyEnv)}
+                  maskMode="obscured-text"
+                  inputProps={{
+                    id: credentialInputId,
+                    name: credentialInputName,
+                    autoComplete: "new-password",
+                    autoCapitalize: "none",
+                    autoCorrect: "off",
+                    spellCheck: false,
+                    "data-form-type": "other",
+                    "data-lpignore": "true",
+                    "data-1p-ignore": "true"
+                  }}
                 />
               </Field>
               <Field label="Custom headers" hint="User-Agent included by default">

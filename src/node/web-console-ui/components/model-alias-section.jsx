@@ -67,8 +67,8 @@ export function ModelAliasSection({
     }));
   }
 
-  async function handleApplyAliasDraft(aliasId, draftAlias) {
-    const result = await onApplyAlias(aliasId, draftAlias);
+  async function handleApplyAliasDraft(aliasId, draftAlias, options = {}) {
+    const result = await onApplyAlias(aliasId, draftAlias, options);
     if (result) {
       const nextAliasId = String(draftAlias?.id || aliasId || "").trim() || aliasId;
       setSelectedAliasId(nextAliasId);

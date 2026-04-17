@@ -26,6 +26,15 @@ import { withCurrentManagedRouteOptions } from "../route-utils.jsx";
 import { DEFAULT_MODEL_ALIAS_ID } from "../../../runtime/config.js";
 import { QUICK_START_ALIAS_ID_PATTERN } from "../constants.js";
 
+const ALIAS_AUTOSAVE_DELAY_MS = 500;
+
+function serializeAliasTargetRows(rows = []) {
+  return (rows || []).map((row) => ({
+    ref: String(row?.ref || "").trim(),
+    weight: String(row?.weight || "1").trim()
+  }));
+}
+
 export function ModelAliasCard({
   aliasId,
   alias,
@@ -57,11 +66,16 @@ export function ModelAliasCard({
   const [aliasIdEditing, setAliasIdEditing] = useState(isNew);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const aliasIdInputRef = useRef(null);
+  const autosaveTimerRef = useRef(0);
+  const lastAutosaveAttemptSignatureRef = useRef("");
+  const [autosaveState, setAutosaveState] = useState("idle");
 
   useEffect(() => {
     setDraft(initialDraft);
     setAliasIdEditing(isNew);
     setSubmitAttempted(false);
+    setAutosaveState("idle");
+    lastAutosaveAttemptSignatureRef.current = "";
   }, [initialDraft, isNew]);
 
   const hasAliasSwitcher = !isNew && Array.isArray(aliasSwitcher?.entries) && aliasSwitcher.entries.length > 1;
@@ -89,31 +103,44 @@ export function ModelAliasCard({
         && option.value !== normalizedAliasId
         && option.value !== `alias:${normalizedAliasId}`
       )),
-      (draft?.targets || []).map((row) => row?.ref)
+      [...(draft?.targets || []).map((row) => row?.ref), ...(draft?.fallbackTargets || []).map((row) => row?.ref)]
     ),
-    [routeOptions, normalizedAliasId, draft?.targets]
+    [routeOptions, normalizedAliasId, draft?.targets, draft?.fallbackTargets]
   );
   const primaryRefs = (draft?.targets || []).map((row) => String(row?.ref || "").trim());
-  const hasBlankRows = (draft?.targets || []).some((row) => !String(row?.ref || "").trim());
-  const hasDuplicates = hasDuplicateTrimmedValues(primaryRefs);
-  const hasInvalidWeights = (draft?.targets || []).some((row) => {
+  const fallbackRefs = (draft?.fallbackTargets || []).map((row) => String(row?.ref || "").trim());
+  const allRefs = [...primaryRefs, ...fallbackRefs];
+  const allRows = [...(draft?.targets || []), ...(draft?.fallbackTargets || [])];
+  const hasBlankRows = allRows.some((row) => !String(row?.ref || "").trim());
+  const hasDuplicates = hasDuplicateTrimmedValues(allRefs);
+  const hasInvalidWeights = allRows.some((row) => {
     if (!String(row?.ref || "").trim()) return false;
     const weight = Math.floor(Number(row?.weight));
     return !Number.isFinite(weight) || weight <= 0;
   });
   const aliasIdConflict = normalizedAliasId && aliasIds.some((candidate) => candidate !== aliasId && candidate === normalizedAliasId);
   const hasSelfReference = normalizedAliasId
-    && primaryRefs.some((ref) => ref === normalizedAliasId || ref === `alias:${normalizedAliasId}`);
-  const hasTargets = primaryRefs.filter(Boolean).length > 0;
+    && allRefs.some((ref) => ref === normalizedAliasId || ref === `alias:${normalizedAliasId}`);
+  const hasTargets = allRefs.filter(Boolean).length > 0;
   const initialSignature = JSON.stringify({
     id: initialDraft.id,
     strategy: initialDraft.strategy,
-    targets: initialDraft.targets.map((row) => ({ ref: row.ref, weight: String(row?.weight || "1") }))
+    targets: serializeAliasTargetRows(initialDraft.targets),
+    fallbackTargets: serializeAliasTargetRows(initialDraft.fallbackTargets)
   });
   const draftSignature = JSON.stringify({
     id: normalizedAliasId,
     strategy: draft?.strategy,
-    targets: (draft?.targets || []).map((row) => ({ ref: String(row?.ref || "").trim(), weight: String(row?.weight || "1").trim() }))
+    targets: serializeAliasTargetRows(draft?.targets),
+    fallbackTargets: serializeAliasTargetRows(draft?.fallbackTargets)
+  });
+  const initialAutosaveSignature = JSON.stringify({
+    targets: serializeAliasTargetRows(initialDraft.targets),
+    fallbackTargets: serializeAliasTargetRows(initialDraft.fallbackTargets)
+  });
+  const autosaveSignature = JSON.stringify({
+    targets: serializeAliasTargetRows(draft?.targets),
+    fallbackTargets: serializeAliasTargetRows(draft?.fallbackTargets)
   });
   const isDirty = initialSignature !== draftSignature;
   const validationIssue = !normalizedAliasId
@@ -150,21 +177,21 @@ export function ModelAliasCard({
   const isAmpDefault = ampDefaultRoute === aliasId || ampDefaultRoute === normalizedAliasId;
   const aliasIdPlaceholder = isNew ? "Enter alias name. Example: claude-opus" : undefined;
   const strategyEntries = useMemo(
-    () => buildAliasStrategyEntries({ ...draft, fallbackTargets: [] }, { ...alias, fallbackTargets: [] }, routeOptions),
+    () => buildAliasStrategyEntries(draft, alias, routeOptions),
     [draft, alias, routeOptions]
   );
 
   async function handleApplyClick() {
     setSubmitAttempted(true);
     if (issue) return false;
-    const result = await onApply(aliasId, { ...draft, fallbackTargets: [] });
+    const result = await onApply(aliasId, draft);
     if (result && isNew) onDiscard(aliasId);
     return result;
   }
 
   async function handleSaveStrategy(strategy) {
     const nextDraft = { ...draft, strategy };
-    const result = await onApply(aliasId, { ...nextDraft, fallbackTargets: [] });
+    const result = await onApply(aliasId, nextDraft);
     if (!result) return false;
     if (isNew) {
       onDiscard(aliasId);
@@ -177,7 +204,7 @@ export function ModelAliasCard({
   async function handleInlineAliasRename() {
     setSubmitAttempted(true);
     if (issue) return false;
-    const result = await onApply(aliasId, { ...draft, fallbackTargets: [] });
+    const result = await onApply(aliasId, draft);
     if (result) {
       setAliasIdEditing(false);
       setSubmitAttempted(false);
@@ -235,6 +262,63 @@ export function ModelAliasCard({
 
     setAliasIdEditing(true);
   }
+
+  useEffect(() => () => {
+    if (typeof window !== "undefined" && autosaveTimerRef.current) {
+      window.clearTimeout(autosaveTimerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isNew || locked || issue || autosaveSignature === initialAutosaveSignature) {
+      if (typeof window !== "undefined" && autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = 0;
+      }
+      if (!isNew && autosaveSignature === initialAutosaveSignature && autosaveState !== "saving") {
+        setAutosaveState("idle");
+      }
+      return undefined;
+    }
+
+    if (lastAutosaveAttemptSignatureRef.current === autosaveSignature && autosaveState === "error") {
+      return undefined;
+    }
+
+    setAutosaveState("pending");
+    if (typeof window === "undefined") return undefined;
+
+    autosaveTimerRef.current = window.setTimeout(() => {
+      autosaveTimerRef.current = 0;
+      lastAutosaveAttemptSignatureRef.current = autosaveSignature;
+      setAutosaveState("saving");
+      void onApply(aliasId, draft, {
+        showSuccessNotice: false,
+        successMessage: ""
+      }).then((result) => {
+        setAutosaveState(result ? "saved" : "error");
+      });
+    }, ALIAS_AUTOSAVE_DELAY_MS);
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = 0;
+      }
+    };
+  }, [aliasId, autosaveSignature, draft, initialAutosaveSignature, isNew, issue, locked, onApply]);
+
+  const autosaveMessage = isNew
+    ? ""
+    : autosaveState === "saving"
+      ? "Saving alias changes…"
+      : autosaveState === "pending"
+        ? "Changes save automatically."
+        : autosaveState === "saved"
+          ? "Alias changes saved."
+          : autosaveState === "error"
+            ? "Autosave failed. Keep editing to retry."
+            : "Changes save automatically.";
 
   const content = (
     <div className="space-y-4">
@@ -408,22 +492,40 @@ export function ModelAliasCard({
       </div>
 
       <RouteTargetListEditor
-        title="Manage model in alias"
+        title="Primary targets"
         rows={draft.targets}
         onChange={(targets) => setDraft((current) => ({ ...current, targets }))}
         options={filteredRouteOptions}
         disabled={locked}
         addLabel="Add target"
         emptyLabel="No targets yet. This alias can stay empty until you wire routes back in."
-        helperText="Drag to reorder targets. Weights and metadata stay with the same ref."
+        helperText="Primary targets are tried first. Drag to reorder targets. Weights and metadata stay with the same ref."
         draftPlaceholder="Add a new target"
         showDraftRow
         showDraftFocusButton
         showWeightInput
         filterOtherSelectedValues
-        excludedValues={[]}
+        excludedValues={fallbackRefs}
       />
 
+      <RouteTargetListEditor
+        title="Fallback targets"
+        rows={draft.fallbackTargets}
+        onChange={(fallbackTargets) => setDraft((current) => ({ ...current, fallbackTargets }))}
+        options={filteredRouteOptions}
+        disabled={locked}
+        addLabel="Add fallback"
+        emptyLabel="No fallback targets configured."
+        helperText="Fallback targets only enter the candidate pool after the full primary list. Weights still apply within the chosen routing strategy."
+        draftPlaceholder="Add a fallback target"
+        showDraftRow
+        showDraftFocusButton
+        showWeightInput
+        filterOtherSelectedValues
+        excludedValues={primaryRefs}
+      />
+
+      {!visibleIssue ? <div className="text-xs text-muted-foreground">{autosaveMessage}</div> : null}
       {visibleIssue ? <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{visibleIssue}</div> : null}
       {!visibleIssue && isFixedDefault && !hasTargets ? (
         <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
@@ -431,32 +533,15 @@ export function ModelAliasCard({
         </div>
       ) : null}
 
-      {isNew || isDirty ? (
+      {isNew ? (
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            {isNew ? (
-              <Button type="button" variant="ghost" onClick={() => onDiscard(aliasId)} disabled={locked}>Discard</Button>
-            ) : null}
+            <Button type="button" variant="ghost" onClick={() => onDiscard(aliasId)} disabled={locked}>Discard</Button>
           </div>
           <div className="flex flex-wrap justify-end gap-2">
-            {isDirty ? (
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => {
-                  setDraft(initialDraft);
-                  setSubmitAttempted(false);
-                }}
-                disabled={locked}
-              >
-                Reset
-              </Button>
-            ) : null}
-            {(isNew || (isDirty && !issue)) ? (
-              <Button type="button" onClick={() => void handleApplyClick()} disabled={locked}>
-                {busy ? "Saving…" : (isNew ? "Create alias" : "Apply alias")}
-              </Button>
-            ) : null}
+            <Button type="button" onClick={() => void handleApplyClick()} disabled={locked || Boolean(issue)}>
+              {busy ? "Saving…" : "Create alias"}
+            </Button>
           </div>
         </div>
       ) : null}

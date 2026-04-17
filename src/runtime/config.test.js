@@ -616,6 +616,50 @@ test("resolveRequestModel prefers an explicit smart alias over the fixed default
   assert.equal(defaultResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
 });
 
+test("resolveRequestModel resolves bare model ids containing brackets (e.g. opus[1m])", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [
+          { id: "opus[1m]" },
+          { id: "sonnet[500k]", aliases: ["sonnet-half"] }
+        ]
+      }
+    ]
+  }));
+
+  const resolved = resolveRequestModel(config, "opus[1m]", FORMATS.OPENAI);
+  assert.equal(resolved.routeType, "bare-model");
+  assert.equal(resolved.resolvedModel, "opus[1m]");
+  assert.equal(resolved.primary.requestModelId, "openrouter/opus[1m]");
+
+  const aliasResolved = resolveRequestModel(config, "sonnet-half", FORMATS.OPENAI);
+  assert.equal(aliasResolved.routeType, "bare-model");
+  assert.equal(aliasResolved.primary.requestModelId, "openrouter/sonnet[500k]");
+});
+
+test("resolveRequestModel resolves alias ids containing brackets (e.g. fast[1m])", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    modelAliases: {
+      "fast[1m]": {
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "fast[1m]", FORMATS.OPENAI);
+  assert.equal(resolved.routeType, "alias");
+  assert.equal(resolved.routeRef, "fast[1m]");
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+});
+
 test("resolveRequestModel uses probed model formats when saved model formats are stale", () => {
   const config = normalizeRuntimeConfig({
     version: CONFIG_VERSION,

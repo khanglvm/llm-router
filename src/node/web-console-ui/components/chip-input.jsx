@@ -15,7 +15,8 @@ export function ChipInput({
   onDraftValueChange = () => {},
   commitOnBlur = false,
   disabled = false,
-  isValueValid = (value) => Boolean(String(value || "").trim())
+  isValueValid = (value) => Boolean(String(value || "").trim()),
+  inputProps = {}
 }) {
   const normalizedValues = useMemo(() => normalizeUniqueTrimmedValues(values), [values]);
   const [editingValue, setEditingValue] = useState("");
@@ -159,6 +160,7 @@ export function ChipInput({
           );
         })}
         <input
+          {...inputProps}
           ref={inputRef}
           className={cn(
             "min-w-[10rem] flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-70",

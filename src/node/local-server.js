@@ -11,6 +11,8 @@ import { readConfigFile, getDefaultConfigPath } from "./config-store.js";
 import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
 import { readActivityLogSettings } from "../shared/local-router-defaults.js";
 import { appendActivityLogEntry, resolveActivityLogPath } from "./activity-log.js";
+import { appendLargeRequestLogEntry, resolveLargeRequestLogPath } from "./large-request-log.js";
+import { isLargeRequestLoggingEnabled } from "../runtime/handler/large-request-log.js";
 
 const DEFAULT_CONFIG_RELOAD_DEBOUNCE_MS = 300;
 const MAX_CONFIG_RELOAD_DEBOUNCE_MS = 5000;
@@ -240,6 +242,7 @@ export async function startLocalRouteServer({
   host = FIXED_LOCAL_ROUTER_HOST,
   configPath = getDefaultConfigPath(),
   activityLogPath = "",
+  largeRequestLogPath = "",
   watchConfig = true,
   configReloadDebounceMs = process.env.LLM_ROUTER_CONFIG_RELOAD_DEBOUNCE_MS,
   validateConfig,
@@ -249,6 +252,7 @@ export async function startLocalRouteServer({
 } = {}) {
   const reloadDebounceMs = resolveReloadDebounceMs(configReloadDebounceMs);
   const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
+  const resolvedLargeRequestLogPath = resolveLargeRequestLogPath(configPath, largeRequestLogPath, process.env);
   let activityLogEnabled = true;
   const configStore = createLiveConfigStore({
     configPath,
@@ -277,6 +281,12 @@ export async function startLocalRouteServer({
         source: entry?.source || "runtime"
       }).catch((error) => {
         console.warn(`[llm-router] Failed writing activity log: ${formatError(error)}`);
+      });
+    },
+    onLargeRequestLog: (entry) => {
+      if (!isLargeRequestLoggingEnabled(process.env)) return;
+      void appendLargeRequestLogEntry(resolvedLargeRequestLogPath, entry).catch((error) => {
+        console.warn(`[llm-router] Failed writing large request log: ${formatError(error)}`);
       });
     }
   });

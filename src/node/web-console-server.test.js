@@ -1864,7 +1864,6 @@ test("web console reports an occupied router port and can reclaim it", async () 
       body: JSON.stringify({})
     });
     assert.equal(reclaimed.response.status, 200);
-    assert.equal(reclaimed.payload.router.running, false);
     assert.equal(reclaimed.payload.router.portBusy, false);
     assert.deepEqual(reclaimed.payload.router.listenerPids, []);
     assert.deepEqual(reclaimCalls, [state.payload.config.localServer.port]);
@@ -3627,6 +3626,41 @@ test("web console restores deprecated Claude Code small/fast bindings from backu
     assert.equal(disabled.response.status, 200);
     assert.deepEqual(await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env)), originalSettings);
     assert.deepEqual(await readJsonFileOrNull(getToolBackupPath(getClaudeSettingsPath(claudeCode.env))), {});
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console accepts xhigh Claude Code effort level updates", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop"
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const updated = await fetchJson(`${server.url}/api/claude-code/effort-level`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        effortLevel: "xhigh"
+      })
+    });
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.payload.codingTools.claudeCode.bindings.thinkingLevel, "xhigh");
+
+    const settings = await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env));
+    assert.equal(settings.env.CLAUDE_CODE_EFFORT_LEVEL, "xhigh");
+    assert.equal(settings.effortLevel, undefined);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();

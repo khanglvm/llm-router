@@ -18,13 +18,13 @@ llr start    # start the local gateway
 llr ai-help  # agent-oriented setup brief
 ```
 
-1. Open the Web UI and add a provider (API key or OAuth login)
+1. Open the Web UI and add a provider (API key or OAuth login). Built-in provider presets prefill the usual endpoint and starter models.
 2. Create model aliases with routing strategy
 3. Start the gateway and point your tools at the local endpoint
 
 ## What You Can Do
 
-- **Add & manage providers** — connect any OpenAI/Anthropic-compatible API endpoint, test connectivity, auto-discover models
+- **Add & manage providers** — connect any OpenAI/Anthropic-compatible API endpoint, start from built-in provider presets, test connectivity, auto-discover models
 - **Unified endpoint** — one local gateway that accepts both OpenAI and Anthropic request formats
 - **Model aliases with routing** — group models into stable alias names with weighted round-robin, quota-aware balancing, and automatic fallback
 - **Rate limiting** — set request caps per model or across all models over configurable time windows

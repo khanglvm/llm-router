@@ -37,7 +37,7 @@ const ALLOWED_RATE_LIMIT_WINDOW_UNITS = new Set([
   "week",
   "month"
 ]);
-const ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\-\[\]]*$/;
 const SUBSCRIPTION_PROVIDER_TYPES = Object.freeze({
   CHATGPT_CODEX: "chatgpt-codex",
   CLAUDE_CODE: "claude-code"

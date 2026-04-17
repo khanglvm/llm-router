@@ -75,6 +75,7 @@ import {
   ensureWebSearchConfigShape,
   buildWebSearchProviderRows,
   buildHostedWebSearchCandidateGroups,
+  buildHostedWebSearchProviderId,
   normalizeWebSearchProviderKey,
   updateWebSearchConfig,
   updateWebSearchProviderConfig,
@@ -288,9 +289,18 @@ export function App() {
   );
   const factoryDroidRouteOptions = useMemo(
     () => withCurrentManagedRouteOptions(managedRouteOptions, [
-      factoryDroidState?.bindings?.defaultModel
+      factoryDroidState?.bindings?.defaultModel,
+      factoryDroidState?.bindings?.missionOrchestratorModel,
+      factoryDroidState?.bindings?.missionWorkerModel,
+      factoryDroidState?.bindings?.missionValidatorModel
     ]),
-    [managedRouteOptions, factoryDroidState?.bindings?.defaultModel]
+    [
+      managedRouteOptions,
+      factoryDroidState?.bindings?.defaultModel,
+      factoryDroidState?.bindings?.missionOrchestratorModel,
+      factoryDroidState?.bindings?.missionWorkerModel,
+      factoryDroidState?.bindings?.missionValidatorModel
+    ]
   );
   const ampDefaultRoute = String(ampEditableConfig?.amp?.defaultRoute || ampEditableConfig?.defaultModel || pickFallbackDefaultModel(ampEditableConfig) || "").trim();
   const effectiveMasterKey = String(ampEditableConfig?.masterKey || snapshot?.config?.document?.masterKey || "").trim();
@@ -364,7 +374,9 @@ export function App() {
             })
           });
           if (currentSequence !== ampAutosaveSequenceRef.current) return;
-          applySnapshot(payload);
+          applySnapshot(payload, {
+            preserveDraft: draftRef.current !== ampAutosaveRequest.rawText
+          });
           setAmpAutosaveState({
             status: "saved",
             message: "",
@@ -585,7 +597,9 @@ export function App() {
         headers: JSON_HEADERS,
         body: JSON.stringify({ rawText })
       });
-      applySnapshot(payload);
+      applySnapshot(payload, {
+        preserveDraft: draftRef.current !== rawText
+      });
       if (showSuccessNotice && successMessage) {
         showNotice("success", successMessage);
       }
@@ -1158,7 +1172,7 @@ export function App() {
     }
   }
 
-  async function handleApplyModelAlias(aliasId, draftAlias) {
+  async function handleApplyModelAlias(aliasId, draftAlias, options = {}) {
     if (providerEditorDisabledReason) {
       showNotice("warning", providerEditorDisabledReason);
       return false;
@@ -1167,7 +1181,9 @@ export function App() {
     const nextConfig = applyModelAliasEdits(parsedDraftState.value || persistedConfig, aliasId, draftAlias);
     const resolvedAliasId = String(draftAlias?.id || aliasId || "").trim() || aliasId;
     try {
-      await saveInlineConfigObject(nextConfig, `Updated alias ${resolvedAliasId}.`);
+      await saveInlineConfigObject(nextConfig, options.successMessage || `Updated alias ${resolvedAliasId}.`, {
+        showSuccessNotice: options.showSuccessNotice !== false
+      });
       return true;
     } catch {
       return false;
@@ -1717,6 +1733,9 @@ export function App() {
           endpointUrl: ampClientUrl,
           bindings: shouldEnable ? {
             defaultModel: factoryDroidState?.bindings?.defaultModel || "",
+            missionOrchestratorModel: factoryDroidState?.bindings?.missionOrchestratorModel || "",
+            missionWorkerModel: factoryDroidState?.bindings?.missionWorkerModel || "",
+            missionValidatorModel: factoryDroidState?.bindings?.missionValidatorModel || "",
             reasoningEffort: factoryDroidState?.bindings?.reasoningEffort || ""
           } : undefined
         })
@@ -1733,6 +1752,9 @@ export function App() {
   async function handleFactoryDroidBindingChange(fieldId, value) {
     const nextBindings = {
       defaultModel: factoryDroidState?.bindings?.defaultModel || "",
+      missionOrchestratorModel: factoryDroidState?.bindings?.missionOrchestratorModel || "",
+      missionWorkerModel: factoryDroidState?.bindings?.missionWorkerModel || "",
+      missionValidatorModel: factoryDroidState?.bindings?.missionValidatorModel || "",
       reasoningEffort: factoryDroidState?.bindings?.reasoningEffort || ""
     };
     nextBindings[fieldId] = value;
@@ -2336,12 +2358,39 @@ export function App() {
               bindingFields={[
                 {
                   id: "defaultModel",
-                  label: "Default model",
-                  description: "Choose a managed route/alias to set Factory Droid `model`. This controls which upstream model Factory Droid uses by default.",
-                  envKey: "model",
+                  label: "Normal mode model",
+                  description: "Choose a managed route or alias for normal Factory sessions. LLM Router writes both the legacy `model` field and current `sessionDefaultSettings.model` default.",
+                  envKey: "sessionDefaultSettings.model",
                   value: factoryDroidState?.bindings?.defaultModel || "",
                   allowUnset: true,
                   placeholder: "Select a default route"
+                },
+                {
+                  id: "missionOrchestratorModel",
+                  label: "Mission orchestrator",
+                  description: "Choose the managed route or alias used for Factory mission orchestration.",
+                  envKey: "missionOrchestratorModel",
+                  value: factoryDroidState?.bindings?.missionOrchestratorModel || "",
+                  allowUnset: true,
+                  placeholder: "Use Factory orchestrator default"
+                },
+                {
+                  id: "missionWorkerModel",
+                  label: "Mission worker",
+                  description: "Choose the managed route or alias used for Factory mission workers.",
+                  envKey: "missionModelSettings.workerModel",
+                  value: factoryDroidState?.bindings?.missionWorkerModel || "",
+                  allowUnset: true,
+                  placeholder: "Use Factory worker default"
+                },
+                {
+                  id: "missionValidatorModel",
+                  label: "Mission validator",
+                  description: "Choose the managed route or alias used for Factory validation workers.",
+                  envKey: "missionModelSettings.validationWorkerModel",
+                  value: factoryDroidState?.bindings?.missionValidatorModel || "",
+                  allowUnset: true,
+                  placeholder: "Use Factory validator default"
                 },
                 {
                   id: "reasoningEffort",

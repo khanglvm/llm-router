@@ -123,7 +123,7 @@ const WEAK_MASTER_KEY_PATTERN = /(password|changeme|default|secret|token|admin|q
 export const CLOUDFLARE_FREE_SECRET_SIZE_LIMIT_BYTES = 5 * 1024;
 const CLOUDFLARE_FREE_TIER_PATTERN = /\bfree\b/i;
 const CLOUDFLARE_PAID_TIER_PATTERN = /\b(pro|business|enterprise|paid|unbound)\b/i;
-const MODEL_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const MODEL_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\-\[\]]*$/;
 const MODEL_ROUTING_STRATEGY_OPTIONS = [
   {
     value: "auto",
@@ -3931,7 +3931,11 @@ function buildFactoryDroidStatusSection(state = {}) {
     ["Settings File", state.settingsFilePath || resolveFactoryDroidSettingsFilePath({})],
     ["Backup File", state.backupFilePath || "(not created)"],
     ["Base URL", state.configuredBaseUrl || "(not set)"],
+    ["Provider", state.configuredProvider || "(not set)"],
     ["Default Model", state.bindings?.defaultModel || "(not set)"],
+    ["Mission Orchestrator", state.bindings?.missionOrchestratorModel || "(not set)"],
+    ["Mission Worker", state.bindings?.missionWorkerModel || "(not set)"],
+    ["Mission Validator", state.bindings?.missionValidatorModel || "(not set)"],
     ["Reasoning Effort", state.bindings?.reasoningEffort || "(not set)"],
     ["Error", state.error || "(none)"]
   ]);
@@ -6646,10 +6650,23 @@ async function doSetFactoryDroidRouting(context) {
   }
 
   const existingBindings = existingState.bindings || {};
+  const resolvedDefaultModel = String(readArg(args, ["default-model", "defaultModel"], undefined) !== undefined
+    ? readArg(args, ["default-model", "defaultModel"], "")
+    : (existingBindings.defaultModel || pickDefaultManagedRoute(config) || "")).trim();
+  const legacyMissionModel = String(readArg(args, ["mission-model", "missionModel"], undefined) !== undefined
+    ? readArg(args, ["mission-model", "missionModel"], "")
+    : "").trim();
   const bindings = {
-    defaultModel: String(readArg(args, ["default-model", "defaultModel"], undefined) !== undefined
-      ? readArg(args, ["default-model", "defaultModel"], "")
-      : (existingBindings.defaultModel || pickDefaultManagedRoute(config) || "")).trim(),
+    defaultModel: resolvedDefaultModel,
+    missionOrchestratorModel: String(readArg(args, ["mission-orchestrator-model", "missionOrchestratorModel"], undefined) !== undefined
+      ? readArg(args, ["mission-orchestrator-model", "missionOrchestratorModel"], "")
+      : (existingBindings.missionOrchestratorModel || legacyMissionModel || resolvedDefaultModel || "")).trim(),
+    missionWorkerModel: String(readArg(args, ["mission-worker-model", "missionWorkerModel"], undefined) !== undefined
+      ? readArg(args, ["mission-worker-model", "missionWorkerModel"], "")
+      : (existingBindings.missionWorkerModel || legacyMissionModel || resolvedDefaultModel || "")).trim(),
+    missionValidatorModel: String(readArg(args, ["mission-validator-model", "missionValidatorModel"], undefined) !== undefined
+      ? readArg(args, ["mission-validator-model", "missionValidatorModel"], "")
+      : (existingBindings.missionValidatorModel || legacyMissionModel || resolvedDefaultModel || "")).trim(),
     reasoningEffort: normalizeFactoryDroidReasoningEffort(
       readArg(args, ["reasoning-effort", "reasoningEffort"], undefined) !== undefined
         ? readArg(args, ["reasoning-effort", "reasoningEffort"], "")
@@ -6674,7 +6691,11 @@ async function doSetFactoryDroidRouting(context) {
         ["Settings File", patchResult.settingsFilePath],
         ["Backup File", patchResult.backupFilePath],
         ["Base URL", patchResult.baseUrl],
+        ["Provider", patchResult.configuredProvider || "generic-chat-completion-api"],
         ["Default Model", patchResult.bindings?.defaultModel || "(not set)"],
+        ["Mission Orchestrator", patchResult.bindings?.missionOrchestratorModel || "(not set)"],
+        ["Mission Worker", patchResult.bindings?.missionWorkerModel || "(not set)"],
+        ["Mission Validator", patchResult.bindings?.missionValidatorModel || "(not set)"],
         ["Reasoning Effort", patchResult.bindings?.reasoningEffort || "(not set)"]
       ]
     )
@@ -9430,6 +9451,8 @@ async function runAiHelpAction(context) {
     "### Factory Droid",
     "- required_gate=patch_gate_factory_droid=ready",
     `- enable/update route: ${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=true --default-model=<target_model_or_group>`,
+    `- optional mission bindings: --mission-orchestrator-model=<route> --mission-worker-model=<route> --mission-validator-model=<route>`,
+    `- legacy shortcut: --mission-model=<target_model_or_group> sets all three Mission defaults`,
     `- optional reasoning: --reasoning-effort=off|none|low|medium|high`,
     `- disable route: ${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=false`,
     "",
@@ -10701,6 +10724,10 @@ const routerModule = {
           { name: "master-key-length", required: false, description: "Generated master key length (min 24).", example: "--master-key-length=48" },
           { name: "master-key-prefix", required: false, description: "Generated master key prefix.", example: "--master-key-prefix=gw_" },
           { name: "default-model", required: false, description: `For set-codex-cli-routing / set-factory-droid-routing: managed route binding, or ${CODEX_CLI_INHERIT_MODEL_VALUE} to keep Codex's own model selection.`, example: "--default-model=chat.default" },
+          { name: "mission-model", required: false, description: "Legacy shortcut for set-factory-droid-routing: applies the same managed route binding to all Factory Mission defaults.", example: "--mission-model=chat.deep" },
+          { name: "mission-orchestrator-model", required: false, description: "For set-factory-droid-routing: managed route binding for Factory mission orchestration.", example: "--mission-orchestrator-model=chat.plan" },
+          { name: "mission-worker-model", required: false, description: "For set-factory-droid-routing: managed route binding for Factory mission workers.", example: "--mission-worker-model=chat.build" },
+          { name: "mission-validator-model", required: false, description: "For set-factory-droid-routing: managed route binding for Factory mission validators.", example: "--mission-validator-model=chat.review" },
           { name: "thinking-level", required: false, description: "For set-codex-cli-routing / set-claude-code-routing / set-claude-code-effort-level: reasoning level.", example: "--thinking-level=medium" },
           { name: "reasoning-effort", required: false, description: "For set-factory-droid-routing: reasoning effort level (off, none, low, medium, high).", example: "--reasoning-effort=medium" },
           { name: "factory-droid-settings-file", required: false, description: "Explicit Factory Droid settings.json path for routing/status operations.", example: "--factory-droid-settings-file=~/.factory/settings.json" },
@@ -10775,7 +10802,7 @@ const routerModule = {
           `${CLI_COMMAND} config --operation=set-codex-cli-routing --enabled=true --default-model=chat.default`,
           `${CLI_COMMAND} config --operation=set-claude-code-routing --enabled=true --primary-model=chat.default --default-haiku-model=chat.fast`,
           `${CLI_COMMAND} config --operation=set-claude-code-effort-level --thinking-level=high`,
-          `${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=true --default-model=chat.default --reasoning-effort=medium`,
+          `${CLI_COMMAND} config --operation=set-factory-droid-routing --enabled=true --default-model=chat.default --mission-orchestrator-model=chat.plan --mission-worker-model=chat.build --mission-validator-model=chat.review --reasoning-effort=medium`,
           `${CLI_COMMAND} config --operation=set-amp-client-routing --enabled=true --amp-client-settings-scope=workspace`,
           `${CLI_COMMAND} config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN} --amp-client-api-key=gw_...`,
           `${CLI_COMMAND} config --operation=list-routing`,

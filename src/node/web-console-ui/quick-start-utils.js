@@ -269,6 +269,86 @@ export function getQuickStartConnectionDefaults(presetKey, protocol = "openai") 
   };
 }
 
+export function applyQuickStartConnectionPreset(current = {}, {
+  baseConfig = {},
+  nextCategory,
+  nextPresetKey,
+  defaultProviderUserAgent = QUICK_START_FALLBACK_USER_AGENT
+} = {}) {
+  const preset = findPresetByKey(nextPresetKey);
+  const isApi = nextCategory === "api";
+  const currentPresetKey = current.selectedConnection || "custom";
+  const currentPreset = findPresetByKey(currentPresetKey);
+  const currentDefaults = getQuickStartConnectionDefaults(currentPresetKey);
+  const existingProviders = Array.isArray(baseConfig?.providers) ? baseConfig.providers : [];
+  const deduped = deduplicateProviderId(preset.providerId, preset.providerName, existingProviders);
+  const currentHeaderDefaults = current.connectionType === "api"
+    ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
+    : [];
+  const nextHeaderDefaults = isApi
+    ? getQuickStartDefaultHeaderRows(defaultProviderUserAgent)
+    : [];
+  const currentHeaderRows = normalizeQuickStartHeaderRows(current.headerRows || []);
+  const providerIdWasAuto = !current.providerId
+    || current.providerId === currentPreset.providerId
+    || current.providerId === currentDefaults.providerId
+    || current.providerId === slugifyProviderId(current.providerName || "");
+  const providerNameWasAuto = !current.providerName
+    || current.providerName === currentPreset.providerName
+    || current.providerName === currentDefaults.providerName;
+  const profileWasAuto = !current.subscriptionProfile || current.subscriptionProfile === currentDefaults.subscriptionProfile;
+  const currentDefaultModels = Array.isArray(currentPreset.defaultModels) ? currentPreset.defaultModels : [];
+  const modelsWereDefault = (current.modelIds || []).length === 0
+    || JSON.stringify(current.modelIds || []) === JSON.stringify(currentDefaultModels)
+    || JSON.stringify(current.modelIds || []) === JSON.stringify(currentDefaults.modelIds || []);
+  const headerRowsWereDefault = JSON.stringify(currentHeaderRows) === JSON.stringify(currentHeaderDefaults);
+  const currentEndpoints = mergeChipValuesAndDraft(current.endpoints, current.endpointDraft);
+  const currentDefaultEndpoints = Array.isArray(currentDefaults.endpoints) ? currentDefaults.endpoints : [];
+  const endpointsWereAuto = currentEndpoints.length === 0
+    || JSON.stringify(currentEndpoints) === JSON.stringify(currentDefaultEndpoints);
+  const currentApiKeyEnv = String(current.apiKeyEnv || "").trim();
+  const apiKeyEnvWasAuto = !currentApiKeyEnv
+    || currentApiKeyEnv === String(currentPreset.apiKeyEnv || "").trim()
+    || currentApiKeyEnv === String(currentDefaults.apiKeyEnv || "").trim();
+  const presetModels = Array.isArray(preset.defaultModels)
+    ? [...preset.defaultModels]
+    : [];
+  const nextDefaults = getQuickStartConnectionDefaults(nextPresetKey);
+
+  return {
+    ...current,
+    connectionType: nextCategory,
+    selectedConnection: nextPresetKey,
+    providerName: providerNameWasAuto ? deduped.providerName : current.providerName,
+    providerId: providerIdWasAuto ? deduped.providerId : current.providerId,
+    endpoints: isApi
+      ? (endpointsWereAuto ? [...nextDefaults.endpoints] : (Array.isArray(current.endpoints) ? current.endpoints : []))
+      : [],
+    endpointDraft: isApi
+      ? (endpointsWereAuto ? "" : String(current.endpointDraft || ""))
+      : "",
+    apiKeyEnv: isApi
+      ? (apiKeyEnvWasAuto ? (preset.apiKeyEnv || "") : current.apiKeyEnv)
+      : "",
+    subscriptionProfile: isApi
+      ? ""
+      : (profileWasAuto ? nextDefaults.subscriptionProfile : current.subscriptionProfile),
+    modelIds: modelsWereDefault ? (presetModels.length > 0 ? presetModels : nextDefaults.modelIds) : current.modelIds,
+    modelContextWindows: modelsWereDefault ? {} : (current.modelContextWindows || {}),
+    modelDraft: "",
+    rateLimitRows: isApi
+      ? createRateLimitDraftRows([], {
+          keyPrefix: `quick-start-${nextPresetKey}-rate-limit`,
+          defaults: preset.rateLimitDefaults || PROVIDER_PRESET_BY_KEY.custom.rateLimitDefaults,
+          includeDefault: true
+        })
+      : [],
+    headerRows: isApi
+      ? ((currentHeaderRows.length === 0 || headerRowsWereDefault) ? nextHeaderDefaults : currentHeaderRows)
+      : []
+  };
+}
+
 export function findQuickStartAliasEntry(baseConfig = {}, providerId = "", { aliasId = "" } = {}) {
   if (!providerId) return null;
   const aliases = baseConfig?.modelAliases && typeof baseConfig.modelAliases === "object" && !Array.isArray(baseConfig.modelAliases)

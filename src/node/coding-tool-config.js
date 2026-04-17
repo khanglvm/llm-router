@@ -966,11 +966,16 @@ export async function patchClaudeCodeEffortLevel({
 }
 
 const FACTORY_DROID_ROUTER_MARKER = "_llmRouterManaged";
+const FACTORY_DROID_ROUTER_PROVIDER = "generic-chat-completion-api";
 
 function normalizeFactoryDroidBindings(bindings = {}) {
   const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+  const legacyMissionModel = normalizeModelBinding(source.missionModel);
   return {
     defaultModel: normalizeModelBinding(source.defaultModel),
+    missionOrchestratorModel: normalizeModelBinding(source.missionOrchestratorModel) || legacyMissionModel,
+    missionWorkerModel: normalizeModelBinding(source.missionWorkerModel) || legacyMissionModel,
+    missionValidatorModel: normalizeModelBinding(source.missionValidatorModel) || legacyMissionModel,
     reasoningEffort: normalizeFactoryDroidReasoningEffort(source.reasoningEffort)
   };
 }
@@ -987,15 +992,95 @@ function findRouterManagedCustomModelIndex(customModels) {
   );
 }
 
+function getRouterManagedCustomModel(customModels) {
+  const routerIndex = findRouterManagedCustomModelIndex(customModels);
+  return routerIndex >= 0 ? customModels[routerIndex] : null;
+}
+
+function stripRouterManagedCustomModels(customModels) {
+  if (!Array.isArray(customModels)) return [];
+  return customModels.filter(
+    (entry) => !(entry && typeof entry === "object" && entry[FACTORY_DROID_ROUTER_MARKER] === true)
+  );
+}
+
+function getNestedObjectValue(source, keys = []) {
+  let current = source;
+  for (const key of keys) {
+    if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) {
+      return undefined;
+    }
+    current = current[key];
+  }
+  return current;
+}
+
+function setNestedObjectValue(target, keys = [], value) {
+  if (!target || typeof target !== "object" || Array.isArray(target) || !Array.isArray(keys) || keys.length === 0) {
+    return;
+  }
+
+  let current = target;
+  for (let index = 0; index < keys.length - 1; index += 1) {
+    const key = keys[index];
+    const nextValue = current[key];
+    if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
+      current[key] = {};
+    }
+    current = current[key];
+  }
+
+  current[keys[keys.length - 1]] = value;
+}
+
+function deleteNestedObjectValue(target, keys = []) {
+  if (!target || typeof target !== "object" || Array.isArray(target) || !Array.isArray(keys) || keys.length === 0) {
+    return;
+  }
+
+  const parents = [];
+  let current = target;
+  for (let index = 0; index < keys.length - 1; index += 1) {
+    const key = keys[index];
+    if (!current[key] || typeof current[key] !== "object" || Array.isArray(current[key])) {
+      return;
+    }
+    parents.push([current, key]);
+    current = current[key];
+  }
+
+  delete current[keys[keys.length - 1]];
+
+  for (let index = parents.length - 1; index >= 0; index -= 1) {
+    const [parent, key] = parents[index];
+    const value = parent[key];
+    if (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0) {
+      delete parent[key];
+      continue;
+    }
+    break;
+  }
+}
+
+function applyNestedBackupValue(target, keys = [], snapshot) {
+  if (snapshot?.exists) {
+    setNestedObjectValue(target, keys, String(snapshot.value || ""));
+    return;
+  }
+  deleteNestedObjectValue(target, keys);
+}
+
 function captureFactoryDroidBackup(config) {
   const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
-  const model = String(config?.model || "").trim();
-  const reasoningEffort = String(config?.reasoningEffort || "").trim();
   return {
     tool: "factory-droid",
-    version: 1,
-    model: { exists: Boolean(model), value: model },
-    reasoningEffort: { exists: Boolean(reasoningEffort), value: reasoningEffort },
+    version: 2,
+    model: getBackupValue(config?.model),
+    sessionDefaultModel: getBackupValue(getNestedObjectValue(config, ["sessionDefaultSettings", "model"])),
+    missionOrchestratorModel: getBackupValue(config?.missionOrchestratorModel),
+    missionWorkerModel: getBackupValue(getNestedObjectValue(config, ["missionModelSettings", "workerModel"])),
+    missionValidationWorkerModel: getBackupValue(getNestedObjectValue(config, ["missionModelSettings", "validationWorkerModel"])),
+    reasoningEffort: getBackupValue(config?.reasoningEffort),
     hadCustomModels: customModels.length > 0
   };
 }
@@ -1005,17 +1090,16 @@ function applyFactoryDroidBackup(config, backup = {}) {
     ? structuredClone(config)
     : {};
 
-  const customModels = Array.isArray(next.customModels) ? [...next.customModels] : [];
-  const routerIndex = findRouterManagedCustomModelIndex(customModels);
-  if (routerIndex >= 0) customModels.splice(routerIndex, 1);
+  const customModels = stripRouterManagedCustomModels(next.customModels);
   if (customModels.length > 0) next.customModels = customModels;
   else delete next.customModels;
 
-  if (backup?.model?.exists) next.model = backup.model.value;
-  else delete next.model;
-
-  if (backup?.reasoningEffort?.exists) next.reasoningEffort = backup.reasoningEffort.value;
-  else delete next.reasoningEffort;
+  applyBackupValue(next, "model", backup?.model);
+  applyNestedBackupValue(next, ["sessionDefaultSettings", "model"], backup?.sessionDefaultModel);
+  applyBackupValue(next, "missionOrchestratorModel", backup?.missionOrchestratorModel);
+  applyNestedBackupValue(next, ["missionModelSettings", "workerModel"], backup?.missionWorkerModel);
+  applyNestedBackupValue(next, ["missionModelSettings", "validationWorkerModel"], backup?.missionValidationWorkerModel);
+  applyBackupValue(next, "reasoningEffort", backup?.reasoningEffort);
 
   return next;
 }
@@ -1060,9 +1144,9 @@ export async function readFactoryDroidRoutingState({
   const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Factory Droid settings file '${resolvedSettingsPath}'`);
   const backupState = await readJsonObjectFile(resolvedBackupPath, `Backup file '${resolvedBackupPath}'`);
   const customModels = Array.isArray(settingsState.data?.customModels) ? settingsState.data.customModels : [];
-  const routerIndex = findRouterManagedCustomModelIndex(customModels);
-  const routerEntry = routerIndex >= 0 ? customModels[routerIndex] : null;
+  const routerEntry = getRouterManagedCustomModel(customModels);
   const configuredBaseUrl = routerEntry ? String(routerEntry.baseUrl || "").trim() : "";
+  const configuredProvider = routerEntry ? String(routerEntry.provider || "").trim() : "";
   const routedViaRouter = Boolean(
     expectedBaseUrl
       && routerEntry
@@ -1077,8 +1161,15 @@ export async function readFactoryDroidRoutingState({
     backupExists: backupState.existed,
     routedViaRouter,
     configuredBaseUrl,
+    configuredProvider,
     bindings: normalizeFactoryDroidBindings({
-      defaultModel: routerEntry?.model || settingsState.data?.model || "",
+      defaultModel: getNestedObjectValue(settingsState.data, ["sessionDefaultSettings", "model"])
+        || settingsState.data?.model
+        || routerEntry?.model
+        || "",
+      missionOrchestratorModel: settingsState.data?.missionOrchestratorModel || "",
+      missionWorkerModel: getNestedObjectValue(settingsState.data, ["missionModelSettings", "workerModel"]) || "",
+      missionValidatorModel: getNestedObjectValue(settingsState.data, ["missionModelSettings", "validationWorkerModel"]) || "",
       reasoningEffort: normalizeFactoryDroidReasoningEffort(settingsState.data?.reasoningEffort)
     })
   };
@@ -1118,26 +1209,47 @@ export async function patchFactoryDroidSettingsFile({
     await writeJsonObjectFile(resolvedBackupPath, backup);
   }
 
-  const customModels = Array.isArray(nextSettings.customModels) ? [...nextSettings.customModels] : [];
-  const routerIndex = findRouterManagedCustomModelIndex(customModels);
+  const customModels = stripRouterManagedCustomModels(nextSettings.customModels);
   const routerEntry = {
     [FACTORY_DROID_ROUTER_MARKER]: true,
-    model: normalizedBindings.defaultModel || "llm-router",
+    model: normalizedBindings.defaultModel
+      || normalizedBindings.missionOrchestratorModel
+      || normalizedBindings.missionWorkerModel
+      || normalizedBindings.missionValidatorModel
+      || "llm-router",
     displayName: "LLM Router",
     baseUrl,
     apiKey: normalizedApiKey,
-    provider: "openai"
+    provider: FACTORY_DROID_ROUTER_PROVIDER
   };
 
-  if (routerIndex >= 0) {
-    customModels[routerIndex] = routerEntry;
-  } else {
-    customModels.push(routerEntry);
-  }
+  customModels.push(routerEntry);
   nextSettings.customModels = customModels;
 
   if (normalizedBindings.defaultModel) {
     nextSettings.model = normalizedBindings.defaultModel;
+    setNestedObjectValue(nextSettings, ["sessionDefaultSettings", "model"], normalizedBindings.defaultModel);
+  } else {
+    delete nextSettings.model;
+    deleteNestedObjectValue(nextSettings, ["sessionDefaultSettings", "model"]);
+  }
+
+  if (normalizedBindings.missionOrchestratorModel) {
+    nextSettings.missionOrchestratorModel = normalizedBindings.missionOrchestratorModel;
+  } else {
+    delete nextSettings.missionOrchestratorModel;
+  }
+
+  if (normalizedBindings.missionWorkerModel) {
+    setNestedObjectValue(nextSettings, ["missionModelSettings", "workerModel"], normalizedBindings.missionWorkerModel);
+  } else {
+    deleteNestedObjectValue(nextSettings, ["missionModelSettings", "workerModel"]);
+  }
+
+  if (normalizedBindings.missionValidatorModel) {
+    setNestedObjectValue(nextSettings, ["missionModelSettings", "validationWorkerModel"], normalizedBindings.missionValidatorModel);
+  } else {
+    deleteNestedObjectValue(nextSettings, ["missionModelSettings", "validationWorkerModel"]);
   }
 
   if (normalizedBindings.reasoningEffort) {
@@ -1152,6 +1264,7 @@ export async function patchFactoryDroidSettingsFile({
     backupFilePath: resolvedBackupPath,
     settingsCreated: !settingsState.existed,
     baseUrl,
+    configuredProvider: FACTORY_DROID_ROUTER_PROVIDER,
     bindings: normalizedBindings
   };
 }

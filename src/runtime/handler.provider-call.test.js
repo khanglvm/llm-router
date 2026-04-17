@@ -579,3 +579,129 @@ test("makeProviderCall falls back to Claude routing when OpenAI tool routing fai
     globalThis.fetch = originalFetch;
   }
 });
+
+test("makeProviderCall queues an oversized request log entry when enabled", { concurrency: false }, async () => {
+  const logs = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({
+    id: "resp_large_log",
+    object: "response",
+    model: "gpt-5.4",
+    output: [{
+      id: "msg_1",
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "Logged."
+      }]
+    }]
+  });
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "rc/gpt-5.4",
+        input: "A".repeat(1024),
+        tools: [{ type: "web_search_preview" }]
+      },
+      sourceFormat: FORMATS.OPENAI,
+      stream: false,
+      candidate: buildOpenAICandidate(),
+      requestKind: "responses",
+      requestHeaders: new Headers(),
+      env: {
+        LLM_ROUTER_LOG_LARGE_REQUESTS: "1",
+        LLM_ROUTER_LARGE_REQUEST_LOG_THRESHOLD_BYTES: "32"
+      },
+      onLargeRequestLog: async (entry) => {
+        logs.push(entry);
+      }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0]?.kind, "large-provider-request");
+    assert.equal(logs[0]?.providerId, "rc");
+    assert.equal(logs[0]?.targetFormat, FORMATS.OPENAI);
+    assert.equal(logs[0]?.requestKind, "responses");
+    assert.equal(logs[0]?.bodySummary?.toolTypes?.[0], "web_search_preview");
+    assert.ok(logs[0]?.requestBytes >= 32);
+    assert.ok(logs[0]?.bodySummary?.largestStringBytes >= 1024);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("makeProviderCall skips oversized request logging when disabled", { concurrency: false }, async () => {
+  const logs = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({
+    id: "resp_large_log_disabled",
+    object: "response",
+    model: "gpt-5.4",
+    output: []
+  });
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "rc/gpt-5.4",
+        input: "B".repeat(1024)
+      },
+      sourceFormat: FORMATS.OPENAI,
+      stream: false,
+      candidate: buildOpenAICandidate(),
+      requestKind: "responses",
+      requestHeaders: new Headers(),
+      env: {
+        LLM_ROUTER_LOG_LARGE_REQUESTS: "0",
+        LLM_ROUTER_LARGE_REQUEST_LOG_THRESHOLD_BYTES: "32"
+      },
+      onLargeRequestLog: (entry) => {
+        logs.push(entry);
+      }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(logs.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("makeProviderCall ignores oversized request logger failures", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({
+    id: "resp_large_log_error",
+    object: "response",
+    model: "gpt-5.4",
+    output: []
+  });
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "rc/gpt-5.4",
+        input: "C".repeat(1024)
+      },
+      sourceFormat: FORMATS.OPENAI,
+      stream: false,
+      candidate: buildOpenAICandidate(),
+      requestKind: "responses",
+      requestHeaders: new Headers(),
+      env: {
+        LLM_ROUTER_LOG_LARGE_REQUESTS: "1",
+        LLM_ROUTER_LARGE_REQUEST_LOG_THRESHOLD_BYTES: "32"
+      },
+      onLargeRequestLog: async () => {
+        throw new Error("logger failed");
+      }
+    });
+
+    assert.equal(result.ok, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

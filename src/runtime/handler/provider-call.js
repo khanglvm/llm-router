@@ -36,9 +36,60 @@ import {
   rewriteProviderBodyForAmpWebSearch,
   shouldInterceptAmpWebSearch
 } from "./amp-web-search.js";
+import {
+  buildLargeRequestLogEntry,
+  isLargeRequestLoggingEnabled,
+  measureSerializedRequestBytes,
+  resolveLargeRequestLogThresholdBytes
+} from "./large-request-log.js";
 
 function isSubscriptionProvider(provider) {
   return provider?.type === "subscription";
+}
+
+function queueLargeRequestEvent(onLargeRequestLog, payload) {
+  if (typeof onLargeRequestLog !== "function") return;
+  try {
+    const result = onLargeRequestLog(payload);
+    if (result && typeof result.then === "function") {
+      result.catch(() => {});
+    }
+  } catch {
+  }
+}
+
+function maybeQueueLargeRequestLog({
+  env,
+  onLargeRequestLog,
+  providerBody,
+  serializedBody,
+  providerUrl,
+  candidate,
+  sourceFormat,
+  targetFormat,
+  requestKind,
+  clientType,
+  stream,
+  providerType = "http"
+} = {}) {
+  if (!isLargeRequestLoggingEnabled(env) || typeof onLargeRequestLog !== "function") return;
+  const requestBytes = measureSerializedRequestBytes(serializedBody);
+  const thresholdBytes = resolveLargeRequestLogThresholdBytes(env);
+  if (requestBytes < thresholdBytes) return;
+
+  queueLargeRequestEvent(onLargeRequestLog, buildLargeRequestLogEntry({
+    providerBody,
+    requestBytes,
+    thresholdBytes,
+    providerUrl,
+    candidate,
+    sourceFormat,
+    targetFormat,
+    requestKind,
+    clientType,
+    stream,
+    providerType
+  }));
 }
 
 async function toProviderError(response) {
@@ -599,7 +650,8 @@ export async function makeProviderCall({
   runtimeConfig,
   stateStore,
   ampContext,
-  runtimeFlags
+  runtimeFlags,
+  onLargeRequestLog
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
@@ -720,13 +772,33 @@ export async function makeProviderCall({
         prompt_cache_key: activePlan.providerBody.prompt_cache_key || ampContext.threadId
       };
     }
-    const executeSubscriptionRequest = async (requestBody) => makeSubscriptionProviderCall({
-      provider,
-      body: requestBody,
-      // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
-      stream: subscriptionType === "chatgpt-codex" ? true : Boolean(stream),
-      env
-    });
+    const executeSubscriptionRequest = async (requestBody) => {
+      const requestStream = subscriptionType === "chatgpt-codex" ? true : Boolean(stream);
+      const providerUrl = subscriptionType === "chatgpt-codex"
+        ? "https://chatgpt.com/backend-api/codex/responses"
+        : "https://console.anthropic.com/v1/messages?beta=true";
+      maybeQueueLargeRequestLog({
+        env,
+        onLargeRequestLog,
+        providerBody: requestBody,
+        serializedBody: JSON.stringify(requestBody),
+        providerUrl,
+        candidate,
+        sourceFormat,
+        targetFormat: activePlan.targetFormat,
+        requestKind: activePlan.requestKind,
+        clientType,
+        stream: requestStream,
+        providerType: subscriptionType
+      });
+      return makeSubscriptionProviderCall({
+        provider,
+        body: requestBody,
+        // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
+        stream: requestStream,
+        env
+      });
+    };
     const subscriptionResult = await executeSubscriptionRequest(activePlan.providerBody);
 
     if (!subscriptionResult?.ok) {
@@ -923,11 +995,26 @@ export async function makeProviderCall({
     const timeoutMs = resolveUpstreamTimeoutMs(env);
     const timeoutControl = buildTimeoutSignal(timeoutMs);
     try {
+      const serializedBody = JSON.stringify(plan.providerBody);
       const init = {
         method: "POST",
         headers,
-        body: JSON.stringify(plan.providerBody)
+        body: serializedBody
       };
+      maybeQueueLargeRequestLog({
+        env,
+        onLargeRequestLog,
+        providerBody: plan.providerBody,
+        serializedBody,
+        providerUrl,
+        candidate,
+        sourceFormat,
+        targetFormat: plan.targetFormat,
+        requestKind: plan.requestKind,
+        clientType,
+        stream,
+        providerType: "http"
+      });
       if (timeoutControl.signal) {
         init.signal = timeoutControl.signal;
       }
@@ -985,19 +1072,6 @@ export async function makeProviderCall({
     }
   }
 
-  // Provider doesn't support native /v1/responses — retry with Chat Completions downgrade.
-  if ((!response || !response.ok) && responsesDowngradedPlan) {
-    try {
-      const downgradedResponse = await executeHttpProviderRequest(responsesDowngradedPlan);
-      if (downgradedResponse instanceof Response && downgradedResponse.ok) {
-        response = downgradedResponse;
-        activePlan = responsesDowngradedPlan;
-      }
-    } catch {
-      // Keep the original failure if the downgraded request also fails.
-    }
-  }
-
   if (!response.ok) {
     const retriedOpenAIHostedWebSearch = await maybeRetryOpenAIHostedWebSearchProviderRequest({
       response,
@@ -1014,6 +1088,19 @@ export async function makeProviderCall({
       ...activePlan,
       providerBody: retriedOpenAIHostedWebSearch.providerBody
     };
+  }
+
+  // Provider doesn't support native /v1/responses — retry with Chat Completions downgrade.
+  if ((!response || !response.ok) && responsesDowngradedPlan) {
+    try {
+      const downgradedResponse = await executeHttpProviderRequest(responsesDowngradedPlan);
+      if (downgradedResponse instanceof Response && downgradedResponse.ok) {
+        response = downgradedResponse;
+        activePlan = responsesDowngradedPlan;
+      }
+    } catch {
+      // Keep the original failure if the downgraded request also fails.
+    }
   }
 
   if (!response.ok) {

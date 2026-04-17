@@ -1708,17 +1708,24 @@ test("set-factory-droid-routing patches Factory Droid settings and tool-status r
     config: configPath,
     "factory-droid-settings-file": factoryDroidSettingsPath,
     "default-model": "openrouter/gpt-4o-mini",
+    "mission-orchestrator-model": "anthropic/claude-3-5-haiku",
+    "mission-worker-model": "openrouter/gpt-4o",
+    "mission-validator-model": "anthropic/claude-3-5-haiku",
     "reasoning-effort": "medium"
   }));
 
   assert.equal(patchResult.ok, true);
   const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
   assert.equal(factoryDroidSettings.model, "openrouter/gpt-4o-mini");
+  assert.equal(factoryDroidSettings.sessionDefaultSettings?.model, "openrouter/gpt-4o-mini");
+  assert.equal(factoryDroidSettings.missionOrchestratorModel, "anthropic/claude-3-5-haiku");
+  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, "openrouter/gpt-4o");
+  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, "anthropic/claude-3-5-haiku");
   assert.equal(factoryDroidSettings.reasoningEffort, "medium");
   assert.ok(Array.isArray(factoryDroidSettings.customModels), "customModels should be an array");
   assert.equal(factoryDroidSettings.customModels.length, 1);
   assert.equal(factoryDroidSettings.customModels[0]._llmRouterManaged, true);
-  assert.equal(factoryDroidSettings.customModels[0].provider, "openai");
+  assert.equal(factoryDroidSettings.customModels[0].provider, "generic-chat-completion-api");
   assert.match(factoryDroidSettings.customModels[0].baseUrl, /\/openai\/v1$/);
 
   const statusResult = await configAction.run(createConfigContext({
@@ -1730,7 +1737,10 @@ test("set-factory-droid-routing patches Factory Droid settings and tool-status r
   assert.equal(statusResult.ok, true);
   assert.match(String(statusResult.data || ""), /Factory Droid/);
   assert.match(String(statusResult.data || ""), /Routed Via Router\s+\|\s+Yes/);
+  assert.match(String(statusResult.data || ""), /Provider\s+\|\s+generic-chat-completion-api/);
   assert.match(String(statusResult.data || ""), /openrouter\/gpt-4o-mini/);
+  assert.match(String(statusResult.data || ""), /openrouter\/gpt-4o/);
+  assert.match(String(statusResult.data || ""), /anthropic\/claude-3-5-haiku/);
 
   const disableResult = await configAction.run(createConfigContext({
     operation: "set-factory-droid-routing",
@@ -1741,6 +1751,36 @@ test("set-factory-droid-routing patches Factory Droid settings and tool-status r
   assert.equal(disableResult.ok, true);
   const restored = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
   assert.ok(!Array.isArray(restored.customModels) || restored.customModels.length === 0, "customModels should be empty after disable");
+  assert.equal("sessionDefaultSettings" in restored, false);
+  assert.equal("missionOrchestratorModel" in restored, false);
+  assert.equal("missionModelSettings" in restored, false);
+});
+
+test("set-factory-droid-routing legacy mission-model applies to all mission roles", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master"
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-factory-droid-legacy-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const factoryDroidSettingsPath = path.join(tempDir, "settings.json");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-factory-droid-routing",
+    config: configPath,
+    "factory-droid-settings-file": factoryDroidSettingsPath,
+    "default-model": "openrouter/gpt-4o-mini",
+    "mission-model": "anthropic/claude-3-5-haiku"
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
+  assert.equal(factoryDroidSettings.missionOrchestratorModel, "anthropic/claude-3-5-haiku");
+  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, "anthropic/claude-3-5-haiku");
+  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, "anthropic/claude-3-5-haiku");
 });
 
 test("set-amp-client-routing bootstraps config and can unpatch AMP client files", async (t) => {

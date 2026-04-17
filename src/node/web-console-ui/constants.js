@@ -33,7 +33,7 @@ export const TOAST_DURATION_MS = 4000;
 export const TOAST_STATUS_TICK_MS = 100;
 export const CONTEXT_LOOKUP_SUGGESTION_LIMIT = 6;
 export const QUICK_START_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
-export const QUICK_START_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+export const QUICK_START_ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\-\[\]]*$/;
 export const QUICK_START_CONNECTION_CATEGORIES = [
   {
     value: "api",
@@ -65,6 +65,7 @@ export const CLAUDE_THINKING_LEVEL_OPTIONS = Object.freeze([
   { value: "low", label: "Low", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=low" },
   { value: "medium", label: "Medium", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=medium" },
   { value: "high", label: "High", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=high" },
+  { value: "xhigh", label: "XHigh", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=xhigh" },
   { value: "max", label: "Max", hint: "Sets CLAUDE_CODE_EFFORT_LEVEL=max" }
 ]);
 export const FACTORY_DROID_REASONING_EFFORT_OPTIONS = Object.freeze([

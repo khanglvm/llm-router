@@ -47,29 +47,55 @@ function EyeOffIcon({ className = "" }) {
   );
 }
 
-export function CredentialInput({ value, onChange, onValueChange, placeholder, disabled, isEnvVar, buffered, commitOnBlur, onValueCommit, className }) {
+export function CredentialInput({
+  value,
+  onChange,
+  onValueChange,
+  placeholder,
+  disabled,
+  isEnvVar,
+  buffered,
+  commitOnBlur,
+  onValueCommit,
+  className,
+  inputProps: extraInputProps = {},
+  maskMode = "password"
+}) {
   const [visible, setVisible] = useState(false);
   const shouldMask = !isEnvVar && !visible;
+  const resolvedType = shouldMask && maskMode !== "obscured-text" ? "password" : "text";
+  const inputStyle = shouldMask && maskMode === "obscured-text"
+    ? {
+        ...(extraInputProps?.style && typeof extraInputProps.style === "object" ? extraInputProps.style : {}),
+        WebkitTextSecurity: "disc"
+      }
+    : extraInputProps?.style;
   const inputProps = buffered
     ? {
         value: value || "",
         onValueChange,
         onValueCommit,
         commitOnBlur,
-        type: shouldMask ? "password" : "text",
+        type: resolvedType,
         autoComplete: "off",
+        spellCheck: false,
         placeholder,
         disabled,
-        className: cn("flex h-9 w-full rounded-lg rounded-r-none border border-r-0 border-input bg-background/80 px-3 py-2 text-sm text-foreground shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40", className)
+        className: cn("flex h-9 w-full rounded-lg rounded-r-none border border-r-0 border-input bg-background/80 px-3 py-2 text-sm text-foreground shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40", className),
+        style: inputStyle,
+        ...extraInputProps
       }
     : {
         value: value || "",
         onChange,
-        type: shouldMask ? "password" : "text",
+        type: resolvedType,
         autoComplete: "off",
+        spellCheck: false,
         placeholder,
         disabled,
-        className: cn("flex h-9 w-full rounded-lg rounded-r-none border border-r-0 border-input bg-background/80 px-3 py-2 text-sm text-foreground shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40", className)
+        className: cn("flex h-9 w-full rounded-lg rounded-r-none border border-r-0 border-input bg-background/80 px-3 py-2 text-sm text-foreground shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/40", className),
+        style: inputStyle,
+        ...extraInputProps
       };
 
   return (

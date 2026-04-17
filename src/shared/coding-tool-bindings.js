@@ -10,12 +10,14 @@ export const CLAUDE_CODE_THINKING_LEVEL_VALUES = Object.freeze([
   "low",
   "medium",
   "high",
+  "xhigh",
   "max"
 ]);
 export const CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL = Object.freeze({
   low: 4096,
   medium: 12000,
   high: 24000,
+  xhigh: 28000,
   max: 31999
 });
 export const CLAUDE_CODE_EFFORT_LEVEL_VALUES = CLAUDE_CODE_THINKING_LEVEL_VALUES;
@@ -45,6 +47,7 @@ export function mapClaudeCodeThinkingTokensToLevel(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return "";
   if (parsed >= CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.max) return "max";
+  if (parsed >= CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.xhigh) return "xhigh";
   if (parsed >= CLAUDE_CODE_THINKING_TOKENS_BY_LEVEL.high) return "high";
   if (parsed >= 6000) return "medium";
   return "low";
