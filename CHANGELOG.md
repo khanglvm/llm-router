@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.4] - 2026-04-17
+
+### Fixed
+- Updated the live provider suite to exercise RamCloud with `minimax-m2.7` only and switched the Claude Code live alias from `normal` to `default`, matching the generated router config so real-provider publish checks pass again.
+
 ## [2.3.3] - 2026-04-17
 
 ### Fixed

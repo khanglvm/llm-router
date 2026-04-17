@@ -719,7 +719,7 @@ test("real-provider flows cover CLI and Web UI", {
 
     try {
       await writeConfigFile(buildToolRoutingConfig(provider, {
-        claudeAlias: "normal",
+        claudeAlias: "default",
         ampDefaultRoute: "amp-live"
       }), configPath);
 
@@ -734,7 +734,7 @@ test("real-provider flows cover CLI and Web UI", {
         ...env,
         ANTHROPIC_BASE_URL: `${baseUrl}/anthropic`,
         ANTHROPIC_AUTH_TOKEN: "gw_live_suite_master_key_1234567890abcdefghijklmnop",
-        ANTHROPIC_MODEL: "normal"
+        ANTHROPIC_MODEL: "default"
       };
 
       const result = await runCommandCapture("claude", [
@@ -791,7 +791,7 @@ test("real-provider flows cover CLI and Web UI", {
     try {
       const config = buildToolRoutingConfig(provider, {
         codexAlias: "gpt-5.4",
-        claudeAlias: "normal",
+        claudeAlias: "default",
         ampDefaultRoute: "amp-live"
       });
       config.amp.upstreamUrl = "https://ampcode.com";
