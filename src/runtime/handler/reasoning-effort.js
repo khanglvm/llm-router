@@ -16,6 +16,16 @@ const EFFORT_HEADER_PATTERNS = [
   /thinking[-_]?effort/i
 ];
 
+const ORDERED_EFFORT_LEVELS = Object.freeze([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+]);
+
 function readHeaderValue(headers, name) {
   if (!headers || !name) return "";
   if (typeof headers.get === "function") {
@@ -63,12 +73,67 @@ function normalizeEffort(rawValue) {
   if (compact === "low") return "low";
   if (["medium", "normal", "standard", "default"].includes(compact)) return "medium";
   if (compact === "high") return "high";
-  if (["xhigh", "extra high", "max", "maximum"].includes(compact)) return "xhigh";
+  if (["xhigh", "extra high"].includes(compact)) return "xhigh";
+  if (["max", "maximum"].includes(compact)) return "max";
 
   if (compact.includes("ultra")) return "xhigh";
   if (compact.includes("think hard") || compact.includes("harder")) return "high";
   if (compact === "think") return "medium";
   return "";
+}
+
+function getEffortRank(effort) {
+  return ORDERED_EFFORT_LEVELS.indexOf(normalizeEffort(effort));
+}
+
+function normalizeModelMatcherValue(value) {
+  let text = String(value || "").trim().toLowerCase();
+  if (!text) return "";
+
+  const slashIndex = Math.max(text.lastIndexOf("/"), text.lastIndexOf(":"));
+  if (slashIndex >= 0) {
+    text = text.slice(slashIndex + 1);
+  }
+
+  return text
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function matchesModelPattern(targetModel, pattern) {
+  const normalizedModel = normalizeModelMatcherValue(targetModel);
+  if (!normalizedModel) return false;
+  return new RegExp(`(?:^|-)${pattern}(?:-|$)`).test(normalizedModel);
+}
+
+function resolveSupportedEffort(requestedEffort, supportedEfforts = []) {
+  const normalizedRequested = normalizeEffort(requestedEffort);
+  if (!normalizedRequested) return "";
+
+  const normalizedSupported = [...new Set(
+    (Array.isArray(supportedEfforts) ? supportedEfforts : [supportedEfforts])
+      .map((effort) => normalizeEffort(effort))
+      .filter(Boolean)
+  )];
+  if (normalizedSupported.length === 0) return normalizedRequested;
+  if (normalizedSupported.includes(normalizedRequested)) return normalizedRequested;
+
+  const requestedRank = getEffortRank(normalizedRequested);
+  let bestAtOrBelow = "";
+  let bestAtOrBelowRank = -1;
+  for (const supported of normalizedSupported) {
+    const supportedRank = getEffortRank(supported);
+    if (supportedRank <= requestedRank && supportedRank > bestAtOrBelowRank) {
+      bestAtOrBelow = supported;
+      bestAtOrBelowRank = supportedRank;
+    }
+  }
+  if (bestAtOrBelow) return bestAtOrBelow;
+
+  return normalizedSupported.reduce((lowest, supported) => (
+    getEffortRank(supported) < getEffortRank(lowest) ? supported : lowest
+  ), normalizedSupported[0]);
 }
 
 function parseNumber(value) {
@@ -81,6 +146,7 @@ function extractEffortFromBody(body) {
   if (!body || typeof body !== "object") return "";
 
   const directCandidates = [
+    body.output_config?.effort,
     body.reasoning_effort,
     body.reasoningEffort,
     body["reasoning-effort"],
@@ -121,12 +187,15 @@ function inferEffortFromClaudeThinking(body) {
 
   if (Number.isFinite(maxTokens) && maxTokens > 0) {
     const ratio = budgetTokens / maxTokens;
-    if (ratio >= 0.9) return "max";
+    if (ratio >= 0.97) return "max";
+    if (ratio >= 0.82) return "xhigh";
     if (ratio >= 0.65) return "high";
     if (ratio >= 0.3) return "medium";
     return "low";
   }
 
+  if (budgetTokens >= 31999) return "max";
+  if (budgetTokens >= 28000) return "xhigh";
   if (budgetTokens >= 24000) return "high";
   if (budgetTokens >= 6000) return "medium";
   return "low";
@@ -153,39 +222,55 @@ function prefersNestedOpenAIReasoning(targetModel) {
   return model.startsWith("gpt-5");
 }
 
-function supportsOpenAIXHighEffort(targetModel) {
-  const model = String(targetModel || "").trim().toLowerCase();
-  if (!model) return false;
-  if (model.startsWith("gpt-5.2")) return true;
-  if (model.startsWith("gpt-5.3-codex")) return true;
-  return false;
+function resolveOpenAISupportedEfforts(targetModel) {
+  if (matchesModelPattern(targetModel, "gpt-5-4-pro")) return ["medium", "high", "xhigh"];
+  if (matchesModelPattern(targetModel, "gpt-5-pro")) return ["high"];
+  if (matchesModelPattern(targetModel, "gpt-5-4")) return ["none", "low", "medium", "high", "xhigh"];
+  if (matchesModelPattern(targetModel, "gpt-5-3-codex")) return ["low", "medium", "high", "xhigh"];
+  if (matchesModelPattern(targetModel, "gpt-5-2-codex")) return ["low", "medium", "high", "xhigh"];
+  if (matchesModelPattern(targetModel, "gpt-5-2-pro")) return ["medium", "high", "xhigh"];
+  if (matchesModelPattern(targetModel, "gpt-5-2")) return ["none", "low", "medium", "high", "xhigh"];
+  if (matchesModelPattern(targetModel, "gpt-5-1-codex")) return ["low", "medium", "high"];
+  if (matchesModelPattern(targetModel, "gpt-5-1")) return ["none", "low", "medium", "high"];
+  if (matchesModelPattern(targetModel, "gpt-5")) return ["minimal", "low", "medium", "high"];
+  return ["low", "medium", "high"];
 }
 
-function supportsOpenAINoneEffort(targetModel) {
-  const model = String(targetModel || "").trim().toLowerCase();
-  if (!model) return false;
-  if (model.startsWith("gpt-5.1") && !model.includes("codex")) return true;
-  if (model.startsWith("gpt-5.2") && !model.includes("codex") && !model.includes("pro")) return true;
-  return false;
+function resolveClaudeEffortProfile(targetModel) {
+  if (matchesModelPattern(targetModel, "opus-4-7")) {
+    return {
+      supportsEffortApi: true,
+      requiresAdaptiveThinking: true,
+      preserveManualBudgetThinking: false,
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"]
+    };
+  }
+  if (matchesModelPattern(targetModel, "opus-4-6") || matchesModelPattern(targetModel, "sonnet-4-6")) {
+    return {
+      supportsEffortApi: true,
+      requiresAdaptiveThinking: true,
+      preserveManualBudgetThinking: true,
+      supportedEfforts: ["low", "medium", "high", "max"]
+    };
+  }
+  if (matchesModelPattern(targetModel, "opus-4-5")) {
+    return {
+      supportsEffortApi: false,
+      requiresAdaptiveThinking: false,
+      preserveManualBudgetThinking: true,
+      supportedEfforts: ["low", "medium", "high", "max"]
+    };
+  }
+  return {
+    supportsEffortApi: false,
+    requiresAdaptiveThinking: false,
+    preserveManualBudgetThinking: true,
+    supportedEfforts: ["low", "medium", "high"]
+  };
 }
 
 function mapEffortToOpenAI(effort, targetModel) {
-  switch (effort) {
-    case "none":
-      return supportsOpenAINoneEffort(targetModel) ? "none" : "low";
-    case "minimal":
-      return "low";
-    case "low":
-      return "low";
-    case "medium":
-      return "medium";
-    case "high":
-      return "high";
-    case "xhigh":
-      return supportsOpenAIXHighEffort(targetModel) ? "xhigh" : "high";
-    default:
-      return "";
-  }
+  return resolveSupportedEffort(effort, resolveOpenAISupportedEfforts(targetModel));
 }
 
 function applyOpenAIEffort(providerBody, effort, targetModel) {
@@ -236,6 +321,7 @@ function toClaudeThinkingBudget(effort, maxTokens) {
     case "high":
       return clampBudget(Math.round(safeMaxTokens * 0.75), 1024, maxBudget);
     case "xhigh":
+      return clampBudget(Math.round(safeMaxTokens * 0.9), 1024, maxBudget);
     case "max":
       return maxBudget;
     default:
@@ -243,10 +329,37 @@ function toClaudeThinkingBudget(effort, maxTokens) {
   }
 }
 
-function applyClaudeEffort(providerBody, effort, { sourceFormat, originalBody } = {}) {
+function applyClaudeEffort(providerBody, effort, { sourceFormat, originalBody, targetModel } = {}) {
   const nextBody = { ...(providerBody || {}) };
+  const requestedEffort = normalizeEffort(effort);
+  const profile = resolveClaudeEffortProfile(targetModel);
+  const mappedEffort = resolveSupportedEffort(requestedEffort, profile.supportedEfforts);
 
-  if (effort === "none" || effort === "minimal") {
+  if (profile.supportsEffortApi && mappedEffort) {
+    nextBody.output_config = {
+      ...(nextBody.output_config && typeof nextBody.output_config === "object" && !Array.isArray(nextBody.output_config)
+        ? nextBody.output_config
+        : {}),
+      effort: mappedEffort
+    };
+
+    const explicitBudgetTokens = parseNumber(nextBody?.thinking?.budget_tokens);
+    const explicitThinkingType = String(nextBody?.thinking?.type || "").trim().toLowerCase();
+    if (profile.preserveManualBudgetThinking && Number.isFinite(explicitBudgetTokens)) {
+      return nextBody;
+    }
+
+    if (profile.requiresAdaptiveThinking) {
+      if (explicitThinkingType === "disabled") {
+        nextBody.thinking = { type: "disabled" };
+      } else {
+        nextBody.thinking = { type: "adaptive" };
+      }
+    }
+    return nextBody;
+  }
+
+  if (requestedEffort === "none" || requestedEffort === "minimal") {
     delete nextBody.thinking;
     return nextBody;
   }
@@ -267,7 +380,7 @@ function applyClaudeEffort(providerBody, effort, { sourceFormat, originalBody } 
     nextBody.max_tokens = maxTokens;
   }
 
-  const budgetTokens = toClaudeThinkingBudget(effort, maxTokens);
+  const budgetTokens = toClaudeThinkingBudget(mappedEffort || requestedEffort, maxTokens);
   if (!Number.isFinite(budgetTokens)) {
     return nextBody;
   }
@@ -316,7 +429,8 @@ export function applyReasoningEffortMapping({
   if (targetFormat === FORMATS.CLAUDE) {
     return applyClaudeEffort(providerBody, effort, {
       sourceFormat,
-      originalBody
+      originalBody,
+      targetModel
     });
   }
   return providerBody;

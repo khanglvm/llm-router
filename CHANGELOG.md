@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.5] - 2026-04-17
+
+### Fixed
+- Added model-aware reasoning/effort conversion so routed requests automatically fall back to the safest supported effort level for the actual backend model, including GPT-5 Codex/OpenAI targets and Claude Opus 4.6 vs 4.7 targets behind the same alias.
+
 ## [2.3.4] - 2026-04-17
 
 ### Fixed
