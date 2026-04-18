@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getDefaultConfigPath } from "../src/node/config-store.js";
+import { getDefaultDevConfigPath } from "../src/node/config-store.js";
+import { RUNTIME_STATE_PATH_ENV } from "../src/node/instance-state.js";
 import { resolveLargeRequestLogPath } from "../src/node/large-request-log.js";
 import { startWebConsoleServer } from "../src/node/web-console-server.js";
 import { openBrowser, resolveWebListenPort } from "../src/node/web-command.js";
@@ -10,6 +11,9 @@ import {
   LARGE_REQUEST_LOG_PATH_ENV,
   LARGE_REQUEST_LOG_THRESHOLD_ENV
 } from "../src/runtime/handler/large-request-log.js";
+
+const DEFAULT_DEV_WEB_PORT = 8789;
+const DEFAULT_DEV_ROUTER_PORT = 8377;
 
 function parseSimpleArgs(argv) {
   const args = {};
@@ -42,11 +46,37 @@ function toBoolean(value, fallback) {
   return fallback;
 }
 
+function toPort(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 65535) return fallback;
+  return parsed;
+}
+
+function resolveDevRuntimeStatePath(configPath) {
+  const absoluteConfigPath = path.resolve(String(configPath || getDefaultDevConfigPath()).trim() || getDefaultDevConfigPath());
+  const configDir = path.dirname(absoluteConfigPath);
+  const configStem = path.basename(absoluteConfigPath)
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[._-]+|[._-]+$/g, "");
+  return path.join(configDir, `.${configStem || "llm-router-dev"}.runtime.json`);
+}
+
 const args = parseSimpleArgs(process.argv.slice(2));
-const configPath = String(args.config || args.configPath || getDefaultConfigPath()).trim() || getDefaultConfigPath();
+const configPath = String(args.config || args.configPath || getDefaultDevConfigPath()).trim() || getDefaultDevConfigPath();
 const host = String(args.host || "127.0.0.1").trim() || "127.0.0.1";
-const port = resolveWebListenPort({ explicitPort: args.port, env: process.env });
+const port = resolveWebListenPort({
+  explicitPort: args.port,
+  env: process.env,
+  defaultPort: DEFAULT_DEV_WEB_PORT
+});
+const routerPort = toPort(args["router-port"] ?? args.routerPort, DEFAULT_DEV_ROUTER_PORT);
 const shouldOpen = toBoolean(args.open, true);
+if (!String(process.env[RUNTIME_STATE_PATH_ENV] || "").trim()) {
+  process.env[RUNTIME_STATE_PATH_ENV] = resolveDevRuntimeStatePath(configPath);
+}
 const largeRequestLogPath = resolveLargeRequestLogPath(configPath, "", process.env);
 if (!String(process.env[LARGE_REQUEST_LOG_ENABLED_ENV] || "").trim()) {
   process.env[LARGE_REQUEST_LOG_ENABLED_ENV] = "1";
@@ -65,7 +95,7 @@ const server = await startWebConsoleServer({
   port,
   configPath,
   routerHost: String(args["router-host"] || args.routerHost || "127.0.0.1").trim() || "127.0.0.1",
-  routerPort: args["router-port"] || args.routerPort,
+  routerPort,
   routerWatchConfig: toBoolean(args["router-watch-config"] ?? args.routerWatchConfig, true),
   routerWatchBinary: toBoolean(args["router-watch-binary"] ?? args.routerWatchBinary, true),
   routerRequireAuth: toBoolean(args["router-require-auth"] ?? args.routerRequireAuth, false),

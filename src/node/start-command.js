@@ -11,6 +11,7 @@ import {
 } from "./local-server-settings.js";
 import { resolveListenPort } from "./listen-port.js";
 import { startLocalRouteServer } from "./local-server.js";
+import { startRouterSupervisor } from "./router-supervisor.js";
 import { reclaimPort, stopStartupManagedListener } from "./port-reclaim.js";
 import { installStartup, startupStatus } from "./startup-manager.js";
 import { configHasProvider, sanitizeConfigForDisplay } from "../runtime/config.js";
@@ -134,10 +135,21 @@ function snapshotCliVersionState(cliPath) {
   return { cliPath, realpath, packageJsonPath, version };
 }
 
-function buildStartArgs({ configPath, watchConfig, watchBinary, requireAuth, useConfigDefaults = false }) {
+function buildStartArgs({
+  configPath,
+  host = FIXED_LOCAL_ROUTER_HOST,
+  port = FIXED_LOCAL_ROUTER_PORT,
+  watchConfig,
+  watchBinary,
+  requireAuth,
+  useConfigDefaults = false,
+  command = "start"
+}) {
   const args = [
-    "start",
-    `--config=${configPath}`
+    command,
+    `--config=${configPath}`,
+    `--host=${host}`,
+    `--port=${port}`
   ];
   if (useConfigDefaults) return args;
   args.push(
@@ -361,8 +373,9 @@ async function attemptServerStartAfterStartupStop(buildLocalServerOptions, deps 
   return { ok: false, error: lastError };
 }
 
-export async function runStartCommand(options = {}) {
+async function runRouterRuntimeCommand(options = {}) {
   const configPath = options.configPath || getDefaultConfigPath();
+  const backendMode = options.backendMode === true;
   const requestedWatchConfig = options.watchConfig;
   const requestedWatchBinary = options.watchBinary;
   const binaryWatchIntervalMs = Math.max(
@@ -373,6 +386,7 @@ export async function runStartCommand(options = {}) {
   const onStartupConflict = typeof options.onStartupConflict === "function" ? options.onStartupConflict : null;
   const managedByStartup = options.managedByStartup === true || process.env.LLM_ROUTER_MANAGED_BY_STARTUP === "1";
   const cliPathForWatch = String(options.cliPathForWatch || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "");
+  const startCommand = String(options.startCommand || (backendMode ? "start-runtime" : "start")).trim() || "start";
   const line = typeof options.onLine === "function" ? options.onLine : console.log;
   const error = typeof options.onError === "function" ? options.onError : console.error;
   const startLocalRouteServerFn = typeof options.startLocalRouteServer === "function" ? options.startLocalRouteServer : startLocalRouteServer;
@@ -421,8 +435,12 @@ export async function runStartCommand(options = {}) {
 
   let config = configState.config;
   const persistedLocalServer = readLocalServerSettings(config);
-  const host = FIXED_LOCAL_ROUTER_HOST;
-  const port = resolveListenPort({ explicitPort: persistedLocalServer.port });
+  const host = backendMode
+    ? String(options.host || FIXED_LOCAL_ROUTER_HOST).trim() || FIXED_LOCAL_ROUTER_HOST
+    : FIXED_LOCAL_ROUTER_HOST;
+  const port = backendMode
+    ? Math.max(1, Number(options.port || FIXED_LOCAL_ROUTER_PORT))
+    : resolveListenPort({ explicitPort: persistedLocalServer.port });
   const watchConfig = requestedWatchConfig === undefined ? persistedLocalServer.watchConfig : toBoolean(requestedWatchConfig, persistedLocalServer.watchConfig);
   const watchBinary = requestedWatchBinary === undefined ? persistedLocalServer.watchBinary : toBoolean(requestedWatchBinary, persistedLocalServer.watchBinary);
   const requireAuth = requestedRequireAuth === undefined ? persistedLocalServer.requireAuth : toBoolean(requestedRequireAuth, persistedLocalServer.requireAuth);
@@ -464,8 +482,8 @@ export async function runStartCommand(options = {}) {
     requireAuth
   };
 
-  const startup = await startupStatusFn().catch(() => null);
-  if (!managedByStartup && startup?.installed) {
+  const startup = backendMode ? null : await startupStatusFn().catch(() => null);
+  if (!backendMode && !managedByStartup && startup?.installed) {
     const handoff = await handoffToStartupManagedWithLatest({
       runtimeState: null,
       fallbackStartArgs: requestedStartArgs,
@@ -502,6 +520,7 @@ export async function runStartCommand(options = {}) {
   }
 
   let restartRequestedByConfig = false;
+  let requestGracefulRelaunch = async () => {};
 
   const buildLocalServerOptions = () => ({
     port,
@@ -524,26 +543,12 @@ export async function runStartCommand(options = {}) {
       if (!areLocalServerSettingsEqual(nextLocalServer, resolvedLocalServer)) {
         if (restartRequestedByConfig) return;
         restartRequestedByConfig = true;
-        line(`Local server settings changed in config (${reason}). Restarting to apply local router settings...`);
-        void (async () => {
-          if (managedByStartup) {
-            await shutdown();
-            process.exit(0);
-            return;
-          }
-
-          await shutdown();
-          const launch = await spawnReplacementCli({
-            cliPath: cliPathForWatch || process.argv[1],
-            startArgs: buildStartArgs({ configPath, ...nextLocalServer })
-          });
-          if (!launch.ok) {
-            error(`Failed to relaunch LLM Router after the config runtime change: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
-            process.exit(1);
-            return;
-          }
-          process.exit(0);
-        })();
+        void requestGracefulRelaunch({
+          reasonMessage: `Local server settings changed in config (${reason}). Restarting to apply local router settings...`,
+          manualRestartMessage: "Local server settings changed, but this process cannot resolve its CLI path. Restart `llr start` manually to apply them.",
+          configPath,
+          ...nextLocalServer
+        });
         return;
       }
 
@@ -702,7 +707,7 @@ export async function runStartCommand(options = {}) {
   let binaryWatchTimer = null;
   let binaryState = watchBinary && cliPathForWatch ? snapshotCliVersionState(cliPathForWatch) : null;
   let binaryNoticeSent = false;
-  let binaryRelaunching = false;
+  let relaunchInProgress = false;
   const runtimeVersion = binaryState?.version || readPackageVersion(resolvePackageJsonPathFromCliPath(safeRealpath(cliPathForWatch)));
 
   try {
@@ -748,9 +753,62 @@ export async function runStartCommand(options = {}) {
       resolveDone();
     };
 
+  requestGracefulRelaunch = async ({
+    reasonMessage = "",
+    manualRestartMessage = "",
+    cliPath = cliPathForWatch || process.argv[1],
+    configPath: nextConfigPath = configPath,
+    host: nextHost = host,
+    port: nextPort = port,
+    watchConfig: nextWatchConfig = watchConfig,
+    watchBinary: nextWatchBinary = watchBinary,
+    requireAuth: nextRequireAuth = requireAuth
+  } = {}) => {
+    if (shuttingDown || relaunchInProgress) return;
+    relaunchInProgress = true;
+
+    if (reasonMessage) {
+      line(reasonMessage);
+    }
+
+    if (managedByStartup) {
+      await shutdown();
+      process.exit(0);
+      return;
+    }
+
+    if (!cliPath) {
+      relaunchInProgress = false;
+      error(manualRestartMessage || "LLM Router needs a manual restart because its CLI path cannot be resolved.");
+      return;
+    }
+
+    await shutdown();
+    const launch = await spawnReplacementCli({
+      cliPath,
+      startArgs: buildStartArgs({
+        command: startCommand,
+        configPath: nextConfigPath,
+        host: nextHost,
+        port: nextPort,
+        watchConfig: nextWatchConfig,
+        watchBinary: nextWatchBinary,
+        requireAuth: nextRequireAuth
+      })
+    });
+    if (!launch.ok) {
+      error(`Failed to relaunch LLM Router: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
+      process.exit(1);
+      return;
+    }
+
+    line(`Started the replacement LLM Router process (pid ${launch.pid || "unknown"}).`);
+    process.exit(0);
+  };
+
   if (watchBinary && binaryState) {
     binaryWatchTimer = setInterval(() => {
-      if (shuttingDown || binaryRelaunching) return;
+      if (shuttingDown || relaunchInProgress) return;
       const nextState = snapshotCliVersionState(binaryState.cliPath);
       const changed =
         nextState.realpath !== binaryState.realpath ||
@@ -762,16 +820,8 @@ export async function runStartCommand(options = {}) {
       const to = nextState.version || nextState.realpath || "(unknown)";
       binaryState = nextState;
 
-      if (managedByStartup) {
-        line(`Detected LLM Router update (${from} -> ${to}). Exiting for the startup manager to relaunch the latest version.`);
-        void shutdown().then(() => {
-          process.exit(0);
-        });
-        return;
-      }
-
       const cliPath = nextState.cliPath || cliPathForWatch || process.argv[1];
-      if (!cliPath) {
+      if (!managedByStartup && !cliPath) {
         if (!binaryNoticeSent) {
           binaryNoticeSent = true;
           line(`Detected LLM Router update (${from} -> ${to}). Restart this process to run the new version.`);
@@ -779,33 +829,32 @@ export async function runStartCommand(options = {}) {
         return;
       }
 
-      binaryRelaunching = true;
-      void (async () => {
-        try {
-          line(`Detected LLM Router update (${from} -> ${to}). Relaunching the latest version...`);
-          await shutdown();
-          const launch = await spawnReplacementCli({
-            cliPath,
-            startArgs: buildStartArgs({ configPath, host, port, watchConfig, watchBinary, requireAuth })
-          });
-          if (!launch.ok) {
-            error(`Failed to relaunch the updated LLM Router process: ${launch.error instanceof Error ? launch.error.message : String(launch.error)}`);
-            process.exit(1);
-            return;
-          }
-
-          line(`Started the updated LLM Router process (pid ${launch.pid || "unknown"}).`);
-          process.exit(0);
-        } catch (relaunchError) {
-          error(`Failed during LLM Router auto-relaunch: ${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`);
-          process.exit(1);
-        }
-      })();
+      void requestGracefulRelaunch({
+        reasonMessage: managedByStartup
+          ? `Detected LLM Router update (${from} -> ${to}). Draining current requests before the startup manager relaunches the latest version.`
+          : `Detected LLM Router update (${from} -> ${to}). Gracefully relaunching the latest version...`,
+        manualRestartMessage: "Detected an updated LLM Router binary, but this process cannot resolve its CLI path. Restart it manually to run the new version.",
+        cliPath
+      }).catch((relaunchError) => {
+        error(`Failed during LLM Router auto-relaunch: ${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`);
+        process.exit(1);
+      });
     }, binaryWatchIntervalMs);
   }
 
   process.once("SIGINT", () => { void shutdown(); });
   process.once("SIGTERM", () => { void shutdown(); });
+  process.once("SIGUSR2", () => {
+    void requestGracefulRelaunch({
+      reasonMessage: managedByStartup
+        ? "Received runtime upgrade signal. Draining current requests before the startup manager relaunches the latest version..."
+        : "Received runtime upgrade signal. Gracefully restarting to activate the newly installed version...",
+      manualRestartMessage: "Received a runtime upgrade signal, but this process cannot resolve its CLI path. Restart it manually to activate the new version."
+    }).catch((relaunchError) => {
+      error(`Failed during the runtime upgrade relaunch: ${relaunchError instanceof Error ? relaunchError.message : String(relaunchError)}`);
+      process.exit(1);
+    });
+  });
 
   await donePromise;
 
@@ -814,4 +863,286 @@ export async function runStartCommand(options = {}) {
     exitCode: 0,
     data: "Server stopped."
   };
+}
+
+async function runRouterSupervisorCommand(options = {}) {
+  const configPath = options.configPath || getDefaultConfigPath();
+  const requestedWatchConfig = options.watchConfig;
+  const requestedWatchBinary = options.watchBinary;
+  const requestedRequireAuth = options.requireAuth;
+  const managedByStartup = options.managedByStartup === true || process.env.LLM_ROUTER_MANAGED_BY_STARTUP === "1";
+  const cliPathForWatch = String(options.cliPathForWatch || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "");
+  const line = typeof options.onLine === "function" ? options.onLine : console.log;
+  const error = typeof options.onError === "function" ? options.onError : console.error;
+  const getActiveRuntimeStateFn = typeof options.getActiveRuntimeState === "function" ? options.getActiveRuntimeState : getActiveRuntimeState;
+  const stopProcessByPidFn = typeof options.stopProcessByPid === "function" ? options.stopProcessByPid : stopProcessByPid;
+  const clearRuntimeStateFn = typeof options.clearRuntimeState === "function" ? options.clearRuntimeState : clearRuntimeState;
+  const installStartupFn = typeof options.installStartup === "function" ? options.installStartup : installStartup;
+  const startupStatusFn = typeof options.startupStatus === "function" ? options.startupStatus : startupStatus;
+  const reclaimPortFn = typeof options.reclaimPort === "function"
+    ? options.reclaimPort
+    : (args) => reclaimPort(args, options);
+  const waitForRuntimeMatchFn = typeof options.waitForRuntimeMatch === "function"
+    ? options.waitForRuntimeMatch
+    : (startOptions, waitOptions = {}) => waitForRuntimeMatch(startOptions, waitOptions);
+  const startRouterSupervisorFn = typeof options.startRouterSupervisor === "function"
+    ? options.startRouterSupervisor
+    : (startOptions) => startRouterSupervisor(startOptions, options);
+
+  if (!(await configFileExists(configPath))) {
+    return {
+      ok: false,
+      exitCode: 2,
+      errorMessage: [
+        `Config file not found: ${configPath}`,
+        "Run 'llr config' to create provider config or 'llr -h' for help."
+      ].join("\n")
+    };
+  }
+
+  let configState;
+  try {
+    configState = await readConfigFileState(configPath);
+  } catch (readConfigError) {
+    return {
+      ok: false,
+      exitCode: 2,
+      errorMessage: `Failed to load config from ${configPath}: ${readConfigError instanceof Error ? readConfigError.message : String(readConfigError)}`
+    };
+  }
+
+  const configMigrationMessage = formatStartupConfigMigrationMessage(configState, configPath);
+  if (configMigrationMessage) {
+    if (configState.persistError) {
+      error(configMigrationMessage);
+    } else {
+      line(configMigrationMessage);
+    }
+  }
+
+  let config = configState.config;
+  const persistedLocalServer = readLocalServerSettings(config);
+  const host = FIXED_LOCAL_ROUTER_HOST;
+  const port = resolveListenPort({ explicitPort: persistedLocalServer.port });
+  const watchConfig = requestedWatchConfig === undefined ? persistedLocalServer.watchConfig : toBoolean(requestedWatchConfig, persistedLocalServer.watchConfig);
+  const watchBinary = requestedWatchBinary === undefined ? persistedLocalServer.watchBinary : toBoolean(requestedWatchBinary, persistedLocalServer.watchBinary);
+  const requireAuth = requestedRequireAuth === undefined ? persistedLocalServer.requireAuth : toBoolean(requestedRequireAuth, persistedLocalServer.requireAuth);
+  const resolvedLocalServer = { host, port, watchConfig, watchBinary, requireAuth };
+
+  if (!areLocalServerSettingsEqual(persistedLocalServer, resolvedLocalServer)) {
+    config = await readConfigFile(configPath, { persistMigrated: false });
+    config = applyLocalServerSettings(config, resolvedLocalServer);
+    config = await writeConfigFile(config, configPath);
+  }
+  if (!configHasProvider(config)) {
+    return {
+      ok: false,
+      exitCode: 2,
+      errorMessage: [
+        `No providers configured in ${configPath}`,
+        "Run 'llr config' to add a provider or 'llr -h' for help."
+      ].join("\n")
+    };
+  }
+
+  if (requireAuth && !config.masterKey) {
+    return {
+      ok: false,
+      exitCode: 2,
+      errorMessage: [
+        `Local auth requires masterKey in ${configPath}.`,
+        "Run 'llr config --operation=set-master-key --master-key=...' or start without --require-auth."
+      ].join("\n")
+    };
+  }
+
+  const requestedStartArgs = {
+    configPath,
+    host,
+    port,
+    watchConfig,
+    watchBinary,
+    requireAuth
+  };
+
+  const startup = await startupStatusFn().catch(() => null);
+  if (!managedByStartup && startup?.installed) {
+    const handoff = await handoffToStartupManagedWithLatest({
+      runtimeState: null,
+      fallbackStartArgs: requestedStartArgs,
+      cliPath: cliPathForWatch,
+      line,
+      error
+    }, {
+      getActiveRuntimeState: getActiveRuntimeStateFn,
+      stopProcessByPid: stopProcessByPidFn,
+      clearRuntimeState: clearRuntimeStateFn,
+      reclaimPort: reclaimPortFn,
+      installStartup: installStartupFn,
+      waitForRuntimeMatch: waitForRuntimeMatchFn,
+      startupStatus: startupStatusFn,
+      onLine: line,
+      onError: error
+    });
+    if (!handoff.ok) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: handoff.errorMessage
+      };
+    }
+    return {
+      ok: true,
+      exitCode: 0,
+      data: [
+        `Startup-managed LLM Router is active on http://${handoff.runtime.host}:${handoff.runtime.port}.`,
+        `manager=${handoff.detail?.manager || startup.manager || "unknown"}`,
+        `service=${handoff.detail?.serviceId || startup.serviceId || "unknown"}`
+      ].join("\n")
+    };
+  }
+
+  const activeRuntime = await getActiveRuntimeStateFn().catch(() => null);
+  if (activeRuntime && Number(activeRuntime.pid) !== Number(process.pid)) {
+    return {
+      ok: false,
+      exitCode: 1,
+      errorMessage: `Another LLM Router instance is already running at http://${activeRuntime.host}:${activeRuntime.port}. Stop it before starting a new one.`
+    };
+  }
+
+  let server;
+  try {
+    server = await startRouterSupervisorFn({
+      host,
+      port,
+      configPath,
+      watchConfig,
+      watchBinary,
+      requireAuth,
+      cliPath: cliPathForWatch,
+      onLine: line,
+      onError: error
+    });
+  } catch (startError) {
+    if (startError?.code !== "EADDRINUSE") {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: `Failed to start LLM Router on http://${host}:${port}: ${startError instanceof Error ? startError.message : String(startError)}`
+      };
+    }
+
+    const reclaimed = await reclaimPortFn({ port, line, error });
+    if (!reclaimed.ok) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: reclaimed.errorMessage
+      };
+    }
+
+    try {
+      server = await startRouterSupervisorFn({
+        host,
+        port,
+        configPath,
+        watchConfig,
+        watchBinary,
+        requireAuth,
+        cliPath: cliPathForWatch,
+        onLine: line,
+        onError: error
+      });
+      line(`Port ${port} reclaimed successfully.`);
+    } catch (retryError) {
+      return {
+        ok: false,
+        exitCode: 1,
+        errorMessage: `Failed to start LLM Router after reclaiming port ${port}: ${retryError instanceof Error ? retryError.message : String(retryError)}`
+      };
+    }
+  }
+
+  const runtimeVersion = readPackageVersion(resolvePackageJsonPathFromCliPath(safeRealpath(cliPathForWatch)));
+  try {
+    await writeRuntimeState({
+      pid: process.pid,
+      host,
+      port,
+      configPath,
+      watchConfig,
+      watchBinary,
+      requireAuth,
+      managedByStartup,
+      cliPath: cliPathForWatch,
+      startedAt: new Date().toISOString(),
+      version: runtimeVersion
+    });
+  } catch (stateError) {
+    error(`Failed to write runtime state file: ${stateError instanceof Error ? stateError.message : String(stateError)}`);
+  }
+
+  line(`LLM Router started on http://${host}:${port}`);
+  line(`Anthropic base URL: http://${host}:${port}/anthropic`);
+  line(`OpenAI base URL: http://${host}:${port}/openai`);
+  for (const row of summarizeConfig(config, configPath)) {
+    line(row);
+  }
+  line(`Local auth: ${requireAuth ? "required (masterKey)" : "disabled"}`);
+  line(`Config hot reload: ${watchConfig ? "enabled" : "disabled"} (backend hot reload via supervisor)`);
+  line(`Binary update watch: ${watchBinary ? "enabled" : "disabled"} (backend hot-swap via supervisor)`);
+  line("Press Ctrl+C to stop.");
+
+  let shuttingDown = false;
+  let shutdownPromise = null;
+  const donePromise = new Promise((resolve) => {
+    server.once("close", resolve);
+  });
+  const shutdown = async () => {
+    if (shutdownPromise) return shutdownPromise;
+    shuttingDown = true;
+    shutdownPromise = (async () => {
+      await new Promise((resolve) => server.close(() => resolve()));
+      await clearRuntimeStateFn({ pid: process.pid });
+    })();
+    return shutdownPromise;
+  };
+
+  const handleSigInt = () => { void shutdown(); };
+  const handleSigTerm = () => { void shutdown(); };
+  const handleSigUsr2 = () => {
+    void server.requestBackendUpgrade("SIGUSR2").then((result) => {
+      if (!result?.ok) {
+        error(`Failed forwarding runtime upgrade signal to router backend: ${result?.reason || "unknown error"}`);
+      }
+    }).catch((upgradeError) => {
+      error(`Failed forwarding runtime upgrade signal to router backend: ${upgradeError instanceof Error ? upgradeError.message : String(upgradeError)}`);
+    });
+  };
+  process.once("SIGINT", handleSigInt);
+  process.once("SIGTERM", handleSigTerm);
+  process.on("SIGUSR2", handleSigUsr2);
+
+  await donePromise;
+  if (shutdownPromise) {
+    await shutdownPromise;
+  }
+
+  process.removeListener("SIGINT", handleSigInt);
+  process.removeListener("SIGTERM", handleSigTerm);
+  process.removeListener("SIGUSR2", handleSigUsr2);
+
+  return {
+    ok: true,
+    exitCode: 0,
+    data: "Server stopped."
+  };
+}
+
+export async function runStartCommand(options = {}) {
+  if (options.backendMode === true) {
+    return runRouterRuntimeCommand(options);
+  }
+  return runRouterSupervisorCommand(options);
 }

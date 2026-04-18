@@ -292,8 +292,36 @@ export async function startLocalRouteServer({
   });
 
   const fallbackHost = formatHostForUrl(host, port);
+  let shuttingDown = false;
+  const socketRequestCounts = new Map();
+
+  function closeSocketIfIdle(socket) {
+    if (!socket || socket.destroyed) return;
+    if (Number(socketRequestCounts.get(socket) || 0) > 0) return;
+    socket.end();
+  }
 
   const server = http.createServer(async (req, res) => {
+    const socket = req.socket;
+    socketRequestCounts.set(socket, Number(socketRequestCounts.get(socket) || 0) + 1);
+    let finalized = false;
+    const finalizeRequest = () => {
+      if (finalized) return;
+      finalized = true;
+      const remaining = Math.max(0, Number(socketRequestCounts.get(socket) || 0) - 1);
+      if (remaining > 0) {
+        socketRequestCounts.set(socket, remaining);
+        return;
+      }
+      socketRequestCounts.set(socket, 0);
+      if (shuttingDown) {
+        closeSocketIfIdle(socket);
+      }
+    };
+
+    res.once("finish", finalizeRequest);
+    res.once("close", finalizeRequest);
+
     try {
       const request = nodeRequestToFetchRequest(req, fallbackHost);
       const response = await fetchHandler(request, {}, undefined);
@@ -308,6 +336,13 @@ export async function startLocalRouteServer({
     }
   });
 
+  server.on("connection", (socket) => {
+    socketRequestCounts.set(socket, Number(socketRequestCounts.get(socket) || 0));
+    socket.on("close", () => {
+      socketRequestCounts.delete(socket);
+    });
+  });
+
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => {
@@ -318,10 +353,15 @@ export async function startLocalRouteServer({
 
   const originalClose = server.close.bind(server);
   server.close = (callback) => {
+    shuttingDown = true;
     Promise.resolve()
       .then(() => configStore.close())
       .then(() => (typeof fetchHandler.close === "function" ? fetchHandler.close() : undefined))
       .finally(() => {
+        server.closeIdleConnections?.();
+        for (const socket of socketRequestCounts.keys()) {
+          closeSocketIfIdle(socket);
+        }
         originalClose(callback);
       });
     return server;

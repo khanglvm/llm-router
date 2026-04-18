@@ -117,14 +117,22 @@ async function promptStartupConflictResolution({ port }) {
   }
 }
 
-async function runStartFastPath(args) {
+async function runStartFastPath(args, { backendMode = false } = {}) {
+  const explicitPort = backendMode
+    ? (() => {
+      const parsed = Number.parseInt(String(args.port ?? ""), 10);
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : FIXED_LOCAL_ROUTER_PORT;
+    })()
+    : resolveListenPort({ explicitPort: args.port });
   const result = await runStartCommand({
     configPath: args.config || args.configPath || getDefaultConfigPath(),
     host: FIXED_LOCAL_ROUTER_HOST,
-    port: resolveListenPort({ explicitPort: args.port }),
+    port: explicitPort,
     watchConfig: parseBoolean(args["watch-config"] ?? args.watchConfig, true),
     watchBinary: parseBoolean(args["watch-binary"] ?? args.watchBinary, true),
     requireAuth: parseBoolean(args["require-auth"] ?? args.requireAuth, false),
+    backendMode,
+    startCommand: backendMode ? "start-runtime" : "start",
     onStartupConflict: (payload) => promptStartupConflictResolution(payload),
     cliPathForWatch: process.argv[1],
     onLine: (line) => console.log(line),
@@ -163,6 +171,7 @@ export async function runCli(argv = process.argv.slice(2), isTTY = undefined, ov
   const parsed = parseSimpleArgs(argv);
   const first = parsed.positional[0];
   const firstIsStart = first === "start";
+  const firstIsStartRuntime = first === "start-runtime";
   const firstIsWeb = first === "web";
   const firstIsConfig = first === "config";
   const firstIsSetup = first === "setup";
@@ -186,6 +195,12 @@ export async function runCli(argv = process.argv.slice(2), isTTY = undefined, ov
     const startArgs = argv.slice(1);
     const parsedStart = parseSimpleArgs(startArgs);
     return runStartFastPathImpl(parsedStart.args);
+  }
+
+  if (firstIsStartRuntime && !parsed.wantsHelp) {
+    const startArgs = argv.slice(1);
+    const parsedStart = parseSimpleArgs(startArgs);
+    return runStartFastPathImpl(parsedStart.args, { backendMode: true });
   }
 
   if (firstIsWeb && !parsed.wantsHelp) {

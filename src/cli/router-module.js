@@ -6694,7 +6694,7 @@ async function doSetFactoryDroidRouting(context) {
         ["Settings File", patchResult.settingsFilePath],
         ["Backup File", patchResult.backupFilePath],
         ["Base URL", patchResult.baseUrl],
-        ["Provider", patchResult.configuredProvider || "generic-chat-completion-api"],
+        ["Provider", patchResult.configuredProvider || "(not set)"],
         ["Default Model", patchResult.bindings?.defaultModel || "(not set)"],
         ["Mission Orchestrator", patchResult.bindings?.missionOrchestratorModel || "(not set)"],
         ["Mission Worker", patchResult.bindings?.missionWorkerModel || "(not set)"],

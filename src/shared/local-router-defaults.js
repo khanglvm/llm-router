@@ -20,16 +20,29 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function normalizeHost(value, fallback = LOCAL_ROUTER_HOST) {
+  const text = String(value || fallback).trim();
+  return text || fallback;
+}
+
+function normalizePort(value, fallback = LOCAL_ROUTER_PORT) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 65535) return fallback;
+  return parsed;
+}
+
 export function buildLocalRouterSettings(source = {}, fallback = {}) {
   const base = {
+    host: normalizeHost(fallback?.host, LOCAL_ROUTER_HOST),
+    port: normalizePort(fallback?.port, LOCAL_ROUTER_PORT),
     watchConfig: toBoolean(fallback?.watchConfig, true),
     watchBinary: toBoolean(fallback?.watchBinary, true),
     requireAuth: toBoolean(fallback?.requireAuth, false)
   };
 
   return {
-    host: LOCAL_ROUTER_HOST,
-    port: LOCAL_ROUTER_PORT,
+    host: normalizeHost(source?.host, base.host),
+    port: normalizePort(source?.port, base.port),
     watchConfig: toBoolean(source?.watchConfig, base.watchConfig),
     watchBinary: toBoolean(source?.watchBinary, base.watchBinary),
     requireAuth: toBoolean(source?.requireAuth, base.requireAuth)

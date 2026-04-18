@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { promises as fs } from "node:fs";
 import {
+  getDefaultDevConfigPath,
   readConfigFileState,
   readConfigFile,
   writeConfigFile
@@ -49,6 +50,10 @@ test("readConfigFile auto-migrates v1 config to latest schema and persists silen
   const rereadRaw = JSON.parse(await fs.readFile(configPath, "utf8"));
   assert.equal(rereadRaw.version, 2);
   assert.deepEqual(Object.keys(rereadRaw.modelAliases || {}), [DEFAULT_MODEL_ALIAS_ID]);
+});
+
+test("getDefaultDevConfigPath points to the dedicated dev config file", () => {
+  assert.equal(path.basename(getDefaultDevConfigPath()), ".llm-router-dev.json");
 });
 
 test("readConfigFileState reports migration details for legacy config reads", async (t) => {

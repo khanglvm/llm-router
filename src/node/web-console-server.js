@@ -12,7 +12,6 @@ import {
   areLocalServerSettingsEqual,
   formatStartupDetail,
   formatStartupLabel,
-  getFixedLocalRouterOrigin,
   readLocalServerSettings
 } from "./local-server-settings.js";
 import { appendActivityLogEntry, clearActivityLogFile, createActivityLogEntry, readActivityLogEntries, resolveActivityLogPath } from "./activity-log.js";
@@ -444,8 +443,17 @@ function formatHostForUrl(host, port) {
   return `[${value}]:${port}`;
 }
 
+function buildManagedRouterOrigin(settings = {}) {
+  const port = Number.isInteger(Number(settings?.port)) ? Number(settings.port) : FIXED_LOCAL_ROUTER_PORT;
+  const configuredHost = normalizeRuntimeHost(settings?.host || FIXED_LOCAL_ROUTER_HOST);
+  const host = isWildcardRuntimeHost(configuredHost) || isLoopbackRuntimeHost(configuredHost)
+    ? FIXED_LOCAL_ROUTER_HOST
+    : configuredHost;
+  return `http://${formatHostForUrl(host, port)}`;
+}
+
 function buildAmpClientEndpointUrl(settings = {}) {
-  return getFixedLocalRouterOrigin();
+  return buildManagedRouterOrigin(settings);
 }
 
 function buildCodexCliEndpointUrl(settings = {}) {
@@ -465,7 +473,7 @@ function buildFactoryDroidEndpointUrl(settings = {}) {
 
 function buildRouterEndpoints({ host, port, running }) {
   if (!running) return [];
-  const origin = getFixedLocalRouterOrigin();
+  const origin = buildManagedRouterOrigin({ host, port });
   return [
     { label: "Unified", url: `${origin}/route` },
     { label: "Anthropic", url: `${origin}/anthropic` },
@@ -805,8 +813,10 @@ function writeJsonLine(res, payload) {
 
 function resolveRouterOptions(current, body) {
   return {
-    host: FIXED_LOCAL_ROUTER_HOST,
-    port: FIXED_LOCAL_ROUTER_PORT,
+    host: normalizeRuntimeHost(body?.host || current?.host || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isInteger(Number(body?.port))
+      ? Number(body.port)
+      : (Number.isInteger(Number(current?.port)) ? Number(current.port) : FIXED_LOCAL_ROUTER_PORT),
     watchConfig: body?.watchConfig === undefined ? current.watchConfig : body.watchConfig === true,
     requireAuth: body?.requireAuth === undefined ? current.requireAuth : body.requireAuth === true,
     watchBinary: body?.watchBinary === undefined ? current.watchBinary : body.watchBinary === true
@@ -815,8 +825,8 @@ function resolveRouterOptions(current, body) {
 
 function getRouterStateSettings(routerState) {
   return {
-    host: FIXED_LOCAL_ROUTER_HOST,
-    port: FIXED_LOCAL_ROUTER_PORT,
+    host: normalizeRuntimeHost(routerState?.host || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isInteger(Number(routerState?.port)) ? Number(routerState.port) : FIXED_LOCAL_ROUTER_PORT,
     watchConfig: routerState?.watchConfig !== false,
     watchBinary: routerState?.watchBinary !== false,
     requireAuth: routerState?.requireAuth === true
@@ -882,6 +892,14 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     : loadWebConsoleDevAssets;
   const resolvedRouterCliPath = String(cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim();
   const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
+  const startupControlsEnabled = !devMode;
+  const defaultRouterSettings = {
+    host: normalizeRuntimeHost(routerHost || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isInteger(Number(routerPort)) ? Number(routerPort) : FIXED_LOCAL_ROUTER_PORT,
+    watchConfig: routerWatchConfig !== false,
+    watchBinary: routerWatchBinary !== false,
+    requireAuth: routerRequireAuth === true
+  };
 
   async function readWebSearchState(config = null) {
     if (!config || typeof config !== "object") return null;
@@ -1718,11 +1736,11 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   let activityLogEnabled = true;
 
   const routerState = {
-    host: FIXED_LOCAL_ROUTER_HOST,
-    port: FIXED_LOCAL_ROUTER_PORT,
-    watchConfig: routerWatchConfig,
-    watchBinary: routerWatchBinary,
-    requireAuth: routerRequireAuth,
+    host: defaultRouterSettings.host,
+    port: defaultRouterSettings.port,
+    watchConfig: defaultRouterSettings.watchConfig,
+    watchBinary: defaultRouterSettings.watchBinary,
+    requireAuth: defaultRouterSettings.requireAuth,
     lastError: ""
   };
 
@@ -1987,6 +2005,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   }
 
   async function stopUntrackedStartupRuntime({ reason = "Stopped startup-managed LLM Router." } = {}) {
+    if (!startupControlsEnabled) return false;
     const startup = await startupStatusFn().catch(() => null);
     if (!startup?.running) return false;
     await stopStartupFn();
@@ -1996,6 +2015,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   }
 
   async function startStartupOwnedRouter(settings, { restart = false } = {}) {
+    if (!startupControlsEnabled) {
+      const error = new Error("Startup service controls are disabled in dev mode.");
+      error.statusCode = 409;
+      throw error;
+    }
+
     await clearRuntimeStateFn();
     const detail = await installStartupFn({
       configPath,
@@ -2058,7 +2083,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       };
     }
 
-    const startup = await startupStatusFn().catch(() => null);
+    const startup = startupControlsEnabled ? await startupStatusFn().catch(() => null) : null;
     const activeRuntime = await readManagedRuntime(configLocalServer);
     if (activeRuntime) {
       return {
@@ -2075,7 +2100,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       await stopExternalRuntime(externalRuntime, {
         reason: `Stopped an existing LLM Router instance so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
       });
-    } else {
+    } else if (startupControlsEnabled) {
       await stopUntrackedStartupRuntime({
         reason: `Stopped the startup-managed LLM Router instance so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
       });
@@ -2270,13 +2295,21 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const configState = await readConfigState(configPath);
     const configLocalServer = getConfigLocalServer(configState);
     const activityLog = resolveActivityLogSnapshot(configState.normalizedConfig);
-    const startup = await startupStatusFn().catch((error) => ({
-      manager: "unknown",
-      serviceId: "llm-router",
-      installed: false,
-      running: false,
-      detail: error instanceof Error ? error.message : String(error)
-    }));
+    const startup = startupControlsEnabled
+      ? await startupStatusFn().catch((error) => ({
+        manager: "unknown",
+        serviceId: "llm-router",
+        installed: false,
+        running: false,
+        detail: error instanceof Error ? error.message : String(error)
+      }))
+      : {
+        manager: "disabled",
+        serviceId: "llm-router",
+        installed: false,
+        running: false,
+        detail: "Startup service controls are disabled in dev mode."
+      };
     const managedRuntime = await readManagedRuntime(configLocalServer);
     const externalRuntime = managedRuntime ? null : await readExternalRuntime(configLocalServer);
     const portProbe = probeRouterPort(configLocalServer);
@@ -2315,9 +2348,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       router: routerSnapshot,
       startup: {
         ...startup,
-        label: formatStartupLabel(startup),
-        friendlyDetail: formatStartupDetail(startup),
-        defaults: configLocalServer
+        label: startupControlsEnabled ? formatStartupLabel(startup) : "Startup disabled in dev mode",
+        friendlyDetail: startupControlsEnabled
+          ? formatStartupDetail(startup)
+          : "Development web console will not install, stop, or replace startup-managed routers.",
+        defaults: configLocalServer,
+        available: startupControlsEnabled
       },
       ampClient: {
         global: ampClientGlobal
@@ -2473,8 +2509,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       nextOptions = persisted.savedSettings;
     }
 
-    const startup = await startupStatusFn().catch(() => null);
-    const preferStartupOwnership = Boolean(startup?.installed);
+    const startup = startupControlsEnabled ? await startupStatusFn().catch(() => null) : null;
+    const preferStartupOwnership = startupControlsEnabled && Boolean(startup?.installed);
     const runningRuntime = await readManagedRuntime(nextOptions);
     const webConsoleConflict = getWebConsoleConflictMessage(nextOptions);
 
@@ -2501,7 +2537,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       await stopExternalRuntime(externalRuntime, {
         reason: "Stopped another LLM Router instance before starting the managed router."
       });
-    } else {
+    } else if (startupControlsEnabled) {
       await stopUntrackedStartupRuntime({
         reason: "Stopped the startup-managed LLM Router instance before starting the managed router."
       });
@@ -3733,6 +3769,10 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       }
 
       if (method === "POST" && requestUrl.pathname === "/api/startup/enable") {
+        if (!startupControlsEnabled) {
+          sendJson(res, 409, { error: "Startup service controls are unavailable in dev mode." });
+          return;
+        }
         const body = await readJsonBody(req);
         const configState = await readConfigState(configPath);
         if (configState.parseError) {
@@ -3795,6 +3835,10 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       }
 
       if (method === "POST" && requestUrl.pathname === "/api/startup/disable") {
+        if (!startupControlsEnabled) {
+          sendJson(res, 409, { error: "Startup service controls are unavailable in dev mode." });
+          return;
+        }
         await readJsonBody(req);
         const statusBefore = await startupStatusFn().catch(() => null);
         if (!statusBefore?.installed) {
@@ -4245,6 +4289,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
   addLog("info", `Web console listening on http://${formatHostForUrl(host, actualWebPort)}`);
   if (devMode) addLog("info", "Development mode enabled for web assets.");
+  if (!startupControlsEnabled) addLog("info", "Startup service controls disabled in dev mode.");
   startConfigWatcher();
   startActivityLogWatcher();
 

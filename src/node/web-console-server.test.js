@@ -2908,6 +2908,91 @@ test("web console toggles Codex CLI global routing and restores the prior config
   }
 });
 
+test("web console uses the configured router port for Codex CLI routing endpoints", async () => {
+  const customRouterPort = FIXED_LOCAL_ROUTER_PORT + 1;
+  const codexCli = await makeCodexCliEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop"
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+    routerPort: customRouterPort
+  }, {
+    codexCliEnv: codexCli.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    assert.equal(initial.response.status, 200);
+
+    const enabled = await fetchJson(`${server.url}/api/codex-cli/global-route`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        rawText: initial.payload.config.rawText
+      })
+    });
+    assert.equal(enabled.response.status, 200);
+    assert.equal(enabled.payload.codingTools.codexCli.routedViaRouter, true);
+
+    const expectedBaseUrl = `http://${FIXED_LOCAL_ROUTER_HOST}:${customRouterPort}/openai/v1`;
+    const codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
+    assert.ok(String(codexConfigText || "").includes(`base_url = "${expectedBaseUrl}"`));
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await codexCli.cleanup();
+  }
+});
+
+test("web console dev mode blocks startup management", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  let installCalls = 0;
+  let uninstallCalls = 0;
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+    devMode: true,
+    routerPort: FIXED_LOCAL_ROUTER_PORT + 1
+  }, {
+    installStartup: async () => {
+      installCalls += 1;
+      return { manager: "launchd", installed: true, running: true };
+    },
+    uninstallStartup: async () => {
+      uninstallCalls += 1;
+    }
+  });
+
+  try {
+    const enableResponse = await fetchJson(`${server.url}/api/startup/enable`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(enableResponse.response.status, 409);
+    assert.match(enableResponse.payload.error || "", /unavailable in dev mode/i);
+
+    const disableResponse = await fetchJson(`${server.url}/api/startup/disable`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(disableResponse.response.status, 409);
+    assert.match(disableResponse.payload.error || "", /unavailable in dev mode/i);
+    assert.equal(installCalls, 0);
+    assert.equal(uninstallCalls, 0);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
 test("web console writes Codex CLI model catalog metadata for alias bindings and removes it on disconnect", async () => {
   const codexCli = await makeCodexCliEnv();
   const fixture = await makeTempConfig({

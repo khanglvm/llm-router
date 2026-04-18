@@ -450,23 +450,23 @@ export function buildFactoryDroidGuideContent({
         title: "Factory defaults are set.",
         body: (
           <>
-            LLM Router injects a managed <code>customModels</code> entry, registers it as <code>generic-chat-completion-api</code>, and writes separate defaults for normal sessions and Missions.
+            LLM Router injects router-managed <code>customModels</code> entries, sets each managed provider to <code>openai</code> or <code>anthropic</code> based on the routed model format, and writes separate defaults for normal sessions and Missions.
           </>
         )
       }
     : {
         variant: "success",
-        title: "Factory Droid connected via custom model entry.",
+        title: "Factory Droid connected via managed custom models.",
         body: (
           <>
-            LLM Router injects a managed <code>customModels</code> entry pointing at the gateway. Set normal or Mission defaults below, or use Factory Droid&apos;s <code>/model</code> command to pick the routed model at runtime.
+            LLM Router injects router-managed <code>customModels</code> entries pointing at the gateway. Set normal or Mission defaults below, or use Factory Droid&apos;s <code>/model</code> command to pick the routed model at runtime.
           </>
         )
       };
 
   return {
     title: "Factory Droid guide",
-    description: "Quick setup for routing Factory Droid through LLM Router via a managed custom model entry.",
+    description: "Quick setup for routing Factory Droid through LLM Router via router-managed custom models.",
     badges: [
       { label: defaultModel ? `Normal: ${defaultModel}` : "Normal: Factory default", variant: defaultModel ? "info" : "outline" },
       { label: missionOrchestratorModel ? `Orchestrator: ${missionOrchestratorModel}` : "Orchestrator: Factory default", variant: missionOrchestratorModel ? "info" : "outline" },
@@ -488,7 +488,7 @@ export function buildFactoryDroidGuideContent({
             )
           : (
               <>
-                Click <span className="font-medium">Connect</span> to inject a managed custom model entry into Factory Droid settings.
+                Click <span className="font-medium">Connect</span> to inject router-managed custom models into Factory Droid settings.
               </>
             )
       },
@@ -535,10 +535,10 @@ export function buildFactoryDroidGuideContent({
       {
         title: "How it works",
         items: [
-          <>LLM Router adds a <code>customModels</code> entry with <code>provider: &quot;generic-chat-completion-api&quot;</code> and the gateway base URL.</>,
-          <>The injected entry has a <code>_llmRouterManaged</code> marker so it can be cleanly updated or removed without touching your other custom models.</>,
+          <>LLM Router adds router-managed <code>customModels</code> entries with <code>provider: &quot;openai&quot;</code> or <code>provider: &quot;anthropic&quot;</code>, plus the matching gateway base URL for that request format.</>,
+          <>Each injected entry has a <code>_llmRouterManaged</code> marker so it can be cleanly updated or removed without touching your other custom models.</>,
           <>The router-managed bindings map to both the legacy root <code>model</code> field and current Factory settings such as <code>sessionDefaultSettings.model</code>, <code>missionOrchestratorModel</code>, and <code>missionModelSettings</code>.</>,
-          <>Disconnecting removes only the managed entry and restores any backed-up session, Mission, or reasoning settings.</>
+          <>Disconnecting removes only the router-managed entries and restores any backed-up session, Mission, or reasoning settings.</>
         ]
       },
       {

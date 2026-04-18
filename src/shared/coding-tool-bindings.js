@@ -83,10 +83,31 @@ function sanitizeFactoryDroidRouterModelIdPart(value) {
 function formatFactoryDroidDisplayNameBase(value) {
   const normalized = String(value || "").trim();
   if (!normalized) return "";
-  if (/^gpt(?=[-\s.]|$)/i.test(normalized)) return `GPT${normalized.slice(3)}`;
-  if (/^glm(?=[-\s.]|$)/i.test(normalized)) return `GLM${normalized.slice(3)}`;
-  if (/^claude(?=[-\s.]|$)/i.test(normalized)) return `Claude${normalized.slice(6)}`;
-  return normalized;
+  let next = normalized;
+  if (/^gpt(?=[-\s.]|$)/i.test(next)) next = `GPT${next.slice(3)}`;
+  else if (/^glm(?=[-\s.]|$)/i.test(next)) next = `GLM${next.slice(3)}`;
+  else if (/^claude(?=[-\s.]|$)/i.test(next)) next = `Claude${next.slice(6)}`;
+
+  return next
+    .replace(/(\d)-(\d)(?=(?:-|$))/g, "$1.$2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatFactoryDroidProviderLabel(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "Provider";
+  if (normalized.toLowerCase() === "openrouter") return "OpenRouter";
+  if (normalized.toLowerCase() === "deepseek") return "DeepSeek";
+  if (/^[A-Za-z]{2,5}$/.test(normalized)) return normalized.toUpperCase();
+  return normalized
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 export function isFactoryDroidRouterModelId(value) {
@@ -181,20 +202,20 @@ export function buildFactoryDroidRouterModelId(modelRef, { kind = "" } = {}) {
   return buildFactoryDroidRouterModelId(normalizedModelRef, { kind: "model" });
 }
 
-export function buildFactoryDroidRouterDisplayName(modelRef, { kind = "" } = {}) {
+export function buildFactoryDroidRouterDisplayName(modelRef, { kind = "", providerName = "" } = {}) {
   const normalizedModelRef = String(modelRef || "").trim();
   if (!normalizedModelRef) return "";
 
   const explicitKind = String(kind || "").trim().toLowerCase();
   const inferredKind = explicitKind || (normalizedModelRef.includes("/") ? "model" : "alias");
   if (inferredKind === "alias") {
-    return `[LLM Alias] ${formatFactoryDroidDisplayNameBase(normalizedModelRef)}`;
+    return `${formatFactoryDroidDisplayNameBase(normalizedModelRef)} - LLM Router (Alias)`;
   }
 
   const modelName = normalizedModelRef.includes("/")
     ? normalizedModelRef.slice(normalizedModelRef.indexOf("/") + 1).trim()
     : normalizedModelRef;
-  return `[LLM] ${formatFactoryDroidDisplayNameBase(modelName)}`;
+  return `${formatFactoryDroidDisplayNameBase(modelName)} - LLM Router (${formatFactoryDroidProviderLabel(providerName)})`;
 }
 
 export function normalizeFactoryDroidReasoningEffort(value) {

@@ -1,5 +1,5 @@
 /**
- * Local config persistence for ~/.llm-router.json.
+ * Local config persistence for the default and development config files.
  */
 
 import os from "node:os";
@@ -14,9 +14,14 @@ import {
 import { sanitizePersistedLocalServerConfig } from "./local-server-settings.js";
 
 export const DEFAULT_CONFIG_FILENAME = ".llm-router.json";
+export const DEFAULT_DEV_CONFIG_FILENAME = ".llm-router-dev.json";
 
 export function getDefaultConfigPath() {
   return path.join(os.homedir(), DEFAULT_CONFIG_FILENAME);
+}
+
+export function getDefaultDevConfigPath() {
+  return path.join(os.homedir(), DEFAULT_DEV_CONFIG_FILENAME);
 }
 
 function normalizePersistedConfig(config, normalizeOptions = undefined) {

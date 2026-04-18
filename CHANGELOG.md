@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.7] - 2026-04-18
+
+### Fixed
+- Local `llr start` now keeps a fixed-port supervisor in front of the router runtime so CLI and tool traffic can survive backend restarts and upgrades without losing the public router endpoint.
+- `llr update` now upgrades the installed package before asking the live backend to reload, keeping the running router online during the install step and draining in-flight requests before the new version takes over.
+- Requests that arrive during a backend restart window are now deferred and automatically retried through the supervisor instead of failing immediately when the backend socket is briefly unavailable.
+
 ## [2.3.6] - 2026-04-18
 
 ### Fixed

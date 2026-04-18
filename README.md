@@ -29,9 +29,16 @@ llr ai-help  # agent-oriented setup brief
 - **Model aliases with routing** — group models into stable alias names with weighted round-robin, quota-aware balancing, and automatic fallback
 - **Rate limiting** — set request caps per model or across all models over configurable time windows
 - **Coding tool routing** — one-click routing config for Codex CLI, Claude Code, Factory Droid, and AMP
+- **Seamless local updates** — `llr update` keeps the fixed local router endpoint online, drains in-flight requests, and automatically retries through backend restart windows
 - **Web search** — built-in web search for AMP and other router-managed tools
 - **Deployable** — run locally or deploy to Cloudflare Workers
 - **AI-agent friendly** — full CLI parity with `llr config --operation=...` so agents can configure everything programmatically
+
+## Local Runtime Reliability
+
+`llr start` keeps a small supervisor bound to the fixed local router port and runs the real router backend behind it on an internal loopback port.
+
+That means `llr update` can install a new package version and gracefully swap the backend without breaking active CLI or tool requests. Requests that arrive during the short backend handoff are deferred and retried automatically instead of failing immediately. The Web UI may reconnect during that window, but router-managed API traffic keeps the same public local endpoint.
 
 ## Web UI
 
