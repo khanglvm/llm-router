@@ -5,6 +5,7 @@ import { buildCandidateKey } from "../state-store.js";
 import { consumeCandidateRateLimits, resolveWindowRange } from "../rate-limits.js";
 import {
   buildProviderHeaders,
+  normalizeClaudeCodeWebSearchProvider,
   resolveProviderFormat,
   resolveProviderUrl,
   resolveRouteReference
@@ -311,16 +312,29 @@ function hasSearchToolType(type) {
   if (!normalized) return false;
   return normalized === SEARCH_TOOL_NAME
     || normalized.startsWith("web_search_preview")
-    || normalized === "web_search_20250305";
+    || normalized.startsWith("web_search_");
 }
 
 function hasSearchToolName(name) {
-  const normalized = String(name || "").trim().toLowerCase();
-  return normalized === SEARCH_TOOL_NAME || normalized === "web_search_preview";
+  const normalized = String(name || "").trim().toLowerCase().replace(/\s+/g, "_");
+  return normalized === SEARCH_TOOL_NAME
+    || normalized === "web_search_preview"
+    || normalized === "websearch";
+}
+
+function hasReadWebPageToolType(type) {
+  const normalized = String(type || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized === READ_WEB_PAGE_TOOL_NAME
+    || normalized === "web_fetch"
+    || normalized.startsWith("web_fetch_");
 }
 
 function hasReadWebPageToolName(name) {
-  return String(name || "").trim().toLowerCase() === READ_WEB_PAGE_TOOL_NAME;
+  const normalized = String(name || "").trim().toLowerCase().replace(/\s+/g, "_");
+  return normalized === READ_WEB_PAGE_TOOL_NAME
+    || normalized === "web_fetch"
+    || normalized === "webfetch";
 }
 
 function hasInterceptableTool(tool) {
@@ -338,7 +352,7 @@ function hasInterceptableToolName(name) {
 
 function getToolName(tool) {
   if (!tool || typeof tool !== "object") return "";
-  if (hasReadWebPageToolName(tool.name) || hasReadWebPageToolName(tool.function?.name)) {
+  if (hasReadWebPageToolType(tool.type) || hasReadWebPageToolName(tool.name) || hasReadWebPageToolName(tool.function?.name)) {
     return READ_WEB_PAGE_TOOL_NAME;
   }
   if (hasSearchToolType(tool.type) || hasSearchToolName(tool.name) || hasSearchToolName(tool.function?.name)) {
@@ -403,6 +417,28 @@ function normalizeHostedSearchProviderEntry(entry, explicitId = "") {
 function normalizeSearchProviderId(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return AMP_WEB_SEARCH_PROVIDER_META.has(normalized) ? normalized : "";
+}
+
+function normalizeSearchProviderSelection(value) {
+  return normalizeClaudeCodeWebSearchProvider(value) || "";
+}
+
+function hasNativeClaudeWebSearchTool(tool) {
+  const normalizedType = String(tool?.type || "").trim().toLowerCase();
+  return normalizedType === "web_search"
+    || (normalizedType.startsWith("web_search_") && !normalizedType.startsWith("web_search_preview"));
+}
+
+function hasNativeClaudeWebFetchTool(tool) {
+  const normalizedType = String(tool?.type || "").trim().toLowerCase();
+  return normalizedType === "web_fetch" || normalizedType.startsWith("web_fetch_");
+}
+
+function shouldUseClaudeCodeWebSearchSelection(runtimeConfig = {}, originalBody = {}) {
+  const selectedProvider = normalizeSearchProviderSelection(runtimeConfig?.claudeCode?.webSearchProvider);
+  if (!selectedProvider) return false;
+  const tools = Array.isArray(originalBody?.tools) ? originalBody.tools : [];
+  return tools.some((tool) => hasNativeClaudeWebSearchTool(tool) || hasNativeClaudeWebFetchTool(tool));
 }
 
 function normalizeSearchRoutingStrategy(value) {
@@ -561,7 +597,7 @@ function normalizeConfiguredSearchProviders(rawProviders, raw = {}, env = {}) {
   ];
 }
 
-export function resolveAmpWebSearchConfig(runtimeConfig = {}, env = {}) {
+export function resolveAmpWebSearchConfig(runtimeConfig = {}, env = {}, options = {}) {
   const amp = runtimeConfig?.amp && typeof runtimeConfig.amp === "object" ? runtimeConfig.amp : {};
   const raw = runtimeConfig?.webSearch && typeof runtimeConfig.webSearch === "object" && !Array.isArray(runtimeConfig.webSearch)
     ? runtimeConfig.webSearch
@@ -574,11 +610,17 @@ export function resolveAmpWebSearchConfig(runtimeConfig = {}, env = {}) {
     { min: MIN_SEARCH_COUNT, max: MAX_SEARCH_COUNT }
   );
   const providers = normalizeConfiguredSearchProviders(raw.providers, raw, env);
+  const selectedProviderId = shouldUseClaudeCodeWebSearchSelection(runtimeConfig, options?.originalBody)
+    ? normalizeSearchProviderSelection(runtimeConfig?.claudeCode?.webSearchProvider)
+    : "";
+  const selectedProviders = selectedProviderId
+    ? providers.filter((provider) => normalizeSearchProviderSelection(provider?.id) === selectedProviderId)
+    : [];
 
   return {
     strategy: normalizeSearchRoutingStrategy(raw.strategy ?? env.AMP_WEB_SEARCH_STRATEGY),
     count,
-    providers
+    providers: selectedProviders.length > 0 ? selectedProviders : providers
   };
 }
 
@@ -895,8 +937,8 @@ function buildSearchProviderStatus(provider, evaluation, runtimeConfig = {}) {
   };
 }
 
-export async function buildAmpWebSearchSnapshot(runtimeConfig = {}, { env = {}, stateStore = null, now = Date.now() } = {}) {
-  const settings = resolveAmpWebSearchConfig(runtimeConfig, env);
+export async function buildAmpWebSearchSnapshot(runtimeConfig = {}, { env = {}, stateStore = null, now = Date.now(), originalBody = null } = {}) {
+  const settings = resolveAmpWebSearchConfig(runtimeConfig, env, { originalBody });
   const effectiveStateStore = resolveSearchStateStore(stateStore);
   const providers = [];
 
@@ -1198,7 +1240,8 @@ export async function executeAmpWebSearch(query, runtimeConfig = {}, env = {}, o
   const snapshot = await buildAmpWebSearchSnapshot(runtimeConfig, {
     env,
     stateStore: options.stateStore,
-    now: options.now
+    now: options.now,
+    originalBody: options.originalBody
   });
   const stateStore = resolveSearchStateStore(options.stateStore);
   const configuredProviders = snapshot.providers.filter((provider) => provider.ready);
@@ -1227,7 +1270,8 @@ export async function executeAmpWebSearch(query, runtimeConfig = {}, env = {}, o
       const refreshedSnapshot = await buildAmpWebSearchSnapshot(runtimeConfig, {
         env,
         stateStore,
-        now: options.now
+        now: options.now,
+        originalBody: options.originalBody
       });
       const refreshedProvider = refreshedSnapshot.providers.find((entry) => entry.id === providerStatus.id) || providerStatus;
       return {
@@ -1271,12 +1315,29 @@ export function shouldInterceptAmpWebSearch({ clientType, originalBody, runtimeC
   if (requestedToolNames.length === 0) {
     return false;
   }
+  const requestsWebSearch = requestedToolNames.includes(SEARCH_TOOL_NAME);
+  const requestsReadWebPage = requestedToolNames.includes(READ_WEB_PAGE_TOOL_NAME);
   const readyProviders = resolveAmpWebSearchConfig(runtimeConfig, env).providers.filter((provider) => {
     if (!isSearchProviderConfigured(provider)) return false;
     if (!isHostedSearchProvider(provider)) return true;
     const resolvedRoute = getResolvedHostedSearchRoute(runtimeConfig, provider);
     return Boolean(resolvedRoute && supportsResolvedHostedSearchRoute(resolvedRoute.provider, resolvedRoute.model));
   });
+  if (
+    clientType === "amp"
+    && requestsWebSearch
+    && !requestsReadWebPage
+    && readyProviders.length === 0
+    && runtimeConfig?.amp?.proxyWebSearchToUpstream === true
+    && String(runtimeConfig?.amp?.upstreamUrl || "").trim()
+    && String(runtimeConfig?.amp?.upstreamApiKey || "").trim()
+  ) {
+    return false;
+  }
+  const hasNativeClaudeWebTool = tools.some((tool) => hasNativeClaudeWebSearchTool(tool) || hasNativeClaudeWebFetchTool(tool));
+  if (hasNativeClaudeWebTool) {
+    return true;
+  }
   if (readyProviders.length === 0) {
     return clientType === "amp" && requestedToolNames.includes(READ_WEB_PAGE_TOOL_NAME);
   }
@@ -2324,6 +2385,7 @@ export async function maybeInterceptAmpWebSearch({
   runtimeConfig,
   env,
   stateStore,
+  originalBody,
   executeProviderRequest
 } = {}) {
   if (!(response instanceof Response)) {
@@ -2362,7 +2424,8 @@ export async function maybeInterceptAmpWebSearch({
       runtimeConfig,
       env,
       {
-        stateStore
+        stateStore,
+        originalBody
       }
     ));
   }

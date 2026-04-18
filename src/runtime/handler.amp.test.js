@@ -1433,12 +1433,10 @@ test("createFetchHandler maps AMP Gemini googleSearch tools onto Claude web sear
     assert.equal(response.status, 200);
     assert.equal(captured?.url, "https://api.anthropic.com/v1/messages");
     assert.equal(captured?.body?.model, "claude-3-5-haiku");
-    assert.deepEqual(captured?.body?.tools, [
-      {
-        type: "web_search_20250305",
-        name: "web_search"
-      }
-    ]);
+    assert.equal(Array.isArray(captured?.body?.tools), true);
+    assert.equal(captured?.body?.tools?.[0]?.name, "web_search");
+    assert.equal(captured?.body?.tools?.[0]?.description?.includes("Search the web"), true);
+    assert.equal(captured?.body?.tools?.[0]?.input_schema?.type, "object");
     assert.equal(response.headers.get("x-llm-router-tool-types"), "web_search");
     assert.match(String(response.headers.get("x-llm-router-tool-routing") || ""), /amp-web-search/);
 
@@ -2129,12 +2127,10 @@ test("createFetchHandler prefers non-Codex routes for AMP web search responses",
     assert.equal(response.status, 200);
     assert.equal(captured?.url, "https://api.anthropic.com/v1/messages");
     assert.equal(captured?.body?.model, "claude-3-5-haiku");
-    assert.deepEqual(captured?.body?.tools, [
-      {
-        type: "web_search_20250305",
-        name: "web_search"
-      }
-    ]);
+    assert.equal(Array.isArray(captured?.body?.tools), true);
+    assert.equal(captured?.body?.tools?.[0]?.name, "web_search");
+    assert.equal(captured?.body?.tools?.[0]?.description?.includes("Search the web"), true);
+    assert.equal(captured?.body?.tools?.[0]?.input_schema?.type, "object");
     assert.equal(response.headers.get("x-llm-router-selected-candidate"), "anthropic/claude-3-5-haiku");
     assert.equal(response.headers.get("x-llm-router-tool-types"), "web_search");
     assert.equal(response.headers.get("x-llm-router-tool-routing"), "amp-web-search:prefer-non-codex");

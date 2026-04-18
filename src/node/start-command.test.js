@@ -94,6 +94,30 @@ test("stopStartupManagedListener stops startup-managed runtime before reclaim", 
   assert.match(lines[0], /Stopping the startup service before reclaim/);
 });
 
+test("stopStartupManagedListener ignores startup-managed status when reclaiming a non-fixed port", async () => {
+  const lines = [];
+  let startupStatusCalls = 0;
+
+  const result = await stopStartupManagedListener({
+    port: LOCAL_ROUTER_PORT + 1,
+    line: (message) => lines.push(message),
+    error: () => {}
+  }, {
+    getActiveRuntimeState: async () => null,
+    startupStatus: async () => {
+      startupStatusCalls += 1;
+      return { running: true };
+    },
+    stopStartup: async () => {
+      throw new Error("stopStartup should not run for a non-fixed port");
+    }
+  });
+
+  assert.deepEqual(result, { ok: true, attempted: false });
+  assert.equal(startupStatusCalls, 0);
+  assert.deepEqual(lines, []);
+});
+
 test("reclaimPort short-circuits when startup-managed stop fails", async () => {
   const calls = [];
   const result = await reclaimPort({

@@ -41,7 +41,8 @@ import {
   HeartIcon,
   PlayIcon,
   PauseIcon,
-  PowerIcon
+  PowerIcon,
+  CopyIcon
 } from "./icons.jsx";
 
 import { initPresetModels } from "./provider-presets.js";
@@ -62,7 +63,6 @@ import {
 } from "./utils.js";
 
 import {
-  buildAmpClientUrl,
   ensureAmpDraftConfigShape,
   buildAmpEntityRows,
   updateAmpEditableRouteConfig,
@@ -74,6 +74,7 @@ import {
 import {
   ensureWebSearchConfigShape,
   buildWebSearchProviderRows,
+  buildClaudeCodeWebSearchProviderOptions,
   buildHostedWebSearchCandidateGroups,
   buildHostedWebSearchProviderId,
   normalizeWebSearchProviderKey,
@@ -142,6 +143,73 @@ async function copyTextToClipboard(value) {
   document.body.removeChild(textarea);
 }
 
+function formatHostForOrigin(host = "127.0.0.1") {
+  const normalizedHost = String(host || "127.0.0.1").trim() || "127.0.0.1";
+  return normalizedHost.includes(":") && !normalizedHost.startsWith("[")
+    ? `[${normalizedHost}]`
+    : normalizedHost;
+}
+
+function buildLocalRouterOrigin(settings = {}) {
+  const host = formatHostForOrigin(settings?.host || "127.0.0.1");
+  const port = Number.isInteger(Number(settings?.port)) ? Number(settings.port) : LOCAL_ROUTER_PORT;
+  return `http://${host}:${port}`;
+}
+
+function DevModeBanner({
+  currentConfigPath = "",
+  productionConfigPath = "",
+  routerPort = LOCAL_ROUTER_PORT,
+  canSyncProductionConfig = false,
+  syncBusy = false,
+  onSyncProductionConfig
+}) {
+  return (
+    <div className="overflow-hidden rounded-[1.75rem] border border-amber-300/80 bg-[linear-gradient(135deg,rgba(255,247,237,0.98),rgba(255,251,235,0.97),rgba(254,243,199,0.82))] shadow-[0_20px_60px_rgba(180,83,9,0.12)]">
+      <div className="flex flex-col gap-4 px-4 py-4 sm:px-5 lg:flex-row lg:items-center lg:justify-between">
+        <div className="min-w-0 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="warning" className="border-amber-300 bg-amber-100 text-amber-950">Dev Mode</Badge>
+            <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-900/80">Isolated router sandbox</span>
+          </div>
+          <div className="space-y-1">
+            <div className="text-base font-semibold text-amber-950 sm:text-lg">
+              Dev console runs on router port {routerPort} and leaves the production startup service alone.
+            </div>
+            <div className="max-w-3xl text-sm leading-6 text-amber-950/75">
+              Use the sync action to clone the current production config into this dev workspace without changing the dev router binding.
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="rounded-full border border-amber-300/70 bg-white/75 px-3 py-1.5 font-medium text-amber-950/80">
+              Dev config: <span className="font-semibold">{currentConfigPath || "Not resolved"}</span>
+            </span>
+            <span className="rounded-full border border-amber-300/60 bg-amber-50/70 px-3 py-1.5 font-medium text-amber-950/75">
+              Production source: <span className="font-semibold">{productionConfigPath || "Not resolved"}</span>
+            </span>
+          </div>
+        </div>
+        {canSyncProductionConfig ? (
+          <div className="flex shrink-0 items-center">
+            <Button
+              size="sm"
+              variant="outline"
+              className="border-amber-300 bg-white/85 text-amber-950 hover:bg-amber-100 hover:text-amber-950"
+              onClick={onSyncProductionConfig}
+              disabled={syncBusy}
+              aria-label={syncBusy ? "Syncing production config" : "Sync production config into this dev workspace"}
+              title={syncBusy ? "Syncing production config" : "Sync production config into this dev workspace"}
+            >
+              <CopyIcon className="h-3.5 w-3.5" />
+              <span>{syncBusy ? "Syncing production config…" : "Sync production config"}</span>
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const [snapshot, setSnapshot] = useState(null);
   const [draftText, setDraftText] = useState("");
@@ -154,6 +222,7 @@ export function App() {
   const [openEditorBusy, setOpenEditorBusy] = useState(false);
   const [routerBusy, setRouterBusy] = useState("");
   const [startupBusy, setStartupBusy] = useState("");
+  const [syncProductionBusy, setSyncProductionBusy] = useState(false);
   const [activeTab, setActiveTab] = useState("model-alias");
   const [remoteConfigUpdated, setRemoteConfigUpdated] = useState(false);
   const [providerWizardOpen, setProviderWizardOpen] = useState(false);
@@ -219,7 +288,11 @@ export function App() {
   const managedRouteOptions = useMemo(() => buildManagedRouteOptions(editableConfig), [editableConfig]);
   const providerEditorDisabledReason = parsedDraftState.parseError ? `Fix the raw JSON parse error first: ${parsedDraftState.parseError}` : "";
   const ampEditableConfig = editableConfig;
-  const ampClientUrl = useMemo(() => buildAmpClientUrl(), []);
+  const resolvedLocalServerSettings = snapshot?.config?.localServer || snapshot?.startup?.defaults || null;
+  const ampClientUrl = useMemo(
+    () => buildLocalRouterOrigin(resolvedLocalServerSettings || {}),
+    [resolvedLocalServerSettings?.host, resolvedLocalServerSettings?.port]
+  );
   const ampClientGlobal = snapshot?.ampClient?.global || {};
   const webSearchSnapshot = snapshot?.webSearch || snapshot?.ampWebSearch || null;
   const codexCliState = snapshot?.codingTools?.codexCli || {};
@@ -245,6 +318,13 @@ export function App() {
   const webSearchProviders = useMemo(
     () => buildWebSearchProviderRows(ampEditableConfig, webSearchSnapshot),
     [ampEditableConfig, webSearchSnapshot]
+  );
+  const claudeWebSearchProviderOptions = useMemo(
+    () => buildClaudeCodeWebSearchProviderOptions(
+      webSearchProviders,
+      claudeCodeState?.webSearchProvider || ""
+    ),
+    [webSearchProviders, claudeCodeState?.webSearchProvider]
   );
   const hostedSearchCandidates = useMemo(() => {
     const existingIds = new Set(
@@ -309,6 +389,13 @@ export function App() {
   const showProviderWizardModal = hasProviders && providerWizardOpen;
   const routerRunning = snapshot?.router?.running === true;
   const startupInstalled = snapshot?.startup?.installed === true;
+  const devModeEnabled = snapshot?.environment?.devMode === true;
+  const currentConfigPath = String(snapshot?.config?.path || snapshot?.environment?.configPath || "").trim();
+  const productionConfigPath = String(snapshot?.environment?.productionConfigPath || "").trim();
+  const canSyncProductionConfig = snapshot?.environment?.canSyncProductionConfig === true;
+  const routerDisplayPort = Number.isInteger(Number(snapshot?.config?.localServer?.port))
+    ? Number(snapshot.config.localServer.port)
+    : (Number.isInteger(Number(snapshot?.router?.port)) ? Number(snapshot.router.port) : LOCAL_ROUTER_PORT);
   const routerActionLabel = routerBusy === "start"
     ? "Starting…"
     : routerBusy === "stop"
@@ -325,7 +412,7 @@ export function App() {
         : "Enable OS startup";
   const routerStatusMessage = snapshot?.router?.portBusy
     ? (snapshot?.router?.portBusyReason
-      || `Port ${LOCAL_ROUTER_PORT} is occupied${snapshot?.router?.listenerPids?.length > 0 ? ` by PID${snapshot.router.listenerPids.length === 1 ? "" : "s"} ${snapshot.router.listenerPids.join(", ")}` : ""}.`)
+      || `Port ${routerDisplayPort} is occupied${snapshot?.router?.listenerPids?.length > 0 ? ` by PID${snapshot.router.listenerPids.length === 1 ? "" : "s"} ${snapshot.router.listenerPids.join(", ")}` : ""}.`)
     : String(snapshot?.router?.lastError || "").trim();
   const showOnboarding = !hasCompletedProviderSetup(editableConfig);
   const wizardEligibleProviders = providers.filter((p) => p?.type !== "ollama");
@@ -609,6 +696,29 @@ export function App() {
       throw error;
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleSyncProductionConfig() {
+    if (!canSyncProductionConfig || syncProductionBusy) return;
+    if (isDirty && typeof window !== "undefined" && typeof window.confirm === "function") {
+      const confirmed = window.confirm("Replace the current dev draft with the production config file? Unsaved edits in this dev session will be lost.");
+      if (!confirmed) return;
+    }
+
+    setSyncProductionBusy(true);
+    try {
+      const payload = await fetchJson("/api/config/sync-production", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: "{}"
+      });
+      applySnapshot(payload, { preserveDraft: false });
+      showNotice("success", payload?.message || "Production config synced into the dev workspace.");
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setSyncProductionBusy(false);
     }
   }
 
@@ -1655,6 +1765,27 @@ export function App() {
   }
 
   async function handleClaudeBindingChange(fieldId, value) {
+    if (fieldId === "webSearchProvider") {
+      setClaudeBindingsBusy(true);
+      try {
+        const payload = await fetchJson("/api/claude-code/search-provider", {
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            webSearchProvider: value,
+            rawText: draftText
+          })
+        });
+        applySnapshot(payload, { preserveDraft: false });
+        showNotice("success", value ? "Claude Code search capability updated." : "Claude Code search capability cleared.");
+      } catch (error) {
+        showNotice("error", error instanceof Error ? error.message : String(error));
+      } finally {
+        setClaudeBindingsBusy(false);
+      }
+      return;
+    }
+
     const isRoutedViaRouter = claudeCodeState?.routedViaRouter === true;
 
     if (fieldId === "thinkingLevel" && !isRoutedViaRouter) {
@@ -1954,6 +2085,16 @@ export function App() {
       <div className="console-shell min-h-screen px-4 py-6 md:px-6">
         <div className="mx-auto flex max-w-5xl flex-col gap-4">
           <ToastStack notices={notices} onDismiss={dismissNotice} />
+          {devModeEnabled ? (
+            <DevModeBanner
+              currentConfigPath={currentConfigPath}
+              productionConfigPath={productionConfigPath}
+              routerPort={routerDisplayPort}
+              canSyncProductionConfig={canSyncProductionConfig}
+              syncBusy={syncProductionBusy}
+              onSyncProductionConfig={handleSyncProductionConfig}
+            />
+          ) : null}
           <div id="quick-start-wizard">
             <QuickStartWizard
               key={`onboarding-wizard-${onboardingSeedMode}-${onboardingTargetProviderId || "new"}`}
@@ -1976,6 +2117,16 @@ export function App() {
   return (
     <div className="console-shell min-h-screen px-4 py-4 md:px-6 md:py-6">
       <div className="mx-auto flex max-w-7xl flex-col gap-4">
+        {devModeEnabled ? (
+          <DevModeBanner
+            currentConfigPath={currentConfigPath}
+            productionConfigPath={productionConfigPath}
+            routerPort={routerDisplayPort}
+            canSyncProductionConfig={canSyncProductionConfig}
+            syncBusy={syncProductionBusy}
+            onSyncProductionConfig={handleSyncProductionConfig}
+          />
+        ) : null}
         <Card className="overflow-hidden">
           <CardContent className="p-5">
             <div className="space-y-4">
@@ -1984,6 +2135,7 @@ export function App() {
                   <h1 className="inline-flex items-center gap-2 text-2xl font-semibold tracking-tight text-foreground">
                     <span>LLM Router Web Console</span>
                     <ConnectedIndicatorDot connected={routerRunning} size="md" srLabel="Router running" />
+                    {devModeEnabled ? <Badge variant="warning" className="border-amber-300 bg-amber-100 text-amber-950">Dev Mode</Badge> : null}
                   </h1>
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -2070,7 +2222,7 @@ export function App() {
               {!routerRunning && snapshot?.router?.portBusy && !snapshot?.router?.portBusySelf ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <Button size="sm" variant="outline" onClick={() => runRouterAction("reclaim")} disabled={routerBusy !== ""}>
-                    {routerBusy === "reclaim" ? "Reclaiming…" : `Reclaim port ${LOCAL_ROUTER_PORT}`}
+                    {routerBusy === "reclaim" ? "Reclaiming…" : `Reclaim port ${routerDisplayPort}`}
                   </Button>
                 </div>
               ) : null}
@@ -2313,6 +2465,18 @@ export function App() {
                   value: claudeCodeState?.bindings?.subagentModel || "",
                   allowUnset: true,
                   placeholder: "Select a sub-agent route"
+                },
+                {
+                  id: "webSearchProvider",
+                  label: "Search capability",
+                  description: "Choose which configured router web-search backend powers Claude Code’s native Anthropic web tools like `web_search_*`. Native `web_fetch_*` page retrieval is intercepted locally by LLM Router and does not use this provider selection.",
+                  envKey: "claudeCode.webSearchProvider",
+                  value: claudeCodeState?.webSearchProvider || "",
+                  allowUnset: true,
+                  usesRouteOptions: false,
+                  standaloneWhenDisconnected: true,
+                  placeholder: "Use default router web-search order",
+                  options: claudeWebSearchProviderOptions
                 },
                 {
                   id: "thinkingLevel",

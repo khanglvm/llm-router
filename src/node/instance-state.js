@@ -239,6 +239,7 @@ export async function waitForRuntimeMatch(options = {}, deps = {}) {
 
 export function spawnStartProcess({
   cliPath,
+  startCommand = "start-runtime",
   configPath,
   host = FIXED_LOCAL_ROUTER_HOST,
   port = FIXED_LOCAL_ROUTER_PORT,
@@ -256,7 +257,7 @@ export function spawnStartProcess({
 
   const args = [
     finalCliPath,
-    "start",
+    String(startCommand || "start-runtime").trim() || "start-runtime",
     `--config=${configPath}`,
     `--host=${host}`,
     `--port=${port}`,
@@ -290,7 +291,10 @@ export async function startDetachedRouterService(options = {}, deps = {}) {
 
   let child;
   try {
-    child = spawnStartProcessFn(options, {
+    child = spawnStartProcessFn({
+      ...options,
+      startCommand: String(options?.startCommand || "start-runtime").trim() || "start-runtime"
+    }, {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
       unref: false,

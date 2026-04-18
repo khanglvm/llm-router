@@ -29,6 +29,8 @@ llr ai-help  # agent-oriented setup brief
 - **Model aliases with routing** — group models into stable alias names with weighted round-robin, quota-aware balancing, and automatic fallback
 - **Rate limiting** — set request caps per model or across all models over configurable time windows
 - **Coding tool routing** — one-click routing config for Codex CLI, Claude Code, Factory Droid, and AMP
+- **Dev sandbox** — `yarn dev` runs the console against a dedicated dev config/router port, highlights dev mode in terminal + UI, and can clone the production config into the sandbox for quick iteration
+- **Claude native web tools** — local handling for Claude web search and page fetch requests, with selectable Claude Code web-search providers from the shared Web Search config
 - **Seamless local updates** — `llr update` keeps the fixed local router endpoint online, drains in-flight requests, and automatically retries through backend restart windows
 - **Web search** — built-in web search for AMP and other router-managed tools
 - **Deployable** — run locally or deploy to Cloudflare Workers
@@ -39,6 +41,14 @@ llr ai-help  # agent-oriented setup brief
 `llr start` keeps a small supervisor bound to the fixed local router port and runs the real router backend behind it on an internal loopback port.
 
 That means `llr update` can install a new package version and gracefully swap the backend without breaking active CLI or tool requests. Requests that arrive during the short backend handoff are deferred and retried automatically instead of failing immediately. The Web UI may reconnect during that window, but router-managed API traffic keeps the same public local endpoint.
+
+## Development Sandbox
+
+```bash
+yarn dev
+```
+
+Development mode uses the dedicated `~/.llm-router-dev.json` config and its own local router port so it can run alongside a startup-managed or manually started production router. The terminal and Web UI both show a dev-mode indicator, and the dev Web UI includes a one-click sync action to copy the current production config into the sandbox without changing the dev router binding.
 
 ## Web UI
 
@@ -65,6 +75,8 @@ Route Codex CLI requests through the gateway with model override and thinking le
 Route Claude Code through the gateway with per-tier model bindings.
 
 ![Claude Code Routing](./assets/screenshots/web-ui-claude-code.png)
+
+Claude Code can also select a shared Web Search provider or hosted search route from the router config. When Claude-compatible traffic uses native web-search or page-fetch tools, LLM Router can satisfy those calls through the selected shared web-search provider instead of relying on upstream-native web tooling.
 
 ### Factory Droid
 

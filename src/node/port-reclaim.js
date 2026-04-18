@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { clearRuntimeState, getActiveRuntimeState } from "./instance-state.js";
+import { FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
 import { startupStatus, stopStartup } from "./startup-manager.js";
 
 export function parsePidList(text) {
@@ -119,7 +120,9 @@ export async function stopStartupManagedListener({ port, line, error }, deps = {
   let shouldStopStartup = false;
   if (activeRuntimeState?.managedByStartup) {
     shouldStopStartup = Number(activeRuntimeState.port) === Number(port);
-  } else if (!activeRuntimeState) {
+  }
+
+  if (!shouldStopStartup && Number(port) === Number(FIXED_LOCAL_ROUTER_PORT)) {
     try {
       const status = await startupStatusFn();
       shouldStopStartup = Boolean(status?.running);

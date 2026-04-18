@@ -306,6 +306,48 @@ export function buildWebSearchProviderRows(config = {}, snapshot = null) {
   });
 }
 
+export function buildClaudeCodeWebSearchProviderOptions(providerRows = [], selectedProviderId = "") {
+  const options = [];
+  const seen = new Set();
+
+  for (const row of Array.isArray(providerRows) ? providerRows : []) {
+    if (!row?.configured) continue;
+    const optionValue = String(row?.id || "").trim();
+    const optionKey = normalizeWebSearchProviderKey(optionValue);
+    if (!optionValue || !optionKey || seen.has(optionKey)) continue;
+
+    const label = row.kind === "hosted"
+      ? [String(row?.label || "").trim(), String(row?.modelId || "").trim()].filter(Boolean).join(" · ")
+      : (String(row?.label || optionValue).trim() || optionValue);
+    const hint = row.kind === "hosted"
+      ? (String(row?.routeId || optionValue).trim() || "Hosted web search route")
+      : (row.active === false ? "Configured but not ready" : "Configured provider");
+
+    options.push({
+      value: optionValue,
+      label,
+      hint,
+      groupKey: row.kind === "hosted" ? "hosted-web-search-routes" : "builtin-web-search-providers",
+      groupLabel: row.kind === "hosted" ? "Hosted search routes" : "Built-in search providers"
+    });
+    seen.add(optionKey);
+  }
+
+  const selectedValue = String(selectedProviderId || "").trim();
+  const selectedKey = normalizeWebSearchProviderKey(selectedValue);
+  if (selectedValue && selectedKey && !seen.has(selectedKey)) {
+    options.unshift({
+      value: selectedValue,
+      label: selectedValue,
+      hint: "Current config (not configured)",
+      groupKey: "current-claude-selection",
+      groupLabel: "Current selection"
+    });
+  }
+
+  return options;
+}
+
 export function updateWebSearchConfig(config = {}, updates = {}) {
   const next = ensureAmpDraftConfigShape(config);
   const webSearch = ensureWebSearchConfigShape(next);

@@ -340,6 +340,280 @@ test("makeProviderCall intercepts native Claude web search locally for non-AMP c
   }
 });
 
+test("makeProviderCall intercepts native Claude web fetch locally for non-AMP clients", { concurrency: false }, async () => {
+  const calls = [];
+  const targetUrl = "https://docs.example.com/web-fetch-target";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const normalizedUrl = String(url);
+    if (normalizedUrl === targetUrl) {
+      calls.push({
+        url: normalizedUrl,
+        kind: "page-fetch"
+      });
+      return new Response(`
+        <html>
+          <head><title>Router Docs</title></head>
+          <body>
+            <main>
+              <h1>Web Fetch Support</h1>
+              <p>LLM Router now intercepts Claude native web fetch requests.</p>
+            </main>
+          </body>
+        </html>
+      `, {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8"
+        }
+      });
+    }
+
+    const body = JSON.parse(String(init.body || "{}"));
+    calls.push({
+      url: normalizedUrl,
+      kind: "provider",
+      body
+    });
+
+    if (calls.filter((entry) => entry.kind === "provider").length === 1) {
+      return jsonResponse({
+        id: "msg_native_fetch",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_fetch_1",
+            name: "read_web_page",
+            input: {
+              url: targetUrl
+            }
+          }
+        ],
+        stop_reason: "tool_use",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5
+        }
+      });
+    }
+
+    return jsonResponse({
+      id: "msg_native_fetch_final",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [
+        {
+          type: "text",
+          text: "The page confirms LLM Router intercepts Claude native web fetch requests."
+        }
+      ],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 16,
+        output_tokens: 11
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "smart",
+        max_tokens: 256,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: `Open ${targetUrl} with Claude's native web fetch tool.` }]
+          }
+        ],
+        tools: [
+          {
+            type: "web_fetch_20250910"
+          }
+        ]
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: false,
+      candidate: buildClaudeCandidate(),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      runtimeConfig: {},
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls[0]?.body?.tools?.[0]?.name, "read_web_page");
+    assert.equal(calls[1]?.url, targetUrl);
+    assert.equal(calls[2]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls[2]?.body?.tools, undefined);
+    assert.equal(calls[2]?.body?.messages?.at(-1)?.role, "user");
+    assert.equal(calls[2]?.body?.messages?.at(-1)?.content?.[0]?.type, "tool_result");
+    assert.match(String(calls[2]?.body?.messages?.at(-1)?.content?.[0]?.content || ""), /Router Docs/);
+    assert.match(String(calls[2]?.body?.messages?.at(-1)?.content?.[0]?.content || ""), /Web Fetch Support/);
+
+    const payload = await result.response.json();
+    assert.equal(payload.type, "message");
+    assert.equal(payload.content?.[0]?.type, "text");
+    assert.match(String(payload.content?.[0]?.text || ""), /native web fetch/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("makeProviderCall uses Claude Code selected web search provider for native Claude web tools", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const normalizedUrl = String(url);
+    if (normalizedUrl.startsWith("https://api.search.brave.com/")) {
+      calls.push({
+        url: normalizedUrl,
+        kind: "search-brave"
+      });
+      return jsonResponse({
+        web: {
+          results: [
+            {
+              title: "Brave Result",
+              url: "https://example.com/brave",
+              description: "Should not be used when Claude Code selects Tavily."
+            }
+          ]
+        }
+      });
+    }
+    if (normalizedUrl === "https://api.tavily.com/search") {
+      calls.push({
+        url: normalizedUrl,
+        kind: "search-tavily"
+      });
+      return jsonResponse({
+        answer: "Claude Code selected Tavily.",
+        results: [
+          {
+            title: "Tavily Result",
+            url: "https://example.com/tavily",
+            content: "This result came from the selected Tavily backend."
+          }
+        ]
+      });
+    }
+
+    const body = JSON.parse(String(init.body || "{}"));
+    calls.push({
+      url: normalizedUrl,
+      kind: "provider",
+      body
+    });
+
+    if (calls.filter((entry) => entry.kind === "provider").length === 1) {
+      return jsonResponse({
+        id: "msg_native_search_selected_provider",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_web_selected_1",
+            name: "web_search",
+            input: {
+              query: "llm-router claude code web search provider"
+            }
+          }
+        ],
+        stop_reason: "tool_use",
+        usage: {
+          input_tokens: 11,
+          output_tokens: 4
+        }
+      });
+    }
+
+    return jsonResponse({
+      id: "msg_native_search_selected_provider_final",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [
+        {
+          type: "text",
+          text: "The selected web search provider was used."
+        }
+      ],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 18,
+        output_tokens: 9
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "smart",
+        max_tokens: 256,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "Search the web using Claude Code's native search tool." }]
+          }
+        ],
+        tools: [
+          {
+            type: "web_search_20250305"
+          }
+        ]
+      },
+      sourceFormat: FORMATS.CLAUDE,
+      stream: false,
+      candidate: buildClaudeCandidate(),
+      requestKind: "messages",
+      requestHeaders: new Headers({ "anthropic-version": "2023-06-01" }),
+      runtimeConfig: {
+        webSearch: {
+          providers: [
+            {
+              id: "brave",
+              apiKey: "brave_test_key",
+              count: 3
+            },
+            {
+              id: "tavily",
+              apiKey: "tavily_test_key",
+              count: 3
+            }
+          ]
+        },
+        claudeCode: {
+          webSearchProvider: "tavily"
+        }
+      },
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.filter((entry) => entry.kind === "search-brave").length, 0);
+    assert.equal(calls.filter((entry) => entry.kind === "search-tavily").length, 1);
+    assert.equal(calls[0]?.url, "https://api.anthropic.com/v1/messages");
+    assert.equal(calls.at(-1)?.url, "https://api.anthropic.com/v1/messages");
+    assert.match(String(calls.at(-1)?.body?.messages?.at(-1)?.content?.[0]?.content || ""), /Tavily Result/);
+
+    const payload = await result.response.json();
+    assert.equal(payload.type, "message");
+    assert.match(String(payload.content?.[0]?.text || ""), /selected web search provider/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("makeProviderCall prefers OpenAI routing for Claude tool calls on dual-format providers", { concurrency: false }, async () => {
   resetOpenAIToolRoutingLearningState();
   const calls = [];

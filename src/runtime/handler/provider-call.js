@@ -920,6 +920,7 @@ export async function makeProviderCall({
         runtimeConfig,
         env,
         stateStore,
+        originalBody: body,
         executeProviderRequest: async (followUpBody) => {
           const followUpResult = await executeSubscriptionRequest(followUpBody);
           return followUpResult?.response instanceof Response ? followUpResult.response : null;
@@ -1219,6 +1220,7 @@ export async function makeProviderCall({
       runtimeConfig,
       env,
       stateStore,
+      originalBody: body,
       executeProviderRequest: async (followUpBody) => {
         try {
           return await executeHttpProviderRequest({

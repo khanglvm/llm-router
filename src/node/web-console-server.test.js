@@ -2993,6 +2993,64 @@ test("web console dev mode blocks startup management", async () => {
   }
 });
 
+test("web console dev mode can sync from the production config while preserving the dev router port", async () => {
+  const devRouterPort = FIXED_LOCAL_ROUTER_PORT + 1;
+  const fixture = await makeTempConfig(createBaseConfig());
+  const productionFixture = await makeTempConfig({
+    providers: [
+      {
+        id: "prod-sync",
+        name: "Production Sync Provider",
+        baseUrl: "https://prod.example.com/v1",
+        apiKey: "sk-prod-sync-1234",
+        format: "openai",
+        models: [{ id: "gpt-4.1-mini" }]
+      }
+    ],
+    modelAliases: {
+      default: {
+        id: "default",
+        strategy: "ordered",
+        targets: [{ ref: "prod-sync/gpt-4.1-mini" }],
+        fallbackTargets: []
+      }
+    }
+  });
+
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+    productionConfigPath: productionFixture.configPath,
+    routerPort: devRouterPort,
+    devMode: true
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    assert.equal(initial.response.status, 200);
+    assert.equal(initial.payload.environment.devMode, true);
+    assert.equal(initial.payload.environment.canSyncProductionConfig, true);
+    assert.equal(initial.payload.config.localServer.port, devRouterPort);
+
+    const synced = await fetchJson(`${server.url}/api/config/sync-production`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(synced.response.status, 200);
+    assert.equal(synced.payload.environment.devMode, true);
+    assert.equal(synced.payload.config.localServer.port, devRouterPort);
+    assert.equal(synced.payload.router.port, devRouterPort);
+    assert.match(String(synced.payload.config.rawText || ""), /prod-sync/);
+    assert.match(String(synced.payload.message || ""), /Synced dev config from/);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await productionFixture.cleanup();
+  }
+});
+
 test("web console writes Codex CLI model catalog metadata for alias bindings and removes it on disconnect", async () => {
   const codexCli = await makeCodexCliEnv();
   const fixture = await makeTempConfig({
@@ -3651,6 +3709,181 @@ test("web console treats Claude Code as connected when the endpoint matches and 
     assert.equal(refreshed.payload.codingTools.claudeCode.routedViaRouter, true);
     assert.equal(refreshed.payload.codingTools.claudeCode.bindings.defaultOpusModel, "coding.default");
     assert.equal(refreshed.payload.codingTools.claudeCode.bindings.thinkingLevel, "high");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console state exposes Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        },
+        {
+          id: "demo/gpt-4o-mini",
+          providerId: "demo",
+          model: "gpt-4o-mini"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "demo/gpt-4o-mini"
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const state = await fetchJson(`${server.url}/api/state`);
+    assert.equal(state.response.status, 200);
+    assert.equal(state.payload.codingTools.claudeCode.webSearchProvider, "demo/gpt-4o-mini");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console updates Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const updated = await fetchJson(`${server.url}/api/claude-code/search-provider`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: initial.payload.config.rawText,
+        webSearchProvider: "brave"
+      })
+    });
+
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.payload.codingTools.claudeCode.webSearchProvider, "brave");
+
+    const config = await readJsonFileOrNull(fixture.configPath);
+    assert.equal(config.claudeCode.webSearchProvider, "brave");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console clears Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "brave"
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const cleared = await fetchJson(`${server.url}/api/claude-code/search-provider`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: initial.payload.config.rawText,
+        webSearchProvider: ""
+      })
+    });
+
+    assert.equal(cleared.response.status, 200);
+    assert.equal(cleared.payload.codingTools.claudeCode.webSearchProvider, "");
+
+    const config = await readJsonFileOrNull(fixture.configPath);
+    assert.equal(config.claudeCode, undefined);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console rejects invalid Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const invalid = await fetchJson(`${server.url}/api/claude-code/search-provider`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: initial.payload.config.rawText,
+        webSearchProvider: "demo/gpt-4o-mini"
+      })
+    });
+
+    assert.equal(invalid.response.status, 400);
+    assert.equal(
+      invalid.payload.error,
+      "Claude Code web search provider 'demo/gpt-4o-mini' must reference a configured webSearch provider."
+    );
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();

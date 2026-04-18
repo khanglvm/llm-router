@@ -559,6 +559,12 @@ function normalizeAmpWebSearchProviderId(value) {
   return AMP_WEB_SEARCH_PROVIDER_IDS.includes(normalized) ? normalized : "";
 }
 
+export function normalizeClaudeCodeWebSearchProvider(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  return normalizeAmpWebSearchProviderId(normalized) || normalized;
+}
+
 function normalizeAmpWebSearchStrategy(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return "ordered";
@@ -748,6 +754,32 @@ function normalizeAmpWebSearchConfig(rawWebSearch) {
       false
     )
   };
+}
+
+function normalizeClaudeCodeConfig(rawClaudeCode) {
+  if (!rawClaudeCode || typeof rawClaudeCode !== "object" || Array.isArray(rawClaudeCode)) {
+    return undefined;
+  }
+
+  const source = rawClaudeCode;
+  const hasWebSearchProvider = hasOwn(source, "webSearchProvider")
+    || hasOwn(source, "web-search-provider")
+    || hasOwn(source, "searchProvider")
+    || hasOwn(source, "search-provider");
+  const webSearchProvider = normalizeClaudeCodeWebSearchProvider(
+    source.webSearchProvider
+    ?? source["web-search-provider"]
+    ?? source.searchProvider
+    ?? source["search-provider"]
+  );
+
+  if (!hasWebSearchProvider) {
+    return undefined;
+  }
+
+  return webSearchProvider
+    ? { webSearchProvider }
+    : {};
 }
 
 function supportsOpenAIHostedWebSearchRoute(provider, model) {
@@ -1759,11 +1791,13 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     ? rawAmp
     : {};
   const rawWebSearch = raw.webSearch ?? raw["web-search"];
+  const rawClaudeCode = raw.claudeCode ?? raw["claude-code"];
   const amp = normalizeAmpConfig(rawAmp);
   const webSearch = normalizeAmpWebSearchConfig(rawWebSearch)
     ?? (amp?.webSearch && typeof amp.webSearch === "object" && !Array.isArray(amp.webSearch)
       ? amp.webSearch
       : undefined);
+  const claudeCode = normalizeClaudeCodeConfig(rawClaudeCode);
   const normalizedAmp = webSearch && amp?.webSearch && typeof amp.webSearch === "object" && !Array.isArray(amp.webSearch)
     ? Object.fromEntries(
         Object.entries(amp).filter(([key]) => key !== "webSearch")
@@ -1780,6 +1814,7 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     modelAliases,
     amp: normalizedAmp,
     ...(webSearch ? { webSearch } : {}),
+    ...(claudeCode && Object.keys(claudeCode).length > 0 ? { claudeCode } : {}),
     ollama,
     metadata: sanitizeRuntimeMetadata(raw.metadata)
   };
@@ -2085,6 +2120,21 @@ function validateAmpConfig(config, routingIndex, errors) {
       }
     }
   }
+
+  const claudeCode = config?.claudeCode;
+  if (claudeCode && typeof claudeCode === "object" && !Array.isArray(claudeCode)) {
+    const selectedWebSearchProvider = normalizeClaudeCodeWebSearchProvider(claudeCode.webSearchProvider);
+    if (selectedWebSearchProvider) {
+      const configuredProviders = Array.isArray(webSearch?.providers) ? webSearch.providers : [];
+      const selectedExists = configuredProviders.some((provider) => {
+        const providerId = normalizeClaudeCodeWebSearchProvider(provider?.id);
+        return providerId && providerId === selectedWebSearchProvider;
+      });
+      if (!selectedExists) {
+        errors.push(`claudeCode.webSearchProvider '${selectedWebSearchProvider}' must reference a configured webSearch provider.`);
+      }
+    }
+  }
 }
 
 export function validateRuntimeConfig(config, { requireMasterKey = false, requireProvider = false } = {}) {
@@ -2325,6 +2375,9 @@ export function sanitizeConfigForDisplay(config) {
     ...config,
     masterKey: config.masterKey ? maskSecret(config.masterKey) : undefined,
     ...(sanitizedWebSearch ? { webSearch: sanitizedWebSearch } : {}),
+    ...(config.claudeCode && typeof config.claudeCode === "object" && !Array.isArray(config.claudeCode)
+      ? { claudeCode: { ...config.claudeCode } }
+      : {}),
     amp: sanitizedAmp,
     providers: (config.providers || []).map((provider) => ({
       ...provider,

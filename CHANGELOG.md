@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-04-18
+
+### Added
+- Claude Code can now store a router-managed `claudeCode.webSearchProvider` selection, with validation plus Web UI controls for choosing either built-in web search providers or hosted search routes.
+- Native Claude web search and page-fetch tool calls can now be intercepted locally for non-AMP clients, so Claude-compatible traffic can use the router-managed shared web search stack instead of falling back to upstream-native tools.
+- `yarn dev` now exposes a one-click "Sync production config" action that clones the current production config into the dedicated dev config while preserving the dev router's local server settings.
+
+### Fixed
+- `yarn dev` now launches the detached router backend with the runtime start path, so the dedicated dev router port is honored instead of conflicting with the fixed production port.
+- Dev-mode router reclaim now leaves startup-managed production instances alone when reclaiming non-fixed dev ports.
+- The dev terminal and web console now clearly mark when you are operating in the isolated development sandbox.
+
 ## [2.3.7] - 2026-04-18
 
 ### Fixed

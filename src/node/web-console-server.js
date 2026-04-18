@@ -68,6 +68,7 @@ import {
   OLLAMA_KEEP_ALIVE_PATTERN,
   OLLAMA_PROVIDER_TYPE,
   configHasProvider,
+  normalizeClaudeCodeWebSearchProvider,
   normalizeOllamaConfig,
   normalizeRuntimeConfig,
   resolveProviderApiKey,
@@ -850,6 +851,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     host = "127.0.0.1",
     port = 8788,
     configPath = getDefaultConfigPath(),
+    productionConfigPath = getDefaultConfigPath(),
     activityLogPath = "",
     routerHost = FIXED_LOCAL_ROUTER_HOST,
     routerPort = FIXED_LOCAL_ROUTER_PORT,
@@ -891,6 +893,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     ? deps.loadWebConsoleDevAssets
     : loadWebConsoleDevAssets;
   const resolvedRouterCliPath = String(cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim();
+  const resolvedConfigPath = path.resolve(String(configPath || getDefaultConfigPath()).trim() || getDefaultConfigPath());
+  const resolvedProductionConfigPath = path.resolve(String(productionConfigPath || getDefaultConfigPath()).trim() || getDefaultConfigPath());
   const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
   const startupControlsEnabled = !devMode;
   const defaultRouterSettings = {
@@ -1326,6 +1330,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   async function readClaudeCodeGlobalRoutingState(settings = {}, config = null) {
     const endpointUrl = buildAmpClientEndpointUrl(settings);
     const apiKey = String(config?.masterKey || "").trim();
+    const webSearchProvider = normalizeClaudeCodeWebSearchProvider(config?.claudeCode?.webSearchProvider);
     try {
       const state = await readClaudeCodeRoutingState({
         endpointUrl,
@@ -1334,6 +1339,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       });
       return {
         ...state,
+        webSearchProvider,
         endpointUrl,
         error: ""
       };
@@ -1354,6 +1360,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           subagentModel: "",
           thinkingLevel: ""
         },
+        webSearchProvider,
         endpointUrl,
         error: error instanceof Error ? error.message : String(error)
       };
@@ -2181,7 +2188,11 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     return savedConfig;
   }
 
-  async function writeAndBroadcastConfig(parsed, { source = "" } = {}) {
+  async function writeAndBroadcastConfig(parsed, {
+    source = "",
+    preserveMissingKeys = true,
+    successMessage = ""
+  } = {}) {
     const previousConfigState = await readConfigState(configPath);
     const previousConfig = previousConfigState.normalizedConfig || buildDefaultConfigObject();
     const previousLocalServer = getConfigLocalServer(previousConfigState);
@@ -2190,7 +2201,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     // This prevents partial writes (e.g. from scoped Ollama endpoints) from wiping
     // unrelated config sections like masterKey, modelAliases, amp, metadata, etc.
     const previousRaw = previousConfigState.rawConfig;
-    if (previousRaw && typeof previousRaw === "object" && parsed && typeof parsed === "object") {
+    if (preserveMissingKeys && previousRaw && typeof previousRaw === "object" && parsed && typeof parsed === "object") {
       for (const key of Object.keys(previousRaw)) {
         if (!(key in parsed)) {
           parsed[key] = previousRaw[key];
@@ -2204,7 +2215,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const nextLocalServer = readLocalServerSettings(savedConfig, previousLocalServer);
 
     if (source !== "autosave") {
-      addLog("success", `Config saved to ${path.basename(configPath)}.`);
+      addLog("success", successMessage || `Config saved to ${path.basename(configPath)}.`);
     }
 
     const managedRuntime = await readManagedRuntime(previousLocalServer);
@@ -2266,6 +2277,54 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       snapshot,
       savedConfig,
       nextLocalServer
+    };
+  }
+
+  async function syncConfigFromProduction() {
+    if (!devMode) {
+      const error = new Error("Production config sync is only available in dev mode.");
+      error.statusCode = 409;
+      throw error;
+    }
+
+    if (resolvedConfigPath === resolvedProductionConfigPath) {
+      const error = new Error("Current config already points to the production config file.");
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const currentConfigState = await readConfigState(configPath);
+    const currentLocalServer = getConfigLocalServer(currentConfigState);
+    const productionConfigState = await readConfigState(resolvedProductionConfigPath);
+
+    if (!productionConfigState.summary?.exists) {
+      const error = new Error(`Production config file was not found at ${resolvedProductionConfigPath}.`);
+      error.statusCode = 404;
+      throw error;
+    }
+
+    if (productionConfigState.parseError) {
+      const error = new Error(`Production config JSON must parse before syncing: ${productionConfigState.parseError}`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const clonedConfig = applyLocalServerSettings(
+      productionConfigState.normalizedConfig || buildDefaultConfigObject(),
+      currentLocalServer
+    );
+
+    const result = await writeAndBroadcastConfig(clonedConfig, {
+      source: "production-sync",
+      preserveMissingKeys: false,
+      successMessage: `Synced ${path.basename(resolvedConfigPath)} from ${path.basename(resolvedProductionConfigPath)}.`
+    });
+
+    return {
+      ...result,
+      message: `Synced dev config from ${resolvedProductionConfigPath}.`,
+      syncedFrom: resolvedProductionConfigPath,
+      syncedTo: resolvedConfigPath
     };
   }
 
@@ -2334,6 +2393,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       : { ok: false };
 
     return {
+      environment: {
+        devMode,
+        configPath: resolvedConfigPath,
+        productionConfigPath: resolvedProductionConfigPath,
+        canSyncProductionConfig: devMode && resolvedConfigPath !== resolvedProductionConfigPath
+      },
       web: {
         host,
         port: actualWebPort,
@@ -2823,6 +2888,17 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         sendJson(res, 200, {
           summary,
           validationMessages: summary.validationMessages
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/config/sync-production") {
+        const synced = await syncConfigFromProduction();
+        sendJson(res, 200, {
+          ...synced.snapshot,
+          message: synced.message,
+          syncedFrom: synced.syncedFrom,
+          syncedTo: synced.syncedTo
         });
         return;
       }
@@ -3450,6 +3526,102 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         sendJson(res, 200, {
           ...snapshot,
           message: "Claude Code model bindings updated."
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/claude-code/search-provider") {
+        const body = await readJsonBody(req);
+        const currentConfigState = await readConfigState(configPath);
+
+        let parsed;
+        try {
+          if (body?.config && typeof body.config === "object" && !Array.isArray(body.config)) {
+            parsed = body.config;
+          } else if (typeof body?.rawText === "string") {
+            const rawText = String(body.rawText || "");
+            parsed = rawText.trim() ? JSON.parse(rawText) : {};
+          } else {
+            parsed = currentConfigState.rawConfig && typeof currentConfigState.rawConfig === "object" && !Array.isArray(currentConfigState.rawConfig)
+              ? { ...currentConfigState.rawConfig }
+              : {};
+          }
+        } catch (error) {
+          sendJson(res, 400, {
+            error: `Config JSON parse failed: ${error instanceof Error ? error.message : String(error)}`
+          });
+          return;
+        }
+
+        const nextConfig = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        const selectedProvider = normalizeClaudeCodeWebSearchProvider(
+          body?.webSearchProvider
+          ?? body?.searchProvider
+          ?? body?.providerId
+        );
+
+        if (selectedProvider) {
+          let normalizedConfig;
+          try {
+            normalizedConfig = normalizeRuntimeConfig(nextConfig, { migrateToVersion: CONFIG_VERSION });
+          } catch (error) {
+            sendJson(res, 400, {
+              error: `Config normalization failed: ${error instanceof Error ? error.message : String(error)}`
+            });
+            return;
+          }
+          const configuredProviders = Array.isArray(normalizedConfig?.webSearch?.providers) ? normalizedConfig.webSearch.providers : [];
+          const selectedExists = configuredProviders.some((provider) => normalizeClaudeCodeWebSearchProvider(provider?.id) === selectedProvider);
+          if (!selectedExists) {
+            sendJson(res, 400, {
+              error: `Claude Code web search provider '${selectedProvider}' must reference a configured webSearch provider.`
+            });
+            return;
+          }
+        }
+
+        if (selectedProvider) {
+          const currentClaudeCode = nextConfig?.claudeCode && typeof nextConfig.claudeCode === "object" && !Array.isArray(nextConfig.claudeCode)
+            ? nextConfig.claudeCode
+            : (nextConfig?.["claude-code"] && typeof nextConfig["claude-code"] === "object" && !Array.isArray(nextConfig["claude-code"])
+              ? nextConfig["claude-code"]
+              : null);
+          const nextClaudeCode = currentClaudeCode
+            ? { ...currentClaudeCode }
+            : {};
+          nextClaudeCode.webSearchProvider = selectedProvider;
+          nextConfig.claudeCode = nextClaudeCode;
+          delete nextConfig["claude-code"];
+        } else {
+          const currentClaudeCode = nextConfig?.claudeCode && typeof nextConfig.claudeCode === "object" && !Array.isArray(nextConfig.claudeCode)
+            ? nextConfig.claudeCode
+            : (nextConfig?.["claude-code"] && typeof nextConfig["claude-code"] === "object" && !Array.isArray(nextConfig["claude-code"])
+              ? nextConfig["claude-code"]
+              : null);
+          if (currentClaudeCode) {
+            const nextClaudeCode = { ...currentClaudeCode };
+            delete nextClaudeCode.webSearchProvider;
+            delete nextClaudeCode["web-search-provider"];
+            delete nextClaudeCode.searchProvider;
+            delete nextClaudeCode["search-provider"];
+            if (Object.keys(nextClaudeCode).length > 0) {
+              nextConfig.claudeCode = nextClaudeCode;
+            } else {
+              nextConfig.claudeCode = {};
+            }
+            delete nextConfig["claude-code"];
+          }
+        }
+
+        const { snapshot } = await writeAndBroadcastConfig(nextConfig, { source: "claude-code-search-provider" });
+        addLog(
+          "success",
+          selectedProvider ? "Claude Code search capability updated." : "Claude Code search capability cleared.",
+          selectedProvider || "Default router search order"
+        );
+        sendJson(res, 200, {
+          ...snapshot,
+          message: selectedProvider ? "Claude Code search capability updated." : "Claude Code search capability cleared."
         });
         return;
       }

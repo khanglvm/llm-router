@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getDefaultDevConfigPath } from "../src/node/config-store.js";
+import { getDefaultConfigPath, getDefaultDevConfigPath } from "../src/node/config-store.js";
 import { RUNTIME_STATE_PATH_ENV } from "../src/node/instance-state.js";
 import { resolveLargeRequestLogPath } from "../src/node/large-request-log.js";
 import { startWebConsoleServer } from "../src/node/web-console-server.js";
@@ -14,6 +14,29 @@ import {
 
 const DEFAULT_DEV_WEB_PORT = 8789;
 const DEFAULT_DEV_ROUTER_PORT = 8377;
+const TERM_COLORS = process.stdout.isTTY
+  ? {
+    reset: "\u001b[0m",
+    dim: "\u001b[2m",
+    yellow: "\u001b[33m",
+    amberBg: "\u001b[48;5;214m",
+    black: "\u001b[30m"
+  }
+  : {
+    reset: "",
+    dim: "",
+    yellow: "",
+    amberBg: "",
+    black: ""
+  };
+
+function formatDevBadge() {
+  return `${TERM_COLORS.amberBg}${TERM_COLORS.black} DEV MODE ${TERM_COLORS.reset}`;
+}
+
+function formatMutedLabel(label) {
+  return `${TERM_COLORS.dim}${label}${TERM_COLORS.reset}`;
+}
 
 function parseSimpleArgs(argv) {
   const args = {};
@@ -94,6 +117,7 @@ const server = await startWebConsoleServer({
   host,
   port,
   configPath,
+  productionConfigPath: getDefaultConfigPath(),
   routerHost: String(args["router-host"] || args.routerHost || "127.0.0.1").trim() || "127.0.0.1",
   routerPort,
   routerWatchConfig: toBoolean(args["router-watch-config"] ?? args.routerWatchConfig, true),
@@ -104,11 +128,13 @@ const server = await startWebConsoleServer({
   devMode: true
 });
 
-console.log(`LLM Router dev console started on ${server.url}`);
-console.log(`Config file: ${configPath}`);
-console.log(`Large request log: ${process.env[LARGE_REQUEST_LOG_PATH_ENV]} (threshold ${process.env[LARGE_REQUEST_LOG_THRESHOLD_ENV]} bytes)`);
-console.log("Watching web UI assets and router source files for changes.");
-console.log("Closing the web console leaves the router service running.");
+console.log(`${formatDevBadge()} ${TERM_COLORS.yellow}LLM Router dev console started on ${server.url}${TERM_COLORS.reset}`);
+console.log(`${formatMutedLabel("Dev config:")} ${configPath}`);
+console.log(`${formatMutedLabel("Production config:")} ${getDefaultConfigPath()}`);
+console.log(`${formatMutedLabel("Dev router target:")} http://${String(args["router-host"] || args.routerHost || "127.0.0.1").trim() || "127.0.0.1"}:${routerPort}`);
+console.log(`${formatMutedLabel("Large request log:")} ${process.env[LARGE_REQUEST_LOG_PATH_ENV]} (threshold ${process.env[LARGE_REQUEST_LOG_THRESHOLD_ENV]} bytes)`);
+console.log(`${formatMutedLabel("Watch mode:")} web UI assets + router source files`);
+console.log(`${formatMutedLabel("Lifecycle:")} closing the web console leaves the dev router running`);
 
 if (shouldOpen) {
   try {

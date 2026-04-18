@@ -974,6 +974,68 @@ test("normalizeRuntimeConfig preserves hosted GPT web search routes", () => {
   });
 });
 
+test("normalizeRuntimeConfig preserves Claude Code web search provider selection", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      providers: [
+        {
+          id: "openrouter/gpt-4o-mini",
+          providerId: "openrouter",
+          model: "gpt-4o-mini"
+        },
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "openrouter/gpt-4o-mini"
+    }
+  }));
+
+  assert.deepEqual(normalized.claudeCode, {
+    webSearchProvider: "openrouter/gpt-4o-mini"
+  });
+});
+
+test("validateRuntimeConfig requires Claude Code web search provider selection to reference a configured webSearch provider", () => {
+  const valid = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "brave"
+    }
+  }));
+  assert.deepEqual(validateRuntimeConfig(valid), []);
+
+  const invalid = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "openrouter/gpt-4o-mini"
+    }
+  }));
+  assert.deepEqual(validateRuntimeConfig(invalid), [
+    "claudeCode.webSearchProvider 'openrouter/gpt-4o-mini' must reference a configured webSearch provider."
+  ]);
+});
+
 test("normalizeRuntimeConfig lets top-level webSearch override legacy amp.webSearch", () => {
   const normalized = normalizeRuntimeConfig(createBaseRawConfig({
     version: CONFIG_VERSION,
