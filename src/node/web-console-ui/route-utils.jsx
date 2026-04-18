@@ -1,6 +1,10 @@
 import { Fragment } from "react";
 import { SelectGroup, SelectItem, SelectLabel } from "./components/ui/select.jsx";
 import { formatContextWindow } from "./context-window-utils.js";
+import {
+  buildFactoryDroidRouterModelId,
+  parseFactoryDroidRouterModelId
+} from "../../shared/coding-tool-bindings.js";
 
 export function buildManagedRouteOptions(config = {}) {
   const options = [];
@@ -46,9 +50,81 @@ export function buildManagedRouteOptions(config = {}) {
   });
 }
 
+export function buildFactoryDroidRouteOptions(config = {}) {
+  const options = [];
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+
+  for (const aliasId of Object.keys(aliases)) {
+    const routerModelId = buildFactoryDroidRouterModelId(aliasId, { kind: "alias" });
+    if (!routerModelId) continue;
+    options.push({
+      value: routerModelId,
+      label: routerModelId,
+      hint: `LLM Router alias · ${(aliases[aliasId]?.targets || []).length || 0} target(s)`,
+      kind: "alias",
+      groupKey: "aliases",
+      groupLabel: "Aliases"
+    });
+  }
+
+  for (const provider of (Array.isArray(config?.providers) ? config.providers : [])) {
+    const providerId = String(provider?.id || "").trim();
+    const providerLabel = String(provider?.name || providerId || "provider").trim() || "provider";
+    for (const model of (Array.isArray(provider?.models) ? provider.models : [])) {
+      const modelId = String(model?.id || "").trim();
+      if (!providerId || !modelId) continue;
+      const routerModelId = buildFactoryDroidRouterModelId(`${providerId}/${modelId}`, { kind: "model" });
+      if (!routerModelId) continue;
+      const contextWindow = Number.isFinite(model?.contextWindow) ? Number(model.contextWindow) : null;
+      options.push({
+        value: routerModelId,
+        label: routerModelId,
+        hint: contextWindow ? `${providerLabel} · ${formatContextWindow(contextWindow)}` : providerLabel,
+        kind: "model",
+        providerId,
+        groupKey: `provider:${providerId}`,
+        groupLabel: providerLabel
+      });
+    }
+  }
+
+  const seen = new Set();
+  return options.filter((option) => {
+    if (!option?.value || seen.has(option.value)) return false;
+    seen.add(option.value);
+    return true;
+  });
+}
+
 export function inferManagedRouteOptionMetadata(value = "") {
   const normalizedValue = String(value || "").trim();
   if (!normalizedValue) return {};
+
+  const factoryRoute = parseFactoryDroidRouterModelId(normalizedValue);
+  if (factoryRoute?.kind === "alias") {
+    return {
+      kind: "alias",
+      groupKey: "aliases",
+      groupLabel: "Aliases"
+    };
+  }
+  if (factoryRoute?.kind === "model" && factoryRoute.providerId) {
+    return {
+      kind: "model",
+      providerId: factoryRoute.providerId,
+      groupKey: `provider:${factoryRoute.providerId}`,
+      groupLabel: factoryRoute.providerId
+    };
+  }
+  if (factoryRoute?.kind === "model") {
+    return {
+      kind: "model",
+      groupKey: "llm-router",
+      groupLabel: "LLM Router"
+    };
+  }
 
   const normalizedAliasValue = normalizedValue.startsWith("alias:")
     ? normalizedValue.slice("alias:".length).trim()

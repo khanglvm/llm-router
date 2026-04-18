@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.6] - 2026-04-18
+
+### Fixed
+- Factory Droid routing now injects every managed alias/provider model as its own router-managed `customModels` entry, writes friendly custom model `displayName` labels for the Droid CLI picker, and stores selected defaults as explicit `custom:llm-*` IDs in `model`, `sessionDefaultSettings.model`, `missionOrchestratorModel`, and `missionModelSettings.*` so Droid resolves the router-managed custom provider instead of falling back to native built-in models.
+
 ## [2.3.5] - 2026-04-17
 
 ### Fixed

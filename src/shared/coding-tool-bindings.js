@@ -64,6 +64,139 @@ export const FACTORY_DROID_REASONING_EFFORT_VALUES = Object.freeze([
   "high"
 ]);
 
+function stripFactoryDroidRouterModelIdPrefix(value) {
+  const normalized = String(value || "").trim();
+  if (normalized.startsWith("custom:")) return normalized.slice("custom:".length).trim();
+  return normalized;
+}
+
+function sanitizeFactoryDroidRouterModelIdPart(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[/:]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function formatFactoryDroidDisplayNameBase(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  if (/^gpt(?=[-\s.]|$)/i.test(normalized)) return `GPT${normalized.slice(3)}`;
+  if (/^glm(?=[-\s.]|$)/i.test(normalized)) return `GLM${normalized.slice(3)}`;
+  if (/^claude(?=[-\s.]|$)/i.test(normalized)) return `Claude${normalized.slice(6)}`;
+  return normalized;
+}
+
+export function isFactoryDroidRouterModelId(value) {
+  const normalized = stripFactoryDroidRouterModelIdPrefix(value);
+  return normalized.startsWith("llm-");
+}
+
+export function parseFactoryDroidRouterModelId(value) {
+  const normalized = stripFactoryDroidRouterModelIdPrefix(value);
+  if (!normalized.startsWith("llm-")) return null;
+
+  if (normalized.startsWith("llm-alias:")) {
+    const aliasId = normalized.slice("llm-alias:".length).trim();
+    return aliasId
+      ? {
+          kind: "alias",
+          aliasId,
+          routeRef: aliasId
+        }
+      : null;
+  }
+
+  if (normalized.startsWith("llm-alias-")) {
+    const aliasId = normalized.slice("llm-alias-".length).trim();
+    return aliasId
+      ? {
+          kind: "alias",
+          aliasId,
+          routeRef: ""
+        }
+      : null;
+  }
+
+  const body = normalized.slice("llm-".length);
+  const separatorIndex = body.indexOf(":");
+  if (separatorIndex <= 0) return null;
+
+  const providerId = body.slice(0, separatorIndex).trim();
+  const modelId = body.slice(separatorIndex + 1).trim();
+  if (!providerId || !modelId) return null;
+
+  return {
+    kind: "model",
+    providerId,
+    modelId,
+    routeRef: `${providerId}/${modelId}`
+  };
+}
+
+export function resolveFactoryDroidRouterModelRef(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  return parseFactoryDroidRouterModelId(normalized)?.routeRef || normalized;
+}
+
+export function buildFactoryDroidRouterModelId(modelRef, { kind = "" } = {}) {
+  const normalizedModelRef = String(modelRef || "").trim();
+  if (!normalizedModelRef) return "";
+  if (normalizedModelRef.startsWith("custom:llm-")) {
+    const parsed = parseFactoryDroidRouterModelId(normalizedModelRef);
+    return parsed?.routeRef
+      ? buildFactoryDroidRouterModelId(parsed.routeRef, { kind: parsed.kind })
+      : normalizedModelRef;
+  }
+  if (normalizedModelRef.startsWith("llm-")) {
+    const parsed = parseFactoryDroidRouterModelId(normalizedModelRef);
+    return parsed?.routeRef
+      ? buildFactoryDroidRouterModelId(parsed.routeRef, { kind: parsed.kind })
+      : `custom:${normalizedModelRef}`;
+  }
+
+  const explicitKind = String(kind || "").trim().toLowerCase();
+  if (explicitKind === "alias") {
+    const aliasId = sanitizeFactoryDroidRouterModelIdPart(normalizedModelRef);
+    return aliasId ? `custom:llm-alias-${aliasId}` : "";
+  }
+
+  if (explicitKind === "model") {
+    const separatorIndex = normalizedModelRef.indexOf("/");
+    if (separatorIndex <= 0 || separatorIndex >= normalizedModelRef.length - 1) return "";
+    const providerId = normalizedModelRef.slice(0, separatorIndex).trim();
+    const modelId = normalizedModelRef.slice(separatorIndex + 1).trim();
+    const providerSlug = sanitizeFactoryDroidRouterModelIdPart(providerId);
+    const modelSlug = sanitizeFactoryDroidRouterModelIdPart(modelId);
+    return providerSlug && modelSlug ? `custom:llm-${providerSlug}-${modelSlug}` : "";
+  }
+
+  if (!normalizedModelRef.includes("/")) {
+    return buildFactoryDroidRouterModelId(normalizedModelRef, { kind: "alias" });
+  }
+
+  return buildFactoryDroidRouterModelId(normalizedModelRef, { kind: "model" });
+}
+
+export function buildFactoryDroidRouterDisplayName(modelRef, { kind = "" } = {}) {
+  const normalizedModelRef = String(modelRef || "").trim();
+  if (!normalizedModelRef) return "";
+
+  const explicitKind = String(kind || "").trim().toLowerCase();
+  const inferredKind = explicitKind || (normalizedModelRef.includes("/") ? "model" : "alias");
+  if (inferredKind === "alias") {
+    return `[LLM Alias] ${formatFactoryDroidDisplayNameBase(normalizedModelRef)}`;
+  }
+
+  const modelName = normalizedModelRef.includes("/")
+    ? normalizedModelRef.slice(normalizedModelRef.indexOf("/") + 1).trim()
+    : normalizedModelRef;
+  return `[LLM] ${formatFactoryDroidDisplayNameBase(modelName)}`;
+}
+
 export function normalizeFactoryDroidReasoningEffort(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return FACTORY_DROID_REASONING_EFFORT_VALUES.includes(normalized) ? normalized : "";

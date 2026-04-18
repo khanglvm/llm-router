@@ -1716,17 +1716,30 @@ test("set-factory-droid-routing patches Factory Droid settings and tool-status r
 
   assert.equal(patchResult.ok, true);
   const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
-  assert.equal(factoryDroidSettings.model, "openrouter/gpt-4o-mini");
-  assert.equal(factoryDroidSettings.sessionDefaultSettings?.model, "openrouter/gpt-4o-mini");
-  assert.equal(factoryDroidSettings.missionOrchestratorModel, "anthropic/claude-3-5-haiku");
-  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, "openrouter/gpt-4o");
-  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, "anthropic/claude-3-5-haiku");
   assert.equal(factoryDroidSettings.reasoningEffort, "medium");
   assert.ok(Array.isArray(factoryDroidSettings.customModels), "customModels should be an array");
-  assert.equal(factoryDroidSettings.customModels.length, 1);
-  assert.equal(factoryDroidSettings.customModels[0]._llmRouterManaged, true);
-  assert.equal(factoryDroidSettings.customModels[0].provider, "generic-chat-completion-api");
-  assert.match(factoryDroidSettings.customModels[0].baseUrl, /\/openai\/v1$/);
+  assert.deepEqual(
+    factoryDroidSettings.customModels.map((entry) => entry.displayName).sort(),
+    [
+      "[LLM Alias] default",
+      "[LLM] Claude-3-5-haiku",
+      "[LLM] GPT-4o",
+      "[LLM] GPT-4o-mini"
+    ]
+  );
+  const customModelIdsByModelRef = new Map(factoryDroidSettings.customModels.map((entry) => [entry.model, entry.id]));
+  for (const entry of factoryDroidSettings.customModels) {
+    assert.equal(entry._llmRouterManaged, true);
+    assert.equal(entry.provider, "generic-chat-completion-api");
+    assert.match(entry.baseUrl, /\/openai\/v1$/);
+    assert.match(String(entry.id || ""), /^custom:llm-/);
+    assert.equal(Number.isInteger(entry.index), true);
+  }
+  assert.equal(factoryDroidSettings.model, customModelIdsByModelRef.get("openrouter/gpt-4o-mini"));
+  assert.equal(factoryDroidSettings.sessionDefaultSettings?.model, customModelIdsByModelRef.get("openrouter/gpt-4o-mini"));
+  assert.equal(factoryDroidSettings.missionOrchestratorModel, customModelIdsByModelRef.get("anthropic/claude-3-5-haiku"));
+  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, customModelIdsByModelRef.get("openrouter/gpt-4o"));
+  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, customModelIdsByModelRef.get("anthropic/claude-3-5-haiku"));
 
   const statusResult = await configAction.run(createConfigContext({
     operation: "tool-status",
@@ -1778,9 +1791,156 @@ test("set-factory-droid-routing legacy mission-model applies to all mission role
 
   assert.equal(patchResult.ok, true);
   const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
-  assert.equal(factoryDroidSettings.missionOrchestratorModel, "anthropic/claude-3-5-haiku");
-  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, "anthropic/claude-3-5-haiku");
-  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, "anthropic/claude-3-5-haiku");
+  const customModelIdsByModelRef = new Map(factoryDroidSettings.customModels.map((entry) => [entry.model, entry.id]));
+  assert.equal(factoryDroidSettings.missionOrchestratorModel, customModelIdsByModelRef.get("anthropic/claude-3-5-haiku"));
+  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, customModelIdsByModelRef.get("anthropic/claude-3-5-haiku"));
+  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, customModelIdsByModelRef.get("anthropic/claude-3-5-haiku"));
+});
+
+test("set-factory-droid-routing injects every router alias into Factory Droid custom model list", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    defaultModel: "chat.default",
+    masterKey: "gw_local_master",
+    modelAliases: {
+      "chat.default": {
+        id: "chat.default",
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      },
+      "chat.plan": {
+        id: "chat.plan",
+        strategy: "ordered",
+        targets: [{ ref: "anthropic/claude-3-5-haiku" }]
+      },
+      "chat.build": {
+        id: "chat.build",
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o" }]
+      }
+    }
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-factory-droid-aliases-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const factoryDroidSettingsPath = path.join(tempDir, "settings.json");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-factory-droid-routing",
+    config: configPath,
+    "factory-droid-settings-file": factoryDroidSettingsPath,
+    "default-model": "chat.default",
+    "mission-orchestrator-model": "chat.plan",
+    "mission-worker-model": "chat.build",
+    "mission-validator-model": "chat.plan"
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
+  assert.deepEqual(
+    factoryDroidSettings.customModels.map((entry) => entry.displayName).sort(),
+    [
+      "[LLM Alias] chat.build",
+      "[LLM Alias] chat.default",
+      "[LLM Alias] chat.plan",
+      "[LLM Alias] default",
+      "[LLM] Claude-3-5-haiku",
+      "[LLM] GPT-4o",
+      "[LLM] GPT-4o-mini"
+    ]
+  );
+  const customModelIdsByModelRef = new Map(factoryDroidSettings.customModels.map((entry) => [entry.model, entry.id]));
+  assert.equal(factoryDroidSettings.model, customModelIdsByModelRef.get("chat.default"));
+  assert.equal(factoryDroidSettings.sessionDefaultSettings?.model, customModelIdsByModelRef.get("chat.default"));
+  assert.equal(factoryDroidSettings.missionOrchestratorModel, customModelIdsByModelRef.get("chat.plan"));
+  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, customModelIdsByModelRef.get("chat.build"));
+  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, customModelIdsByModelRef.get("chat.plan"));
+});
+
+test("set-factory-droid-routing accepts stable llm model ids for Factory bindings", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    defaultModel: "chat.default",
+    masterKey: "gw_local_master",
+    modelAliases: {
+      "chat.default": {
+        id: "chat.default",
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-factory-droid-ids-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const factoryDroidSettingsPath = path.join(tempDir, "settings.json");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-factory-droid-routing",
+    config: configPath,
+    "factory-droid-settings-file": factoryDroidSettingsPath,
+    "default-model": "custom:llm-alias-chat.default",
+    "mission-orchestrator-model": "custom:llm-anthropic-claude-3-5-haiku",
+    "mission-worker-model": "custom:llm-openrouter-gpt-4o",
+    "mission-validator-model": "custom:llm-anthropic-claude-3-5-haiku"
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
+  assert.equal(factoryDroidSettings.model, "custom:llm-alias-chat.default");
+  assert.equal(factoryDroidSettings.sessionDefaultSettings?.model, "custom:llm-alias-chat.default");
+  assert.equal(factoryDroidSettings.missionOrchestratorModel, "custom:llm-anthropic-claude-3-5-haiku");
+  assert.equal(factoryDroidSettings.missionModelSettings?.workerModel, "custom:llm-openrouter-gpt-4o");
+  assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, "custom:llm-anthropic-claude-3-5-haiku");
+});
+
+test("tool-status resolves Factory Droid internal llm ids back to managed route refs", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    defaultModel: "chat.default",
+    modelAliases: {
+      "chat.default": {
+        id: "chat.default",
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-factory-droid-status-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const factoryDroidSettingsPath = path.join(tempDir, "settings.json");
+  await fs.writeFile(factoryDroidSettingsPath, JSON.stringify({
+    model: "custom:llm-alias-chat.default",
+    sessionDefaultSettings: {
+      model: "custom:llm-alias-chat.default"
+    },
+    missionOrchestratorModel: "custom:llm-openrouter-gpt-4o-mini",
+    missionModelSettings: {
+      workerModel: "custom:llm-openrouter-gpt-4o",
+      validationWorkerModel: "custom:llm-anthropic-claude-3-5-haiku"
+    }
+  }, null, 2));
+
+  const statusResult = await configAction.run(createConfigContext({
+    operation: "tool-status",
+    config: configPath,
+    "factory-droid-settings-file": factoryDroidSettingsPath
+  }));
+
+  assert.equal(statusResult.ok, true);
+  assert.match(String(statusResult.data || ""), /Factory Droid/);
+  assert.match(String(statusResult.data || ""), /Default Model\s+\|\s+chat\.default/);
+  assert.match(String(statusResult.data || ""), /Mission Orchestrator\s+\|\s+openrouter\/gpt-4o-mini/);
+  assert.match(String(statusResult.data || ""), /Mission Worker\s+\|\s+openrouter\/gpt-4o/);
+  assert.match(String(statusResult.data || ""), /Mission Validator\s+\|\s+anthropic\/claude-3-5-haiku/);
+  assert.doesNotMatch(String(statusResult.data || ""), /custom:llm-/);
 });
 
 test("set-amp-client-routing bootstraps config and can unpatch AMP client files", async (t) => {

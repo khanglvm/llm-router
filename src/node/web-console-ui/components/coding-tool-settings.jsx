@@ -18,7 +18,8 @@ import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   normalizeClaudeCodeEffortLevel,
   normalizeFactoryDroidReasoningEffort,
-  isCodexCliInheritModelBinding
+  isCodexCliInheritModelBinding,
+  parseFactoryDroidRouterModelId
 } from "../../../shared/coding-tool-bindings.js";
 
 // ── Local helpers (mirrors of app.jsx private functions) ──────────────────────
@@ -26,6 +27,26 @@ import {
 function inferManagedRouteOptionMetadata(value = "") {
   const normalizedValue = String(value || "").trim();
   if (!normalizedValue) return {};
+
+  const factoryRoute = parseFactoryDroidRouterModelId(normalizedValue);
+  if (factoryRoute?.kind === "alias") {
+    return { kind: "alias", groupKey: "aliases", groupLabel: "Aliases" };
+  }
+  if (factoryRoute?.kind === "model" && factoryRoute.providerId) {
+    return {
+      kind: "model",
+      providerId: factoryRoute.providerId,
+      groupKey: `provider:${factoryRoute.providerId}`,
+      groupLabel: factoryRoute.providerId
+    };
+  }
+  if (factoryRoute?.kind === "model") {
+    return {
+      kind: "model",
+      groupKey: "llm-router",
+      groupLabel: "LLM Router"
+    };
+  }
 
   const normalizedAliasValue = normalizedValue.startsWith("alias:")
     ? normalizedValue.slice("alias:".length).trim()

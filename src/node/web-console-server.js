@@ -1488,7 +1488,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const endpointUrl = buildAmpClientEndpointUrl(settings);
     try {
       const state = await readFactoryDroidRoutingState({
-        endpointUrl
+        endpointUrl,
+        config
       });
       return {
         ...state,
@@ -1506,6 +1507,13 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         configuredBaseUrl: "",
         configuredProvider: "",
         bindings: {
+          defaultModel: "",
+          missionOrchestratorModel: "",
+          missionWorkerModel: "",
+          missionValidatorModel: "",
+          reasoningEffort: ""
+        },
+        bindingIds: {
           defaultModel: "",
           missionOrchestratorModel: "",
           missionWorkerModel: "",
@@ -1551,6 +1559,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         endpointUrl: nextEndpointUrl,
         apiKey: nextMasterKey,
         bindings,
+        config: nextConfig,
         captureBackup: false
       });
       if (endpointOrKeyChanged) {
@@ -3487,6 +3496,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           endpointUrl,
           apiKey,
           bindings,
+          config: nextConfig,
           captureBackup: true
         });
         addLog("success", "Factory Droid routing enabled.", patchResult.baseUrl);
@@ -3537,6 +3547,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           endpointUrl,
           apiKey,
           bindings,
+          config: configState.normalizedConfig,
           captureBackup: false
         });
         addLog("success", "Factory Droid model bindings updated.", patchResult.bindings.defaultModel || "Default");

@@ -62,6 +62,7 @@ Route Claude Code through the gateway with per-tier model bindings.
 ### Factory Droid
 
 Route Factory Droid through the gateway via a managed custom model entry with reasoning effort control.
+LLM Router injects router-managed `customModels` entries for aliases and provider/model routes, then writes Factory defaults as `custom:llm-*` IDs so Droid selects the custom provider entry instead of a native built-in model with the same name.
 
 ### Web Search
 

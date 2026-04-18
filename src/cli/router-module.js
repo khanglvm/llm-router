@@ -3853,7 +3853,8 @@ async function buildCodingToolRoutingSnapshot({
   }));
   const factoryDroid = await readFactoryDroidRoutingState({
     settingsFilePath: readArg(args, ["factory-droid-settings-file", "factoryDroidSettingsFile"], ""),
-    endpointUrl
+    endpointUrl,
+    config
   }).catch((error) => ({
     tool: "factory-droid",
     settingsFilePath: resolveFactoryDroidSettingsFilePath({}),
@@ -6635,7 +6636,8 @@ async function doSetFactoryDroidRouting(context) {
 
   const existingState = await readFactoryDroidRoutingState({
     settingsFilePath,
-    endpointUrl
+    endpointUrl,
+    config
   });
   const apiKey = String(
     readArg(args, ["master-key", "masterKey", "api-key", "apiKey"], config?.masterKey || "") || ""
@@ -6679,6 +6681,7 @@ async function doSetFactoryDroidRouting(context) {
     endpointUrl,
     apiKey,
     bindings,
+    config,
     captureBackup: true
   });
   return {
