@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-04-19
+
+### Fixed
+- The published production web console bundle now rebuilds before packing so Claude Code shows the shared web-search provider selector added in `2.4.0` instead of serving a stale prebuilt client.
+
 ## [2.4.0] - 2026-04-18
 
 ### Added

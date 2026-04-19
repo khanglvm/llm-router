@@ -26,6 +26,7 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "build:web-console": "node ./scripts/build-web-console.mjs",
+    "prepack": "npm run build:web-console",
     "start": "node ./src/cli-entry.js start",
     "config": "node ./src/cli-entry.js config",
     "deploy:worker": "node ./src/cli-entry.js deploy",

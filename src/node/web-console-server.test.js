@@ -1233,6 +1233,8 @@ test("web console serves the React shell assets", async () => {
     const appResponse = await fetch(`${server.url}/app.js`);
     assert.equal(appResponse.status, 200);
     assert.match(appResponse.headers.get("content-type") || "", /application\/javascript/);
+    const appJs = await appResponse.text();
+    assert.match(appJs, /claudeCode\.webSearchProvider/);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
