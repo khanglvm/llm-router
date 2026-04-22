@@ -113,11 +113,13 @@ import { ToastStack } from "./components/toast.jsx";
 import { ModelAliasSection } from "./components/model-alias-section.jsx";
 import { ProviderModelsSection } from "./components/provider-card.jsx";
 import { OllamaSettingsPanel } from "./components/ollama-settings.jsx";
+import { LocalModelsPanel } from "./components/local-models-panel.jsx";
 import { AmpSettingsPanel } from "./components/amp-settings.jsx";
 import { WebSearchSettingsPanel } from "./components/web-search-settings.jsx";
 import { buildCodexCliGuideContent, buildClaudeCodeGuideContent, buildFactoryDroidGuideContent, CodingToolSettingsPanel } from "./components/coding-tool-settings.jsx";
 import { LogList } from "./components/log-list.jsx";
 import { QuickStartWizard } from "./components/quick-start-wizard.jsx";
+import { buildLocalModelsSummary } from "./local-models-utils.js";
 
 async function copyTextToClipboard(value) {
   const text = String(value || "");
@@ -305,6 +307,22 @@ export function App() {
   const ollamaSnapshot = snapshot?.ollama || null;
   const ollamaTabConnected = ollamaSnapshot?.connected === true;
   const [ollamaModels, setOllamaModels] = useState([]);
+  const localModelsMetadata = editableConfig?.metadata?.localModels || {};
+  const localModelsState = useMemo(() => ({
+    runtime: {
+      ...(localModelsMetadata?.runtime || {}),
+      ollama: {
+        ...(localModelsMetadata?.runtime?.ollama || {}),
+        status: ollamaTabConnected ? "running" : "stopped"
+      }
+    },
+    library: localModelsMetadata?.library || {},
+    variants: localModelsMetadata?.variants || {}
+  }), [localModelsMetadata, ollamaTabConnected]);
+  const localModelsSummary = useMemo(
+    () => buildLocalModelsSummary(localModelsState),
+    [localModelsState]
+  );
   const [ollamaBusy, setOllamaBusy] = useState({});
   const [ollamaRefreshing, setOllamaRefreshing] = useState(false);
   const activityLogState = snapshot?.activityLog || { enabled: true };
@@ -2011,7 +2029,7 @@ export function App() {
       if (data?.models) setOllamaModels(data.models);
     } catch { /* ignore */ } finally { setOllamaRefreshing(false); }
   }
-  useEffect(() => { if (activeTab === "ollama" && ollamaTabConnected) refreshOllamaModels(); }, [activeTab, ollamaTabConnected]);
+  useEffect(() => { if (activeTab === "local-models" && ollamaTabConnected) refreshOllamaModels(); }, [activeTab, ollamaTabConnected]);
 
   function setOllamaBusyKey(model, key, value) {
     setOllamaBusy((prev) => ({ ...prev, [model]: { ...(prev[model] || {}), [key]: value } }));
@@ -2284,10 +2302,10 @@ export function App() {
                   <ConnectedIndicatorDot connected={factoryDroidTabConnected} srLabel="Factory Droid connected" />
                 </span>
               </TabsTrigger>
-              <TabsTrigger value="ollama">
+              <TabsTrigger value="local-models">
                 <span className="inline-flex items-center gap-2">
-                  <span>Ollama</span>
-                  <ConnectedIndicatorDot connected={ollamaTabConnected} srLabel="Ollama connected" />
+                  <span>Local Models</span>
+                  <ConnectedIndicatorDot connected={localModelsSummary.runningRuntimes > 0} srLabel="Local runtime connected" />
                 </span>
               </TabsTrigger>
               <TabsTrigger value="web-search">Web Search</TabsTrigger>
@@ -2571,28 +2589,40 @@ export function App() {
             />
           </TabsContent>
 
-          <TabsContent value="ollama" className="space-y-4">
-            <OllamaSettingsPanel
-              connected={ollamaTabConnected}
-              snapshot={ollamaSnapshot}
-              models={ollamaModels}
-              busy={ollamaBusy}
-              refreshing={ollamaRefreshing}
-              config={editableConfig}
-              onRefresh={refreshOllamaModels}
-              onLoad={handleOllamaLoad}
-              onUnload={handleOllamaUnload}
-              onPin={handleOllamaPin}
-              onKeepAlive={handleOllamaKeepAlive}
-              onContextLength={handleOllamaContextLength}
-              onAddToRouter={handleOllamaAddToRouter}
-              onRemoveFromRouter={handleOllamaRemoveFromRouter}
-              onAutoLoad={handleOllamaAutoLoad}
-              onSaveSettings={handleOllamaSaveSettings}
-              onInstall={handleOllamaInstall}
-              onStartServer={handleOllamaStartServer}
-              onStopServer={handleOllamaStopServer}
-              onSyncRouter={handleOllamaSyncRouter}
+          <TabsContent value="local-models" className="space-y-4">
+            <LocalModelsPanel
+              summary={localModelsSummary}
+              llamacpp={{
+                runtime: localModelsState.runtime?.llamacpp || {},
+                library: Object.fromEntries(
+                  Object.entries(localModelsState.library || {}).filter(([, entry]) => String(entry?.source || "").startsWith("llamacpp"))
+                ),
+                variants: Object.fromEntries(
+                  Object.entries(localModelsState.variants || {}).filter(([, variant]) => variant?.runtime === "llamacpp")
+                )
+              }}
+              ollama={{
+                connected: ollamaTabConnected,
+                snapshot: ollamaSnapshot,
+                models: ollamaModels,
+                busy: ollamaBusy,
+                refreshing: ollamaRefreshing,
+                config: editableConfig,
+                onRefresh: refreshOllamaModels,
+                onLoad: handleOllamaLoad,
+                onUnload: handleOllamaUnload,
+                onPin: handleOllamaPin,
+                onKeepAlive: handleOllamaKeepAlive,
+                onContextLength: handleOllamaContextLength,
+                onAddToRouter: handleOllamaAddToRouter,
+                onRemoveFromRouter: handleOllamaRemoveFromRouter,
+                onAutoLoad: handleOllamaAutoLoad,
+                onSaveSettings: handleOllamaSaveSettings,
+                onInstall: handleOllamaInstall,
+                onStartServer: handleOllamaStartServer,
+                onStopServer: handleOllamaStopServer,
+                onSyncRouter: handleOllamaSyncRouter
+              }}
             />
           </TabsContent>
 

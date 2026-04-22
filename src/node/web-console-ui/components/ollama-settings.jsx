@@ -17,7 +17,8 @@ export function OllamaSettingsPanel({
   connected, snapshot, models, busy, refreshing, config,
   onRefresh, onLoad, onUnload, onPin, onKeepAlive, onContextLength,
   onAddToRouter, onRemoveFromRouter, onAutoLoad, onSaveSettings,
-  onInstall, onStartServer, onStopServer, onSyncRouter
+  onInstall, onStartServer, onStopServer, onSyncRouter,
+  embedded = false
 }) {
   const ollamaConfig = config?.ollama || {};
   const [settingsBaseUrl, setSettingsBaseUrl] = useState(ollamaConfig.baseUrl || "http://localhost:11434");
@@ -34,6 +35,7 @@ export function OllamaSettingsPanel({
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <h3 className="font-medium">Ollama Connection</h3>
+              {embedded ? <span className="text-xs text-muted-foreground">Local Models runtime</span> : null}
               {connected ? (
                 <Badge variant="success">Connected</Badge>
               ) : (
