@@ -495,6 +495,67 @@ test("web console state exposes config metadata and raw text", async () => {
   }
 });
 
+test("web console state exposes local model runtime, library, and variant metadata", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/opt/homebrew/bin/llama-server",
+            status: "running",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            displayName: "Qwen Q5",
+            source: "llamacpp-managed",
+            path: "/Users/test/.llm-router/local-models/qwen-q5.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-q5-balanced",
+            name: "Qwen Q5 Balanced",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            availability: "available",
+            contextWindow: 200000
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { response, payload } = await fetchJson(`${server.url}/api/state`);
+    assert.equal(response.status, 200);
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.status, "running");
+    assert.equal(payload.config.document.metadata.localModels.library["base-qwen"].displayName, "Qwen Q5");
+    assert.equal(payload.config.document.metadata.localModels.variants["variant-qwen"].preload, true);
+
+    const localProvider = payload.config.document.providers.find((provider) => provider.id === "local-models");
+    assert.equal(localProvider?.type, "local-runtime");
+    assert.deepEqual(localProvider?.models?.map((model) => model.id), ["local/qwen-q5-balanced"]);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
 test("web console state exposes live AMP web search quota state", async () => {
   const runtime = await makeRuntimeEnv();
   const fixture = await makeTempConfig({
