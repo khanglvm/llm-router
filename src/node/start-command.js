@@ -14,6 +14,7 @@ import { startLocalRouteServer } from "./local-server.js";
 import { startRouterSupervisor } from "./router-supervisor.js";
 import { reclaimPort, stopStartupManagedListener } from "./port-reclaim.js";
 import { installStartup, startupStatus } from "./startup-manager.js";
+import { ensureConfiguredLlamacppRuntimeStarted, stopManagedLlamacppRuntime } from "./llamacpp-runtime.js";
 import { configHasProvider, sanitizeConfigForDisplay } from "../runtime/config.js";
 
 function summarizeConfig(config, configPath) {
@@ -888,6 +889,12 @@ async function runRouterSupervisorCommand(options = {}) {
   const startRouterSupervisorFn = typeof options.startRouterSupervisor === "function"
     ? options.startRouterSupervisor
     : (startOptions) => startRouterSupervisor(startOptions, options);
+  const ensureConfiguredLlamacppRuntimeStartedFn = typeof options.ensureConfiguredLlamacppRuntimeStarted === "function"
+    ? options.ensureConfiguredLlamacppRuntimeStarted
+    : ensureConfiguredLlamacppRuntimeStarted;
+  const stopManagedLlamacppRuntimeFn = typeof options.stopManagedLlamacppRuntime === "function"
+    ? options.stopManagedLlamacppRuntime
+    : stopManagedLlamacppRuntime;
 
   if (!(await configFileExists(configPath))) {
     return {
@@ -955,6 +962,8 @@ async function runRouterSupervisorCommand(options = {}) {
       ].join("\n")
     };
   }
+
+  await ensureConfiguredLlamacppRuntimeStartedFn(config, { line, error });
 
   const requestedStartArgs = {
     configPath,
@@ -1103,6 +1112,7 @@ async function runRouterSupervisorCommand(options = {}) {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     shutdownPromise = (async () => {
+      await stopManagedLlamacppRuntimeFn({ line, error });
       await new Promise((resolve) => server.close(() => resolve()));
       await clearRuntimeStateFn({ pid: process.pid });
     })();
@@ -1127,6 +1137,8 @@ async function runRouterSupervisorCommand(options = {}) {
   await donePromise;
   if (shutdownPromise) {
     await shutdownPromise;
+  } else {
+    await stopManagedLlamacppRuntimeFn({ line, error });
   }
 
   process.removeListener("SIGINT", handleSigInt);

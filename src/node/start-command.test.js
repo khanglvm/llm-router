@@ -2,6 +2,7 @@ import test from "node:test";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { runStartCommand } from "./start-command.js";
 import { parseFuserPidList, parsePidList, reclaimPort, stopStartupManagedListener } from "./port-reclaim.js";
@@ -446,6 +447,66 @@ test("runStartCommand continues with an in-memory migrated config when the legac
     assert.equal(saved.version, 1);
   } finally {
     await chmod(fixture.configPath, 0o600).catch(() => {});
+    await fixture.cleanup();
+  }
+});
+
+test("runStartCommand ensures configured llama.cpp runtime before launching the supervisor", async () => {
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            startWithRouter: true,
+            selectedCommand: "/opt/homebrew/bin/llama-server"
+          }
+        }
+      }
+    }
+  });
+  const runtimeStatePath = path.join(fixture.dir, "runtime-state.json");
+  const previousRuntimeStatePath = process.env.LLM_ROUTER_RUNTIME_STATE_PATH;
+  process.env.LLM_ROUTER_RUNTIME_STATE_PATH = runtimeStatePath;
+  const callOrder = [];
+
+  try {
+    const result = await runStartCommand({
+      configPath: fixture.configPath,
+      onLine: () => {},
+      onError: () => {},
+      startupStatus: async () => ({ installed: false }),
+      getActiveRuntimeState: async () => null,
+      reclaimPort: async () => ({ ok: true }),
+      ensureConfiguredLlamacppRuntimeStarted: async () => {
+        callOrder.push("llamacpp");
+        return { ok: true };
+      },
+      startRouterSupervisor: async () => {
+        callOrder.push("supervisor");
+        const server = new EventEmitter();
+        server.close = (callback) => {
+          if (typeof callback === "function") callback();
+        };
+        server.requestBackendUpgrade = async () => ({ ok: true });
+        const emitTimer = setInterval(() => {
+          if (server.listenerCount("close") === 0) return;
+          clearInterval(emitTimer);
+          server.emit("close");
+        }, 1);
+        return server;
+      }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(callOrder, ["llamacpp", "supervisor"]);
+  } finally {
+    if (previousRuntimeStatePath === undefined) {
+      delete process.env.LLM_ROUTER_RUNTIME_STATE_PATH;
+    } else {
+      process.env.LLM_ROUTER_RUNTIME_STATE_PATH = previousRuntimeStatePath;
+    }
     await fixture.cleanup();
   }
 });
