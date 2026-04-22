@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
 import {
   reconcileLocalModelPaths,
   registerAttachedLlamacppModel,
+  registerManagedLlamacppModel,
   removeLocalBaseModel
 } from "./local-models-service.js";
 
@@ -55,4 +58,19 @@ test("removeLocalBaseModel removes the base model and descendant variants", asyn
   assert.equal(next.metadata.localModels.library["base-qwen"], undefined);
   assert.equal(next.metadata.localModels.variants["variant-qwen"], undefined);
   assert.ok(next.metadata.localModels.variants["variant-other"]);
+});
+
+test("registerManagedLlamacppModel stores a managed base model in the router-owned location", async () => {
+  const next = await registerManagedLlamacppModel({ metadata: { localModels: {} } }, {
+    id: "base-qwen-managed",
+    displayName: "Qwen Managed",
+    filePath: path.join(os.homedir(), ".llm-router", "local-models", "Qwen", "qwen.Q5.gguf"),
+    repo: "Qwen/Qwen",
+    file: "qwen.Q5.gguf",
+    sizeBytes: 24 * 1024 ** 3
+  });
+
+  assert.equal(next.metadata.localModels.library["base-qwen-managed"].source, "llamacpp-managed");
+  assert.equal(next.metadata.localModels.library["base-qwen-managed"].managed, true);
+  assert.equal(next.metadata.localModels.library["base-qwen-managed"].metadata.repo, "Qwen/Qwen");
 });

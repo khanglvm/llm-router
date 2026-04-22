@@ -1,4 +1,5 @@
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
@@ -61,7 +62,15 @@ import {
 } from "./ollama-client.js";
 import { estimateMaxContext, estimateModelVram, formatBytes } from "./ollama-hardware.js";
 import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaServer, isOllamaRunning } from "./ollama-install.js";
-import { registerAttachedLlamacppModel } from "./local-models-service.js";
+import {
+  getManagedLocalModelsDir,
+  registerAttachedLlamacppModel,
+  registerManagedLlamacppModel
+} from "./local-models-service.js";
+import {
+  downloadManagedHuggingFaceGguf,
+  searchHuggingFaceGgufCandidates
+} from "./huggingface-gguf.js";
 import {
   CONFIG_VERSION,
   DEFAULT_MODEL_ALIAS_ID,
@@ -885,6 +894,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     ? deps.waitForRuntimeMatch
     : (startOptions, waitOptions = {}) => waitForRuntimeMatch(startOptions, waitOptions);
   const loginSubscriptionFn = typeof deps.loginSubscription === "function" ? deps.loginSubscription : loginSubscription;
+  const searchHuggingFaceGgufCandidatesFn = typeof deps.searchHuggingFaceGgufCandidates === "function"
+    ? deps.searchHuggingFaceGgufCandidates
+    : searchHuggingFaceGgufCandidates;
+  const downloadManagedHuggingFaceGgufFn = typeof deps.downloadManagedHuggingFaceGguf === "function"
+    ? deps.downloadManagedHuggingFaceGguf
+    : (request, runtimeOptions = {}) => downloadManagedHuggingFaceGguf(request, runtimeOptions);
   const ampClientEnv = deps.ampClientEnv && typeof deps.ampClientEnv === "object" ? deps.ampClientEnv : process.env;
   const ampClientCwd = typeof deps.ampClientCwd === "string" && deps.ampClientCwd.trim() ? deps.ampClientCwd : process.cwd();
   const codexCliEnv = deps.codexCliEnv && typeof deps.codexCliEnv === "object" ? deps.codexCliEnv : process.env;
@@ -3163,6 +3178,70 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           ok: true,
           library: savedConfig?.metadata?.localModels?.library || {}
         });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/search-huggingface") {
+        const body = await readJsonBody(req);
+        const results = await searchHuggingFaceGgufCandidatesFn(String(body.query || "").trim(), {
+          limit: body.limit,
+          totalMemoryBytes: os.totalmem()
+        });
+        sendJson(res, 200, { results });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/download-managed") {
+        const body = await readJsonBody(req);
+        const id = String(body.id || "").trim();
+        const repo = String(body.repo || "").trim();
+        const file = String(body.file || "").trim();
+        if (!id || !repo || !file) {
+          sendJson(res, 400, { error: "id, repo, and file are required." });
+          return;
+        }
+
+        startJsonLineStream(res);
+        writeJsonLine(res, { type: "start", id, repo, file });
+
+        try {
+          const destinationPath = path.join(getManagedLocalModelsDir(), repo, file);
+          const downloaded = await downloadManagedHuggingFaceGgufFn({
+            id,
+            displayName: String(body.displayName || "").trim() || file,
+            repo,
+            file,
+            destinationPath
+          }, {
+            onProgress: (event) => writeJsonLine(res, { type: "progress", event })
+          });
+          const configState = await readConfigState(configPath);
+          const updated = await registerManagedLlamacppModel(configState.rawConfig || {}, {
+            id,
+            displayName: String(body.displayName || "").trim() || file,
+            filePath: downloaded.filePath,
+            repo,
+            file,
+            sizeBytes: downloaded.sizeBytes
+          });
+          const { savedConfig } = await writeAndBroadcastConfig(updated, {
+            source: "local-models-download-managed"
+          });
+          writeJsonLine(res, {
+            type: "result",
+            result: {
+              library: savedConfig?.metadata?.localModels?.library || {}
+            }
+          });
+        } catch (error) {
+          writeJsonLine(res, {
+            type: "error",
+            statusCode: Number(error?.statusCode) || 500,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        } finally {
+          res.end();
+        }
         return;
       }
 

@@ -126,3 +126,20 @@ export async function lookupLiteLlmContextWindow(models = []) {
   });
   return Array.isArray(payload?.result) ? payload.result : [];
 }
+
+export async function searchHuggingFaceGguf(request = {}) {
+  const payload = await fetchJson("/api/local-models/search-huggingface", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(request)
+  });
+  return Array.isArray(payload?.results) ? payload.results : [];
+}
+
+export async function downloadManagedGguf(request, { onMessage } = {}) {
+  return fetchJsonLineStream("/api/local-models/download-managed", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(request)
+  }, { onMessage });
+}

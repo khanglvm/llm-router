@@ -164,6 +164,17 @@ async function fetchJson(url, options = {}) {
   return { response, payload };
 }
 
+async function fetchJsonLines(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  const messages = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  return { response, messages };
+}
+
 function createSilentEventSource(window) {
   return class SilentEventSource extends window.EventTarget {
     close() {}
@@ -4286,6 +4297,96 @@ test("POST /api/local-models/attach stores an attached llama.cpp model in config
 
     const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
     assert.equal(saved.metadata.localModels.library["base-qwen"].path, "/Volumes/models/qwen.gguf");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/search-huggingface returns shaped candidates with disabled reasons", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    searchHuggingFaceGgufCandidates: async () => ([
+      {
+        repo: "org/model",
+        file: "model.Q5_K_M.gguf",
+        sizeBytes: 24 * 1024 ** 3,
+        disabled: false,
+        disabledReason: "",
+        fit: "safe",
+        badges: ["GGUF", "llama.cpp", "Mac OK"]
+      },
+      {
+        repo: "org/model",
+        file: "model.safetensors",
+        sizeBytes: 24 * 1024 ** 3,
+        disabled: true,
+        disabledReason: "Not a GGUF file",
+        fit: "unsupported",
+        badges: ["Mac review"]
+      }
+    ])
+  });
+
+  try {
+    const searched = await fetchJson(`${server.url}/api/local-models/search-huggingface`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: "qwen" })
+    });
+
+    assert.equal(searched.response.status, 200);
+    assert.equal(searched.payload.results.length, 2);
+    assert.equal(searched.payload.results[1].disabled, true);
+    assert.match(searched.payload.results[1].disabledReason, /not a gguf file/i);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/download-managed streams progress and registers the managed model", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    downloadManagedHuggingFaceGguf: async (request, { onProgress }) => {
+      onProgress({ receivedBytes: 5, totalBytes: 10 });
+      return {
+        id: "base-qwen-managed",
+        displayName: "Qwen Managed",
+        filePath: path.join(fixture.dir, "managed", "qwen.Q5.gguf"),
+        repo: request.repo,
+        file: request.file,
+        sizeBytes: 10
+      };
+    }
+  });
+
+  try {
+    const streamed = await fetchJsonLines(`${server.url}/api/local-models/download-managed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "base-qwen-managed",
+        displayName: "Qwen Managed",
+        repo: "org/model",
+        file: "qwen.Q5.gguf"
+      })
+    });
+
+    assert.equal(streamed.response.status, 200);
+    assert.equal(streamed.messages[0].type, "start");
+    assert.equal(streamed.messages.some((message) => message.type === "progress"), true);
+    const resultMessage = streamed.messages.find((message) => message.type === "result");
+    assert.equal(resultMessage.result.library["base-qwen-managed"].source, "llamacpp-managed");
+
+    const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(saved.metadata.localModels.library["base-qwen-managed"].managed, true);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();

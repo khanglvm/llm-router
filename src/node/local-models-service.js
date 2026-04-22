@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import { promises as fs } from "node:fs";
 import { normalizeLocalModelsMetadata } from "../runtime/local-models.js";
 
@@ -11,6 +13,10 @@ function cloneConfig(config) {
 
 function normalizeString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeManagedMetadata(metadata) {
+  return isPlainObject(metadata) ? metadata : {};
 }
 
 function ensureLocalModelsState(config) {
@@ -27,6 +33,10 @@ async function defaultPathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+export function getManagedLocalModelsDir({ homeDir = os.homedir() } = {}) {
+  return path.join(homeDir, ".llm-router", "local-models");
 }
 
 export async function registerAttachedLlamacppModel(config, {
@@ -51,6 +61,41 @@ export async function registerAttachedLlamacppModel(config, {
     availability: "available",
     metadata: isPlainObject(metadata) ? metadata : {},
     managed: false
+  };
+
+  return next;
+}
+
+export async function registerManagedLlamacppModel(config, {
+  id,
+  displayName,
+  filePath,
+  repo = "",
+  file = "",
+  sizeBytes = undefined,
+  metadata = {}
+} = {}) {
+  const baseModelId = normalizeString(id);
+  const modelPath = normalizeString(filePath);
+  const label = normalizeString(displayName);
+
+  if (!baseModelId) throw new Error("Managed local model id is required.");
+  if (!modelPath) throw new Error("Managed local model path is required.");
+
+  const next = ensureLocalModelsState(config);
+  next.metadata.localModels.library[baseModelId] = {
+    id: baseModelId,
+    source: "llamacpp-managed",
+    displayName: label || baseModelId,
+    path: modelPath,
+    availability: "available",
+    metadata: {
+      ...normalizeManagedMetadata(metadata),
+      repo: normalizeString(repo),
+      file: normalizeString(file),
+      ...(Number.isFinite(Number(sizeBytes)) ? { sizeBytes: Number(sizeBytes) } : {})
+    },
+    managed: true
   };
 
   return next;
