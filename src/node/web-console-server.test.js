@@ -4278,6 +4278,8 @@ test("POST /api/local-models/attach stores an attached llama.cpp model in config
   const server = await startTestWebConsoleServer({
     configPath: fixture.configPath,
     port: await getAvailablePort()
+  }, {
+    localModelPathExists: async () => true
   });
 
   try {
@@ -4444,6 +4446,162 @@ test("POST /api/local-models/variants/save persists a local variant and returns 
     assert.equal(saved.payload.ok, true);
     assert.equal(saved.payload.variants["qwen-balanced"].id, "local/qwen-balanced");
     assert.equal(saved.payload.variants["qwen-balanced"].capacityState, "safe");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/locate repairs a stale base model path and descendant variants", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            path: "/missing/qwen.gguf",
+            availability: "stale"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp",
+            availability: "stale"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    localModelPathExists: async () => true
+  });
+
+  try {
+    const located = await fetchJson(`${server.url}/api/local-models/locate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        baseModelId: "base-qwen",
+        filePath: "/Volumes/models/qwen.gguf"
+      })
+    });
+
+    assert.equal(located.response.status, 200);
+    assert.equal(located.payload.ok, true);
+    assert.equal(located.payload.library["base-qwen"].path, "/Volumes/models/qwen.gguf");
+    assert.equal(located.payload.library["base-qwen"].availability, "available");
+    assert.equal(located.payload.variants["variant-qwen"].availability, "available");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/remove deletes a base model and descendant variants", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            path: "/models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  });
+
+  try {
+    const removed = await fetchJson(`${server.url}/api/local-models/remove`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        baseModelId: "base-qwen"
+      })
+    });
+
+    assert.equal(removed.response.status, 200);
+    assert.equal(removed.payload.ok, true);
+    assert.equal(removed.payload.library["base-qwen"], undefined);
+    assert.equal(removed.payload.variants["variant-qwen"], undefined);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/reconcile refreshes stale availability from disk state", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            path: "/models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp",
+            availability: "available"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    localModelPathExists: async () => false
+  });
+
+  try {
+    const reconciled = await fetchJson(`${server.url}/api/local-models/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(reconciled.response.status, 200);
+    assert.equal(reconciled.payload.ok, true);
+    assert.equal(reconciled.payload.library["base-qwen"].availability, "stale");
+    assert.equal(reconciled.payload.variants["variant-qwen"].availability, "stale");
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();

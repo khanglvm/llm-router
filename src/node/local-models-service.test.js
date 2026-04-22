@@ -6,6 +6,7 @@ import {
   reconcileLocalModelPaths,
   registerAttachedLlamacppModel,
   registerManagedLlamacppModel,
+  updateLocalBaseModelPath,
   saveLocalModelVariant,
   removeLocalBaseModel
 } from "./local-models-service.js";
@@ -59,6 +60,33 @@ test("removeLocalBaseModel removes the base model and descendant variants", asyn
   assert.equal(next.metadata.localModels.library["base-qwen"], undefined);
   assert.equal(next.metadata.localModels.variants["variant-qwen"], undefined);
   assert.ok(next.metadata.localModels.variants["variant-other"]);
+});
+
+test("updateLocalBaseModelPath repairs a stale base model and descendant variants", async () => {
+  const next = await updateLocalBaseModelPath({
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            path: "/missing/qwen.gguf",
+            availability: "stale"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            availability: "stale"
+          }
+        }
+      }
+    }
+  }, "base-qwen", "/Volumes/models/qwen.gguf");
+
+  assert.equal(next.metadata.localModels.library["base-qwen"].path, "/Volumes/models/qwen.gguf");
+  assert.equal(next.metadata.localModels.library["base-qwen"].availability, "available");
+  assert.equal(next.metadata.localModels.variants["variant-qwen"].availability, "available");
 });
 
 test("registerManagedLlamacppModel stores a managed base model in the router-owned location", async () => {

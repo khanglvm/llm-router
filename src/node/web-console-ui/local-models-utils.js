@@ -31,6 +31,48 @@ function makeUniqueId(candidate, existingIds = new Set()) {
   return `${base}-${index}`;
 }
 
+function buildExistingLocalModelIds(existingEntries = {}) {
+  return new Set(
+    Object.values(existingEntries || {})
+      .map((entry) => String(entry?.id || "").trim())
+      .filter(Boolean)
+  );
+}
+
+function stripFileExtension(fileName) {
+  return String(fileName || "").replace(/\.[^.]+$/u, "");
+}
+
+function pickLastPathSegment(filePath) {
+  const normalized = String(filePath || "").trim().replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).pop() || "";
+}
+
+export function buildManagedLocalModelDraft(candidate = {}, existingEntries = {}) {
+  const repo = String(candidate?.repo || "").trim();
+  const file = String(candidate?.file || "").trim();
+  const existingIds = buildExistingLocalModelIds(existingEntries);
+  const idSeed = slugify(`${repo}-${stripFileExtension(file)}`) || "local-model";
+  return {
+    id: makeUniqueId(idSeed, existingIds),
+    displayName: file || repo || "Managed GGUF",
+    repo,
+    file
+  };
+}
+
+export function buildAttachedLocalModelDraft(filePath = "", existingEntries = {}) {
+  const normalizedPath = String(filePath || "").trim();
+  const fileName = pickLastPathSegment(normalizedPath);
+  const existingIds = buildExistingLocalModelIds(existingEntries);
+  const idSeed = slugify(stripFileExtension(fileName)) || "local-model";
+  return {
+    id: makeUniqueId(idSeed, existingIds),
+    displayName: fileName || normalizedPath || "Attached GGUF",
+    filePath: normalizedPath
+  };
+}
+
 export function normalizeLocalVariantContextWindow(value) {
   const parsed = Number.parseInt(String(value ?? "").replace(/[^\d]/g, ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;

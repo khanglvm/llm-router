@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildAttachedLocalModelDraft,
   buildEditableLlamacppVariantDraft,
   buildLlamacppVariantDraft,
   buildLocalModelsSummary,
+  buildManagedLocalModelDraft,
   normalizeLocalVariantContextWindow,
   resolveLocalVariantSaveDisabledReason
 } from "./local-models-utils.js";
@@ -78,4 +80,28 @@ test("normalizeLocalVariantContextWindow strips formatting and rejects invalid v
   assert.equal(normalizeLocalVariantContextWindow("200,000"), 200000);
   assert.equal(normalizeLocalVariantContextWindow("0"), undefined);
   assert.equal(normalizeLocalVariantContextWindow("abc"), undefined);
+});
+
+test("buildManagedLocalModelDraft derives a unique id and display name from a hugging face file", () => {
+  const draft = buildManagedLocalModelDraft({
+    repo: "org/Qwen-Model",
+    file: "qwen.Q5_K_M.gguf"
+  }, {
+    existing: { id: "org-qwen-model-qwen-q5-k-m" }
+  });
+
+  assert.equal(draft.id, "org-qwen-model-qwen-q5-k-m-2");
+  assert.equal(draft.displayName, "qwen.Q5_K_M.gguf");
+  assert.equal(draft.repo, "org/Qwen-Model");
+  assert.equal(draft.file, "qwen.Q5_K_M.gguf");
+});
+
+test("buildAttachedLocalModelDraft derives a unique id and display name from a file path", () => {
+  const draft = buildAttachedLocalModelDraft("/Volumes/models/Qwen3/qwen-local.Q5.gguf", {
+    existing: { id: "qwen-local-q5" }
+  });
+
+  assert.equal(draft.id, "qwen-local-q5-2");
+  assert.equal(draft.displayName, "qwen-local.Q5.gguf");
+  assert.equal(draft.filePath, "/Volumes/models/Qwen3/qwen-local.Q5.gguf");
 });

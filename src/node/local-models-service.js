@@ -143,6 +143,31 @@ export async function removeLocalBaseModel(config, baseModelId) {
   return next;
 }
 
+export async function updateLocalBaseModelPath(config, baseModelId, filePath) {
+  const targetId = normalizeString(baseModelId);
+  const nextPath = normalizeString(filePath);
+  const next = ensureLocalModelsState(config);
+
+  if (!targetId) throw new Error("Base model id is required.");
+  if (!nextPath) throw new Error("Updated local model path is required.");
+
+  const baseModel = next.metadata.localModels.library[targetId];
+  if (!baseModel) {
+    throw new Error(`Base model '${targetId}' was not found.`);
+  }
+
+  baseModel.path = nextPath;
+  baseModel.availability = "available";
+
+  for (const variant of Object.values(next.metadata.localModels.variants)) {
+    if (variant?.baseModelId === targetId) {
+      variant.availability = "available";
+    }
+  }
+
+  return next;
+}
+
 export async function saveLocalModelVariant(config, draft, {
   system = {}
 } = {}) {

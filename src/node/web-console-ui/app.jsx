@@ -89,10 +89,15 @@ import {
 import { normalizeContextWindowInput } from "./context-window-utils.js";
 
 import {
+  attachLocalModel,
   fetchJson,
   fetchJsonLineStream,
+  locateLocalModel,
   probeFreeTierModels,
+  reconcileLocalModels,
+  removeLocalModel,
   lookupLiteLlmContextWindow,
+  downloadManagedGguf,
   saveLocalModelVariant
 } from "./api-client.js";
 
@@ -2042,6 +2047,111 @@ export function App() {
     }
   }
 
+  async function handleRefreshLocalModels({ silent = false } = {}) {
+    if (parsedDraftState.parseError) {
+      if (!silent) showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      if (!silent) showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await reconcileLocalModels();
+      await loadState({ preserveDraft: false });
+      if (!silent) showNotice("success", "Local model status refreshed.");
+      return true;
+    } catch (error) {
+      if (!silent) showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleAttachLocalModel(request) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await attachLocalModel(request);
+      await loadState({ preserveDraft: false });
+      showNotice("success", `Attached local model ${String(request?.displayName || request?.id || "").trim() || "draft"}.`);
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleLocateLocalModel(request) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await locateLocalModel(request);
+      await loadState({ preserveDraft: false });
+      showNotice("success", "Updated local model path.");
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleRemoveLocalModel(baseModelId) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await removeLocalModel(baseModelId);
+      await loadState({ preserveDraft: false });
+      showNotice("success", "Removed local model.");
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleDownloadManagedLocalModel(request, { onMessage } = {}) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await downloadManagedGguf(request, { onMessage });
+      await loadState({ preserveDraft: false });
+      showNotice("success", `Downloaded ${String(request?.displayName || request?.file || "").trim() || "managed GGUF"}.`);
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   // ── Ollama handlers ──────────────────────────────────────────────
   async function refreshOllamaModels() {
     setOllamaRefreshing(true);
@@ -2627,7 +2737,12 @@ export function App() {
                   : (draftRef.current !== baselineRef.current
                     ? "Save or discard the current config draft before changing local models."
                     : ""),
-                onSaveVariant: handleSaveLocalVariant
+                onSaveVariant: handleSaveLocalVariant,
+                onRefreshLibrary: handleRefreshLocalModels,
+                onAttachModel: handleAttachLocalModel,
+                onLocateModel: handleLocateLocalModel,
+                onRemoveModel: handleRemoveLocalModel,
+                onDownloadManagedModel: handleDownloadManagedLocalModel
               }}
               ollama={{
                 connected: ollamaTabConnected,

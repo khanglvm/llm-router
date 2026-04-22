@@ -64,9 +64,13 @@ import { estimateMaxContext, estimateModelVram, formatBytes } from "./ollama-har
 import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaServer, isOllamaRunning } from "./ollama-install.js";
 import {
   getManagedLocalModelsDir,
+  reconcileLocalModelPaths,
   registerAttachedLlamacppModel,
   registerManagedLlamacppModel,
+  removeLocalBaseModel,
   saveLocalModelVariant
+  ,
+  updateLocalBaseModelPath
 } from "./local-models-service.js";
 import {
   downloadManagedHuggingFaceGguf,
@@ -908,6 +912,9 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   const downloadManagedHuggingFaceGgufFn = typeof deps.downloadManagedHuggingFaceGguf === "function"
     ? deps.downloadManagedHuggingFaceGguf
     : (request, runtimeOptions = {}) => downloadManagedHuggingFaceGguf(request, runtimeOptions);
+  const localModelPathExistsFn = typeof deps.localModelPathExists === "function"
+    ? deps.localModelPathExists
+    : undefined;
   const ampClientEnv = deps.ampClientEnv && typeof deps.ampClientEnv === "object" ? deps.ampClientEnv : process.env;
   const ampClientCwd = typeof deps.ampClientCwd === "string" && deps.ampClientCwd.trim() ? deps.ampClientCwd : process.cwd();
   const codexCliEnv = deps.codexCliEnv && typeof deps.codexCliEnv === "object" ? deps.codexCliEnv : process.env;
@@ -3185,6 +3192,97 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         sendJson(res, 200, {
           ok: true,
           library: savedConfig?.metadata?.localModels?.library || {}
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/locate") {
+        const body = await readJsonBody(req);
+        const baseModelId = String(body.baseModelId || "").trim();
+        const filePath = String(body.filePath || "").trim();
+        if (!baseModelId || !filePath) {
+          sendJson(res, 400, {
+            error: "baseModelId and filePath are required."
+          });
+          return;
+        }
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before locating a local model: ${configState.parseError}`
+          });
+          return;
+        }
+
+        try {
+          const relocated = await updateLocalBaseModelPath(configState.rawConfig || {}, baseModelId, filePath);
+          const reconciled = await reconcileLocalModelPaths(relocated, {
+            ...(localModelPathExistsFn ? { pathExists: localModelPathExistsFn } : {})
+          });
+          const { savedConfig } = await writeAndBroadcastConfig(reconciled, {
+            source: "local-models-locate"
+          });
+          sendJson(res, 200, {
+            ok: true,
+            library: savedConfig?.metadata?.localModels?.library || {},
+            variants: savedConfig?.metadata?.localModels?.variants || {}
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/remove") {
+        const body = await readJsonBody(req);
+        const baseModelId = String(body.baseModelId || "").trim();
+        if (!baseModelId) {
+          sendJson(res, 400, {
+            error: "baseModelId is required."
+          });
+          return;
+        }
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before removing a local model: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = await removeLocalBaseModel(configState.rawConfig || {}, baseModelId);
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-remove"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          library: savedConfig?.metadata?.localModels?.library || {},
+          variants: savedConfig?.metadata?.localModels?.variants || {}
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/reconcile") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before refreshing local model status: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = await reconcileLocalModelPaths(configState.rawConfig || {}, {
+          ...(localModelPathExistsFn ? { pathExists: localModelPathExistsFn } : {})
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-reconcile"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          library: savedConfig?.metadata?.localModels?.library || {},
+          variants: savedConfig?.metadata?.localModels?.variants || {}
         });
         return;
       }

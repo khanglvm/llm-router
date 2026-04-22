@@ -152,3 +152,39 @@ export async function saveLocalModelVariant(variant) {
   });
   return payload?.variants || {};
 }
+
+export async function attachLocalModel(request) {
+  const payload = await fetchJson("/api/local-models/attach", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(request)
+  });
+  return payload;
+}
+
+export async function locateLocalModel(request) {
+  const payload = await fetchJson("/api/local-models/locate", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(request)
+  });
+  return payload;
+}
+
+export async function removeLocalModel(baseModelId) {
+  const payload = await fetchJson("/api/local-models/remove", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ baseModelId })
+  });
+  return payload;
+}
+
+export async function reconcileLocalModels() {
+  const payload = await fetchJson("/api/local-models/reconcile", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: "{}"
+  });
+  return payload;
+}
