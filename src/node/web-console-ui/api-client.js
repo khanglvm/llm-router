@@ -143,3 +143,12 @@ export async function downloadManagedGguf(request, { onMessage } = {}) {
     body: JSON.stringify(request)
   }, { onMessage });
 }
+
+export async function saveLocalModelVariant(variant) {
+  const payload = await fetchJson("/api/local-models/variants/save", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ variant })
+  });
+  return payload?.variants || {};
+}

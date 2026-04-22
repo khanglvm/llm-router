@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { normalizeLocalModelsMetadata } from "../runtime/local-models.js";
+import { canActivateVariant, classifyVariantCapacity } from "./local-model-capacity.js";
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -138,6 +139,75 @@ export async function removeLocalBaseModel(config, baseModelId) {
       delete next.metadata.localModels.variants[variantKey];
     }
   }
+
+  return next;
+}
+
+export async function saveLocalModelVariant(config, draft, {
+  system = {}
+} = {}) {
+  const next = ensureLocalModelsState(config);
+  const normalizedDraft = isPlainObject(draft) ? draft : {};
+  const key = normalizeString(normalizedDraft.key || normalizedDraft.id);
+  const baseModelId = normalizeString(normalizedDraft.baseModelId);
+  const modelId = normalizeString(normalizedDraft.id);
+  const name = normalizeString(normalizedDraft.name);
+  const runtime = normalizeString(normalizedDraft.runtime);
+
+  if (!key || !baseModelId || !modelId || !name || !runtime) {
+    throw new Error("key, baseModelId, id, name, and runtime are required.");
+  }
+
+  const baseModel = next.metadata.localModels.library[baseModelId];
+  if (!baseModel) {
+    throw new Error(`Base model '${baseModelId}' was not found.`);
+  }
+
+  const sizeBytes = Number(baseModel?.metadata?.sizeBytes || 0);
+  const capacity = classifyVariantCapacity({
+    sizeBytes,
+    contextWindow: normalizedDraft.contextWindow,
+    preload: normalizedDraft.preload === true
+  }, system);
+
+  const shouldActivate = normalizedDraft.enabled === true || normalizedDraft.preload === true;
+  if (shouldActivate && system?.platform === "darwin" && system?.unifiedMemory === true) {
+    const activeVariants = Object.values(next.metadata.localModels.variants)
+      .filter((variant) => variant?.key !== key)
+      .filter((variant) => variant?.enabled === true || variant?.preload === true)
+      .map((variant) => ({
+        estimatedBytes: Number(variant?.estimatedBytes || 0),
+        preload: variant?.preload === true
+      }));
+    const decision = canActivateVariant({
+      candidate: {
+        estimatedBytes: capacity.estimatedBytes,
+        preload: normalizedDraft.preload === true
+      },
+      activeVariants,
+      totalMemoryBytes: system.totalMemoryBytes
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.reason);
+    }
+  }
+
+  next.metadata.localModels.variants[key] = {
+    ...(isPlainObject(next.metadata.localModels.variants[key]) ? next.metadata.localModels.variants[key] : {}),
+    key,
+    baseModelId,
+    id: modelId,
+    name,
+    runtime,
+    preset: normalizeString(normalizedDraft.preset),
+    enabled: normalizedDraft.enabled === true,
+    preload: normalizedDraft.preload === true,
+    contextWindow: Number.isFinite(Number(normalizedDraft.contextWindow)) ? Number(normalizedDraft.contextWindow) : undefined,
+    capabilities: isPlainObject(normalizedDraft.capabilities) ? normalizedDraft.capabilities : undefined,
+    availability: normalizeString(baseModel?.availability) || "available",
+    capacityState: capacity.fit,
+    estimatedBytes: capacity.estimatedBytes
+  };
 
   return next;
 }

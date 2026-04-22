@@ -65,7 +65,8 @@ import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaS
 import {
   getManagedLocalModelsDir,
   registerAttachedLlamacppModel,
-  registerManagedLlamacppModel
+  registerManagedLlamacppModel,
+  saveLocalModelVariant
 } from "./local-models-service.js";
 import {
   downloadManagedHuggingFaceGguf,
@@ -894,6 +895,13 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     ? deps.waitForRuntimeMatch
     : (startOptions, waitOptions = {}) => waitForRuntimeMatch(startOptions, waitOptions);
   const loginSubscriptionFn = typeof deps.loginSubscription === "function" ? deps.loginSubscription : loginSubscription;
+  const getLocalModelSystemInfoFn = typeof deps.getLocalModelSystemInfo === "function"
+    ? deps.getLocalModelSystemInfo
+    : () => ({
+      platform: process.platform,
+      totalMemoryBytes: os.totalmem(),
+      unifiedMemory: process.platform === "darwin"
+    });
   const searchHuggingFaceGgufCandidatesFn = typeof deps.searchHuggingFaceGgufCandidates === "function"
     ? deps.searchHuggingFaceGgufCandidates
     : searchHuggingFaceGgufCandidates;
@@ -3241,6 +3249,35 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           });
         } finally {
           res.end();
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/variants/save") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before saving a local variant: ${configState.parseError}`
+          });
+          return;
+        }
+
+        try {
+          const updated = await saveLocalModelVariant(configState.rawConfig || {}, body.variant || {}, {
+            system: getLocalModelSystemInfoFn()
+          });
+          const { savedConfig } = await writeAndBroadcastConfig(updated, {
+            source: "local-models-variant-save"
+          });
+          sendJson(res, 200, {
+            ok: true,
+            variants: savedConfig?.metadata?.localModels?.variants || {}
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            error: error instanceof Error ? error.message : String(error)
+          });
         }
         return;
       }

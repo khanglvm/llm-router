@@ -53,9 +53,19 @@ function normalizeLocalModelVariantEntry(key, entry) {
     preload: entry.preload === true
   };
 
+  if ("preset" in normalized) {
+    const preset = normalizeString(normalized.preset);
+    if (preset) normalized.preset = preset;
+    else delete normalized.preset;
+  }
+
   const contextWindow = normalizePositiveNumber(entry.contextWindow);
   if (contextWindow !== undefined) normalized.contextWindow = contextWindow;
   else delete normalized.contextWindow;
+
+  const estimatedBytes = normalizePositiveNumber(entry.estimatedBytes);
+  if (estimatedBytes !== undefined) normalized.estimatedBytes = estimatedBytes;
+  else delete normalized.estimatedBytes;
 
   if (isPlainObject(entry.capabilities)) normalized.capabilities = { ...entry.capabilities };
   else delete normalized.capabilities;
@@ -128,7 +138,9 @@ export function materializeLocalVariantProvider(config = {}) {
         baseModelId: variant.baseModelId,
         runtime: variant.runtime,
         preload: variant.preload === true,
-        availability: variant.availability || baseModel?.availability || "available"
+        availability: variant.availability || baseModel?.availability || "available",
+        capacityState: variant.capacityState,
+        estimatedBytes: variant.estimatedBytes
       }
     };
 

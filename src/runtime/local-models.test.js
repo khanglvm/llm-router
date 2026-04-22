@@ -63,3 +63,39 @@ test("validateRuntimeConfig rejects duplicate local variant model ids", () => {
   const errors = validateRuntimeConfig(config, { requireMasterKey: false, requireProvider: false });
   assert.match(errors.join("\n"), /duplicate local variant model id/i);
 });
+
+test("normalizeRuntimeConfig materializes local variant capacity metadata", () => {
+  const config = normalizeRuntimeConfig({
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-managed",
+            path: "/Users/test/.llm-router/local-models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "qwen-tight": {
+            key: "qwen-tight",
+            baseModelId: "base-qwen",
+            id: "local/qwen-tight",
+            name: "Qwen Tight",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 131072,
+            capacityState: "tight",
+            estimatedBytes: 1234
+          }
+        }
+      }
+    }
+  });
+
+  const localProvider = config.providers.find((provider) => provider.type === LOCAL_RUNTIME_PROVIDER_TYPE);
+  assert.equal(localProvider.models[0].metadata.capacityState, "tight");
+  assert.equal(localProvider.models[0].metadata.estimatedBytes, 1234);
+});

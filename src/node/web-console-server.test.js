@@ -4392,3 +4392,60 @@ test("POST /api/local-models/download-managed streams progress and registers the
     await fixture.cleanup();
   }
 });
+
+test("POST /api/local-models/variants/save persists a local variant and returns it", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-managed",
+            path: "/tmp/qwen.gguf",
+            metadata: { sizeBytes: 8 * 1024 ** 3 }
+          }
+        },
+        variants: {}
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    getLocalModelSystemInfo: () => ({
+      platform: "darwin",
+      totalMemoryBytes: 64 * 1024 ** 3,
+      unifiedMemory: true
+    })
+  });
+
+  try {
+    const saved = await fetchJson(`${server.url}/api/local-models/variants/save`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        variant: {
+          key: "qwen-balanced",
+          baseModelId: "base-qwen",
+          id: "local/qwen-balanced",
+          name: "Qwen Balanced",
+          runtime: "llamacpp",
+          enabled: true,
+          preload: false,
+          contextWindow: 65536
+        }
+      })
+    });
+
+    assert.equal(saved.response.status, 200);
+    assert.equal(saved.payload.ok, true);
+    assert.equal(saved.payload.variants["qwen-balanced"].id, "local/qwen-balanced");
+    assert.equal(saved.payload.variants["qwen-balanced"].capacityState, "safe");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});

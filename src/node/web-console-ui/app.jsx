@@ -92,7 +92,8 @@ import {
   fetchJson,
   fetchJsonLineStream,
   probeFreeTierModels,
-  lookupLiteLlmContextWindow
+  lookupLiteLlmContextWindow,
+  saveLocalModelVariant
 } from "./api-client.js";
 
 import {
@@ -2020,6 +2021,27 @@ export function App() {
     }
   }
 
+  async function handleSaveLocalVariant(variantDraft) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await saveLocalModelVariant(variantDraft);
+      await loadState({ preserveDraft: false });
+      showNotice("success", `Saved local variant ${String(variantDraft?.name || variantDraft?.id || "").trim() || "draft"}.`);
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   // ── Ollama handlers ──────────────────────────────────────────────
   async function refreshOllamaModels() {
     setOllamaRefreshing(true);
@@ -2599,7 +2621,13 @@ export function App() {
                 ),
                 variants: Object.fromEntries(
                   Object.entries(localModelsState.variants || {}).filter(([, variant]) => variant?.runtime === "llamacpp")
-                )
+                ),
+                disableEditsReason: parsedDraftState.parseError
+                  ? `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`
+                  : (draftRef.current !== baselineRef.current
+                    ? "Save or discard the current config draft before changing local models."
+                    : ""),
+                onSaveVariant: handleSaveLocalVariant
               }}
               ollama={{
                 connected: ollamaTabConnected,

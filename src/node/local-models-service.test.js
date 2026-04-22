@@ -6,6 +6,7 @@ import {
   reconcileLocalModelPaths,
   registerAttachedLlamacppModel,
   registerManagedLlamacppModel,
+  saveLocalModelVariant,
   removeLocalBaseModel
 } from "./local-models-service.js";
 
@@ -73,4 +74,49 @@ test("registerManagedLlamacppModel stores a managed base model in the router-own
   assert.equal(next.metadata.localModels.library["base-qwen-managed"].source, "llamacpp-managed");
   assert.equal(next.metadata.localModels.library["base-qwen-managed"].managed, true);
   assert.equal(next.metadata.localModels.library["base-qwen-managed"].metadata.repo, "Qwen/Qwen");
+});
+
+test("saveLocalModelVariant blocks enabling a variant that exceeds the Mac unified-memory budget", async () => {
+  await assert.rejects(
+    saveLocalModelVariant({
+      metadata: {
+        localModels: {
+          library: {
+            "base-qwen": {
+              id: "base-qwen",
+              metadata: { sizeBytes: 24 * 1024 ** 3 }
+            }
+          },
+          variants: {
+            active: {
+              key: "active",
+              baseModelId: "base-qwen",
+              id: "local/active",
+              name: "Active",
+              runtime: "llamacpp",
+              enabled: true,
+              preload: true,
+              estimatedBytes: 28 * 1024 ** 3
+            }
+          }
+        }
+      }
+    }, {
+      key: "candidate",
+      baseModelId: "base-qwen",
+      id: "local/candidate",
+      name: "Candidate",
+      runtime: "llamacpp",
+      enabled: true,
+      preload: true,
+      contextWindow: 200000
+    }, {
+      system: {
+        platform: "darwin",
+        totalMemoryBytes: 64 * 1024 ** 3,
+        unifiedMemory: true
+      }
+    }),
+    /capacity/i
+  );
 });
