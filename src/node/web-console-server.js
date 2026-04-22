@@ -61,6 +61,7 @@ import {
 } from "./ollama-client.js";
 import { estimateMaxContext, estimateModelVram, formatBytes } from "./ollama-hardware.js";
 import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaServer, isOllamaRunning } from "./ollama-install.js";
+import { registerAttachedLlamacppModel } from "./local-models-service.js";
 import {
   CONFIG_VERSION,
   DEFAULT_MODEL_ALIAS_ID,
@@ -3128,6 +3129,40 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const source = String(body?.source || "").trim();
         const { snapshot } = await writeAndBroadcastConfig(parsed, { source });
         sendJson(res, 200, snapshot);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/attach") {
+        const body = await readJsonBody(req);
+        const id = String(body.id || "").trim();
+        const filePath = String(body.filePath || "").trim();
+        if (!id || !filePath) {
+          sendJson(res, 400, {
+            error: "id and filePath are required."
+          });
+          return;
+        }
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before attaching a local model: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = await registerAttachedLlamacppModel(configState.rawConfig || {}, {
+          id,
+          displayName: String(body.displayName || "").trim(),
+          filePath,
+          metadata: body.metadata || {}
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-attach"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          library: savedConfig?.metadata?.localModels?.library || {}
+        });
         return;
       }
 

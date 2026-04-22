@@ -4250,3 +4250,44 @@ test("web console updates Claude Code routing when the gateway key changes", asy
     await claudeCode.cleanup();
   }
 });
+
+test("POST /api/local-models/attach stores an attached llama.cpp model in config metadata", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {},
+        library: {},
+        variants: {},
+        capacity: {}
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  });
+
+  try {
+    const attached = await fetchJson(`${server.url}/api/local-models/attach`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "base-qwen",
+        displayName: "Qwen External",
+        filePath: "/Volumes/models/qwen.gguf"
+      })
+    });
+
+    assert.equal(attached.response.status, 200);
+    assert.equal(attached.payload.ok, true);
+    assert.equal(attached.payload.library["base-qwen"].source, "llamacpp-attached");
+
+    const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(saved.metadata.localModels.library["base-qwen"].path, "/Volumes/models/qwen.gguf");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
