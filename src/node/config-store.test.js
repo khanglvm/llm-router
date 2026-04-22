@@ -176,3 +176,50 @@ test("readConfigFile strips persisted local router host and port metadata", asyn
   assert.equal(rereadRaw.metadata?.localServer?.requireAuth, true);
   assert.equal(LOCAL_ROUTER_PORT, 8376);
 });
+
+test("writeConfigFile preserves metadata.localModels across round-trip reads", async (t) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-config-store-test-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const configPath = path.join(tempDir, "config.json");
+
+  const written = await writeConfigFile({
+    ...createLegacyV1Config(),
+    version: 2,
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            displayName: "Qwen GGUF",
+            path: "/Volumes/models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "qwen-local": {
+            key: "qwen-local",
+            baseModelId: "base-qwen",
+            id: "local/qwen-local",
+            name: "Qwen Local",
+            runtime: "llamacpp",
+            enabled: true
+          }
+        }
+      }
+    }
+  }, configPath);
+
+  assert.equal(written.metadata?.localModels?.library?.["base-qwen"]?.displayName, "Qwen GGUF");
+  assert.equal(written.metadata?.localModels?.variants?.["qwen-local"]?.id, "local/qwen-local");
+
+  const reread = await readConfigFile(configPath);
+  assert.equal(reread.metadata?.localModels?.library?.["base-qwen"]?.path, "/Volumes/models/qwen.gguf");
+  assert.equal(reread.metadata?.localModels?.variants?.["qwen-local"]?.name, "Qwen Local");
+
+  const raw = JSON.parse(await fs.readFile(configPath, "utf8"));
+  assert.equal(raw.metadata?.localModels?.library?.["base-qwen"]?.source, "llamacpp-attached");
+  assert.equal(raw.metadata?.localModels?.variants?.["qwen-local"]?.runtime, "llamacpp");
+});

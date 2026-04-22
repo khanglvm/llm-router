@@ -9,6 +9,12 @@ import {
   CLAUDE_CODE_SUBSCRIPTION_MODELS
 } from "./subscription-constants.js";
 import { sanitizeRuntimeMetadata } from "../shared/local-router-defaults.js";
+import {
+  LOCAL_RUNTIME_PROVIDER_TYPE,
+  collectDuplicateLocalVariantModelIds,
+  materializeLocalVariantProvider,
+  normalizeLocalModelsMetadata
+} from "./local-models.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
@@ -1769,12 +1775,15 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
   const raw = shouldMigrate
     ? migrateRuntimeConfig(rawInput, { targetVersion })
     : rawInput;
-  const providers = sanitizeModelFallbackReferences(
-    toArray(raw.providers)
-    .map(normalizeProvider)
-    .filter(Boolean)
-    .filter((provider) => provider.enabled !== false)
-  );
+  const localModels = normalizeLocalModelsMetadata(raw.metadata?.localModels);
+  const providers = sanitizeModelFallbackReferences([
+    ...toArray(raw.providers)
+      .map(normalizeProvider)
+      .filter(Boolean)
+      .filter((provider) => provider.enabled !== false)
+      .filter((provider) => provider.type !== LOCAL_RUNTIME_PROVIDER_TYPE),
+    ...materializeLocalVariantProvider({ metadata: { localModels } })
+  ]);
   const modelAliasResult = normalizeModelAliases(raw.modelAliases || raw["model-aliases"]);
   const rawDefaultModel = typeof raw.defaultModel === "string"
     ? raw.defaultModel
@@ -1816,7 +1825,10 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     ...(webSearch ? { webSearch } : {}),
     ...(claudeCode && Object.keys(claudeCode).length > 0 ? { claudeCode } : {}),
     ollama,
-    metadata: sanitizeRuntimeMetadata(raw.metadata)
+    metadata: sanitizeRuntimeMetadata({
+      ...(normalizeMetadataObject(raw.metadata) || {}),
+      localModels
+    })
   };
   Object.defineProperty(normalized, NORMALIZATION_ISSUES_SYMBOL, {
     value: {
@@ -2185,6 +2197,9 @@ export function validateRuntimeConfig(config, { requireMasterKey = false, requir
   validateProviderRateLimits(config, routingIndex, errors);
   validateModelAliases(config, routingIndex, errors);
   validateAmpConfig(config, routingIndex, errors);
+  for (const duplicateModelId of collectDuplicateLocalVariantModelIds(config.metadata?.localModels)) {
+    errors.push(`Duplicate local variant model id '${duplicateModelId}'.`);
+  }
 
   if (requireMasterKey && !config.masterKey) {
     errors.push("masterKey is required for worker deployment/export.");
