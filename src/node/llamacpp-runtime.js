@@ -155,6 +155,31 @@ export function buildLlamacppLaunchArgs({
   return args.filter(Boolean);
 }
 
+export async function spawnManagedLlamacppRuntime({
+  command,
+  host = LLAMACPP_DEFAULT_HOST,
+  port = LLAMACPP_DEFAULT_PORT,
+  launchProfile
+} = {}, {
+  spawnImpl = spawn
+} = {}) {
+  const args = buildLlamacppLaunchArgs({
+    command,
+    host,
+    port,
+    launchProfile
+  });
+  const child = spawnImpl(args[0], args.slice(1), { stdio: "ignore" });
+  return {
+    pid: child?.pid,
+    child,
+    host,
+    port,
+    baseUrl: `http://${host}:${port}/v1`,
+    args
+  };
+}
+
 export function parseLlamacppValidationOutput(output = "") {
   const text = String(output || "").trim();
   const lowered = text.toLowerCase();

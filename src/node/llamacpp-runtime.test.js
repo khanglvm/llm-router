@@ -4,6 +4,7 @@ import {
   buildLlamacppLaunchArgs,
   detectLlamacppCandidates,
   parseLlamacppValidationOutput,
+  spawnManagedLlamacppRuntime,
   startConfiguredLlamacppRuntime
 } from "./llamacpp-runtime.js";
 
@@ -61,6 +62,30 @@ test("buildLlamacppLaunchArgs appends derived launch profile arguments", () => {
   assert.equal(args[0], "/opt/homebrew/bin/llama-server");
   assert.match(args.join(" "), /-a local\/qwen-balanced/);
   assert.match(args.join(" "), /-ngl 0/);
+});
+
+test("spawnManagedLlamacppRuntime returns process metadata and expanded args", async () => {
+  const spawnCalls = [];
+  const runtime = await spawnManagedLlamacppRuntime({
+    command: "/opt/homebrew/bin/llama-server",
+    host: "127.0.0.1",
+    port: 39391,
+    launchProfile: {
+      args: ["-m", "/tmp/qwen.gguf", "-a", "local/qwen-balanced", "-c", "65536", "-ngl", "0"]
+    }
+  }, {
+    spawnImpl(command, args) {
+      spawnCalls.push({ command, args });
+      return { pid: 3210 };
+    }
+  });
+
+  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls[0].command, "/opt/homebrew/bin/llama-server");
+  assert.equal(spawnCalls[0].args[0], "--host");
+  assert.match(spawnCalls[0].args.join(" "), /-a local\/qwen-balanced/);
+  assert.equal(runtime.pid, 3210);
+  assert.equal(runtime.baseUrl, "http://127.0.0.1:39391/v1");
 });
 
 test("startConfiguredLlamacppRuntime derives launch profile without referencing an undefined deps binding", async () => {
