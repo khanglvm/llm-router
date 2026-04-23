@@ -1,6 +1,9 @@
 export function createLlamacppManagedRuntimeRegistry(deps = {}) {
   const instances = new Map();
+  const inFlightStarts = new Map();
   let nextPort = 39391;
+  const MIN_PORT = 1;
+  const MAX_PORT = 65535;
 
   function resolveSpawnRuntime(overrides = {}) {
     if (typeof overrides.spawnRuntime === "function") return overrides.spawnRuntime;
@@ -40,9 +43,50 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
     return true;
   }
 
+  function normalizeRuntimePort(value, fallback = null) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < MIN_PORT || parsed > MAX_PORT) return fallback;
+    return parsed;
+  }
+
+  function buildCompatibilityKey(variantKey, profileHash) {
+    return `${String(variantKey || "")}::${String(profileHash || "")}`;
+  }
+
+  function buildReservedPorts() {
+    const reserved = new Set();
+    for (const instance of instances.values()) {
+      const port = normalizeRuntimePort(instance?.port);
+      if (port !== null) reserved.add(port);
+    }
+    for (const start of inFlightStarts.values()) {
+      const port = normalizeRuntimePort(start?.reservedPort);
+      if (port !== null) reserved.add(port);
+    }
+    return reserved;
+  }
+
+  function allocatePort(preferredPort) {
+    const reservedPorts = buildReservedPorts();
+    const preferred = normalizeRuntimePort(preferredPort);
+    if (preferred !== null && !reservedPorts.has(preferred)) {
+      if (preferred >= nextPort) nextPort = preferred + 1;
+      return preferred;
+    }
+
+    let port = Math.max(39391, nextPort);
+    while (reservedPorts.has(port)) {
+      port += 1;
+    }
+    nextPort = port + 1;
+    return port;
+  }
+
   async function ensureRuntimeForVariant({ variantKey, profileHash, launchArgs, preferredPort } = {}, runtimeDeps = {}) {
     const spawnRuntime = resolveSpawnRuntime(runtimeDeps);
     const waitForHealthy = resolveWaitForHealthy(runtimeDeps);
+    const compatibilityKey = buildCompatibilityKey(variantKey, profileHash);
+
     for (const instance of instances.values()) {
       if (
         instance.profileHash === profileHash
@@ -53,20 +97,33 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
       }
     }
 
-    const parsedPort = Number(preferredPort);
-    const port = Number.isInteger(parsedPort) ? parsedPort : nextPort++;
-    const spawned = await spawnRuntime({ variantKey, profileHash, launchArgs, port });
-    const healthy = await waitForHealthy(spawned);
-    const instance = {
-      instanceId: `${variantKey}:${profileHash}:${port}`,
-      owner: "llm-router",
-      variantKey,
-      profileHash,
-      healthy: true,
-      ...healthy
-    };
-    instances.set(instance.instanceId, instance);
-    return instance;
+    const inFlight = inFlightStarts.get(compatibilityKey);
+    if (inFlight?.promise) {
+      return inFlight.promise;
+    }
+
+    const port = allocatePort(preferredPort);
+    const startPromise = (async () => {
+      const spawned = await spawnRuntime({ variantKey, profileHash, launchArgs, port });
+      const healthy = await waitForHealthy(spawned);
+      const assignedPort = normalizeRuntimePort(healthy?.port, port);
+      const instance = {
+        instanceId: `${variantKey}:${profileHash}:${assignedPort}`,
+        owner: "llm-router",
+        variantKey,
+        profileHash,
+        healthy: true,
+        ...healthy,
+        port: assignedPort
+      };
+      instances.set(instance.instanceId, instance);
+      return instance;
+    })().finally(() => {
+      inFlightStarts.delete(compatibilityKey);
+    });
+
+    inFlightStarts.set(compatibilityKey, { promise: startPromise, reservedPort: port });
+    return startPromise;
   }
 
   async function reconcile(runtimeDeps = {}) {

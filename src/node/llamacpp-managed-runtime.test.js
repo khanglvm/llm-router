@@ -57,3 +57,65 @@ test("registry reconcile removes dead router-owned runtimes without touching for
   await registry.reconcile();
   assert.deepEqual(stopped, [4001]);
 });
+
+test("registry allocates a different port when preferred port is already used by another runtime", async () => {
+  const spawnedPorts = [];
+  const registry = createLlamacppManagedRuntimeRegistry({
+    spawnRuntime: async ({ port }) => {
+      spawnedPorts.push(port);
+      return { pid: 5000 + spawnedPorts.length, host: "127.0.0.1", port, baseUrl: `http://127.0.0.1:${port}/v1` };
+    },
+    waitForHealthy: async (instance) => ({ ...instance, healthy: true }),
+    listListeningPids: async () => [],
+    stopProcessByPid: async () => {}
+  });
+
+  const first = await registry.ensureRuntimeForVariant({
+    variantKey: "qwen-balanced",
+    profileHash: "cpu-safe-qwen",
+    launchArgs: ["-m", "/models/qwen-a.gguf", "-ngl", "0"],
+    preferredPort: 39391
+  });
+  const second = await registry.ensureRuntimeForVariant({
+    variantKey: "qwen-throughput",
+    profileHash: "gpu-fast-qwen",
+    launchArgs: ["-m", "/models/qwen-b.gguf", "-ngl", "99"],
+    preferredPort: 39391
+  });
+
+  assert.equal(first.port, 39391);
+  assert.equal(second.port, 39392);
+  assert.deepEqual(spawnedPorts, [39391, 39392]);
+});
+
+test("registry deduplicates concurrent starts for the same variant/profile key", async () => {
+  let spawnCount = 0;
+  const registry = createLlamacppManagedRuntimeRegistry({
+    spawnRuntime: async ({ port }) => {
+      spawnCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      return { pid: 6000 + spawnCount, host: "127.0.0.1", port, baseUrl: `http://127.0.0.1:${port}/v1` };
+    },
+    waitForHealthy: async (instance) => ({ ...instance, healthy: true }),
+    listListeningPids: async () => [],
+    stopProcessByPid: async () => {}
+  });
+
+  const [first, second] = await Promise.all([
+    registry.ensureRuntimeForVariant({
+      variantKey: "qwen-balanced",
+      profileHash: "cpu-safe-qwen",
+      launchArgs: ["-m", "/models/qwen.gguf", "-ngl", "0"],
+      preferredPort: 39391
+    }),
+    registry.ensureRuntimeForVariant({
+      variantKey: "qwen-balanced",
+      profileHash: "cpu-safe-qwen",
+      launchArgs: ["-m", "/models/qwen.gguf", "-ngl", "0"],
+      preferredPort: 39391
+    })
+  ]);
+
+  assert.equal(spawnCount, 1);
+  assert.equal(first.instanceId, second.instanceId);
+});
