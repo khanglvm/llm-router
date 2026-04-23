@@ -47,6 +47,21 @@ test("buildLlamacppLaunchArgs includes host/port and selected model preload sett
   assert.match(args.join(" "), /qwen\.gguf/);
 });
 
+test("buildLlamacppLaunchArgs appends derived launch profile arguments", () => {
+  const args = buildLlamacppLaunchArgs({
+    command: "/opt/homebrew/bin/llama-server",
+    host: "127.0.0.1",
+    port: 39391,
+    launchProfile: {
+      args: ["-m", "/tmp/qwen.gguf", "-a", "local/qwen-balanced", "-c", "65536", "-ngl", "0"]
+    }
+  });
+
+  assert.equal(args[0], "/opt/homebrew/bin/llama-server");
+  assert.match(args.join(" "), /-a local\/qwen-balanced/);
+  assert.match(args.join(" "), /-ngl 0/);
+});
+
 test("parseLlamacppValidationOutput detects llama-server support and TurboQuant builds", () => {
   const validation = parseLlamacppValidationOutput(`
 llama-server build 9999

@@ -2,6 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import { existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { deriveLlamacppLaunchProfile } from "./llamacpp-runtime-profile.js";
 
 export const LLAMACPP_DEFAULT_HOST = "127.0.0.1";
 export const LLAMACPP_DEFAULT_PORT = 39391;
@@ -72,11 +73,22 @@ function buildPreloadModels(config) {
     if (!modelPath) continue;
     preloadModels.push({
       variantId: normalizeString(variant.id),
+      variant,
+      baseModel,
       modelPath,
       contextWindow: Number.isFinite(Number(variant.contextWindow)) ? Number(variant.contextWindow) : undefined
     });
   }
   return preloadModels;
+}
+
+function detectLlamacppSystemProfile(system = {}) {
+  const totalMemoryBytes = Number(system?.totalMemoryBytes);
+  return {
+    platform: normalizeString(system?.platform) || process.platform,
+    unifiedMemory: system?.unifiedMemory === true || process.platform === "darwin",
+    totalMemoryBytes: Number.isFinite(totalMemoryBytes) && totalMemoryBytes > 0 ? totalMemoryBytes : os.totalmem()
+  };
 }
 
 export function detectLlamacppCandidates({
@@ -122,16 +134,18 @@ export function buildLlamacppLaunchArgs({
   command,
   host = LLAMACPP_DEFAULT_HOST,
   port = LLAMACPP_DEFAULT_PORT,
-  preloadModels = []
+  preloadModels = [],
+  launchProfile = null
 } = {}) {
   const firstModel = Array.isArray(preloadModels) ? preloadModels[0] : null;
   const args = [
     normalizeString(command),
     "--host", normalizeString(host) || LLAMACPP_DEFAULT_HOST,
-    "--port", String(normalizePort(port, LLAMACPP_DEFAULT_PORT))
+    "--port", String(normalizePort(port, LLAMACPP_DEFAULT_PORT)),
+    ...((Array.isArray(launchProfile?.args) ? launchProfile.args : []).filter(Boolean))
   ];
 
-  if (firstModel?.modelPath) {
+  if (!launchProfile && firstModel?.modelPath) {
     args.push("-m", firstModel.modelPath);
     if (Number.isFinite(Number(firstModel.contextWindow)) && Number(firstModel.contextWindow) > 0) {
       args.push("-c", String(Math.floor(Number(firstModel.contextWindow))));
@@ -228,11 +242,20 @@ async function startConfiguredRuntime(config, {
   }
 
   const preloadModels = buildPreloadModels(config);
+  const firstModel = Array.isArray(preloadModels) ? preloadModels[0] : null;
+  const launchProfile = firstModel?.variant && firstModel?.baseModel
+    ? deriveLlamacppLaunchProfile({
+      variant: firstModel.variant,
+      baseModel: firstModel.baseModel,
+      system: detectLlamacppSystemProfile(deps.system)
+    })
+    : null;
   const args = buildLlamacppLaunchArgs({
     command: runtime.command,
     host: runtime.host,
     port: runtime.port,
-    preloadModels
+    preloadModels,
+    launchProfile
   });
 
   return new Promise((resolve) => {

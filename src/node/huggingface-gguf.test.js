@@ -41,3 +41,16 @@ test("shapeHuggingFaceGgufResults ranks long-context friendly quantizations firs
   assert.match(results[1].recommendation, /200k/i);
   assert.equal(results[2].disabled, true);
 });
+
+test("shapeHuggingFaceGgufResults includes estimatedRuntimeBytes and fit labels", () => {
+  const results = shapeHuggingFaceGgufResults([
+    { repo: "org/model", file: "model.Q5_K_M.gguf", size: 24 * 1024 ** 3, downloads: 500 }
+  ], {
+    totalMemoryBytes: 64 * 1024 ** 3,
+    expectedContextWindow: 65536
+  });
+
+  assert.equal(typeof results[0].estimatedRuntimeBytes, "number");
+  assert.match(results[0].memoryLabel, /gb/i);
+  assert.equal(results[0].fit, "safe");
+});

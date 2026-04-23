@@ -1,5 +1,6 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { estimateLlamacppRuntimeBytes } from "./llamacpp-runtime-profile.js";
 
 const HUGGING_FACE_API_URL = "https://huggingface.co/api/models";
 const HUGGING_FACE_BASE_URL = "https://huggingface.co";
@@ -154,6 +155,13 @@ export function shapeHuggingFaceGgufResults(files, systemInfo = {}) {
       expectedContextWindow: systemInfo?.expectedContextWindow
     }, systemInfo);
     const quantization = parseQuantizationFromFileName(file);
+    const estimatedRuntimeBytes = sizeBytes
+      ? estimateLlamacppRuntimeBytes({
+        sizeBytes,
+        contextWindow: systemInfo?.expectedContextWindow,
+        preset: status.fit === "tight" ? "memory-safe" : "balanced"
+      })
+      : undefined;
     const fitScore = status.fit === "safe" ? 30 : status.fit === "tight" ? 15 : status.fit === "unknown" ? 8 : -20;
     const rankingScore = fitScore
       + (status.disabled ? -100 : 0)
@@ -166,6 +174,10 @@ export function shapeHuggingFaceGgufResults(files, systemInfo = {}) {
       file,
       quantization,
       sizeBytes,
+      estimatedRuntimeBytes,
+      memoryLabel: estimatedRuntimeBytes
+        ? `${(estimatedRuntimeBytes / (1024 ** 3)).toFixed(1)} GB runtime est.`
+        : "Runtime estimate unavailable",
       disabled: status.disabled,
       disabledReason: status.reason,
       fit: status.fit,
