@@ -188,3 +188,35 @@ export async function reconcileLocalModels() {
   });
   return payload;
 }
+
+export async function discoverLlamacppRuntime() {
+  return fetchJson("/api/local-models/runtime/discover", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: "{}"
+  });
+}
+
+export async function selectLlamacppRuntime(command) {
+  return fetchJson("/api/local-models/runtime/select", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ command })
+  });
+}
+
+export async function browseLocalModelPath(selection = "file") {
+  return fetchJson("/api/local-models/browse", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ selection })
+  });
+}
+
+export async function scanLocalModelPath(targetPath) {
+  return fetchJson("/api/local-models/scan-path", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ path: targetPath })
+  });
+}

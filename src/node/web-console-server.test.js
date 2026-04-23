@@ -4668,3 +4668,310 @@ test("POST /api/local-models/reconcile refreshes stale availability from disk st
     await fixture.cleanup();
   }
 });
+
+test("POST /api/local-models/runtime/discover exposes detected llama.cpp candidates and TurboQuant builds", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/opt/homebrew/bin/llama-server",
+            startWithRouter: true,
+            host: "127.0.0.1",
+            port: 39391
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    detectLlamacppCandidates: () => ([
+      { id: "/opt/homebrew/bin/llama-server", label: "Homebrew llama-server", path: "/opt/homebrew/bin/llama-server", source: "homebrew" }
+    ]),
+    validateLlamacppCommand: () => ({
+      ok: true,
+      kind: "server",
+      supportsHost: true,
+      supportsPort: true,
+      isTurboQuant: true
+    })
+  });
+
+  try {
+    const discovered = await fetchJson(`${server.url}/api/local-models/runtime/discover`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(discovered.response.status, 200);
+    assert.equal(discovered.payload.runtime.selectedCommand, "/opt/homebrew/bin/llama-server");
+    assert.equal(discovered.payload.runtime.candidates.length, 1);
+    assert.equal(discovered.payload.runtime.candidates[0].isTurboQuant, true);
+    assert.equal(discovered.payload.runtime.candidates[0].current, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/browse returns scanned GGUF matches for a selected directory", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    browseForLocalModelPath: async () => ({
+      canceled: false,
+      selection: "directory",
+      path: "/Volumes/models"
+    }),
+    scanLocalModelPath: async () => ([
+      { filePath: "/Volumes/models/qwen.Q5_K_M.gguf", fileName: "qwen.Q5_K_M.gguf", sizeBytes: 24 * 1024 ** 3 }
+    ])
+  });
+
+  try {
+    const result = await fetchJson(`${server.url}/api/local-models/browse`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ selection: "directory" })
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.payload.selection.path, "/Volumes/models");
+    assert.equal(result.payload.matches.length, 1);
+    assert.equal(result.payload.matches[0].fileName, "qwen.Q5_K_M.gguf");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/scan-path scans a manual folder path for GGUF files", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    scanLocalModelPath: async (targetPath) => ([
+      { filePath: `${targetPath}/qwen.Q5_K_M.gguf`, fileName: "qwen.Q5_K_M.gguf", sizeBytes: 24 * 1024 ** 3 }
+    ])
+  });
+
+  try {
+    const result = await fetchJson(`${server.url}/api/local-models/scan-path`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "/Volumes/models" })
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.payload.path, "/Volumes/models");
+    assert.equal(result.payload.matches.length, 1);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/select persists a browsed llama.cpp runtime command", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: true
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    validateLlamacppCommand: () => ({
+      ok: true,
+      kind: "server",
+      supportsHost: true,
+      supportsPort: true,
+      isTurboQuant: true
+    })
+  });
+
+  try {
+    const selected = await fetchJson(`${server.url}/api/local-models/runtime/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        command: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server"
+      })
+    });
+
+    assert.equal(selected.response.status, 200);
+    assert.equal(selected.payload.ok, true);
+    assert.equal(selected.payload.runtime.selectedCommand, "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server");
+    assert.equal(selected.payload.runtime.status, "stopped");
+    assert.equal(selected.payload.runtime.isTurboQuant, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/settings persists llama.cpp autostart settings", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: false,
+            status: "stopped"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  });
+
+  try {
+    const updated = await fetchJson(`${server.url}/api/local-models/runtime/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        startWithRouter: true
+      })
+    });
+
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.payload.ok, true);
+    assert.equal(updated.payload.runtime.startWithRouter, true);
+    assert.equal(updated.payload.runtime.selectedCommand, "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/start starts the configured llama.cpp runtime and marks it running", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: true,
+            status: "stopped"
+          }
+        }
+      }
+    }
+  });
+  let startCalls = 0;
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    listListeningPids: () => [],
+    startConfiguredLlamacppRuntime: async () => {
+      startCalls += 1;
+      return {
+        ok: true,
+        validation: {
+          ok: true,
+          kind: "server",
+          supportsHost: true,
+          supportsPort: true,
+          isTurboQuant: true
+        }
+      };
+    }
+  });
+
+  try {
+    const started = await fetchJson(`${server.url}/api/local-models/runtime/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(started.response.status, 200);
+    assert.equal(started.payload.ok, true);
+    assert.equal(startCalls, 1);
+    assert.equal(started.payload.runtime.status, "running");
+    assert.equal(started.payload.runtime.isTurboQuant, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/stop stops a running llama.cpp runtime by port and marks it stopped", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: true,
+            status: "running"
+          }
+        }
+      }
+    }
+  });
+  const stoppedPids = [];
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    listListeningPids: () => [42424],
+    stopProcessByPid: async (pid) => {
+      stoppedPids.push(pid);
+      return { ok: true };
+    },
+    stopManagedLlamacppRuntime: async () => ({ ok: true, skipped: true })
+  });
+
+  try {
+    const stopped = await fetchJson(`${server.url}/api/local-models/runtime/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(stopped.response.status, 200);
+    assert.equal(stopped.payload.ok, true);
+    assert.deepEqual(stoppedPids, [42424]);
+    assert.equal(stopped.payload.runtime.status, "stopped");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});

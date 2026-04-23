@@ -62,6 +62,13 @@ import {
 } from "./ollama-client.js";
 import { estimateMaxContext, estimateModelVram, formatBytes } from "./ollama-hardware.js";
 import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaServer, isOllamaRunning } from "./ollama-install.js";
+import { browseForLocalModelPath, scanLocalModelPath } from "./local-model-browser.js";
+import {
+  detectLlamacppCandidates,
+  startConfiguredLlamacppRuntime,
+  stopManagedLlamacppRuntime,
+  validateLlamacppCommand
+} from "./llamacpp-runtime.js";
 import {
   getManagedLocalModelsDir,
   reconcileLocalModelPaths,
@@ -861,6 +868,80 @@ function routeSnapshotDocument(configState) {
   return configState.parseError ? null : (configState.normalizedConfig || buildDefaultConfigObject());
 }
 
+function readConfiguredLlamacppRuntime(config = {}) {
+  const runtime = config?.metadata?.localModels?.runtime?.llamacpp;
+  if (!runtime || typeof runtime !== "object") {
+    return {
+      selectedCommand: "",
+      selectedDirectory: "",
+      manualCommand: "",
+      host: "127.0.0.1",
+      port: 39391,
+      startWithRouter: false,
+      status: ""
+    };
+  }
+
+  const selectedCommand = String(runtime.selectedCommand || runtime.manualCommand || runtime.command || "").trim();
+  return {
+    ...runtime,
+    selectedCommand,
+    selectedDirectory: selectedCommand ? path.dirname(selectedCommand) : "",
+    manualCommand: String(runtime.manualCommand || "").trim(),
+    host: String(runtime.host || "127.0.0.1").trim() || "127.0.0.1",
+    port: Number.isInteger(Number(runtime.port)) ? Number(runtime.port) : 39391,
+    startWithRouter: runtime.startWithRouter === true,
+    status: String(runtime.status || "").trim()
+  };
+}
+
+function buildLlamacppRuntimePayload(runtime = {}, validation = {}, candidates = []) {
+  const selectedCommand = String(runtime.selectedCommand || runtime.manualCommand || runtime.command || "").trim();
+  return {
+    ...runtime,
+    selectedCommand,
+    selectedDirectory: selectedCommand ? path.dirname(selectedCommand) : "",
+    ...(validation && typeof validation === "object" ? validation : {}),
+    candidates
+  };
+}
+
+function updateLlamacppRuntimeConfig(config = {}, runtimePatch = {}) {
+  const nextConfig = JSON.parse(JSON.stringify(config || {}));
+  if (!nextConfig.metadata || typeof nextConfig.metadata !== "object" || Array.isArray(nextConfig.metadata)) {
+    nextConfig.metadata = {};
+  }
+  if (!nextConfig.metadata.localModels || typeof nextConfig.metadata.localModels !== "object" || Array.isArray(nextConfig.metadata.localModels)) {
+    nextConfig.metadata.localModels = {};
+  }
+  if (!nextConfig.metadata.localModels.runtime || typeof nextConfig.metadata.localModels.runtime !== "object" || Array.isArray(nextConfig.metadata.localModels.runtime)) {
+    nextConfig.metadata.localModels.runtime = {};
+  }
+
+  const currentRuntime = readConfiguredLlamacppRuntime(nextConfig);
+  const nextRuntime = {
+    ...currentRuntime,
+    ...runtimePatch
+  };
+  const {
+    selectedDirectory: _selectedDirectory,
+    candidates: _candidates,
+    ...persistedRuntime
+  } = nextRuntime;
+  const selectedCommand = String(nextRuntime.selectedCommand || nextRuntime.manualCommand || nextRuntime.command || "").trim();
+
+  nextConfig.metadata.localModels.runtime.llamacpp = {
+    ...nextConfig.metadata.localModels.runtime.llamacpp,
+    ...persistedRuntime,
+    selectedCommand,
+    manualCommand: selectedCommand,
+    command: selectedCommand,
+    path: selectedCommand,
+    status: String(nextRuntime.status || "").trim()
+  };
+  return nextConfig;
+}
+
 export async function startWebConsoleServer(options = {}, deps = {}) {
   const {
     host = "127.0.0.1",
@@ -915,6 +996,24 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   const localModelPathExistsFn = typeof deps.localModelPathExists === "function"
     ? deps.localModelPathExists
     : undefined;
+  const browseForLocalModelPathFn = typeof deps.browseForLocalModelPath === "function"
+    ? deps.browseForLocalModelPath
+    : browseForLocalModelPath;
+  const scanLocalModelPathFn = typeof deps.scanLocalModelPath === "function"
+    ? deps.scanLocalModelPath
+    : scanLocalModelPath;
+  const detectLlamacppCandidatesFn = typeof deps.detectLlamacppCandidates === "function"
+    ? deps.detectLlamacppCandidates
+    : detectLlamacppCandidates;
+  const startConfiguredLlamacppRuntimeFn = typeof deps.startConfiguredLlamacppRuntime === "function"
+    ? deps.startConfiguredLlamacppRuntime
+    : (config, callbacks = {}, runtimeDeps = {}) => startConfiguredLlamacppRuntime(config, callbacks, runtimeDeps);
+  const stopManagedLlamacppRuntimeFn = typeof deps.stopManagedLlamacppRuntime === "function"
+    ? deps.stopManagedLlamacppRuntime
+    : (callbacks = {}) => stopManagedLlamacppRuntime(callbacks);
+  const validateLlamacppCommandFn = typeof deps.validateLlamacppCommand === "function"
+    ? deps.validateLlamacppCommand
+    : validateLlamacppCommand;
   const ampClientEnv = deps.ampClientEnv && typeof deps.ampClientEnv === "object" ? deps.ampClientEnv : process.env;
   const ampClientCwd = typeof deps.ampClientCwd === "string" && deps.ampClientCwd.trim() ? deps.ampClientCwd : process.cwd();
   const codexCliEnv = deps.codexCliEnv && typeof deps.codexCliEnv === "object" ? deps.codexCliEnv : process.env;
@@ -3287,11 +3386,238 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/discover") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before discovering llama.cpp runtimes: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const configuredRuntime = readConfiguredLlamacppRuntime(configState.rawConfig || {});
+        const candidates = detectLlamacppCandidatesFn();
+        const hydratedCandidates = candidates.map((candidate) => {
+          const validation = validateLlamacppCommandFn(candidate.path);
+          return {
+            ...candidate,
+            directory: path.dirname(candidate.path),
+            ...validation,
+            current: candidate.path === configuredRuntime.selectedCommand
+          };
+        });
+
+        sendJson(res, 200, {
+          runtime: buildLlamacppRuntimePayload(configuredRuntime, {}, hydratedCandidates)
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/select") {
+        const body = await readJsonBody(req);
+        const command = String(body.command || "").trim();
+        if (!command) {
+          sendJson(res, 400, {
+            error: "command is required."
+          });
+          return;
+        }
+
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before selecting a llama.cpp runtime: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const validation = validateLlamacppCommandFn(command);
+        if (!validation?.ok) {
+          sendJson(res, 400, {
+            error: validation?.errorMessage || `Failed validating llama.cpp runtime '${command}'.`,
+            runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(configState.rawConfig || {}), validation)
+          });
+          return;
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          selectedCommand: command,
+          manualCommand: command,
+          status: "stopped"
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-select"
+        });
+        const configuredRuntime = readConfiguredLlamacppRuntime(savedConfig || {});
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(configuredRuntime, {
+            ...validation,
+            status: configuredRuntime.status || "stopped"
+          })
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/settings") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before updating llama.cpp runtime settings: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          ...(body?.startWithRouter !== undefined ? { startWithRouter: body.startWithRouter === true } : {})
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-settings"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}))
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/start") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before starting llama.cpp runtime: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const configuredRuntime = readConfiguredLlamacppRuntime(configState.rawConfig || {});
+        if (!configuredRuntime.selectedCommand) {
+          sendJson(res, 400, {
+            error: "Select a llama.cpp runtime before starting it."
+          });
+          return;
+        }
+
+        const listenerPids = await Promise.resolve(listListeningPidsFn(configuredRuntime.port)).catch(() => []);
+        let validation = validateLlamacppCommandFn(configuredRuntime.selectedCommand);
+        if ((listenerPids || []).length === 0) {
+          const started = await startConfiguredLlamacppRuntimeFn(configState.rawConfig || {}, {
+            line: (message) => addLog("info", message),
+            error: (message) => addLog("warn", message)
+          });
+          if (!started?.ok) {
+            sendJson(res, 502, {
+              error: started?.errorMessage || "Failed to start llama.cpp runtime."
+            });
+            return;
+          }
+          validation = started?.validation || validation;
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          status: "running"
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-start"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
+            ...(validation && typeof validation === "object" ? validation : {}),
+            status: "running"
+          })
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/stop") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before stopping llama.cpp runtime: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const configuredRuntime = readConfiguredLlamacppRuntime(configState.rawConfig || {});
+        await stopManagedLlamacppRuntimeFn({
+          line: (message) => addLog("info", message),
+          error: (message) => addLog("warn", message)
+        });
+        const listenerPids = await Promise.resolve(listListeningPidsFn(configuredRuntime.port)).catch(() => []);
+        for (const pid of listenerPids) {
+          if (!Number.isInteger(Number(pid))) continue;
+          await stopProcessByPidFn(Number(pid)).catch(() => {});
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          status: "stopped"
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-stop"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
+            status: "stopped"
+          })
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/browse") {
+        const body = await readJsonBody(req);
+        const selection = String(body.selection || "file").trim() || "file";
+        try {
+          const picked = await browseForLocalModelPathFn({ selection });
+          const matches = picked?.canceled || !picked?.path || selection === "runtime"
+            ? []
+            : await scanLocalModelPathFn(picked.path);
+          sendJson(res, 200, {
+            ok: true,
+            selection: picked,
+            matches
+          });
+        } catch (error) {
+          sendJson(res, 500, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/scan-path") {
+        const body = await readJsonBody(req);
+        const targetPath = String(body.path || "").trim();
+        if (!targetPath) {
+          sendJson(res, 400, { error: "path is required." });
+          return;
+        }
+
+        try {
+          const matches = await scanLocalModelPathFn(targetPath);
+          sendJson(res, 200, {
+            ok: true,
+            path: targetPath,
+            matches
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/local-models/search-huggingface") {
         const body = await readJsonBody(req);
         const results = await searchHuggingFaceGgufCandidatesFn(String(body.query || "").trim(), {
           limit: body.limit,
-          totalMemoryBytes: os.totalmem()
+          totalMemoryBytes: os.totalmem(),
+          expectedContextWindow: Number.isInteger(Number(body.expectedContextWindow))
+            ? Number(body.expectedContextWindow)
+            : 200000
         });
         sendJson(res, 200, { results });
         return;

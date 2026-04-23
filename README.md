@@ -41,8 +41,9 @@ llr ai-help  # agent-oriented setup brief
 Open `llr` and use the **Local Models** tab to manage local inference sources alongside hosted providers.
 
 - **`llama.cpp` runtime** — detect or point at a local `llama-server`, attach GGUF files in place, or download public GGUF artifacts into the router-managed library under `~/.llm-router/local-models`
+- **Native macOS browsing** — use the built-in file picker to choose a single GGUF file, scan a folder recursively for GGUF models, or browse directly to a local `llama-server` binary
 - **Managed + attached model library** — stale or moved files stay visible instead of crashing the app, and can be repaired by locating the file again or removed cleanly
-- **Router-visible local variants** — create friendly model variants with bounded presets, context-window metadata, preload toggles, and Mac unified-memory fit guidance
+- **Router-visible local variants** — create friendly model variants with bounded presets, context-window metadata, preload toggles, and Mac unified-memory fit guidance with clearer safe/tight recommendations
 - **Alias-ready local routing** — once saved, local variants behave like normal router models and can be used in aliases, capability flags, and fallback chains
 
 For v1, the managed download flow only searches public Hugging Face GGUF files and the fit guidance is tuned for Macs with unified memory.

@@ -98,7 +98,8 @@ import {
   removeLocalModel,
   lookupLiteLlmContextWindow,
   downloadManagedGguf,
-  saveLocalModelVariant
+  saveLocalModelVariant,
+  selectLlamacppRuntime
 } from "./api-client.js";
 
 import {
@@ -2152,6 +2153,102 @@ export function App() {
     }
   }
 
+  async function handleSelectLlamacppRuntime(command) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await selectLlamacppRuntime(command);
+      await loadState({ preserveDraft: false });
+      showNotice("success", `Selected llama.cpp runtime ${String(command || "").trim() || "binary"}.`);
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleSaveLlamacppRuntimeSettings(settings) {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await fetchJson("/api/local-models/runtime/settings", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify(settings)
+      });
+      await loadState({ preserveDraft: false });
+      showNotice("success", "Updated llama.cpp runtime settings.");
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleStartLlamacppRuntime() {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await fetchJson("/api/local-models/runtime/start", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: "{}"
+      });
+      await loadState({ preserveDraft: false });
+      showNotice("success", "Started llama.cpp runtime.");
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function handleStopLlamacppRuntime() {
+    if (parsedDraftState.parseError) {
+      showNotice("warning", `Fix the raw JSON parse error first: ${parsedDraftState.parseError}`);
+      return false;
+    }
+    if (draftRef.current !== baselineRef.current) {
+      showNotice("warning", "Save or discard the current config draft before changing local models.");
+      return false;
+    }
+
+    try {
+      await fetchJson("/api/local-models/runtime/stop", {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: "{}"
+      });
+      await loadState({ preserveDraft: false });
+      showNotice("success", "Stopped llama.cpp runtime.");
+      return true;
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   // ── Ollama handlers ──────────────────────────────────────────────
   async function refreshOllamaModels() {
     setOllamaRefreshing(true);
@@ -2739,6 +2836,10 @@ export function App() {
                     : ""),
                 onSaveVariant: handleSaveLocalVariant,
                 onRefreshLibrary: handleRefreshLocalModels,
+                onSelectRuntime: handleSelectLlamacppRuntime,
+                onStartRuntime: handleStartLlamacppRuntime,
+                onStopRuntime: handleStopLlamacppRuntime,
+                onSaveRuntimeSettings: handleSaveLlamacppRuntimeSettings,
                 onAttachModel: handleAttachLocalModel,
                 onLocateModel: handleLocateLocalModel,
                 onRemoveModel: handleRemoveLocalModel,

@@ -702,6 +702,8 @@ test("makeProviderCall prefers OpenAI routing for Claude tool calls on dual-form
     assert.equal(payload.content?.[0]?.type, "tool_use");
     assert.equal(payload.content?.[0]?.name, "fetch");
     assert.deepEqual(payload.content?.[0]?.input, { url: "https://example.com" });
+    assert.equal(payload.usage?.speed, "standard");
+    assert.equal(payload.usage?.service_tier, "standard");
   } finally {
     globalThis.fetch = originalFetch;
     resetOpenAIToolRoutingLearningState();
@@ -778,6 +780,7 @@ test("makeProviderCall translates streamed OpenAI tool calls back to Claude SSE 
     assert.match(sseText, /"type":"tool_use"/);
     assert.match(sseText, /"name":"fetch"/);
     assert.match(sseText, /"stop_reason":"tool_use"/);
+    assert.match(sseText, /"speed":"standard"/);
   } finally {
     globalThis.fetch = originalFetch;
     resetOpenAIToolRoutingLearningState();

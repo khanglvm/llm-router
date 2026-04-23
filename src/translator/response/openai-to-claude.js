@@ -4,6 +4,73 @@
 
 import { FORMATS } from "../formats.js";
 
+const DEFAULT_CLAUDE_SERVER_TOOL_USE = Object.freeze({
+  web_search_requests: 0,
+  web_fetch_requests: 0
+});
+
+const DEFAULT_CLAUDE_CACHE_CREATION = Object.freeze({
+  ephemeral_1h_input_tokens: 0,
+  ephemeral_5m_input_tokens: 0
+});
+
+function toNonNegativeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function normalizeClaudeServerToolUse(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ...DEFAULT_CLAUDE_SERVER_TOOL_USE };
+  }
+
+  return {
+    web_search_requests: toNonNegativeNumber(value.web_search_requests),
+    web_fetch_requests: toNonNegativeNumber(value.web_fetch_requests)
+  };
+}
+
+function normalizeClaudeCacheCreation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ...DEFAULT_CLAUDE_CACHE_CREATION };
+  }
+
+  return {
+    ephemeral_1h_input_tokens: toNonNegativeNumber(value.ephemeral_1h_input_tokens),
+    ephemeral_5m_input_tokens: toNonNegativeNumber(value.ephemeral_5m_input_tokens)
+  };
+}
+
+export function normalizeOpenAIUsageToClaude(rawUsage) {
+  const usage = rawUsage && typeof rawUsage === "object" && !Array.isArray(rawUsage)
+    ? rawUsage
+    : {};
+  const cacheCreation = normalizeClaudeCacheCreation(usage.cache_creation);
+  const inputTokens = usage.prompt_tokens ?? usage.input_tokens;
+  const outputTokens = usage.completion_tokens ?? usage.output_tokens;
+  const cacheCreationInputTokens = usage.cache_creation_input_tokens
+    ?? (cacheCreation.ephemeral_1h_input_tokens + cacheCreation.ephemeral_5m_input_tokens);
+  const speed = typeof usage.speed === "string" && usage.speed.trim()
+    ? usage.speed.trim()
+    : "standard";
+  const serviceTier = typeof usage.service_tier === "string" && usage.service_tier.trim()
+    ? usage.service_tier.trim()
+    : "standard";
+
+  return {
+    input_tokens: toNonNegativeNumber(inputTokens),
+    cache_creation_input_tokens: toNonNegativeNumber(cacheCreationInputTokens),
+    cache_read_input_tokens: toNonNegativeNumber(usage.cache_read_input_tokens),
+    output_tokens: toNonNegativeNumber(outputTokens),
+    server_tool_use: normalizeClaudeServerToolUse(usage.server_tool_use),
+    service_tier: serviceTier,
+    cache_creation: cacheCreation,
+    inference_geo: typeof usage.inference_geo === "string" ? usage.inference_geo : "",
+    iterations: Array.isArray(usage.iterations) ? usage.iterations : [],
+    speed
+  };
+}
+
 /**
  * Convert OpenAI stream chunk to Claude format
  */
@@ -16,13 +83,7 @@ export function openaiToClaudeResponse(chunk, state) {
 
   // Track usage
   if (chunk.usage && typeof chunk.usage === "object") {
-    const promptTokens = chunk.usage.prompt_tokens || 0;
-    const outputTokens = chunk.usage.completion_tokens || 0;
-    
-    state.usage = {
-      input_tokens: promptTokens,
-      output_tokens: outputTokens
-    };
+    state.usage = normalizeOpenAIUsageToClaude(chunk.usage);
   }
 
   // First chunk - send message_start
@@ -264,7 +325,7 @@ function ensureMessageStart(state, results, chunk = undefined) {
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 }
+      usage: normalizeOpenAIUsageToClaude(state.usage)
     }
   });
 }
@@ -297,7 +358,7 @@ export function finalizeOpenAIToClaudeStream(state, { force = false } = {}) {
     results.push({
       type: "message_delta",
       delta: { stop_reason: convertFinishReason(normalizedFinishReason) },
-      usage: state.usage || { input_tokens: 0, output_tokens: 0 }
+      usage: normalizeOpenAIUsageToClaude(state.usage)
     });
     state.messageDeltaSent = true;
   }

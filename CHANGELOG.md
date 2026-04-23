@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-04-23
+
+### Added
+- Local Models can now use a native macOS file/folder picker to attach GGUF files in place, scan a selected folder recursively for GGUF artifacts, and browse directly to a local `llama-server` runtime binary.
+
+### Changed
+- Hugging Face GGUF search results for Local Models now rank quantizations more intelligently, show tighter Mac memory-fit guidance, and call out better long-context download choices for 64 GB Macs.
+- `llama.cpp` runtime detection now searches common local source-build locations in addition to `PATH` and Homebrew installs, and server validation now recognizes more `llama-server` help output variants including TurboQuant builds.
+
+### Fixed
+- OpenAI-to-Claude response translation now preserves Anthropic-compatible usage metadata such as `speed`, `service_tier`, cache counters, and tool-usage fields so Claude Code no longer trips over missing `usage.speed` on routed responses.
+
 ## [2.4.1] - 2026-04-19
 
 ### Fixed

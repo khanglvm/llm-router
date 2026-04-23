@@ -18,6 +18,19 @@ test("detectLlamacppCandidates returns PATH and common Homebrew candidates witho
   ]);
 });
 
+test("detectLlamacppCandidates includes common source-build TurboQuant runtimes under the home directory", () => {
+  const candidates = detectLlamacppCandidates({
+    envPathEntries: [],
+    homeDir: "/Users/tester",
+    existingPaths: new Set(["/Users/tester/src/llama-cpp-turboquant/build/bin/llama-server"])
+  });
+
+  assert.deepEqual(candidates.map((entry) => entry.path), [
+    "/Users/tester/src/llama-cpp-turboquant/build/bin/llama-server"
+  ]);
+  assert.equal(candidates[0].source, "source-build");
+});
+
 test("buildLlamacppLaunchArgs includes host/port and selected model preload settings", () => {
   const args = buildLlamacppLaunchArgs({
     command: "/opt/homebrew/bin/llama-server",
@@ -40,6 +53,19 @@ llama-server build 9999
 TurboQuant enabled
   --host HOST
   --port PORT
+`);
+
+  assert.equal(validation.ok, true);
+  assert.equal(validation.kind, "server");
+  assert.equal(validation.isTurboQuant, true);
+});
+
+test("parseLlamacppValidationOutput accepts TurboQuant help output even when llama-server banner is absent", () => {
+  const validation = parseLlamacppValidationOutput(`
+ggml_metal_library_init: turbo3 using 4-mag LUT (pre-M5 hardware)
+-m,    --model FNAME                    model path to load
+--host HOST                             ip address to listen
+--port PORT                             port to listen (default: 8080)
 `);
 
   assert.equal(validation.ok, true);

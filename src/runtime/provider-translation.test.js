@@ -262,6 +262,117 @@ test("convertOpenAINonStreamToClaude maps legacy function_call payloads", () => 
   }]);
 });
 
+test("convertOpenAINonStreamToClaude preserves Anthropic-compatible usage metadata", () => {
+  const iterations = [{
+    type: "message",
+    input_tokens: 12,
+    output_tokens: 4
+  }];
+
+  const translated = convertOpenAINonStreamToClaude({
+    id: "chatcmpl_usage_meta_1",
+    model: "gpt-4o",
+    choices: [{
+      index: 0,
+      finish_reason: "stop",
+      message: {
+        role: "assistant",
+        content: "hello"
+      }
+    }],
+    usage: {
+      prompt_tokens: 12,
+      completion_tokens: 4,
+      cache_creation_input_tokens: 3,
+      cache_read_input_tokens: 5,
+      server_tool_use: {
+        web_search_requests: 2
+      },
+      service_tier: "priority",
+      cache_creation: {
+        ephemeral_1h_input_tokens: 3
+      },
+      inference_geo: "us",
+      iterations,
+      speed: "turbo"
+    }
+  }, "gpt-4o");
+
+  assert.deepEqual(translated.usage, {
+    input_tokens: 12,
+    cache_creation_input_tokens: 3,
+    cache_read_input_tokens: 5,
+    output_tokens: 4,
+    server_tool_use: {
+      web_search_requests: 2,
+      web_fetch_requests: 0
+    },
+    service_tier: "priority",
+    cache_creation: {
+      ephemeral_1h_input_tokens: 3,
+      ephemeral_5m_input_tokens: 0
+    },
+    inference_geo: "us",
+    iterations,
+    speed: "turbo"
+  });
+});
+
+test("handleOpenAIStreamToClaude synthesizes Anthropic-compatible usage defaults", async () => {
+  const openAIStream = [
+    'data: {"id":"chatcmpl_usage_stream_1","object":"chat.completion.chunk","created":1730000029,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}',
+    '',
+    'data: {"id":"chatcmpl_usage_stream_1","object":"chat.completion.chunk","created":1730000029,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"service_tier":"priority","speed":"turbo","cache_creation":{"ephemeral_5m_input_tokens":7}}}',
+    '',
+    'data: [DONE]'
+  ].join("\n");
+
+  const response = handleOpenAIStreamToClaude(new Response(openAIStream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream"
+    }
+  }));
+
+  const events = parseSseEvents(await response.text());
+  assert.deepEqual(events[0]?.payload?.message?.usage, {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0,
+    server_tool_use: {
+      web_search_requests: 0,
+      web_fetch_requests: 0
+    },
+    service_tier: "standard",
+    cache_creation: {
+      ephemeral_1h_input_tokens: 0,
+      ephemeral_5m_input_tokens: 0
+    },
+    inference_geo: "",
+    iterations: [],
+    speed: "standard"
+  });
+  assert.deepEqual(events[4]?.payload?.usage, {
+    input_tokens: 2,
+    cache_creation_input_tokens: 7,
+    cache_read_input_tokens: 0,
+    output_tokens: 1,
+    server_tool_use: {
+      web_search_requests: 0,
+      web_fetch_requests: 0
+    },
+    service_tier: "priority",
+    cache_creation: {
+      ephemeral_1h_input_tokens: 0,
+      ephemeral_5m_input_tokens: 7
+    },
+    inference_geo: "",
+    iterations: [],
+    speed: "turbo"
+  });
+});
+
 test("handleClaudeStreamToOpenAIResponses emits contiguous output indexes when thinking precedes tool calls", async () => {
   const claudeStream = [
     'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_router_2","model":"glm-5","usage":{"input_tokens":2,"output_tokens":0}}}\n\n',

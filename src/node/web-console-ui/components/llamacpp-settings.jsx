@@ -3,8 +3,15 @@ import { Badge } from "./ui/badge.jsx";
 import { Button } from "./ui/button.jsx";
 import { Card, CardContent } from "./ui/card.jsx";
 import { Input } from "./ui/input.jsx";
+import { Switch } from "./ui/switch.jsx";
 import { Field, Modal } from "./shared.jsx";
 import { formatContextWindow } from "../context-window-utils.js";
+import {
+  browseLocalModelPath,
+  discoverLlamacppRuntime,
+  scanLocalModelPath,
+  searchHuggingFaceGguf
+} from "../api-client.js";
 import {
   buildAttachedLocalModelDraft,
   buildEditableLlamacppVariantDraft,
@@ -14,7 +21,6 @@ import {
   normalizeLocalVariantContextWindow,
   resolveLocalVariantSaveDisabledReason
 } from "../local-models-utils.js";
-import { searchHuggingFaceGguf } from "../api-client.js";
 import { LocalModelVariantEditor } from "./local-model-variant-editor.jsx";
 
 function formatRuntimeStatus(status) {
@@ -60,6 +66,54 @@ function formatBytes(value) {
   }
   const rendered = size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1);
   return `${rendered} ${units[unitIndex]}`;
+}
+
+function looksLikeGgufPath(filePath) {
+  return /\.gguf$/i.test(String(filePath || "").trim());
+}
+
+function deriveParentPath(filePath) {
+  const normalized = String(filePath || "").trim();
+  if (!normalized) return "";
+  const slashIndex = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+  return slashIndex > 0 ? normalized.slice(0, slashIndex) : "";
+}
+
+function RuntimeCandidateRow({ candidate, busy = false, onUseRuntime }) {
+  return (
+    <div className="rounded-2xl border border-border/70 bg-background/75 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-sm font-semibold text-foreground">{candidate?.label || candidate?.path}</div>
+            <Badge variant="outline">{candidate?.source || "path"}</Badge>
+            {candidate?.isTurboQuant ? <Badge variant="warning">TurboQuant</Badge> : null}
+            {candidate?.current ? <Badge variant="success">Configured</Badge> : null}
+            <Badge variant={candidate?.ok === false ? "warning" : "outline"}>
+              {candidate?.ok === false ? "Needs review" : "Detected"}
+            </Badge>
+          </div>
+          <div className="break-all font-mono text-xs text-muted-foreground">{candidate?.path}</div>
+          {candidate?.directory ? (
+            <div className="font-mono text-xs text-muted-foreground/80">Dir: {candidate.directory}</div>
+          ) : null}
+          {candidate?.errorMessage ? (
+            <div className="text-xs text-amber-900">{candidate.errorMessage}</div>
+          ) : null}
+        </div>
+        <div className="flex shrink-0 items-center">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => onUseRuntime?.(candidate?.path)}
+            disabled={busy || candidate?.current === true || candidate?.ok === false}
+          >
+            {candidate?.current === true ? "Selected" : (busy ? "Selecting…" : "Use runtime")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function LibraryRow({
@@ -186,6 +240,11 @@ function SearchResultRow({ result, downloading = false, onDownload }) {
               {result.disabledReason}
             </div>
           ) : null}
+          {result.recommendation ? (
+            <div className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
+              {result.recommendation}
+            </div>
+          ) : null}
         </div>
         <Button
           size="sm"
@@ -204,6 +263,10 @@ export function LlamacppSettingsPanel({
   library = {},
   variants = {},
   disableEditsReason = "",
+  onSelectRuntime,
+  onStartRuntime,
+  onStopRuntime,
+  onSaveRuntimeSettings,
   onSaveVariant,
   onRefreshLibrary,
   onAttachModel,
@@ -215,13 +278,31 @@ export function LlamacppSettingsPanel({
   const libraryEntries = useMemo(() => Object.values(library || {}), [library]);
   const variantEntries = useMemo(() => Object.values(variants || {}), [variants]);
   const selectedCommand = String(runtime?.selectedCommand || runtime?.manualCommand || "").trim();
+  const selectedDirectory = String(runtime?.selectedDirectory || "").trim() || deriveParentPath(selectedCommand);
   const host = String(runtime?.host || "127.0.0.1").trim() || "127.0.0.1";
   const port = Number.isFinite(Number(runtime?.port)) ? Number(runtime.port) : 39391;
+  const runtimeRunning = String(runtime?.status || "").trim().toLowerCase() === "running";
 
   const [editorState, setEditorState] = useState({ open: false, draft: null, baseModelId: "", title: "" });
   const [savingVariant, setSavingVariant] = useState(false);
-  const [attachState, setAttachState] = useState({ open: false, draft: { id: "", displayName: "", filePath: "" }, saving: false });
-  const [locateState, setLocateState] = useState({ open: false, baseModelId: "", displayName: "", filePath: "", saving: false });
+  const [attachState, setAttachState] = useState({
+    open: false,
+    draft: { id: "", displayName: "", filePath: "" },
+    saving: false,
+    browseBusy: false,
+    scanBusy: false,
+    scanMatches: [],
+    error: ""
+  });
+  const [locateState, setLocateState] = useState({
+    open: false,
+    baseModelId: "",
+    displayName: "",
+    filePath: "",
+    saving: false,
+    browseBusy: false,
+    error: ""
+  });
   const [downloadState, setDownloadState] = useState({
     open: false,
     query: "",
@@ -233,6 +314,23 @@ export function LlamacppSettingsPanel({
   });
   const [refreshingLibrary, setRefreshingLibrary] = useState(false);
   const [rowActionKey, setRowActionKey] = useState("");
+  const [runtimeActionState, setRuntimeActionState] = useState({
+    selecting: false,
+    starting: false,
+    stopping: false,
+    savingSettings: false,
+    error: ""
+  });
+  const [runtimeAutoStart, setRuntimeAutoStart] = useState(runtime?.startWithRouter === true);
+  const [runtimeDiscovery, setRuntimeDiscovery] = useState({
+    loading: false,
+    error: "",
+    runtime: null
+  });
+
+  useEffect(() => {
+    setRuntimeAutoStart(runtime?.startWithRouter === true);
+  }, [runtime?.startWithRouter]);
 
   const duplicateIds = useMemo(() => {
     const draftId = String(editorState?.draft?.id || "").trim();
@@ -249,13 +347,202 @@ export function LlamacppSettingsPanel({
   const saveDisabledReason = resolveLocalVariantSaveDisabledReason(editorState?.draft || {}, duplicateIds);
   const attachDisabledReason = !String(attachState?.draft?.id || "").trim()
     ? "Model id is required."
-    : (!String(attachState?.draft?.filePath || "").trim() ? "GGUF file path is required." : "");
+    : (!String(attachState?.draft?.filePath || "").trim()
+        ? "GGUF file path is required."
+        : (!looksLikeGgufPath(attachState?.draft?.filePath) ? "Select a GGUF file path." : ""));
+  const locateDisabledReason = !String(locateState.filePath || "").trim()
+    ? "GGUF file path is required."
+    : (!looksLikeGgufPath(locateState.filePath) ? "Select a GGUF file path." : "");
 
   useEffect(() => {
     if (!disableEditsReason && typeof onRefreshLibrary === "function") {
       void onRefreshLibrary({ silent: true });
     }
   }, []);
+
+  async function loadRuntimeDiscovery() {
+    setRuntimeDiscovery((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const payload = await discoverLlamacppRuntime();
+      setRuntimeDiscovery({
+        loading: false,
+        error: "",
+        runtime: payload?.runtime || null
+      });
+    } catch (error) {
+      setRuntimeDiscovery({
+        loading: false,
+        error: error instanceof Error ? error.message : String(error),
+        runtime: null
+      });
+    }
+  }
+
+  useEffect(() => {
+    let canceled = false;
+
+    async function load() {
+      setRuntimeDiscovery((current) => ({ ...current, loading: true, error: "" }));
+      try {
+        const payload = await discoverLlamacppRuntime();
+        if (canceled) return;
+        setRuntimeDiscovery({
+          loading: false,
+          error: "",
+          runtime: payload?.runtime || null
+        });
+      } catch (error) {
+        if (canceled) return;
+        setRuntimeDiscovery({
+          loading: false,
+          error: error instanceof Error ? error.message : String(error),
+          runtime: null
+        });
+      }
+    }
+
+    void load();
+    return () => {
+      canceled = true;
+    };
+  }, [selectedCommand, runtime?.startWithRouter, runtime?.status]);
+
+  async function handleSelectRuntime(command) {
+    const normalizedCommand = String(command || "").trim();
+    if (!normalizedCommand || !onSelectRuntime) return;
+    setRuntimeActionState((current) => ({
+      ...current,
+      selecting: true,
+      error: ""
+    }));
+    try {
+      const didSave = await onSelectRuntime(normalizedCommand);
+      if (didSave) {
+        await loadRuntimeDiscovery();
+      }
+    } catch (error) {
+      setRuntimeActionState((current) => ({
+        ...current,
+        selecting: false,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+      return;
+    }
+    setRuntimeActionState((current) => ({
+      ...current,
+      selecting: false,
+      error: ""
+    }));
+  }
+
+  async function handleStartRuntime() {
+    if (!onStartRuntime || !selectedCommand) return;
+    setRuntimeActionState((current) => ({
+      ...current,
+      starting: true,
+      error: ""
+    }));
+    try {
+      await onStartRuntime();
+      await loadRuntimeDiscovery();
+      setRuntimeActionState((current) => ({
+        ...current,
+        starting: false,
+        error: ""
+      }));
+    } catch (error) {
+      setRuntimeActionState((current) => ({
+        ...current,
+        starting: false,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+
+  async function handleStopRuntime() {
+    if (!onStopRuntime) return;
+    setRuntimeActionState((current) => ({
+      ...current,
+      stopping: true,
+      error: ""
+    }));
+    try {
+      await onStopRuntime();
+      await loadRuntimeDiscovery();
+      setRuntimeActionState((current) => ({
+        ...current,
+        stopping: false,
+        error: ""
+      }));
+    } catch (error) {
+      setRuntimeActionState((current) => ({
+        ...current,
+        stopping: false,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+
+  async function handleSaveRuntimeSettings() {
+    if (!onSaveRuntimeSettings) return;
+    setRuntimeActionState((current) => ({
+      ...current,
+      savingSettings: true,
+      error: ""
+    }));
+    try {
+      await onSaveRuntimeSettings({
+        startWithRouter: runtimeAutoStart
+      });
+      await loadRuntimeDiscovery();
+      setRuntimeActionState((current) => ({
+        ...current,
+        savingSettings: false,
+        error: ""
+      }));
+    } catch (error) {
+      setRuntimeActionState((current) => ({
+        ...current,
+        savingSettings: false,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
+
+  async function handleBrowseRuntime() {
+    setRuntimeActionState((current) => ({
+      ...current,
+      selecting: true,
+      error: ""
+    }));
+    try {
+      const payload = await browseLocalModelPath("runtime");
+      const pickedPath = String(payload?.selection?.path || "").trim();
+      if (!pickedPath) {
+        setRuntimeActionState((current) => ({
+          ...current,
+          selecting: false,
+          error: ""
+        }));
+        return;
+      }
+      const didSave = await onSelectRuntime?.(pickedPath);
+      if (didSave) {
+        await loadRuntimeDiscovery();
+      }
+      setRuntimeActionState((current) => ({
+        ...current,
+        selecting: false,
+        error: ""
+      }));
+    } catch (error) {
+      setRuntimeActionState((current) => ({
+        ...current,
+        selecting: false,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  }
 
   function openCreateModal(baseModel) {
     setEditorState({
@@ -302,13 +589,25 @@ export function LlamacppSettingsPanel({
     setAttachState({
       open: true,
       saving: false,
+      browseBusy: false,
+      scanBusy: false,
+      scanMatches: [],
+      error: "",
       draft: { id: "", displayName: "", filePath: "" }
     });
   }
 
   function closeAttachModal() {
     if (attachState.saving) return;
-    setAttachState({ open: false, draft: { id: "", displayName: "", filePath: "" }, saving: false });
+    setAttachState({
+      open: false,
+      draft: { id: "", displayName: "", filePath: "" },
+      saving: false,
+      browseBusy: false,
+      scanBusy: false,
+      scanMatches: [],
+      error: ""
+    });
   }
 
   async function handleAttachSave() {
@@ -321,7 +620,98 @@ export function LlamacppSettingsPanel({
       setAttachState((current) => ({ ...current, saving: false }));
     }
     if (didSave) {
-      setAttachState({ open: false, draft: { id: "", displayName: "", filePath: "" }, saving: false });
+      setAttachState({
+        open: false,
+        draft: { id: "", displayName: "", filePath: "" },
+        saving: false,
+        browseBusy: false,
+        scanBusy: false,
+        scanMatches: [],
+        error: ""
+      });
+    }
+  }
+
+  function applyAttachFilePath(filePath) {
+    const suggested = buildAttachedLocalModelDraft(filePath, library);
+    setAttachState((current) => ({
+      ...current,
+      draft: {
+        id: suggested.id,
+        displayName: suggested.displayName,
+        filePath: suggested.filePath
+      },
+      error: ""
+    }));
+  }
+
+  async function handleBrowseAttach(selection) {
+    setAttachState((current) => ({
+      ...current,
+      browseBusy: true,
+      error: ""
+    }));
+    try {
+      const payload = await browseLocalModelPath(selection);
+      const pickedPath = String(payload?.selection?.path || "").trim();
+      const matches = Array.isArray(payload?.matches) ? payload.matches : [];
+      if (pickedPath && selection === "file" && matches.length > 0) {
+        applyAttachFilePath(matches[0].filePath || pickedPath);
+      } else {
+        setAttachState((current) => ({
+          ...current,
+          draft: {
+            ...current.draft,
+            filePath: pickedPath || current.draft.filePath
+          },
+          scanMatches: matches,
+          error: matches.length === 0 && selection === "directory" && pickedPath
+            ? "No GGUF files were found in that folder."
+            : ""
+        }));
+      }
+    } catch (error) {
+      setAttachState((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    } finally {
+      setAttachState((current) => ({
+        ...current,
+        browseBusy: false
+      }));
+    }
+  }
+
+  async function handleScanAttachPath() {
+    const targetPath = String(attachState?.draft?.filePath || "").trim();
+    if (!targetPath) return;
+    setAttachState((current) => ({
+      ...current,
+      scanBusy: true,
+      error: ""
+    }));
+    try {
+      const payload = await scanLocalModelPath(targetPath);
+      const matches = Array.isArray(payload?.matches) ? payload.matches : [];
+      setAttachState((current) => ({
+        ...current,
+        scanMatches: matches,
+        error: matches.length === 0 ? "No GGUF files were found at that path." : ""
+      }));
+      if (matches.length === 1 && looksLikeGgufPath(matches[0]?.filePath)) {
+        applyAttachFilePath(matches[0].filePath);
+      }
+    } catch (error) {
+      setAttachState((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    } finally {
+      setAttachState((current) => ({
+        ...current,
+        scanBusy: false
+      }));
     }
   }
 
@@ -331,13 +721,23 @@ export function LlamacppSettingsPanel({
       baseModelId: entry?.id || "",
       displayName: entry?.displayName || entry?.id || "",
       filePath: entry?.path || "",
-      saving: false
+      saving: false,
+      browseBusy: false,
+      error: ""
     });
   }
 
   function closeLocateModal() {
     if (locateState.saving) return;
-    setLocateState({ open: false, baseModelId: "", displayName: "", filePath: "", saving: false });
+    setLocateState({
+      open: false,
+      baseModelId: "",
+      displayName: "",
+      filePath: "",
+      saving: false,
+      browseBusy: false,
+      error: ""
+    });
   }
 
   async function handleLocateSave() {
@@ -353,7 +753,43 @@ export function LlamacppSettingsPanel({
       setLocateState((current) => ({ ...current, saving: false }));
     }
     if (didSave) {
-      setLocateState({ open: false, baseModelId: "", displayName: "", filePath: "", saving: false });
+      setLocateState({
+        open: false,
+        baseModelId: "",
+        displayName: "",
+        filePath: "",
+        saving: false,
+        browseBusy: false,
+        error: ""
+      });
+    }
+  }
+
+  async function handleBrowseLocate() {
+    setLocateState((current) => ({
+      ...current,
+      browseBusy: true,
+      error: ""
+    }));
+    try {
+      const payload = await browseLocalModelPath("file");
+      const pickedPath = String(payload?.selection?.path || "").trim();
+      if (pickedPath) {
+        setLocateState((current) => ({
+          ...current,
+          filePath: pickedPath
+        }));
+      }
+    } catch (error) {
+      setLocateState((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    } finally {
+      setLocateState((current) => ({
+        ...current,
+        browseBusy: false
+      }));
     }
   }
 
@@ -389,7 +825,10 @@ export function LlamacppSettingsPanel({
       error: ""
     }));
     try {
-      const results = await searchHuggingFaceGguf({ query });
+      const results = await searchHuggingFaceGguf({
+        query,
+        expectedContextWindow: 200000
+      });
       setDownloadState((current) => ({
         ...current,
         query,
@@ -487,12 +926,26 @@ export function LlamacppSettingsPanel({
               <div className="text-sm font-semibold uppercase tracking-[0.14em] text-muted-foreground">llama.cpp Runtime</div>
               <div className="text-lg font-semibold text-foreground">Native runtime configuration</div>
             </div>
-            <Badge variant={runtimeStatus.variant}>{runtimeStatus.label}</Badge>
+            <div className="flex flex-wrap items-center gap-2">
+              {!runtimeRunning ? (
+                <Button size="sm" onClick={handleStartRuntime} disabled={!selectedCommand || runtimeActionState.starting}>
+                  {runtimeActionState.starting ? "Starting…" : "Start Runtime"}
+                </Button>
+              ) : (
+                <Button size="sm" variant="outline" onClick={handleStopRuntime} disabled={runtimeActionState.stopping}>
+                  {runtimeActionState.stopping ? "Stopping…" : "Stop Runtime"}
+                </Button>
+              )}
+              <Badge variant={runtimeStatus.variant}>{runtimeStatus.label}</Badge>
+            </div>
           </div>
           <div className="grid gap-3 md:grid-cols-3">
             <div className="rounded-2xl border border-border/70 bg-background/75 p-4">
               <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Selected Command</div>
               <div className="mt-2 break-all font-mono text-sm text-foreground">{selectedCommand || "Not configured yet"}</div>
+              {selectedDirectory ? (
+                <div className="mt-2 font-mono text-xs text-muted-foreground">Dir: {selectedDirectory}</div>
+              ) : null}
             </div>
             <div className="rounded-2xl border border-border/70 bg-background/75 p-4">
               <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Runtime Address</div>
@@ -502,6 +955,68 @@ export function LlamacppSettingsPanel({
               <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Start With Router</div>
               <div className="mt-2 text-sm text-foreground">{runtime?.startWithRouter === true ? "Enabled" : "Disabled"}</div>
             </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border/70 bg-background/75 p-4">
+            <div className="space-y-1">
+              <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Runtime Settings</div>
+              <div className="text-sm text-muted-foreground">Auto-start launches the selected `llama-server` when the router starts.</div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm text-foreground">Auto-start with router</label>
+              <Switch checked={runtimeAutoStart} onCheckedChange={setRuntimeAutoStart} disabled={Boolean(disableEditsReason) || runtimeActionState.savingSettings} />
+              <Button size="sm" variant="outline" onClick={handleSaveRuntimeSettings} disabled={Boolean(disableEditsReason) || runtimeActionState.savingSettings}>
+                {runtimeActionState.savingSettings ? "Saving…" : "Save Settings"}
+              </Button>
+            </div>
+          </div>
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Detected runtimes</div>
+                <div className="mt-1 text-sm text-muted-foreground">
+                  Auto-search checks `PATH`, Homebrew, and common source-build locations such as `~/src/llama-cpp-turboquant/build/bin`. TurboQuant builds are labeled explicitly when detected.
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleBrowseRuntime}
+                  disabled={runtimeActionState.selecting}
+                >
+                  {runtimeActionState.selecting ? "Selecting…" : "Browse runtime"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => void loadRuntimeDiscovery()} disabled={runtimeDiscovery.loading || runtimeActionState.selecting}>
+                  {runtimeDiscovery.loading ? "Refreshing…" : "Refresh runtimes"}
+                </Button>
+              </div>
+            </div>
+            {runtimeActionState.error ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                {runtimeActionState.error}
+              </div>
+            ) : null}
+            {runtimeDiscovery.error ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                {runtimeDiscovery.error}
+              </div>
+            ) : null}
+            {(runtimeDiscovery.runtime?.candidates || []).length === 0 && !runtimeDiscovery.loading ? (
+              <div className="rounded-2xl border border-dashed border-border px-4 py-4 text-sm text-muted-foreground">
+                No local `llama-server` candidates were detected yet. If TurboQuant is already built outside the common search locations, use Browse runtime and point the router at the binary directly.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {(runtimeDiscovery.runtime?.candidates || []).map((candidate) => (
+                  <RuntimeCandidateRow
+                    key={candidate.path || candidate.id}
+                    candidate={candidate}
+                    busy={runtimeActionState.selecting}
+                    onUseRuntime={handleSelectRuntime}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -596,22 +1111,35 @@ export function LlamacppSettingsPanel({
       >
         <div className="space-y-4">
           <Field label="GGUF file path" stacked>
-            <Input
-              value={attachState.draft.filePath}
-              onChange={(event) => {
-                const nextDraft = {
-                  ...attachState.draft,
-                  filePath: event.target.value
-                };
-                if (!String(attachState.draft.id || "").trim() || !String(attachState.draft.displayName || "").trim()) {
-                  const suggested = buildAttachedLocalModelDraft(event.target.value, library);
-                  if (!String(attachState.draft.id || "").trim()) nextDraft.id = suggested.id;
-                  if (!String(attachState.draft.displayName || "").trim()) nextDraft.displayName = suggested.displayName;
-                }
-                setAttachState((current) => ({ ...current, draft: nextDraft }));
-              }}
-              placeholder="/Volumes/models/qwen.Q5.gguf"
-            />
+            <div className="space-y-2">
+              <Input
+                value={attachState.draft.filePath}
+                onChange={(event) => {
+                  const nextDraft = {
+                    ...attachState.draft,
+                    filePath: event.target.value
+                  };
+                  if (!String(attachState.draft.id || "").trim() || !String(attachState.draft.displayName || "").trim()) {
+                    const suggested = buildAttachedLocalModelDraft(event.target.value, library);
+                    if (!String(attachState.draft.id || "").trim()) nextDraft.id = suggested.id;
+                    if (!String(attachState.draft.displayName || "").trim()) nextDraft.displayName = suggested.displayName;
+                  }
+                  setAttachState((current) => ({ ...current, draft: nextDraft }));
+                }}
+                placeholder="/Volumes/models/qwen.Q5.gguf"
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="outline" onClick={() => handleBrowseAttach("file")} disabled={attachState.browseBusy || attachState.scanBusy}>
+                  {attachState.browseBusy ? "Browsing…" : "Browse file"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => handleBrowseAttach("directory")} disabled={attachState.browseBusy || attachState.scanBusy}>
+                  {attachState.browseBusy ? "Browsing…" : "Browse folder"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={handleScanAttachPath} disabled={attachState.scanBusy || !String(attachState.draft.filePath || "").trim()}>
+                  {attachState.scanBusy ? "Scanning…" : "Scan path"}
+                </Button>
+              </div>
+            </div>
           </Field>
           <Field label="Model name" stacked>
             <Input
@@ -623,7 +1151,6 @@ export function LlamacppSettingsPanel({
                   displayName: event.target.value
                 }
               }))}
-              placeholder="Qwen Local"
             />
           </Field>
           <Field label="Base model id" stacked hint="Stable inventory id used for variants and stale-path recovery.">
@@ -636,9 +1163,30 @@ export function LlamacppSettingsPanel({
                   id: event.target.value
                 }
               }))}
-              placeholder="qwen-local-q5"
             />
           </Field>
+          {attachState.error ? (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              {attachState.error}
+            </div>
+          ) : null}
+          {(attachState.scanMatches || []).length > 0 ? (
+            <div className="space-y-2 rounded-2xl border border-border/70 bg-background/60 p-3">
+              <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Scanned GGUF files</div>
+              {(attachState.scanMatches || []).map((match) => (
+                <div key={match.filePath} className="flex flex-wrap items-start justify-between gap-2 rounded-xl border border-border/60 bg-background/80 px-3 py-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium text-foreground">{match.fileName}</div>
+                    <div className="break-all font-mono text-xs text-muted-foreground">{match.filePath}</div>
+                    {match.sizeBytes ? <div className="text-xs text-muted-foreground">{formatBytes(match.sizeBytes)}</div> : null}
+                  </div>
+                  <Button size="sm" variant="outline" onClick={() => applyAttachFilePath(match.filePath)} disabled={attachState.saving}>
+                    Use file
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {attachDisabledReason ? (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
               {attachDisabledReason}
@@ -664,22 +1212,34 @@ export function LlamacppSettingsPanel({
       >
         <div className="space-y-4">
           <Field label="Updated GGUF path" stacked>
-            <Input
-              value={locateState.filePath}
-              onChange={(event) => setLocateState((current) => ({ ...current, filePath: event.target.value }))}
-              placeholder="/Volumes/models/qwen.Q5.gguf"
-            />
+            <div className="space-y-2">
+              <Input
+                value={locateState.filePath}
+                onChange={(event) => setLocateState((current) => ({ ...current, filePath: event.target.value }))}
+                placeholder="/Volumes/models/qwen.Q5.gguf"
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="outline" onClick={handleBrowseLocate} disabled={locateState.browseBusy || locateState.saving}>
+                  {locateState.browseBusy ? "Browsing…" : "Browse file"}
+                </Button>
+              </div>
+            </div>
           </Field>
-          {!String(locateState.filePath || "").trim() ? (
+          {locateState.error ? (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-              GGUF file path is required.
+              {locateState.error}
+            </div>
+          ) : null}
+          {locateDisabledReason ? (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              {locateDisabledReason}
             </div>
           ) : null}
           <div className="flex flex-wrap items-center justify-end gap-2">
             <Button type="button" variant="outline" onClick={closeLocateModal} disabled={locateState.saving}>
               Cancel
             </Button>
-            <Button type="button" onClick={handleLocateSave} disabled={!String(locateState.filePath || "").trim() || locateState.saving}>
+            <Button type="button" onClick={handleLocateSave} disabled={Boolean(locateDisabledReason) || locateState.saving}>
               {locateState.saving ? "Updating…" : "Save path"}
             </Button>
           </div>

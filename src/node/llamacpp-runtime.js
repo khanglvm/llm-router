@@ -1,4 +1,5 @@
 import path from "node:path";
+import os from "node:os";
 import { existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -8,6 +9,12 @@ const LLAMACPP_EXECUTABLE = "llama-server";
 const FALLBACK_LLAMACPP_PATHS = Object.freeze([
   "/opt/homebrew/bin/llama-server",
   "/usr/local/bin/llama-server"
+]);
+const COMMON_SOURCE_BUILD_PATHS = Object.freeze([
+  "src/llama-cpp/build/bin/llama-server",
+  "src/llama.cpp/build/bin/llama-server",
+  "src/llama-cpp-turboquant/build/bin/llama-server",
+  "src/llama.cpp-turboquant/build/bin/llama-server"
 ]);
 
 let managedLlamacppRuntime = null;
@@ -74,17 +81,28 @@ function buildPreloadModels(config) {
 
 export function detectLlamacppCandidates({
   envPathEntries = process.env.PATH?.split(path.delimiter) || [],
+  homeDir = os.homedir(),
   existingPaths = null
 } = {}) {
   const seen = new Set();
   const candidates = [];
-  const searchDirs = [
-    ...normalizePathEntries(envPathEntries),
-    ...FALLBACK_LLAMACPP_PATHS.map((entry) => path.dirname(entry))
+  const searchTargets = [
+    ...normalizePathEntries(envPathEntries).map((entry) => ({
+      path: path.join(entry, LLAMACPP_EXECUTABLE),
+      source: "path"
+    })),
+    ...FALLBACK_LLAMACPP_PATHS.map((entry) => ({
+      path: entry,
+      source: "homebrew"
+    })),
+    ...COMMON_SOURCE_BUILD_PATHS.map((entry) => ({
+      path: path.join(homeDir, entry),
+      source: "source-build"
+    }))
   ];
 
-  for (const dir of searchDirs) {
-    const candidatePath = path.join(dir, LLAMACPP_EXECUTABLE);
+  for (const target of searchTargets) {
+    const candidatePath = normalizeString(target.path);
     if (seen.has(candidatePath)) continue;
     seen.add(candidatePath);
     const exists = existingPaths instanceof Set ? existingPaths.has(candidatePath) : existsSync(candidatePath);
@@ -93,9 +111,7 @@ export function detectLlamacppCandidates({
       id: candidatePath,
       label: candidatePath,
       path: candidatePath,
-      source: candidatePath.startsWith("/opt/homebrew/") || candidatePath.startsWith("/usr/local/")
-        ? "homebrew"
-        : "path"
+      source: target.source
     });
   }
 
@@ -130,14 +146,16 @@ export function parseLlamacppValidationOutput(output = "") {
   const lowered = text.toLowerCase();
   const supportsHost = /(^|\s)--host(\s|$)/m.test(text);
   const supportsPort = /(^|\s)--port(\s|$)/m.test(text);
-  const kind = lowered.includes("llama-server") ? "server" : "";
+  const referencesModelFlag = /(^|\s)(-m,\s+)?--model(\s|$)/m.test(text);
+  const looksLikeServerHelp = supportsHost && supportsPort && referencesModelFlag;
+  const kind = lowered.includes("llama-server") || looksLikeServerHelp ? "server" : "";
 
   return {
     ok: Boolean(kind) && supportsHost && supportsPort,
     kind,
     supportsHost,
     supportsPort,
-    isTurboQuant: lowered.includes("turboquant")
+    isTurboQuant: lowered.includes("turboquant") || /\bturbo[234]\b/.test(lowered)
   };
 }
 
@@ -175,15 +193,16 @@ export function validateLlamacppCommand(command, { spawnSyncImpl = spawnSync } =
   };
 }
 
-export async function ensureConfiguredLlamacppRuntimeStarted(config, {
+async function startConfiguredRuntime(config, {
   line = () => {},
-  error = () => {}
+  error = () => {},
+  requireAutostart = true
 } = {}, {
   spawnSyncImpl = spawnSync,
   spawnImpl = spawn
 } = {}) {
   const runtime = readConfiguredLlamacppRuntime(config);
-  if (!runtime.startWithRouter) {
+  if (requireAutostart && !runtime.startWithRouter) {
     return { ok: true, skipped: true, reason: "autostart-disabled" };
   }
 
@@ -252,6 +271,20 @@ export async function ensureConfiguredLlamacppRuntimeStarted(config, {
       finish({ ok: false, errorMessage });
     });
   });
+}
+
+export async function ensureConfiguredLlamacppRuntimeStarted(config, callbacks = {}, deps = {}) {
+  return startConfiguredRuntime(config, {
+    ...callbacks,
+    requireAutostart: true
+  }, deps);
+}
+
+export async function startConfiguredLlamacppRuntime(config, callbacks = {}, deps = {}) {
+  return startConfiguredRuntime(config, {
+    ...callbacks,
+    requireAutostart: false
+  }, deps);
 }
 
 export async function stopManagedLlamacppRuntime({
