@@ -356,6 +356,99 @@ llama-server build 9999
   await stopManagedLlamacppRuntime();
 });
 
+test("startConfiguredLlamacppRuntime preserves healthy tracked runtime when probe result is unknown", async () => {
+  await stopManagedLlamacppRuntime();
+  const spawnCalls = [];
+  const stopCalls = [];
+  const config = {
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            startWithRouter: true,
+            command: "/opt/homebrew/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            path: "/tmp/qwen.gguf"
+          }
+        },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 4096,
+            runtimeProfile: {
+              mode: "auto",
+              preset: "balanced",
+              overrides: {},
+              extraArgs: [],
+              lastKnownGood: null,
+              lastFailure: null
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const deps = {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl(command, args) {
+      spawnCalls.push([command, args]);
+      return {
+        pid: 9501,
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          if (event === "spawn") queueMicrotask(handler);
+        },
+        unref() {},
+        kill() {
+          this.killed = true;
+          this.exitCode = 0;
+          return true;
+        }
+      };
+    },
+    listListeningPids() {
+      return { ok: false, pids: [] };
+    },
+    stopProcessByPid(pid) {
+      stopCalls.push(pid);
+      return { ok: true };
+    }
+  };
+
+  const first = await startConfiguredLlamacppRuntime(config, {}, deps);
+  const second = await startConfiguredLlamacppRuntime(config, {}, deps);
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(second.alreadyRunning, true);
+  assert.equal(spawnCalls.length, 1);
+  assert.deepEqual(stopCalls, []);
+  await stopManagedLlamacppRuntime();
+});
+
 test("stopManagedLlamacppRuntime stops all registry-tracked managed runtimes", async () => {
   await stopManagedLlamacppRuntime();
   const killed = [];
@@ -751,8 +844,9 @@ llama-server build 9999
   }, {}, deps);
 
   const firstStop = await stopManagedLlamacppRuntime();
-  assert.equal(firstStop.ok, true);
+  assert.equal(firstStop.ok, false);
   assert.equal(firstStop.stoppedCount, 1);
+  assert.equal(firstStop.pendingExitCount, 1);
 
   const secondStart = await startConfiguredLlamacppRuntime({
     metadata: {
@@ -782,6 +876,81 @@ llama-server build 9999
 
   await stopManagedLlamacppRuntime();
   await stopManagedLlamacppRuntime();
+});
+
+test("stopManagedLlamacppRuntime reports non-success when exits are still pending", async () => {
+  await stopManagedLlamacppRuntime();
+  const deps = {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl() {
+      return {
+        pid: 9601,
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          if (event === "spawn") queueMicrotask(handler);
+        },
+        unref() {},
+        kill() {
+          // ignore SIGTERM and remain alive
+          return true;
+        }
+      };
+    },
+    listListeningPids() {
+      return [9601];
+    }
+  };
+
+  const started = await startConfiguredLlamacppRuntime({
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            startWithRouter: true,
+            command: "/opt/homebrew/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: { "base-qwen": { id: "base-qwen", path: "/tmp/qwen.gguf" } },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 4096,
+            runtimeProfile: { mode: "auto", preset: "balanced", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  }, {}, deps);
+  assert.equal(started.ok, true);
+
+  const messages = [];
+  const stopped = await stopManagedLlamacppRuntime({
+    line(message) {
+      messages.push(message);
+    }
+  });
+  assert.equal(stopped.ok, false);
+  assert.equal(stopped.pendingExitCount, 1);
+  assert.equal(stopped.stoppedCount, 1);
+  assert.equal(messages.includes("Stopped managed llama.cpp runtime."), false);
 });
 
 test("stopManagedLlamacppRuntime does not increment stoppedCount when kill returns false", async () => {
@@ -844,7 +1013,7 @@ llama-server build 9999
   assert.equal(started.ok, true);
 
   const stopped = await stopManagedLlamacppRuntime();
-  assert.equal(stopped.ok, true);
+  assert.equal(stopped.ok, false);
   assert.equal(stopped.stoppedCount, 0);
   assert.equal(stopped.pendingExitCount, 1);
 });

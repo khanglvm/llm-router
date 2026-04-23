@@ -55,6 +55,9 @@ function isManagedRuntimeAlive(instance) {
 }
 
 function normalizeListeningPidResult(result) {
+  if (result && typeof result === "object" && result.ok === false) {
+    return { ok: false, pids: [] };
+  }
   if (Array.isArray(result)) {
     return result
       .map((value) => Number(value))
@@ -457,11 +460,18 @@ export async function stopManagedLlamacppRuntime({
   }
 
   if (stoppedCount > 0) {
-    line(stoppedCount === 1 ? "Stopped managed llama.cpp runtime." : `Stopped ${stoppedCount} managed llama.cpp runtimes.`);
+    if (pendingExitCount === 0) {
+      line(stoppedCount === 1 ? "Stopped managed llama.cpp runtime." : `Stopped ${stoppedCount} managed llama.cpp runtimes.`);
+    } else {
+      line(stoppedCount === 1
+        ? "Stop signal sent to managed llama.cpp runtime; waiting for exit."
+        : `Stop signal sent to ${stoppedCount} managed llama.cpp runtimes; waiting for exits.`);
+    }
   }
 
+  const completed = failures.length === 0 && pendingExitCount === 0;
   return {
-    ok: failures.length === 0,
+    ok: completed,
     stoppedCount,
     pendingExitCount,
     ...(failures.length > 0 ? { errorMessage: failures.join("; ") } : {})
