@@ -387,6 +387,9 @@ export async function stopManagedLlamacppRuntime({
   line = () => {},
   error = () => {}
 } = {}) {
+  if (typeof managedLlamacppRuntimeRegistry.waitForInFlightStarts === "function") {
+    await managedLlamacppRuntimeRegistry.waitForInFlightStarts();
+  }
   const instances = managedLlamacppRuntimeRegistry.snapshot();
   if (instances.length === 0) {
     return { ok: true, skipped: true, reason: "not-running" };
@@ -394,13 +397,18 @@ export async function stopManagedLlamacppRuntime({
 
   const failures = [];
   let stoppedCount = 0;
+  let pendingExitCount = 0;
   for (const instance of instances) {
     try {
       if (instance?.owner === "llm-router" && typeof instance?.child?.kill === "function") {
         instance.child.kill("SIGTERM");
         stoppedCount += 1;
       }
-      await managedLlamacppRuntimeRegistry.untrackInstance(instance?.instanceId);
+      if (!isManagedRuntimeAlive(instance)) {
+        await managedLlamacppRuntimeRegistry.untrackInstance(instance?.instanceId);
+      } else {
+        pendingExitCount += 1;
+      }
     } catch (stopError) {
       const errorMessage = stopError instanceof Error ? stopError.message : String(stopError);
       failures.push(errorMessage);
@@ -415,6 +423,7 @@ export async function stopManagedLlamacppRuntime({
   return {
     ok: failures.length === 0,
     stoppedCount,
+    pendingExitCount,
     ...(failures.length > 0 ? { errorMessage: failures.join("; ") } : {})
   };
 }

@@ -157,9 +157,21 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
     }
   }
 
+  async function waitForInFlightStarts() {
+    while (inFlightStarts.size > 0) {
+      const pending = [...inFlightStarts.values()]
+        .map((entry) => entry?.promise)
+        .filter(Boolean)
+        .map((promise) => promise.catch(() => null));
+      if (pending.length === 0) return;
+      await Promise.all(pending);
+    }
+  }
+
   return {
     ensureRuntimeForVariant,
     reconcile,
+    waitForInFlightStarts,
     trackInstance: async (instance) => {
       instances.set(instance.instanceId, { ...instance });
     },

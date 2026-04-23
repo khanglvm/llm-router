@@ -151,7 +151,12 @@ llama-server build 9999
         once(event, handler) {
           if (event === "spawn") queueMicrotask(handler);
         },
-        unref() {}
+        unref() {},
+        kill() {
+          this.killed = true;
+          this.exitCode = 0;
+          return true;
+        }
       };
     }
   });
@@ -437,13 +442,217 @@ llama-server build 9999
   }, {}, baseDeps);
 
   const allocatedSecondPort = Number(secondStart?.runtime?.port);
+  const allocatedFirstPort = Number(firstStart?.runtime?.port);
   assert.equal(spawnCalls.length, 2);
-  assert.match(spawnCalls[0][1].join(" "), /--port 39391/);
+  assert.match(spawnCalls[0][1].join(" "), new RegExp(`--port ${allocatedFirstPort}`));
   assert.equal(firstStart.ok, true);
   assert.equal(secondStart.ok, true);
-  assert.notEqual(allocatedSecondPort, 39391);
+  assert.notEqual(allocatedSecondPort, allocatedFirstPort);
   assert.match(spawnCalls[1][1].join(" "), new RegExp(`--port ${allocatedSecondPort}`));
 
+  await stopManagedLlamacppRuntime();
+});
+
+test("stopManagedLlamacppRuntime drains in-flight startup before returning", async () => {
+  await stopManagedLlamacppRuntime();
+  const killed = [];
+  let releaseSpawn;
+  const spawnGate = new Promise((resolve) => {
+    releaseSpawn = resolve;
+  });
+
+  const config = {
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            startWithRouter: true,
+            command: "/opt/homebrew/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: {
+          "base-qwen": { id: "base-qwen", path: "/tmp/qwen.gguf" }
+        },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 4096,
+            runtimeProfile: { mode: "auto", preset: "balanced", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  };
+
+  const deps = {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl() {
+      const handlers = new Map();
+      const child = {
+        pid: 9101,
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          handlers.set(event, handler);
+          if (event === "spawn") {
+            spawnGate.then(() => {
+              const onSpawn = handlers.get("spawn");
+              if (typeof onSpawn === "function") onSpawn();
+            });
+          }
+        },
+        unref() {},
+        kill() {
+          killed.push(this.pid);
+          this.killed = true;
+          this.exitCode = 0;
+          const onExit = handlers.get("exit");
+          if (typeof onExit === "function") onExit(0);
+          return true;
+        }
+      };
+      return child;
+    }
+  };
+
+  const startPromise = startConfiguredLlamacppRuntime(config, {}, deps);
+  const stopPromise = stopManagedLlamacppRuntime();
+  releaseSpawn();
+  const [started, stopped] = await Promise.all([startPromise, stopPromise]);
+
+  assert.equal(started.ok, true);
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.stoppedCount, 1);
+  assert.deepEqual(killed, [9101]);
+  const secondStop = await stopManagedLlamacppRuntime();
+  assert.equal(secondStop.skipped, true);
+});
+
+test("stopManagedLlamacppRuntime keeps alive instances reserved to avoid immediate port reuse", async () => {
+  await stopManagedLlamacppRuntime();
+  const spawnCalls = [];
+  let spawnIndex = 0;
+  const stubbornKillCountByPid = new Map();
+
+  const deps = {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl(command, args) {
+      spawnCalls.push([command, args]);
+      spawnIndex += 1;
+      const pid = 9200 + spawnIndex;
+      const handlers = new Map();
+      return {
+        pid,
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          handlers.set(event, handler);
+          if (event === "spawn") queueMicrotask(handler);
+        },
+        unref() {},
+        kill() {
+          const prior = stubbornKillCountByPid.get(pid) || 0;
+          stubbornKillCountByPid.set(pid, prior + 1);
+          if (pid === 9201 && prior === 0) {
+            // First runtime ignores first SIGTERM and remains alive.
+            return true;
+          }
+          this.killed = true;
+          this.exitCode = 0;
+          const onExit = handlers.get("exit");
+          if (typeof onExit === "function") onExit(0);
+          return true;
+        }
+      };
+    }
+  };
+
+  const baseRuntime = {
+    startWithRouter: true,
+    command: "/opt/homebrew/bin/llama-server",
+    host: "127.0.0.1",
+    port: 39391
+  };
+
+  await startConfiguredLlamacppRuntime({
+    metadata: {
+      localModels: {
+        runtime: { llamacpp: baseRuntime },
+        library: { "base-qwen-a": { id: "base-qwen-a", path: "/tmp/qwen-a.gguf" } },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen-a",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 4096,
+            runtimeProfile: { mode: "auto", preset: "balanced", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  }, {}, deps);
+
+  const firstStop = await stopManagedLlamacppRuntime();
+  assert.equal(firstStop.ok, true);
+  assert.equal(firstStop.stoppedCount, 1);
+
+  const secondStart = await startConfiguredLlamacppRuntime({
+    metadata: {
+      localModels: {
+        runtime: { llamacpp: baseRuntime },
+        library: { "base-qwen-b": { id: "base-qwen-b", path: "/tmp/qwen-b.gguf" } },
+        variants: {
+          "qwen-throughput": {
+            id: "local/qwen-throughput",
+            key: "qwen-throughput",
+            baseModelId: "base-qwen-b",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 16384,
+            runtimeProfile: { mode: "auto", preset: "throughput", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  }, {}, deps);
+
+  assert.equal(secondStart.ok, true);
+  const secondStartPort = Number(secondStart.runtime?.port);
+  assert.notEqual(secondStartPort, 39391);
+  assert.match(spawnCalls[1][1].join(" "), new RegExp(`--port ${secondStartPort}`));
+
+  await stopManagedLlamacppRuntime();
   await stopManagedLlamacppRuntime();
 });
 
