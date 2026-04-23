@@ -57,6 +57,36 @@ test("buildEditableLlamacppVariantDraft preserves existing fields and normalizes
   assert.equal(draft.preset, "balanced");
   assert.equal(draft.contextWindow, 65536);
   assert.deepEqual(draft.capabilities, { supportsReasoning: true });
+  assert.deepEqual(draft.runtimeProfile, {
+    mode: "auto",
+    preset: "balanced",
+    overrides: {},
+    extraArgs: [],
+    lastKnownGood: null,
+    lastFailure: null
+  });
+});
+
+test("buildEditableLlamacppVariantDraft clones runtimeProfile fields", () => {
+  const draft = buildEditableLlamacppVariantDraft({
+    runtimeProfile: {
+      mode: "custom",
+      preset: "memory-safe",
+      overrides: { gpuLayers: 0 },
+      extraArgs: ["--no-warmup"],
+      lastKnownGood: { preset: "balanced" },
+      lastFailure: { reason: "oom" }
+    }
+  });
+
+  assert.deepEqual(draft.runtimeProfile, {
+    mode: "custom",
+    preset: "memory-safe",
+    overrides: { gpuLayers: 0 },
+    extraArgs: ["--no-warmup"],
+    lastKnownGood: { preset: "balanced" },
+    lastFailure: { reason: "oom" }
+  });
 });
 
 test("resolveLocalVariantSaveDisabledReason validates required variant fields", () => {

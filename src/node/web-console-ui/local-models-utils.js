@@ -9,6 +9,15 @@ export const LLAMACPP_VARIANT_PRESETS = {
   "fast-response": { label: "Fast Response", contextWindow: 8192 }
 };
 
+const DEFAULT_RUNTIME_PROFILE = {
+  mode: "auto",
+  preset: "balanced",
+  overrides: {},
+  extraArgs: [],
+  lastKnownGood: null,
+  lastFailure: null
+};
+
 function normalizeRuntimeStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (!normalized) return "stopped";
@@ -110,6 +119,14 @@ export function buildEditableLlamacppVariantDraft(variant) {
     contextWindow: Number.isFinite(Number(variant?.contextWindow))
       ? Number(variant.contextWindow)
       : LLAMACPP_VARIANT_PRESETS.balanced.contextWindow,
+    runtimeProfile: {
+      ...DEFAULT_RUNTIME_PROFILE,
+      ...(variant?.runtimeProfile || {}),
+      overrides: variant?.runtimeProfile?.overrides && typeof variant.runtimeProfile.overrides === "object"
+        ? { ...variant.runtimeProfile.overrides }
+        : {},
+      extraArgs: Array.isArray(variant?.runtimeProfile?.extraArgs) ? [...variant.runtimeProfile.extraArgs] : []
+    },
     capabilities: variant?.capabilities && typeof variant.capabilities === "object"
       ? { ...variant.capabilities }
       : {}

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { normalizeRuntimeConfig, validateRuntimeConfig } from "./config.js";
 import {
   LOCAL_RUNTIME_PROVIDER_ID,
-  LOCAL_RUNTIME_PROVIDER_TYPE
+  LOCAL_RUNTIME_PROVIDER_TYPE,
+  normalizeLocalModelsMetadata
 } from "./local-models.js";
 
 test("normalizeRuntimeConfig preserves metadata.localModels and materializes enabled local variants", () => {
@@ -98,4 +99,28 @@ test("normalizeRuntimeConfig materializes local variant capacity metadata", () =
   const localProvider = config.providers.find((provider) => provider.type === LOCAL_RUNTIME_PROVIDER_TYPE);
   assert.equal(localProvider.models[0].metadata.capacityState, "tight");
   assert.equal(localProvider.models[0].metadata.estimatedBytes, 1234);
+});
+
+test("normalizeLocalModelsMetadata defaults llama.cpp runtimeProfile fields", () => {
+  const metadata = normalizeLocalModelsMetadata({
+    variants: {
+      "qwen-balanced": {
+        key: "qwen-balanced",
+        baseModelId: "base-qwen",
+        id: "local/qwen-balanced",
+        name: "Qwen Balanced",
+        runtime: "llamacpp",
+        enabled: true
+      }
+    }
+  });
+
+  assert.deepEqual(metadata.variants["qwen-balanced"].runtimeProfile, {
+    mode: "auto",
+    preset: "balanced",
+    overrides: {},
+    extraArgs: [],
+    lastKnownGood: null,
+    lastFailure: null
+  });
 });

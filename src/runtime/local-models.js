@@ -20,6 +20,34 @@ function normalizePositiveNumber(value) {
   return Math.floor(parsed);
 }
 
+function normalizeRuntimeProfile(raw = {}) {
+  const source = isPlainObject(raw) ? raw : {};
+  const overrides = isPlainObject(source.overrides) ? { ...source.overrides } : {};
+  const extraArgs = Array.isArray(source.extraArgs)
+    ? source.extraArgs.map((value) => normalizeString(value)).filter(Boolean)
+    : [];
+
+  return {
+    mode: normalizeString(source.mode) === "custom" ? "custom" : "auto",
+    preset: normalizeString(source.preset) || "balanced",
+    overrides,
+    extraArgs,
+    lastKnownGood: isPlainObject(source.lastKnownGood) ? { ...source.lastKnownGood } : null,
+    lastFailure: isPlainObject(source.lastFailure) ? { ...source.lastFailure } : null
+  };
+}
+
+function normalizeRuntimeStatus(raw = {}) {
+  const source = isPlainObject(raw) ? raw : {};
+
+  return {
+    activeInstanceId: normalizeString(source.activeInstanceId),
+    lastFailure: isPlainObject(source.lastFailure) ? { ...source.lastFailure } : null,
+    lastStartedAt: normalizeString(source.lastStartedAt),
+    lastHealthyAt: normalizeString(source.lastHealthyAt)
+  };
+}
+
 function normalizeLocalModelLibraryEntry(key, entry) {
   if (!isPlainObject(entry)) return null;
 
@@ -74,6 +102,14 @@ function normalizeLocalModelVariantEntry(key, entry) {
     const availability = normalizeString(normalized.availability);
     if (availability) normalized.availability = availability;
     else delete normalized.availability;
+  }
+
+  if (normalized.runtime === "llamacpp") {
+    normalized.runtimeProfile = normalizeRuntimeProfile(entry.runtimeProfile);
+    normalized.runtimeStatus = normalizeRuntimeStatus(entry.runtimeStatus);
+  } else {
+    delete normalized.runtimeProfile;
+    delete normalized.runtimeStatus;
   }
 
   return normalized;

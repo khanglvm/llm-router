@@ -212,19 +212,42 @@ export async function saveLocalModelVariant(config, draft, {
       activeVariants,
       totalMemoryBytes: system.totalMemoryBytes
     });
-    if (!decision.allowed) {
+  if (!decision.allowed) {
       throw new Error(decision.reason);
     }
   }
 
+  const normalizedMetadata = normalizeLocalModelsMetadata({
+    variants: {
+      draft: normalizedDraft
+    }
+  });
+  const normalizedVariantDraft = Object.values(normalizedMetadata.variants)[0] || {};
+  const previousVariant = isPlainObject(next.metadata.localModels.variants[key])
+    ? next.metadata.localModels.variants[key]
+    : {};
+
   next.metadata.localModels.variants[key] = {
-    ...(isPlainObject(next.metadata.localModels.variants[key]) ? next.metadata.localModels.variants[key] : {}),
+    ...previousVariant,
     key,
     baseModelId,
     id: modelId,
     name,
     runtime,
     preset: normalizeString(normalizedDraft.preset),
+    runtimeProfile: runtime === "llamacpp"
+      ? normalizedVariantDraft.runtimeProfile
+      : undefined,
+    runtimeStatus: runtime === "llamacpp"
+      ? (isPlainObject(previousVariant.runtimeStatus)
+        ? previousVariant.runtimeStatus
+        : {
+          activeInstanceId: "",
+          lastFailure: null,
+          lastStartedAt: "",
+          lastHealthyAt: ""
+        })
+      : undefined,
     enabled: normalizedDraft.enabled === true,
     preload: normalizedDraft.preload === true,
     contextWindow: Number.isFinite(Number(normalizedDraft.contextWindow)) ? Number(normalizedDraft.contextWindow) : undefined,

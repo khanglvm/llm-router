@@ -148,3 +148,37 @@ test("saveLocalModelVariant blocks enabling a variant that exceeds the Mac unifi
     /capacity/i
   );
 });
+
+test("saveLocalModelVariant persists runtimeProfile and runtimeStatus fields", async () => {
+  const next = await saveLocalModelVariant({
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            metadata: { sizeBytes: 24 * 1024 ** 3 }
+          }
+        },
+        variants: {}
+      }
+    }
+  }, {
+    key: "qwen-balanced",
+    baseModelId: "base-qwen",
+    id: "local/qwen-balanced",
+    name: "Qwen Balanced",
+    runtime: "llamacpp",
+    enabled: true,
+    contextWindow: 65536,
+    runtimeProfile: {
+      mode: "custom",
+      preset: "memory-safe",
+      overrides: { gpuLayers: 0, batchSize: 64 },
+      extraArgs: ["--no-warmup"]
+    }
+  });
+
+  assert.equal(next.metadata.localModels.variants["qwen-balanced"].runtimeProfile.mode, "custom");
+  assert.equal(next.metadata.localModels.variants["qwen-balanced"].runtimeProfile.overrides.gpuLayers, 0);
+  assert.equal(next.metadata.localModels.variants["qwen-balanced"].runtimeStatus.lastFailure, null);
+});
