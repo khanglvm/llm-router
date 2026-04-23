@@ -135,6 +135,21 @@ function queueLargeRequestEvent(onLargeRequestLog, payload) {
   }
 }
 
+async function resolveRequestProviderUrl(provider, plan, candidate, runtimeFlags) {
+  if (provider?.type === "local-runtime" && typeof runtimeFlags?.resolveLocalRuntimeBaseUrl === "function") {
+    const dynamicBaseUrl = await runtimeFlags.resolveLocalRuntimeBaseUrl({
+      candidate,
+      targetFormat: plan.targetFormat,
+      requestKind: plan.requestKind
+    });
+    if (dynamicBaseUrl) {
+      return resolveProviderUrl({ ...provider, baseUrl: dynamicBaseUrl }, plan.targetFormat, plan.requestKind);
+    }
+  }
+
+  return resolveProviderUrl(provider, plan.targetFormat, plan.requestKind);
+}
+
 function maybeQueueLargeRequestLog({
   env,
   onLargeRequestLog,
@@ -1074,8 +1089,27 @@ export async function makeProviderCall({
   }
 
   const executeHttpProviderRequest = async (plan) => {
-    const providerUrl = resolveProviderUrl(provider, plan.targetFormat, plan.requestKind);
-    if (!providerUrl) return null;
+    let providerUrl;
+    try {
+      providerUrl = await resolveRequestProviderUrl(provider, plan, candidate, runtimeFlags);
+    } catch (error) {
+      return jsonResponse({
+        type: "error",
+        error: {
+          type: "api_error",
+          message: error instanceof Error ? error.message : String(error)
+        }
+      }, 503);
+    }
+    if (!providerUrl) {
+      return jsonResponse({
+        type: "error",
+        error: {
+          type: "configuration_error",
+          message: `Provider ${provider.id} has invalid baseUrl.`
+        }
+      }, 500);
+    }
     const headers = mergeCachingHeaders(
       buildProviderHeaders(provider, env, plan.targetFormat),
       requestHeaders,
@@ -1113,22 +1147,6 @@ export async function makeProviderCall({
       timeoutControl.cleanup();
     }
   };
-
-  if (!resolveProviderUrl(provider, activePlan.targetFormat, activePlan.requestKind)) {
-    return {
-      ok: false,
-      status: 500,
-      retryable: false,
-      errorKind: "configuration_error",
-      response: jsonResponse({
-        type: "error",
-        error: {
-          type: "configuration_error",
-          message: `Provider ${provider.id} has invalid baseUrl.`
-        }
-      }, 500)
-    };
-  }
 
   let response;
   try {

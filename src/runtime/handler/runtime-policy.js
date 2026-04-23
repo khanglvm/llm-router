@@ -27,7 +27,10 @@ export function resolveRuntimeFlags(options = {}, env = {}) {
     workerRuntime,
     workerSafeMode,
     allowBestEffortStatefulRouting,
-    statefulRoutingEnabled: !workerSafeMode || allowBestEffortStatefulRouting
+    statefulRoutingEnabled: !workerSafeMode || allowBestEffortStatefulRouting,
+    ...(typeof options.resolveLocalRuntimeBaseUrl === "function"
+      ? { resolveLocalRuntimeBaseUrl: options.resolveLocalRuntimeBaseUrl }
+      : {})
   };
 }
 

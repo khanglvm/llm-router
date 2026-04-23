@@ -13,6 +13,10 @@ import { readActivityLogSettings } from "../shared/local-router-defaults.js";
 import { appendActivityLogEntry, resolveActivityLogPath } from "./activity-log.js";
 import { appendLargeRequestLogEntry, resolveLargeRequestLogPath } from "./large-request-log.js";
 import { isLargeRequestLoggingEnabled } from "../runtime/handler/large-request-log.js";
+import {
+  startConfiguredLlamacppRuntime,
+  stopManagedLlamacppRuntime
+} from "./llamacpp-runtime.js";
 
 const DEFAULT_CONFIG_RELOAD_DEBOUNCE_MS = 300;
 const MAX_CONFIG_RELOAD_DEBOUNCE_MS = 5000;
@@ -32,6 +36,10 @@ function resolveReloadDebounceMs(value) {
 
 function formatError(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeString(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function createLiveConfigStore({
@@ -237,6 +245,39 @@ async function writeFetchResponseToNode(res, response) {
   readable.pipe(res);
 }
 
+function buildVariantLlamacppRuntimeConfig(config, variantKey) {
+  const normalizedVariantKey = normalizeString(variantKey);
+  const runtime = config?.metadata?.localModels?.runtime?.llamacpp;
+  const variants = config?.metadata?.localModels?.variants;
+  const library = config?.metadata?.localModels?.library;
+  const variant = variants?.[normalizedVariantKey];
+  if (!runtime || !variant || variant.runtime !== "llamacpp") return null;
+
+  const baseModelId = normalizeString(variant?.baseModelId);
+  const baseModel = library?.[baseModelId];
+  if (!baseModel) return null;
+
+  return {
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: { ...runtime }
+        },
+        library: {
+          [baseModelId]: { ...baseModel }
+        },
+        variants: {
+          [normalizedVariantKey]: {
+            ...variant,
+            enabled: true,
+            preload: true
+          }
+        }
+      }
+    }
+  };
+}
+
 export async function startLocalRouteServer({
   port = FIXED_LOCAL_ROUTER_PORT,
   host = FIXED_LOCAL_ROUTER_HOST,
@@ -248,7 +289,10 @@ export async function startLocalRouteServer({
   validateConfig,
   onConfigReload,
   onConfigReloadError,
-  requireAuth = false
+  requireAuth = false,
+  createFetchHandlerImpl = createFetchHandler,
+  startConfiguredLlamacppRuntimeImpl = startConfiguredLlamacppRuntime,
+  stopManagedLlamacppRuntimeImpl = stopManagedLlamacppRuntime
 } = {}) {
   const reloadDebounceMs = resolveReloadDebounceMs(configReloadDebounceMs);
   const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
@@ -270,9 +314,22 @@ export async function startLocalRouteServer({
   const initialConfig = await configStore.getConfig();
   activityLogEnabled = readActivityLogSettings(initialConfig).enabled;
 
-  const fetchHandler = createFetchHandler({
+  const fetchHandler = createFetchHandlerImpl({
     ignoreAuth: !requireAuth,
+    runtime: "node",
     getConfig: () => configStore.getConfig(),
+    resolveLocalRuntimeBaseUrl: async ({ candidate }) => {
+      const variantKey = candidate?.model?.metadata?.localVariantKey;
+      const config = await configStore.getConfig();
+      const targetedConfig = buildVariantLlamacppRuntimeConfig(config, variantKey);
+      if (!targetedConfig) return "";
+
+      const started = await startConfiguredLlamacppRuntimeImpl(targetedConfig);
+      if (!started?.ok) {
+        throw new Error(started?.errorMessage || `Failed starting local runtime for ${normalizeString(variantKey) || "unknown variant"}.`);
+      }
+      return normalizeString(started?.runtime?.baseUrl);
+    },
     defaultStateStoreBackend: "file",
     onActivityLog: (entry) => {
       if (!activityLogEnabled) return;
@@ -355,6 +412,7 @@ export async function startLocalRouteServer({
   server.close = (callback) => {
     shuttingDown = true;
     Promise.resolve()
+      .then(() => stopManagedLlamacppRuntimeImpl().catch(() => {}))
       .then(() => configStore.close())
       .then(() => (typeof fetchHandler.close === "function" ? fetchHandler.close() : undefined))
       .finally(() => {

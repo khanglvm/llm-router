@@ -206,6 +206,65 @@ test("makeProviderCall applies configured OpenAI responses hosted web search too
   }
 });
 
+test("makeProviderCall uses resolveLocalRuntimeBaseUrl for local-runtime candidates", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      body: JSON.parse(String(init.body || "{}"))
+    });
+    return jsonResponse({
+      id: "local-runtime-ok",
+      object: "chat.completion",
+      choices: []
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "local-models/local/qwen-balanced",
+        messages: [{ role: "user", content: "hi" }]
+      },
+      sourceFormat: FORMATS.OPENAI,
+      stream: false,
+      requestKind: "chat.completions",
+      candidate: {
+        providerId: "local-models",
+        modelId: "local/qwen-balanced",
+        backend: "local/qwen-balanced",
+        targetFormat: FORMATS.OPENAI,
+        provider: {
+          id: "local-models",
+          type: "local-runtime",
+          baseUrl: "http://127.0.0.1:39391/v1",
+          format: FORMATS.OPENAI,
+          formats: [FORMATS.OPENAI],
+          models: [{ id: "local/qwen-balanced", metadata: { localVariantKey: "qwen-balanced" } }]
+        },
+        model: {
+          id: "local/qwen-balanced",
+          metadata: { localVariantKey: "qwen-balanced" }
+        }
+      },
+      requestHeaders: new Headers(),
+      env: {},
+      runtimeFlags: {
+        resolveLocalRuntimeBaseUrl: async ({ candidate }) => {
+          assert.equal(candidate.model.metadata.localVariantKey, "qwen-balanced");
+          return "http://127.0.0.1:40404/v1";
+        }
+      }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls[0]?.url, "http://127.0.0.1:40404/v1/chat/completions");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("makeProviderCall intercepts native Claude web search locally for non-AMP clients", { concurrency: false }, async () => {
   const calls = [];
   const originalFetch = globalThis.fetch;
