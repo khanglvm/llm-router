@@ -125,7 +125,13 @@ export function buildEditableLlamacppVariantDraft(variant) {
       overrides: variant?.runtimeProfile?.overrides && typeof variant.runtimeProfile.overrides === "object"
         ? { ...variant.runtimeProfile.overrides }
         : {},
-      extraArgs: Array.isArray(variant?.runtimeProfile?.extraArgs) ? [...variant.runtimeProfile.extraArgs] : []
+      extraArgs: Array.isArray(variant?.runtimeProfile?.extraArgs) ? [...variant.runtimeProfile.extraArgs] : [],
+      lastKnownGood: variant?.runtimeProfile?.lastKnownGood && typeof variant.runtimeProfile.lastKnownGood === "object"
+        ? { ...variant.runtimeProfile.lastKnownGood }
+        : null,
+      lastFailure: variant?.runtimeProfile?.lastFailure && typeof variant.runtimeProfile.lastFailure === "object"
+        ? { ...variant.runtimeProfile.lastFailure }
+        : null
     },
     capabilities: variant?.capabilities && typeof variant.capabilities === "object"
       ? { ...variant.capabilities }

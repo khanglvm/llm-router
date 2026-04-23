@@ -68,7 +68,7 @@ test("buildEditableLlamacppVariantDraft preserves existing fields and normalizes
 });
 
 test("buildEditableLlamacppVariantDraft clones runtimeProfile fields", () => {
-  const draft = buildEditableLlamacppVariantDraft({
+  const variant = {
     runtimeProfile: {
       mode: "custom",
       preset: "memory-safe",
@@ -77,7 +77,13 @@ test("buildEditableLlamacppVariantDraft clones runtimeProfile fields", () => {
       lastKnownGood: { preset: "balanced" },
       lastFailure: { reason: "oom" }
     }
-  });
+  };
+  const draft = buildEditableLlamacppVariantDraft(variant);
+
+  variant.runtimeProfile.overrides.gpuLayers = 12;
+  variant.runtimeProfile.extraArgs.push("--verbose");
+  variant.runtimeProfile.lastKnownGood.preset = "fast-response";
+  variant.runtimeProfile.lastFailure.reason = "timeout";
 
   assert.deepEqual(draft.runtimeProfile, {
     mode: "custom",
