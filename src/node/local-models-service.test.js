@@ -182,3 +182,65 @@ test("saveLocalModelVariant persists runtimeProfile and runtimeStatus fields", a
   assert.equal(next.metadata.localModels.variants["qwen-balanced"].runtimeProfile.overrides.gpuLayers, 0);
   assert.equal(next.metadata.localModels.variants["qwen-balanced"].runtimeStatus.lastFailure, null);
 });
+
+test("saveLocalModelVariant preserves existing runtimeStatus while updating runtimeProfile", async () => {
+  const next = await saveLocalModelVariant({
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            metadata: { sizeBytes: 24 * 1024 ** 3 }
+          }
+        },
+        variants: {
+          "qwen-balanced": {
+            key: "qwen-balanced",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp",
+            enabled: true,
+            contextWindow: 65536,
+            runtimeProfile: {
+              mode: "auto",
+              preset: "balanced",
+              overrides: {},
+              extraArgs: [],
+              lastKnownGood: null,
+              lastFailure: null
+            },
+            runtimeStatus: {
+              activeInstanceId: "instance-1",
+              lastFailure: { reason: "warmup-timeout" },
+              lastStartedAt: "2026-04-23T10:00:00.000Z",
+              lastHealthyAt: "2026-04-23T10:05:00.000Z"
+            }
+          }
+        }
+      }
+    }
+  }, {
+    key: "qwen-balanced",
+    baseModelId: "base-qwen",
+    id: "local/qwen-balanced",
+    name: "Qwen Balanced",
+    runtime: "llamacpp",
+    enabled: true,
+    contextWindow: 65536,
+    runtimeProfile: {
+      mode: "custom",
+      preset: "memory-safe",
+      overrides: { gpuLayers: 0 },
+      extraArgs: ["--no-warmup"]
+    }
+  });
+
+  assert.equal(next.metadata.localModels.variants["qwen-balanced"].runtimeProfile.mode, "custom");
+  assert.deepEqual(next.metadata.localModels.variants["qwen-balanced"].runtimeStatus, {
+    activeInstanceId: "instance-1",
+    lastFailure: { reason: "warmup-timeout" },
+    lastStartedAt: "2026-04-23T10:00:00.000Z",
+    lastHealthyAt: "2026-04-23T10:05:00.000Z"
+  });
+});

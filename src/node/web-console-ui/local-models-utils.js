@@ -18,6 +18,16 @@ const DEFAULT_RUNTIME_PROFILE = {
   lastFailure: null
 };
 
+function cloneRuntimeProfileValue(value) {
+  if (Array.isArray(value)) return value.map((entry) => cloneRuntimeProfileValue(entry));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, cloneRuntimeProfileValue(entry)])
+    );
+  }
+  return value;
+}
+
 function normalizeRuntimeStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (!normalized) return "stopped";
@@ -123,14 +133,14 @@ export function buildEditableLlamacppVariantDraft(variant) {
       ...DEFAULT_RUNTIME_PROFILE,
       ...(variant?.runtimeProfile || {}),
       overrides: variant?.runtimeProfile?.overrides && typeof variant.runtimeProfile.overrides === "object"
-        ? { ...variant.runtimeProfile.overrides }
+        ? cloneRuntimeProfileValue(variant.runtimeProfile.overrides)
         : {},
       extraArgs: Array.isArray(variant?.runtimeProfile?.extraArgs) ? [...variant.runtimeProfile.extraArgs] : [],
       lastKnownGood: variant?.runtimeProfile?.lastKnownGood && typeof variant.runtimeProfile.lastKnownGood === "object"
-        ? { ...variant.runtimeProfile.lastKnownGood }
+        ? cloneRuntimeProfileValue(variant.runtimeProfile.lastKnownGood)
         : null,
       lastFailure: variant?.runtimeProfile?.lastFailure && typeof variant.runtimeProfile.lastFailure === "object"
-        ? { ...variant.runtimeProfile.lastFailure }
+        ? cloneRuntimeProfileValue(variant.runtimeProfile.lastFailure)
         : null
     },
     capabilities: variant?.capabilities && typeof variant.capabilities === "object"

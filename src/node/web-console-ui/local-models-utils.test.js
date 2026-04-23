@@ -72,26 +72,29 @@ test("buildEditableLlamacppVariantDraft clones runtimeProfile fields", () => {
     runtimeProfile: {
       mode: "custom",
       preset: "memory-safe",
-      overrides: { gpuLayers: 0 },
+      overrides: { gpuLayers: 0, tuning: { cacheReuse: true } },
       extraArgs: ["--no-warmup"],
-      lastKnownGood: { preset: "balanced" },
-      lastFailure: { reason: "oom" }
+      lastKnownGood: { preset: "balanced", overrides: { gpuLayers: 8 } },
+      lastFailure: { reason: "oom", detail: { code: "ENOMEM" } }
     }
   };
   const draft = buildEditableLlamacppVariantDraft(variant);
 
   variant.runtimeProfile.overrides.gpuLayers = 12;
+  variant.runtimeProfile.overrides.tuning.cacheReuse = false;
   variant.runtimeProfile.extraArgs.push("--verbose");
   variant.runtimeProfile.lastKnownGood.preset = "fast-response";
+  variant.runtimeProfile.lastKnownGood.overrides.gpuLayers = 2;
   variant.runtimeProfile.lastFailure.reason = "timeout";
+  variant.runtimeProfile.lastFailure.detail.code = "ETIME";
 
   assert.deepEqual(draft.runtimeProfile, {
     mode: "custom",
     preset: "memory-safe",
-    overrides: { gpuLayers: 0 },
+    overrides: { gpuLayers: 0, tuning: { cacheReuse: true } },
     extraArgs: ["--no-warmup"],
-    lastKnownGood: { preset: "balanced" },
-    lastFailure: { reason: "oom" }
+    lastKnownGood: { preset: "balanced", overrides: { gpuLayers: 8 } },
+    lastFailure: { reason: "oom", detail: { code: "ENOMEM" } }
   });
 });
 
