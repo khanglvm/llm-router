@@ -3,6 +3,7 @@ import os from "node:os";
 import { existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { deriveLlamacppLaunchProfile } from "./llamacpp-runtime-profile.js";
+import { createLlamacppManagedRuntimeRegistry } from "./llamacpp-managed-runtime.js";
 
 export const LLAMACPP_DEFAULT_HOST = "127.0.0.1";
 export const LLAMACPP_DEFAULT_PORT = 39391;
@@ -17,8 +18,7 @@ const COMMON_SOURCE_BUILD_PATHS = Object.freeze([
   "src/llama-cpp-turboquant/build/bin/llama-server",
   "src/llama.cpp-turboquant/build/bin/llama-server"
 ]);
-
-let managedLlamacppRuntime = null;
+const managedLlamacppRuntimeRegistry = createLlamacppManagedRuntimeRegistry();
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -38,6 +38,17 @@ function normalizePathEntries(entries) {
   return Array.isArray(entries)
     ? entries.map((entry) => normalizeString(entry)).filter(Boolean)
     : [];
+}
+
+function buildRuntimeProfileHash({ command, host, port, args = [] } = {}) {
+  const normalizedArgs = Array.isArray(args) ? args.filter(Boolean) : [];
+  return `${normalizeString(command)}|${normalizeString(host)}|${String(normalizePort(port, LLAMACPP_DEFAULT_PORT))}|${normalizedArgs.join("\u001f")}`;
+}
+
+function isManagedRuntimeAlive(instance) {
+  const child = instance?.child;
+  if (!child) return false;
+  return child.exitCode === null && child.killed !== true;
 }
 
 function readConfiguredLlamacppRuntime(config) {
@@ -252,21 +263,6 @@ async function startConfiguredRuntime(config, {
     return { ok: false, errorMessage };
   }
 
-  if (managedLlamacppRuntime
-    && managedLlamacppRuntime.command === runtime.command
-    && managedLlamacppRuntime.host === runtime.host
-    && managedLlamacppRuntime.port === runtime.port
-    && managedLlamacppRuntime.child?.exitCode === null
-    && managedLlamacppRuntime.child?.killed !== true) {
-    return { ok: true, alreadyRunning: true, runtime: managedLlamacppRuntime };
-  }
-
-  const validation = validateLlamacppCommand(runtime.command, { spawnSyncImpl });
-  if (!validation.ok) {
-    error(validation.errorMessage || `Failed validating llama.cpp runtime '${runtime.command}'.`);
-    return validation;
-  }
-
   const preloadModels = buildPreloadModels(config);
   const firstModel = Array.isArray(preloadModels) ? preloadModels[0] : null;
   const launchProfile = firstModel?.variant && firstModel?.baseModel
@@ -283,43 +279,87 @@ async function startConfiguredRuntime(config, {
     preloadModels,
     launchProfile
   });
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const child = spawnImpl(args[0], args.slice(1), {
-      stdio: "ignore"
-    });
-
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-
-    child.once("spawn", () => {
-      managedLlamacppRuntime = {
-        child,
-        command: runtime.command,
-        host: runtime.host,
-        port: runtime.port,
-        args
-      };
-      child.once("exit", () => {
-        if (managedLlamacppRuntime?.child === child) {
-          managedLlamacppRuntime = null;
-        }
-      });
-      if (typeof child.unref === "function") child.unref();
-      line(`Started llama.cpp runtime on http://${runtime.host}:${runtime.port}${validation.isTurboQuant ? " (TurboQuant detected)" : ""}.`);
-      finish({ ok: true, runtime: managedLlamacppRuntime, validation });
-    });
-
-    child.once("error", (spawnError) => {
-      const errorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-      error(`Failed starting llama.cpp runtime: ${errorMessage}`);
-      finish({ ok: false, errorMessage });
-    });
+  const variantKey = normalizeString(firstModel?.variant?.key || firstModel?.variantId) || "default";
+  const profileHash = buildRuntimeProfileHash({
+    command: runtime.command,
+    host: runtime.host,
+    port: runtime.port,
+    args: args.slice(1)
   });
+  const existing = managedLlamacppRuntimeRegistry
+    .snapshot()
+    .find((instance) => (
+      instance.variantKey === variantKey
+      && instance.profileHash === profileHash
+      && isManagedRuntimeAlive(instance)
+    ));
+  if (existing) {
+    return { ok: true, alreadyRunning: true, runtime: existing };
+  }
+
+  const validation = validateLlamacppCommand(runtime.command, { spawnSyncImpl });
+  if (!validation.ok) {
+    error(validation.errorMessage || `Failed validating llama.cpp runtime '${runtime.command}'.`);
+    return validation;
+  }
+
+  try {
+    const managedRuntime = await managedLlamacppRuntimeRegistry.ensureRuntimeForVariant({
+      variantKey,
+      profileHash,
+      launchArgs: args.slice(1),
+      preferredPort: runtime.port
+    }, {
+      spawnRuntime: async ({ port }) => new Promise((resolve, reject) => {
+        let settled = false;
+        const child = spawnImpl(args[0], args.slice(1), {
+          stdio: "ignore"
+        });
+
+        const settleResolve = (value) => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+        };
+        const settleReject = (reason) => {
+          if (settled) return;
+          settled = true;
+          reject(reason);
+        };
+
+        child.once("spawn", () => {
+          if (typeof child.unref === "function") child.unref();
+          settleResolve({
+            pid: child?.pid,
+            child,
+            command: runtime.command,
+            host: runtime.host,
+            port,
+            args,
+            baseUrl: `http://${runtime.host}:${port}/v1`
+          });
+        });
+        child.once("error", (spawnError) => {
+          settleReject(spawnError);
+        });
+      }),
+      waitForHealthy: async (instance) => instance
+    });
+
+    const managedInstanceId = managedRuntime?.instanceId;
+    if (managedRuntime?.child && managedRuntime.child.__llamacppManagedExitHookAttached !== true) {
+      managedRuntime.child.__llamacppManagedExitHookAttached = true;
+      managedRuntime.child.once("exit", () => {
+        void managedLlamacppRuntimeRegistry.untrackInstance(managedInstanceId);
+      });
+    }
+    line(`Started llama.cpp runtime on http://${managedRuntime.host}:${managedRuntime.port}${validation.isTurboQuant ? " (TurboQuant detected)" : ""}.`);
+    return { ok: true, runtime: managedRuntime, validation };
+  } catch (spawnError) {
+    const errorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
+    error(`Failed starting llama.cpp runtime: ${errorMessage}`);
+    return { ok: false, errorMessage };
+  }
 }
 
 export async function ensureConfiguredLlamacppRuntimeStarted(config, callbacks = {}, deps = {}) {
@@ -340,19 +380,34 @@ export async function stopManagedLlamacppRuntime({
   line = () => {},
   error = () => {}
 } = {}) {
-  const active = managedLlamacppRuntime;
-  if (!active?.child) {
+  const instances = managedLlamacppRuntimeRegistry.snapshot();
+  if (instances.length === 0) {
     return { ok: true, skipped: true, reason: "not-running" };
   }
 
-  managedLlamacppRuntime = null;
-  try {
-    active.child.kill("SIGTERM");
-    line("Stopped managed llama.cpp runtime.");
-    return { ok: true };
-  } catch (stopError) {
-    const errorMessage = stopError instanceof Error ? stopError.message : String(stopError);
-    error(`Failed stopping llama.cpp runtime: ${errorMessage}`);
-    return { ok: false, errorMessage };
+  const failures = [];
+  let stoppedCount = 0;
+  for (const instance of instances) {
+    try {
+      if (instance?.owner === "llm-router" && typeof instance?.child?.kill === "function") {
+        instance.child.kill("SIGTERM");
+        stoppedCount += 1;
+      }
+      await managedLlamacppRuntimeRegistry.untrackInstance(instance?.instanceId);
+    } catch (stopError) {
+      const errorMessage = stopError instanceof Error ? stopError.message : String(stopError);
+      failures.push(errorMessage);
+      error(`Failed stopping llama.cpp runtime: ${errorMessage}`);
+    }
   }
+
+  if (stoppedCount > 0) {
+    line(stoppedCount === 1 ? "Stopped managed llama.cpp runtime." : `Stopped ${stoppedCount} managed llama.cpp runtimes.`);
+  }
+
+  return {
+    ok: failures.length === 0,
+    stoppedCount,
+    ...(failures.length > 0 ? { errorMessage: failures.join("; ") } : {})
+  };
 }
