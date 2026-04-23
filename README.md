@@ -29,7 +29,7 @@ llr ai-help  # agent-oriented setup brief
 - **Model aliases with routing** — group models into stable alias names with weighted round-robin, quota-aware balancing, and automatic fallback
 - **Rate limiting** — set request caps per model or across all models over configurable time windows
 - **Coding tool routing** — one-click routing config for Codex CLI, Claude Code, Factory Droid, and AMP
-- **Dev sandbox** — `yarn dev` runs the console against a dedicated dev config/router port, highlights dev mode in terminal + UI, and can clone the production config into the sandbox for quick iteration
+- **Dev sandbox** — `yarn dev` runs the console against a dedicated dev config/router port, highlights dev mode in terminal + UI, can clone the production config into the sandbox for quick iteration, and automatically reclaims stale dev listeners before the next session starts
 - **Claude native web tools** — local handling for Claude web search and page fetch requests, with selectable Claude Code web-search providers from the shared Web Search config
 - **Seamless local updates** — `llr update` keeps the fixed local router endpoint online, drains in-flight requests, and automatically retries through backend restart windows
 - **Web search** — built-in web search for AMP and other router-managed tools
@@ -60,7 +60,7 @@ That means `llr update` can install a new package version and gracefully swap th
 yarn dev
 ```
 
-Development mode uses the dedicated `~/.llm-router-dev.json` config and its own local router port so it can run alongside a startup-managed or manually started production router. The terminal and Web UI both show a dev-mode indicator, and the dev Web UI includes a one-click sync action to copy the current production config into the sandbox without changing the dev router binding.
+Development mode uses the dedicated `~/.llm-router-dev.json` config and its own local router port so it can run alongside a startup-managed or manually started production router. The terminal and Web UI both show a dev-mode indicator, the dev Web UI includes a one-click sync action to copy the current production config into the sandbox without changing the dev router binding, and each new `yarn dev` run automatically takes over any stale dev web-console/router listeners from a prior session.
 
 ## Web UI
 

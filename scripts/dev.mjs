@@ -1,9 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultConfigPath, getDefaultDevConfigPath } from "../src/node/config-store.js";
+import { startManagedDevWebConsole } from "../src/node/dev-command.js";
 import { RUNTIME_STATE_PATH_ENV } from "../src/node/instance-state.js";
 import { resolveLargeRequestLogPath } from "../src/node/large-request-log.js";
-import { startWebConsoleServer } from "../src/node/web-console-server.js";
 import { openBrowser, resolveWebListenPort } from "../src/node/web-command.js";
 import {
   DEFAULT_LARGE_REQUEST_LOG_THRESHOLD_BYTES,
@@ -113,7 +113,7 @@ if (!String(process.env[LARGE_REQUEST_LOG_PATH_ENV] || "").trim()) {
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const cliPathForRouter = path.resolve(scriptDir, "../src/cli-entry.js");
 
-const server = await startWebConsoleServer({
+const server = await startManagedDevWebConsole({
   host,
   port,
   configPath,
@@ -124,8 +124,7 @@ const server = await startWebConsoleServer({
   routerWatchBinary: toBoolean(args["router-watch-binary"] ?? args.routerWatchBinary, true),
   routerRequireAuth: toBoolean(args["router-require-auth"] ?? args.routerRequireAuth, false),
   allowRemoteClients: toBoolean(args["allow-remote-clients"] ?? args.allowRemoteClients, false),
-  cliPathForRouter,
-  devMode: true
+  cliPathForRouter
 });
 
 console.log(`${formatDevBadge()} ${TERM_COLORS.yellow}LLM Router dev console started on ${server.url}${TERM_COLORS.reset}`);
@@ -134,7 +133,7 @@ console.log(`${formatMutedLabel("Production config:")} ${getDefaultConfigPath()}
 console.log(`${formatMutedLabel("Dev router target:")} http://${String(args["router-host"] || args.routerHost || "127.0.0.1").trim() || "127.0.0.1"}:${routerPort}`);
 console.log(`${formatMutedLabel("Large request log:")} ${process.env[LARGE_REQUEST_LOG_PATH_ENV]} (threshold ${process.env[LARGE_REQUEST_LOG_THRESHOLD_ENV]} bytes)`);
 console.log(`${formatMutedLabel("Watch mode:")} web UI assets + router source files`);
-console.log(`${formatMutedLabel("Lifecycle:")} closing the web console leaves the dev router running`);
+console.log(`${formatMutedLabel("Lifecycle:")} stale dev web/router listeners are reclaimed automatically on the next run`);
 
 if (shouldOpen) {
   try {
@@ -147,8 +146,8 @@ if (shouldOpen) {
 }
 
 const handleSignal = (signal) => {
-  console.log(`Received ${signal}. Closing dev web console...`);
-  void server.close(signal.toLowerCase());
+  console.log(`Received ${signal}. Closing dev web console and attempting dev router cleanup...`);
+  void server.shutdown(signal.toLowerCase());
 };
 process.once("SIGINT", handleSignal);
 process.once("SIGTERM", handleSignal);

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-04-23
+
+### Fixed
+- `yarn dev` now force-reclaims stale dev web-console listeners on startup and restarts matching stale dev routers so the next dev session takes over the sandbox cleanly instead of inheriting the old process.
+
 ## [2.5.1] - 2026-04-23
 
 ### Fixed
