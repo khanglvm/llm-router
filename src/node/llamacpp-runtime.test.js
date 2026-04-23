@@ -758,6 +758,89 @@ llama-server build 9999
   assert.equal(secondStop.skipped, true);
 });
 
+test("stopManagedLlamacppRuntime yields event loop while waiting for configured starts", async () => {
+  await stopManagedLlamacppRuntime();
+  const spawnCalls = [];
+  const config = {
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            startWithRouter: true,
+            command: "/opt/homebrew/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: {
+          "base-qwen": { id: "base-qwen", path: "/tmp/qwen.gguf" }
+        },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 4096,
+            runtimeProfile: { mode: "auto", preset: "balanced", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  };
+
+  const deps = {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl(command, args) {
+      spawnCalls.push([command, args]);
+      const handlers = new Map();
+      return {
+        pid: 9701,
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          handlers.set(event, handler);
+          if (event === "spawn") {
+            setTimeout(() => {
+              const onSpawn = handlers.get("spawn");
+              if (typeof onSpawn === "function") onSpawn();
+            }, 0);
+          }
+        },
+        unref() {},
+        kill() {
+          this.killed = true;
+          this.exitCode = 0;
+          const onExit = handlers.get("exit");
+          if (typeof onExit === "function") onExit(0);
+          return true;
+        }
+      };
+    }
+  };
+
+  const startPromise = startConfiguredLlamacppRuntime(config, {}, deps);
+  const stopPromise = stopManagedLlamacppRuntime();
+  const [started, stopped] = await Promise.all([startPromise, stopPromise]);
+
+  assert.equal(started.ok, true);
+  assert.equal(stopped.stoppedCount, 1);
+  assert.equal(spawnCalls.length, 1);
+  await stopManagedLlamacppRuntime();
+});
+
 test("stopManagedLlamacppRuntime keeps alive instances reserved to avoid immediate port reuse", async () => {
   await stopManagedLlamacppRuntime();
   const spawnCalls = [];

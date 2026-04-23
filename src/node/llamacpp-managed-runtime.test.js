@@ -167,3 +167,30 @@ test("registry does not keep dead immediate-exit runtime tracked or reserve its 
   assert.equal(recovered.port, 39391);
   assert.deepEqual(spawnedPorts, [39391, 39391]);
 });
+
+test("registry wraps fallback allocation back into the valid managed port range", async () => {
+  const registry = createLlamacppManagedRuntimeRegistry({
+    spawnRuntime: async ({ port }) => ({
+      pid: port,
+      host: "127.0.0.1",
+      port,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
+      child: { exitCode: null, killed: false }
+    }),
+    waitForHealthy: async (instance) => ({ ...instance, healthy: true })
+  });
+
+  const lastPort = await registry.ensureRuntimeForVariant({
+    variantKey: "last-port",
+    profileHash: "last-port",
+    preferredPort: 65535
+  });
+  const wrapped = await registry.ensureRuntimeForVariant({
+      variantKey: "wrapped-variant",
+      profileHash: "wrapped-profile",
+      preferredPort: 65535
+    });
+
+  assert.equal(lastPort.port, 65535);
+  assert.equal(wrapped.port, 39391);
+});

@@ -89,9 +89,20 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
     }
 
     let port = Math.max(39391, nextPort);
+    if (port > MAX_PORT) {
+      port = 39391;
+    }
+    const startPort = port;
     while (reservedPorts.has(port)) {
       port += 1;
+      if (port > MAX_PORT) {
+        port = 39391;
+      }
+      if (port === startPort) {
+        throw new Error("No available managed runtime port.");
+      }
     }
+
     nextPort = port + 1;
     return port;
   }

@@ -2,6 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import { existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import { deriveLlamacppLaunchProfile } from "./llamacpp-runtime-profile.js";
 import { createLlamacppManagedRuntimeRegistry } from "./llamacpp-managed-runtime.js";
 import { listListeningPids as listListeningPidsForPort } from "./port-reclaim.js";
@@ -276,132 +277,132 @@ async function startConfiguredRuntime(config, {
 } = {}) {
   inFlightConfiguredStartCount += 1;
   try {
-  const runtime = readConfiguredLlamacppRuntime(config);
-  if (requireAutostart && !runtime.startWithRouter) {
-    return { ok: true, skipped: true, reason: "autostart-disabled" };
-  }
+    const runtime = readConfiguredLlamacppRuntime(config);
+    if (requireAutostart && !runtime.startWithRouter) {
+      return { ok: true, skipped: true, reason: "autostart-disabled" };
+    }
 
-  if (!runtime.command) {
-    const errorMessage = "llama.cpp autostart is enabled, but no runtime command is configured.";
-    error(errorMessage);
-    return { ok: false, errorMessage };
-  }
+    if (!runtime.command) {
+      const errorMessage = "llama.cpp autostart is enabled, but no runtime command is configured.";
+      error(errorMessage);
+      return { ok: false, errorMessage };
+    }
 
-  const preloadModels = buildPreloadModels(config);
-  const firstModel = Array.isArray(preloadModels) ? preloadModels[0] : null;
-  const launchProfile = firstModel?.variant && firstModel?.baseModel
-    ? deriveLlamacppLaunchProfile({
-      variant: firstModel.variant,
-      baseModel: firstModel.baseModel,
-      system: detectLlamacppSystemProfile(system)
-    })
-    : null;
-  const args = buildLlamacppLaunchArgs({
-    command: runtime.command,
-    host: runtime.host,
-    port: runtime.port,
-    preloadModels,
-    launchProfile
-  });
-  const variantKey = normalizeString(firstModel?.variant?.key || firstModel?.variantId) || "default";
-  const profileHash = buildRuntimeProfileHash({
-    command: runtime.command,
-    host: runtime.host,
-    port: runtime.port,
-    args: args.slice(1)
-  });
-  const listListeningPidsFn = typeof listListeningPids === "function"
-    ? listListeningPids
-    : (port) => listListeningPidsForPort(port, { spawnSync: spawnSyncImpl });
-  const stopProcessByPidFn = typeof stopProcessByPid === "function"
-    ? stopProcessByPid
-    : (pid) => stopProcessByPidForRuntime(pid);
-  await managedLlamacppRuntimeRegistry.reconcile({
-    listListeningPids: async (port) => normalizeListeningPidResult(await listListeningPidsFn(port)),
-    stopProcessByPid: async (pid) => stopProcessByPidFn(pid)
-  });
+    const preloadModels = buildPreloadModels(config);
+    const firstModel = Array.isArray(preloadModels) ? preloadModels[0] : null;
+    const launchProfile = firstModel?.variant && firstModel?.baseModel
+      ? deriveLlamacppLaunchProfile({
+        variant: firstModel.variant,
+        baseModel: firstModel.baseModel,
+        system: detectLlamacppSystemProfile(system)
+      })
+      : null;
+    const args = buildLlamacppLaunchArgs({
+      command: runtime.command,
+      host: runtime.host,
+      port: runtime.port,
+      preloadModels,
+      launchProfile
+    });
+    const variantKey = normalizeString(firstModel?.variant?.key || firstModel?.variantId) || "default";
+    const profileHash = buildRuntimeProfileHash({
+      command: runtime.command,
+      host: runtime.host,
+      port: runtime.port,
+      args: args.slice(1)
+    });
+    const listListeningPidsFn = typeof listListeningPids === "function"
+      ? listListeningPids
+      : (port) => listListeningPidsForPort(port, { spawnSync: spawnSyncImpl });
+    const stopProcessByPidFn = typeof stopProcessByPid === "function"
+      ? stopProcessByPid
+      : (pid) => stopProcessByPidForRuntime(pid);
+    await managedLlamacppRuntimeRegistry.reconcile({
+      listListeningPids: async (port) => normalizeListeningPidResult(await listListeningPidsFn(port)),
+      stopProcessByPid: async (pid) => stopProcessByPidFn(pid)
+    });
 
-  const existing = managedLlamacppRuntimeRegistry
-    .snapshot()
-    .find((instance) => (
-      instance.variantKey === variantKey
-      && instance.profileHash === profileHash
-      && isManagedRuntimeAlive(instance)
-    ));
-  if (existing) {
-    return { ok: true, alreadyRunning: true, runtime: existing };
-  }
+    const existing = managedLlamacppRuntimeRegistry
+      .snapshot()
+      .find((instance) => (
+        instance.variantKey === variantKey
+        && instance.profileHash === profileHash
+        && isManagedRuntimeAlive(instance)
+      ));
+    if (existing) {
+      return { ok: true, alreadyRunning: true, runtime: existing };
+    }
 
-  const validation = validateLlamacppCommand(runtime.command, { spawnSyncImpl });
-  if (!validation.ok) {
-    error(validation.errorMessage || `Failed validating llama.cpp runtime '${runtime.command}'.`);
-    return validation;
-  }
+    const validation = validateLlamacppCommand(runtime.command, { spawnSyncImpl });
+    if (!validation.ok) {
+      error(validation.errorMessage || `Failed validating llama.cpp runtime '${runtime.command}'.`);
+      return validation;
+    }
 
-  try {
-    const managedRuntime = await managedLlamacppRuntimeRegistry.ensureRuntimeForVariant({
-      variantKey,
-      profileHash,
-      launchArgs: args.slice(1),
-      preferredPort: runtime.port
-    }, {
-      spawnRuntime: async ({ port }) => new Promise((resolve, reject) => {
-        let settled = false;
-        const allocatedArgs = buildLlamacppLaunchArgs({
-          command: runtime.command,
-          host: runtime.host,
-          port,
-          preloadModels,
-          launchProfile
-        });
-        const child = spawnImpl(allocatedArgs[0], allocatedArgs.slice(1), {
-          stdio: "ignore"
-        });
-        const expectedInstanceId = `${variantKey}:${profileHash}:${port}`;
-        if (child && child.__llamacppManagedExitHookAttached !== true) {
-          child.__llamacppManagedExitHookAttached = true;
-          child.once("exit", () => {
-            void managedLlamacppRuntimeRegistry.untrackInstance(expectedInstanceId);
-          });
-        }
-
-        const settleResolve = (value) => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        const settleReject = (reason) => {
-          if (settled) return;
-          settled = true;
-          reject(reason);
-        };
-
-        child.once("spawn", () => {
-          if (typeof child.unref === "function") child.unref();
-          settleResolve({
-            pid: child?.pid,
-            child,
+    try {
+      const managedRuntime = await managedLlamacppRuntimeRegistry.ensureRuntimeForVariant({
+        variantKey,
+        profileHash,
+        launchArgs: args.slice(1),
+        preferredPort: runtime.port
+      }, {
+        spawnRuntime: async ({ port }) => new Promise((resolve, reject) => {
+          let settled = false;
+          const allocatedArgs = buildLlamacppLaunchArgs({
             command: runtime.command,
             host: runtime.host,
             port,
-            args: allocatedArgs,
-            baseUrl: `http://${runtime.host}:${port}/v1`
+            preloadModels,
+            launchProfile
           });
-        });
-        child.once("error", (spawnError) => {
-          settleReject(spawnError);
-        });
-      }),
-      waitForHealthy: async (instance) => instance
-    });
+          const child = spawnImpl(allocatedArgs[0], allocatedArgs.slice(1), {
+            stdio: "ignore"
+          });
+          const expectedInstanceId = `${variantKey}:${profileHash}:${port}`;
+          if (child && child.__llamacppManagedExitHookAttached !== true) {
+            child.__llamacppManagedExitHookAttached = true;
+            child.once("exit", () => {
+              void managedLlamacppRuntimeRegistry.untrackInstance(expectedInstanceId);
+            });
+          }
 
-    line(`Started llama.cpp runtime on http://${managedRuntime.host}:${managedRuntime.port}${validation.isTurboQuant ? " (TurboQuant detected)" : ""}.`);
-    return { ok: true, runtime: managedRuntime, validation };
-  } catch (spawnError) {
-    const errorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-    error(`Failed starting llama.cpp runtime: ${errorMessage}`);
-    return { ok: false, errorMessage };
-  }
+          const settleResolve = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          };
+          const settleReject = (reason) => {
+            if (settled) return;
+            settled = true;
+            reject(reason);
+          };
+
+          child.once("spawn", () => {
+            if (typeof child.unref === "function") child.unref();
+            settleResolve({
+              pid: child?.pid,
+              child,
+              command: runtime.command,
+              host: runtime.host,
+              port,
+              args: allocatedArgs,
+              baseUrl: `http://${runtime.host}:${port}/v1`
+            });
+          });
+          child.once("error", (spawnError) => {
+            settleReject(spawnError);
+          });
+        }),
+        waitForHealthy: async (instance) => instance
+      });
+
+      line(`Started llama.cpp runtime on http://${managedRuntime.host}:${managedRuntime.port}${validation.isTurboQuant ? " (TurboQuant detected)" : ""}.`);
+      return { ok: true, runtime: managedRuntime, validation };
+    } catch (spawnError) {
+      const errorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
+      error(`Failed starting llama.cpp runtime: ${errorMessage}`);
+      return { ok: false, errorMessage };
+    }
   } finally {
     inFlightConfiguredStartCount = Math.max(0, inFlightConfiguredStartCount - 1);
   }
@@ -426,7 +427,7 @@ export async function stopManagedLlamacppRuntime({
   error = () => {}
 } = {}) {
   while (inFlightConfiguredStartCount > 0) {
-    await Promise.resolve();
+    await delay(0);
   }
   if (typeof managedLlamacppRuntimeRegistry.waitForInFlightStarts === "function") {
     await managedLlamacppRuntimeRegistry.waitForInFlightStarts();
