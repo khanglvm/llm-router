@@ -213,7 +213,8 @@ async function startConfiguredRuntime(config, {
   requireAutostart = true
 } = {}, {
   spawnSyncImpl = spawnSync,
-  spawnImpl = spawn
+  spawnImpl = spawn,
+  system = undefined
 } = {}) {
   const runtime = readConfiguredLlamacppRuntime(config);
   if (requireAutostart && !runtime.startWithRouter) {
@@ -247,7 +248,7 @@ async function startConfiguredRuntime(config, {
     ? deriveLlamacppLaunchProfile({
       variant: firstModel.variant,
       baseModel: firstModel.baseModel,
-      system: detectLlamacppSystemProfile(deps.system)
+      system: detectLlamacppSystemProfile(system)
     })
     : null;
   const args = buildLlamacppLaunchArgs({

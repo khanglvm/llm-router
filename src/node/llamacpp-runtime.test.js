@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import {
   buildLlamacppLaunchArgs,
   detectLlamacppCandidates,
-  parseLlamacppValidationOutput
+  parseLlamacppValidationOutput,
+  startConfiguredLlamacppRuntime
 } from "./llamacpp-runtime.js";
 
 test("detectLlamacppCandidates returns PATH and common Homebrew candidates without duplicates", () => {
@@ -60,6 +61,77 @@ test("buildLlamacppLaunchArgs appends derived launch profile arguments", () => {
   assert.equal(args[0], "/opt/homebrew/bin/llama-server");
   assert.match(args.join(" "), /-a local\/qwen-balanced/);
   assert.match(args.join(" "), /-ngl 0/);
+});
+
+test("startConfiguredLlamacppRuntime derives launch profile without referencing an undefined deps binding", async () => {
+  const spawnCalls = [];
+  const result = await startConfiguredLlamacppRuntime({
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            startWithRouter: true,
+            command: "/opt/homebrew/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            path: "/tmp/qwen.gguf",
+            metadata: { sizeBytes: 24 * 1024 ** 3 }
+          }
+        },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 2048,
+            runtimeProfile: {
+              mode: "auto",
+              preset: "balanced",
+              overrides: {},
+              extraArgs: [],
+              lastKnownGood: null,
+              lastFailure: null
+            }
+          }
+        }
+      }
+    }
+  }, {}, {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl(command, args) {
+      spawnCalls.push([command, args]);
+      return {
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          if (event === "spawn") queueMicrotask(handler);
+        },
+        unref() {}
+      };
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(spawnCalls.length, 1);
+  assert.match(spawnCalls[0][1].join(" "), /-a local\/qwen-balanced/);
 });
 
 test("parseLlamacppValidationOutput detects llama-server support and TurboQuant builds", () => {
