@@ -44,6 +44,9 @@ Open `llr` and use the **Local Models** tab to manage local inference sources al
 - **Native macOS browsing** — use the built-in file picker to choose a single GGUF file, scan a folder recursively for GGUF models, or browse directly to a local `llama-server` binary
 - **Managed + attached model library** — stale or moved files stay visible instead of crashing the app, and can be repaired by locating the file again or removed cleanly
 - **Router-visible local variants** — create friendly model variants with bounded presets, context-window metadata, preload toggles, and Mac unified-memory fit guidance with clearer safe/tight recommendations
+- **Per-variant llama.cpp tuning** — each local variant can store its own runtime profile so balanced, throughput, long-context, low-memory, or custom launch overrides do not fight over one shared global `llama-server` config
+- **Managed per-model runtimes** — the router automatically starts, reuses, and stops the right `llama.cpp` instance for the requested local variant, with stale-runtime cleanup handled internally instead of asking the user to manage separate servers
+- **GGUF size + memory guidance** — Hugging Face search results now show model file size plus estimated runtime memory fit guidance before download, helping choose viable quantizations faster
 - **Alias-ready local routing** — once saved, local variants behave like normal router models and can be used in aliases, capability flags, and fallback chains
 
 For v1, the managed download flow only searches public Hugging Face GGUF files and the fit guidance is tuned for Macs with unified memory.

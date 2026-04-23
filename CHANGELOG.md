@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-04-23
+
+### Added
+- Local `llama.cpp` variants can now persist a per-model runtime profile, including auto-tuned presets and custom launch overrides, so each GGUF variant can run with settings that match its own size and context shape instead of sharing one global `llama-server` startup profile.
+- The Web UI now exposes managed `llama.cpp` runtime health for Local Models, including tracked instance counts, healthy/stale summaries, and persisted runtime-profile data for each saved variant.
+
+### Changed
+- Local variant requests are now resolved through a managed per-variant `llama.cpp` runtime layer that can reuse compatible instances, allocate fallback ports safely, and start the right runtime configuration for the specific model variant without exposing multi-process lifecycle management to the user.
+- Hugging Face GGUF search/download flows now surface file size plus estimated runtime memory guidance directly in the Local Models workflow, making it easier to choose a viable quantization before download.
+
+### Fixed
+- Managed `llama.cpp` runtimes now reconcile stale tracked instances before reuse, avoid reserving dead immediate-exit servers, and drain pending shutdown/startup edges more reliably so local per-model routing does not leave behind stale `llama-server` processes.
+
 ## [2.5.2] - 2026-04-23
 
 ### Fixed
