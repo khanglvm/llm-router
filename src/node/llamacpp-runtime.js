@@ -4,6 +4,8 @@ import { existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { deriveLlamacppLaunchProfile } from "./llamacpp-runtime-profile.js";
 import { createLlamacppManagedRuntimeRegistry } from "./llamacpp-managed-runtime.js";
+import { listListeningPids as listListeningPidsForPort } from "./port-reclaim.js";
+import { stopProcessByPid as stopProcessByPidForRuntime } from "./instance-state.js";
 
 export const LLAMACPP_DEFAULT_HOST = "127.0.0.1";
 export const LLAMACPP_DEFAULT_PORT = 39391;
@@ -19,6 +21,7 @@ const COMMON_SOURCE_BUILD_PATHS = Object.freeze([
   "src/llama.cpp-turboquant/build/bin/llama-server"
 ]);
 const managedLlamacppRuntimeRegistry = createLlamacppManagedRuntimeRegistry();
+let inFlightConfiguredStartCount = 0;
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -49,6 +52,20 @@ function isManagedRuntimeAlive(instance) {
   const child = instance?.child;
   if (!child) return false;
   return child.exitCode === null && child.killed !== true;
+}
+
+function normalizeListeningPidResult(result) {
+  if (Array.isArray(result)) {
+    return result
+      .map((value) => Number(value))
+      .filter((pid) => Number.isInteger(pid) && pid > 0);
+  }
+  if (result && typeof result === "object" && Array.isArray(result.pids)) {
+    return result.pids
+      .map((value) => Number(value))
+      .filter((pid) => Number.isInteger(pid) && pid > 0);
+  }
+  return [];
 }
 
 function readConfiguredLlamacppRuntime(config) {
@@ -250,8 +267,12 @@ async function startConfiguredRuntime(config, {
 } = {}, {
   spawnSyncImpl = spawnSync,
   spawnImpl = spawn,
-  system = undefined
+  system = undefined,
+  listListeningPids = undefined,
+  stopProcessByPid = undefined
 } = {}) {
+  inFlightConfiguredStartCount += 1;
+  try {
   const runtime = readConfiguredLlamacppRuntime(config);
   if (requireAutostart && !runtime.startWithRouter) {
     return { ok: true, skipped: true, reason: "autostart-disabled" };
@@ -286,6 +307,17 @@ async function startConfiguredRuntime(config, {
     port: runtime.port,
     args: args.slice(1)
   });
+  const listListeningPidsFn = typeof listListeningPids === "function"
+    ? listListeningPids
+    : (port) => listListeningPidsForPort(port, { spawnSync: spawnSyncImpl });
+  const stopProcessByPidFn = typeof stopProcessByPid === "function"
+    ? stopProcessByPid
+    : (pid) => stopProcessByPidForRuntime(pid);
+  await managedLlamacppRuntimeRegistry.reconcile({
+    listListeningPids: async (port) => normalizeListeningPidResult(await listListeningPidsFn(port)),
+    stopProcessByPid: async (pid) => stopProcessByPidFn(pid)
+  });
+
   const existing = managedLlamacppRuntimeRegistry
     .snapshot()
     .find((instance) => (
@@ -367,6 +399,9 @@ async function startConfiguredRuntime(config, {
     error(`Failed starting llama.cpp runtime: ${errorMessage}`);
     return { ok: false, errorMessage };
   }
+  } finally {
+    inFlightConfiguredStartCount = Math.max(0, inFlightConfiguredStartCount - 1);
+  }
 }
 
 export async function ensureConfiguredLlamacppRuntimeStarted(config, callbacks = {}, deps = {}) {
@@ -387,6 +422,9 @@ export async function stopManagedLlamacppRuntime({
   line = () => {},
   error = () => {}
 } = {}) {
+  while (inFlightConfiguredStartCount > 0) {
+    await Promise.resolve();
+  }
   if (typeof managedLlamacppRuntimeRegistry.waitForInFlightStarts === "function") {
     await managedLlamacppRuntimeRegistry.waitForInFlightStarts();
   }
@@ -401,8 +439,10 @@ export async function stopManagedLlamacppRuntime({
   for (const instance of instances) {
     try {
       if (instance?.owner === "llm-router" && typeof instance?.child?.kill === "function") {
-        instance.child.kill("SIGTERM");
-        stoppedCount += 1;
+        const killResult = instance.child.kill("SIGTERM");
+        if (killResult !== false) {
+          stoppedCount += 1;
+        }
       }
       if (!isManagedRuntimeAlive(instance)) {
         await managedLlamacppRuntimeRegistry.untrackInstance(instance?.instanceId);

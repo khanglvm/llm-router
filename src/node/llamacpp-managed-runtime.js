@@ -148,8 +148,13 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
     const listListeningPids = resolveListListeningPids(runtimeDeps);
     const stopProcessByPid = resolveStopProcessByPid(runtimeDeps);
     for (const [instanceId, instance] of instances.entries()) {
-      const livePids = await listListeningPids(instance.port).catch(() => []);
-      if (Array.isArray(livePids) && livePids.includes(instance.pid)) continue;
+      const probe = await listListeningPids(instance.port).catch(() => null);
+      const livePids = Array.isArray(probe)
+        ? probe
+        : (probe && typeof probe === "object" && Array.isArray(probe.pids) ? probe.pids : null);
+      const probeFailed = Boolean(probe && typeof probe === "object" && probe.ok === false);
+      if (probeFailed || !Array.isArray(livePids)) continue;
+      if (livePids.includes(instance.pid)) continue;
       if (instance.owner === "llm-router") {
         await stopProcessByPid(instance.pid).catch(() => {});
       }
