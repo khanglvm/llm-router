@@ -119,3 +119,51 @@ test("registry deduplicates concurrent starts for the same variant/profile key",
   assert.equal(spawnCount, 1);
   assert.equal(first.instanceId, second.instanceId);
 });
+
+test("registry does not keep dead immediate-exit runtime tracked or reserve its preferred port", async () => {
+  const spawnedPorts = [];
+  const registry = createLlamacppManagedRuntimeRegistry({
+    spawnRuntime: async ({ variantKey, port }) => {
+      spawnedPorts.push(port);
+      if (variantKey === "dead-first") {
+        return {
+          pid: 7101,
+          host: "127.0.0.1",
+          port,
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          child: { exitCode: 1, killed: false }
+        };
+      }
+      return {
+        pid: 7102,
+        host: "127.0.0.1",
+        port,
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        child: { exitCode: null, killed: false }
+      };
+    },
+    waitForHealthy: async (instance) => ({ ...instance, healthy: true }),
+    listListeningPids: async () => [],
+    stopProcessByPid: async () => {}
+  });
+
+  await assert.rejects(
+    registry.ensureRuntimeForVariant({
+      variantKey: "dead-first",
+      profileHash: "cpu-safe-qwen",
+      launchArgs: ["-m", "/models/qwen-a.gguf", "-ngl", "0"],
+      preferredPort: 39391
+    }),
+    /exited/
+  );
+
+  const recovered = await registry.ensureRuntimeForVariant({
+    variantKey: "healthy-second",
+    profileHash: "cpu-safe-qwen-2",
+    launchArgs: ["-m", "/models/qwen-b.gguf", "-ngl", "0"],
+    preferredPort: 39391
+  });
+
+  assert.equal(recovered.port, 39391);
+  assert.deepEqual(spawnedPorts, [39391, 39391]);
+});

@@ -312,9 +312,23 @@ async function startConfiguredRuntime(config, {
     }, {
       spawnRuntime: async ({ port }) => new Promise((resolve, reject) => {
         let settled = false;
-        const child = spawnImpl(args[0], args.slice(1), {
+        const allocatedArgs = buildLlamacppLaunchArgs({
+          command: runtime.command,
+          host: runtime.host,
+          port,
+          preloadModels,
+          launchProfile
+        });
+        const child = spawnImpl(allocatedArgs[0], allocatedArgs.slice(1), {
           stdio: "ignore"
         });
+        const expectedInstanceId = `${variantKey}:${profileHash}:${port}`;
+        if (child && child.__llamacppManagedExitHookAttached !== true) {
+          child.__llamacppManagedExitHookAttached = true;
+          child.once("exit", () => {
+            void managedLlamacppRuntimeRegistry.untrackInstance(expectedInstanceId);
+          });
+        }
 
         const settleResolve = (value) => {
           if (settled) return;
@@ -335,7 +349,7 @@ async function startConfiguredRuntime(config, {
             command: runtime.command,
             host: runtime.host,
             port,
-            args,
+            args: allocatedArgs,
             baseUrl: `http://${runtime.host}:${port}/v1`
           });
         });
@@ -346,13 +360,6 @@ async function startConfiguredRuntime(config, {
       waitForHealthy: async (instance) => instance
     });
 
-    const managedInstanceId = managedRuntime?.instanceId;
-    if (managedRuntime?.child && managedRuntime.child.__llamacppManagedExitHookAttached !== true) {
-      managedRuntime.child.__llamacppManagedExitHookAttached = true;
-      managedRuntime.child.once("exit", () => {
-        void managedLlamacppRuntimeRegistry.untrackInstance(managedInstanceId);
-      });
-    }
     line(`Started llama.cpp runtime on http://${managedRuntime.host}:${managedRuntime.port}${validation.isTurboQuant ? " (TurboQuant detected)" : ""}.`);
     return { ok: true, runtime: managedRuntime, validation };
   } catch (spawnError) {

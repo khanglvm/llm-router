@@ -297,7 +297,7 @@ llama-server build 9999
     port: 39391
   };
 
-  await startConfiguredLlamacppRuntime({
+  const firstStart = await startConfiguredLlamacppRuntime({
     metadata: {
       localModels: {
         runtime: { llamacpp: baseRuntime },
@@ -320,7 +320,7 @@ llama-server build 9999
     }
   }, {}, makeDeps(7001));
 
-  await startConfiguredLlamacppRuntime({
+  const secondStart = await startConfiguredLlamacppRuntime({
     metadata: {
       localModels: {
         runtime: { llamacpp: baseRuntime },
@@ -347,6 +347,104 @@ llama-server build 9999
   assert.equal(stopped.ok, true);
   assert.equal(stopped.stoppedCount, 2);
   assert.deepEqual(killed.sort(), [7001, 7002]);
+});
+
+test("startConfiguredLlamacppRuntime spawns incompatible runtimes with allocated fallback port args", async () => {
+  await stopManagedLlamacppRuntime();
+  const spawnCalls = [];
+  const baseDeps = {
+    spawnSyncImpl() {
+      return {
+        stdout: `
+llama-server build 9999
+  --host HOST
+  --port PORT
+-m,    --model FNAME
+`,
+        stderr: ""
+      };
+    },
+    spawnImpl(command, args) {
+      spawnCalls.push([command, args]);
+      return {
+        pid: 8100 + spawnCalls.length,
+        exitCode: null,
+        killed: false,
+        once(event, handler) {
+          if (event === "spawn") queueMicrotask(handler);
+        },
+        unref() {},
+        kill() {
+          this.killed = true;
+          this.exitCode = 0;
+          return true;
+        }
+      };
+    }
+  };
+
+  const baseRuntime = {
+    startWithRouter: true,
+    command: "/opt/homebrew/bin/llama-server",
+    host: "127.0.0.1",
+    port: 39391
+  };
+
+  const firstStart = await startConfiguredLlamacppRuntime({
+    metadata: {
+      localModels: {
+        runtime: { llamacpp: baseRuntime },
+        library: {
+          "base-qwen-a": { id: "base-qwen-a", path: "/tmp/qwen-a.gguf" }
+        },
+        variants: {
+          "qwen-balanced": {
+            id: "local/qwen-balanced",
+            key: "qwen-balanced",
+            baseModelId: "base-qwen-a",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 4096,
+            runtimeProfile: { mode: "auto", preset: "balanced", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  }, {}, baseDeps);
+
+  const secondStart = await startConfiguredLlamacppRuntime({
+    metadata: {
+      localModels: {
+        runtime: { llamacpp: baseRuntime },
+        library: {
+          "base-qwen-b": { id: "base-qwen-b", path: "/tmp/qwen-b.gguf" }
+        },
+        variants: {
+          "qwen-throughput": {
+            id: "local/qwen-throughput",
+            key: "qwen-throughput",
+            baseModelId: "base-qwen-b",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            contextWindow: 16384,
+            runtimeProfile: { mode: "auto", preset: "throughput", overrides: {}, extraArgs: [], lastKnownGood: null, lastFailure: null }
+          }
+        }
+      }
+    }
+  }, {}, baseDeps);
+
+  const allocatedSecondPort = Number(secondStart?.runtime?.port);
+  assert.equal(spawnCalls.length, 2);
+  assert.match(spawnCalls[0][1].join(" "), /--port 39391/);
+  assert.equal(firstStart.ok, true);
+  assert.equal(secondStart.ok, true);
+  assert.notEqual(allocatedSecondPort, 39391);
+  assert.match(spawnCalls[1][1].join(" "), new RegExp(`--port ${allocatedSecondPort}`));
+
+  await stopManagedLlamacppRuntime();
 });
 
 test("parseLlamacppValidationOutput detects llama-server support and TurboQuant builds", () => {

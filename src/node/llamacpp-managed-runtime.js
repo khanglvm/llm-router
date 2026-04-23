@@ -43,6 +43,11 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
     return true;
   }
 
+  function isChildAlive(child) {
+    if (!child) return true;
+    return child.exitCode === null && child.killed !== true;
+  }
+
   function normalizeRuntimePort(value, fallback = null) {
     const parsed = Number(value);
     if (!Number.isInteger(parsed) || parsed < MIN_PORT || parsed > MAX_PORT) return fallback;
@@ -56,6 +61,7 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
   function buildReservedPorts() {
     const reserved = new Set();
     for (const instance of instances.values()) {
+      if (!isChildAlive(instance?.child)) continue;
       const port = normalizeRuntimePort(instance?.port);
       if (port !== null) reserved.add(port);
     }
@@ -64,6 +70,14 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
       if (port !== null) reserved.add(port);
     }
     return reserved;
+  }
+
+  function pruneDeadInstances() {
+    for (const [instanceId, instance] of instances.entries()) {
+      if (!isChildAlive(instance?.child)) {
+        instances.delete(instanceId);
+      }
+    }
   }
 
   function allocatePort(preferredPort) {
@@ -86,6 +100,7 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
     const spawnRuntime = resolveSpawnRuntime(runtimeDeps);
     const waitForHealthy = resolveWaitForHealthy(runtimeDeps);
     const compatibilityKey = buildCompatibilityKey(variantKey, profileHash);
+    pruneDeadInstances();
 
     for (const instance of instances.values()) {
       if (
@@ -107,6 +122,9 @@ export function createLlamacppManagedRuntimeRegistry(deps = {}) {
       const spawned = await spawnRuntime({ variantKey, profileHash, launchArgs, port });
       const healthy = await waitForHealthy(spawned);
       const assignedPort = normalizeRuntimePort(healthy?.port, port);
+      if (!isChildAlive(healthy?.child)) {
+        throw new Error("Managed runtime exited before becoming healthy.");
+      }
       const instance = {
         instanceId: `${variantKey}:${profileHash}:${assignedPort}`,
         owner: "llm-router",
