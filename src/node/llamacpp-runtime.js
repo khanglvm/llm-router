@@ -422,6 +422,13 @@ export async function startConfiguredLlamacppRuntime(config, callbacks = {}, dep
   }, deps);
 }
 
+export function getManagedLlamacppRuntimeSnapshot() {
+  return managedLlamacppRuntimeRegistry.snapshot().map((instance) => {
+    const { child: _child, ...rest } = instance || {};
+    return JSON.parse(JSON.stringify(rest));
+  });
+}
+
 export async function stopManagedLlamacppRuntime({
   line = () => {},
   error = () => {}

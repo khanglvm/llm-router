@@ -65,6 +65,7 @@ import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaS
 import { browseForLocalModelPath, scanLocalModelPath } from "./local-model-browser.js";
 import {
   detectLlamacppCandidates,
+  getManagedLlamacppRuntimeSnapshot,
   startConfiguredLlamacppRuntime,
   stopManagedLlamacppRuntime,
   validateLlamacppCommand
@@ -868,6 +869,10 @@ function routeSnapshotDocument(configState) {
   return configState.parseError ? null : (configState.normalizedConfig || buildDefaultConfigObject());
 }
 
+function isObjectRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function readConfiguredLlamacppRuntime(config = {}) {
   const runtime = config?.metadata?.localModels?.runtime?.llamacpp;
   if (!runtime || typeof runtime !== "object") {
@@ -895,15 +900,44 @@ function readConfiguredLlamacppRuntime(config = {}) {
   };
 }
 
-function buildLlamacppRuntimePayload(runtime = {}, validation = {}, candidates = []) {
+function buildLlamacppRuntimePayload(runtime = {}, validation = {}, candidates = [], registrySnapshot = []) {
   const selectedCommand = String(runtime.selectedCommand || runtime.manualCommand || runtime.command || "").trim();
+  const runtimeInstances = Array.isArray(registrySnapshot) ? registrySnapshot : [];
+  const healthyInstances = runtimeInstances.filter((entry) => entry?.healthy === true);
   return {
     ...runtime,
     selectedCommand,
     selectedDirectory: selectedCommand ? path.dirname(selectedCommand) : "",
+    managedInstanceCount: runtimeInstances.length,
+    healthyInstanceCount: healthyInstances.length,
+    staleRuntimeCount: runtimeInstances.filter((entry) => entry?.healthy !== true).length,
+    instances: runtimeInstances,
     ...(validation && typeof validation === "object" ? validation : {}),
     candidates
   };
+}
+
+function buildRouteSnapshotDocument(configState, registrySnapshot = []) {
+  const document = routeSnapshotDocument(configState);
+  if (!isObjectRecord(document)) return document;
+
+  const runtimeInstances = Array.isArray(registrySnapshot) ? registrySnapshot : [];
+  if (!isObjectRecord(document.metadata?.localModels) && runtimeInstances.length === 0) {
+    return document;
+  }
+
+  const nextDocument = JSON.parse(JSON.stringify(document));
+  if (!isObjectRecord(nextDocument.metadata)) nextDocument.metadata = {};
+  if (!isObjectRecord(nextDocument.metadata.localModels)) nextDocument.metadata.localModels = {};
+  if (!isObjectRecord(nextDocument.metadata.localModels.runtime)) nextDocument.metadata.localModels.runtime = {};
+
+  nextDocument.metadata.localModels.runtime.llamacpp = buildLlamacppRuntimePayload(
+    readConfiguredLlamacppRuntime(nextDocument),
+    {},
+    [],
+    runtimeInstances
+  );
+  return nextDocument;
 }
 
 function updateLlamacppRuntimeConfig(config = {}, runtimePatch = {}) {
@@ -1011,6 +1045,9 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   const stopManagedLlamacppRuntimeFn = typeof deps.stopManagedLlamacppRuntime === "function"
     ? deps.stopManagedLlamacppRuntime
     : (callbacks = {}) => stopManagedLlamacppRuntime(callbacks);
+  const getManagedLlamacppRuntimeSnapshotFn = typeof deps.getManagedLlamacppRuntimeSnapshot === "function"
+    ? deps.getManagedLlamacppRuntimeSnapshot
+    : getManagedLlamacppRuntimeSnapshot;
   const validateLlamacppCommandFn = typeof deps.validateLlamacppCommand === "function"
     ? deps.validateLlamacppCommand
     : validateLlamacppCommand;
@@ -2460,6 +2497,24 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
   let routerRestartPromise = null;
 
+  async function readManagedLlamacppRuntimeSnapshot() {
+    try {
+      const snapshot = await Promise.resolve(getManagedLlamacppRuntimeSnapshotFn());
+      return Array.isArray(snapshot) ? snapshot : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function buildManagedLlamacppRuntimePayload(runtime = {}, validation = {}, candidates = []) {
+    return buildLlamacppRuntimePayload(
+      runtime,
+      validation,
+      candidates,
+      await readManagedLlamacppRuntimeSnapshot()
+    );
+  }
+
   async function restartManagedRouterWithSettings(settings, {
     reason = "Restarting managed router.",
     configStateOverride = null
@@ -2515,6 +2570,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const claudeCodeGlobal = await readClaudeCodeGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const factoryDroidGlobal = await readFactoryDroidGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const webSearch = await readWebSearchState(configState.normalizedConfig).catch(() => null);
+    const managedLlamacppRegistrySnapshot = await readManagedLlamacppRuntimeSnapshot();
     const ollamaConfig = configState.normalizedConfig?.ollama;
     const ollamaBaseUrl = ollamaConfig?.baseUrl || "http://localhost:11434";
     const ollamaInstallation = detectOllamaInstallation();
@@ -2537,7 +2593,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       },
       config: {
         ...configState.summary,
-        document: routeSnapshotDocument(configState),
+        document: buildRouteSnapshotDocument(configState, managedLlamacppRegistrySnapshot),
         localServer: configLocalServer
       },
       router: routerSnapshot,
@@ -3408,7 +3464,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         });
 
         sendJson(res, 200, {
-          runtime: buildLlamacppRuntimePayload(configuredRuntime, {}, hydratedCandidates)
+          runtime: await buildManagedLlamacppRuntimePayload(configuredRuntime, {}, hydratedCandidates)
         });
         return;
       }
@@ -3435,7 +3491,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         if (!validation?.ok) {
           sendJson(res, 400, {
             error: validation?.errorMessage || `Failed validating llama.cpp runtime '${command}'.`,
-            runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(configState.rawConfig || {}), validation)
+            runtime: await buildManagedLlamacppRuntimePayload(readConfiguredLlamacppRuntime(configState.rawConfig || {}), validation)
           });
           return;
         }
@@ -3451,7 +3507,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const configuredRuntime = readConfiguredLlamacppRuntime(savedConfig || {});
         sendJson(res, 200, {
           ok: true,
-          runtime: buildLlamacppRuntimePayload(configuredRuntime, {
+          runtime: await buildManagedLlamacppRuntimePayload(configuredRuntime, {
             ...validation,
             status: configuredRuntime.status || "stopped"
           })
@@ -3477,7 +3533,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         });
         sendJson(res, 200, {
           ok: true,
-          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}))
+          runtime: await buildManagedLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}))
         });
         return;
       }
@@ -3523,7 +3579,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         });
         sendJson(res, 200, {
           ok: true,
-          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
+          runtime: await buildManagedLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
             ...(validation && typeof validation === "object" ? validation : {}),
             status: "running"
           })
@@ -3559,7 +3615,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         });
         sendJson(res, 200, {
           ok: true,
-          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
+          runtime: await buildManagedLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
             status: "stopped"
           })
         });

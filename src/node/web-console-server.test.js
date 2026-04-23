@@ -556,6 +556,64 @@ test("web console state exposes local model runtime, library, and variant metada
   }
 });
 
+test("GET /api/state includes llama.cpp managed instance counts and stale runtime summary", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/opt/homebrew/bin/llama-server",
+            status: "running",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    getManagedLlamacppRuntimeSnapshot: () => ([
+      {
+        instanceId: "qwen-balanced:hash:39391",
+        variantKey: "qwen-balanced",
+        profileHash: "hash",
+        healthy: true,
+        host: "127.0.0.1",
+        port: 39391,
+        baseUrl: "http://127.0.0.1:39391/v1"
+      },
+      {
+        instanceId: "qwen-throughput:hash:39392",
+        variantKey: "qwen-throughput",
+        profileHash: "hash",
+        healthy: false,
+        host: "127.0.0.1",
+        port: 39392,
+        baseUrl: "http://127.0.0.1:39392/v1"
+      }
+    ])
+  });
+
+  try {
+    const { response, payload } = await fetchJson(`${server.url}/api/state`);
+    assert.equal(response.status, 200);
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.managedInstanceCount, 2);
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.healthyInstanceCount, 1);
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.staleRuntimeCount, 1);
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.selectedDirectory, "/opt/homebrew/bin");
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.instances.length, 2);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
 test("web console state exposes live AMP web search quota state", async () => {
   const runtime = await makeRuntimeEnv();
   const fixture = await makeTempConfig({
@@ -4507,6 +4565,73 @@ test("POST /api/local-models/variants/save persists a local variant and returns 
     assert.equal(saved.payload.ok, true);
     assert.equal(saved.payload.variants["qwen-balanced"].id, "local/qwen-balanced");
     assert.equal(saved.payload.variants["qwen-balanced"].capacityState, "safe");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/variants/save persists a llama.cpp runtimeProfile", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-managed",
+            path: "/tmp/qwen.gguf",
+            metadata: { sizeBytes: 8 * 1024 ** 3 }
+          }
+        },
+        variants: {}
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    getLocalModelSystemInfo: () => ({
+      platform: "darwin",
+      totalMemoryBytes: 64 * 1024 ** 3,
+      unifiedMemory: true
+    })
+  });
+
+  try {
+    const saved = await fetchJson(`${server.url}/api/local-models/variants/save`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        variant: {
+          key: "qwen-balanced",
+          baseModelId: "base-qwen",
+          id: "local/qwen-balanced",
+          name: "Qwen Balanced",
+          runtime: "llamacpp",
+          enabled: true,
+          contextWindow: 65536,
+          runtimeProfile: {
+            mode: "custom",
+            preset: "cpu-safe",
+            overrides: { gpuLayers: 0, batchSize: 64 },
+            extraArgs: ["--no-warmup"]
+          }
+        }
+      })
+    });
+
+    assert.equal(saved.response.status, 200);
+    assert.equal(saved.payload.variants["qwen-balanced"].runtimeProfile.mode, "custom");
+    assert.equal(saved.payload.variants["qwen-balanced"].runtimeProfile.overrides.gpuLayers, 0);
+    assert.deepEqual(saved.payload.variants["qwen-balanced"].runtimeProfile.extraArgs, ["--no-warmup"]);
+
+    const persisted = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(persisted.metadata.localModels.variants["qwen-balanced"].runtimeProfile.mode, "custom");
+    assert.equal(persisted.metadata.localModels.variants["qwen-balanced"].runtimeProfile.overrides.batchSize, 64);
+    assert.deepEqual(persisted.metadata.localModels.variants["qwen-balanced"].runtimeProfile.extraArgs, ["--no-warmup"]);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
