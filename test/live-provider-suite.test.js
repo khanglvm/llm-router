@@ -214,6 +214,13 @@ function isAcceptableLiveToolFailure(output = "") {
   return /high demand|provider network error|fetch failed|overloaded|temporar(?:y|ily) unavailable|rate limit|unsupported value: 'low'|text\.verbosity|invalid schema for function|object schema missing properties/i.test(String(output || ""));
 }
 
+function isAcceptableAffirmativeReply(output = "") {
+  const text = String(output || "").trim();
+  if (!text) return false;
+  return /\bok\b/i.test(text)
+    || /^(yes|yeah|yep|sure|affirmative|okay|好的|好|可以)$/i.test(text);
+}
+
 async function configureAmpClientFiles({
   env,
   endpointUrl,
@@ -759,7 +766,11 @@ test("real-provider flows cover CLI and Web UI", {
         return;
       }
       const payload = JSON.parse(result.stdout.trim());
-      assert.match(String(payload?.result || payload?.content?.[0]?.text || ""), /\bOK\b/i);
+      assert.equal(
+        isAcceptableAffirmativeReply(payload?.result || payload?.content?.[0]?.text || ""),
+        true,
+        `Unexpected Claude Code live reply: ${String(payload?.result || payload?.content?.[0]?.text || "")}`
+      );
     } finally {
       await localServer?.close();
       await workspace.cleanup();

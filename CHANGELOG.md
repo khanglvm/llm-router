@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-04-23
+
+### Fixed
+- Relaxed the live Claude Code publish smoke check so short affirmative routed replies such as `OK` or `好的` no longer fail `npm publish` when the end-to-end router path is otherwise healthy.
+
 ## [2.5.0] - 2026-04-23
 
 ### Added
