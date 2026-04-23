@@ -16,6 +16,56 @@ function normalizePositiveInteger(value, fallback) {
   return Math.floor(parsed);
 }
 
+const LLAMACPP_PRESET_TUNING = Object.freeze({
+  balanced: Object.freeze({
+    canonicalPreset: "balanced",
+    batchSize: 64,
+    ubatchSize: 16,
+    gpuLayers: { darwin: 99, other: 0 },
+    penaltyRatio: 0.10,
+    noContBatching: false
+  }),
+  "long-context": Object.freeze({
+    canonicalPreset: "long-context",
+    batchSize: 32,
+    ubatchSize: 8,
+    gpuLayers: { darwin: 80, other: 0 },
+    penaltyRatio: 0.16,
+    noContBatching: false
+  }),
+  "low-memory": Object.freeze({
+    canonicalPreset: "low-memory",
+    batchSize: 32,
+    ubatchSize: 8,
+    gpuLayers: { darwin: 0, other: 0 },
+    penaltyRatio: 0.04,
+    noContBatching: true
+  }),
+  "fast-response": Object.freeze({
+    canonicalPreset: "fast-response",
+    batchSize: 16,
+    ubatchSize: 8,
+    gpuLayers: { darwin: 40, other: 0 },
+    penaltyRatio: 0.07,
+    noContBatching: false
+  }),
+  "cpu-safe": Object.freeze({
+    canonicalPreset: "cpu-safe",
+    batchSize: 32,
+    ubatchSize: 8,
+    gpuLayers: { darwin: 0, other: 0 },
+    penaltyRatio: 0.04,
+    noContBatching: true
+  })
+});
+
+function resolveCanonicalPreset(requestedPreset) {
+  const normalizedPreset = normalizeString(requestedPreset).toLowerCase();
+  if (normalizedPreset === "throughput") return LLAMACPP_PRESET_TUNING["fast-response"];
+  if (normalizedPreset === "memory-safe") return LLAMACPP_PRESET_TUNING["low-memory"];
+  return LLAMACPP_PRESET_TUNING[normalizedPreset] || LLAMACPP_PRESET_TUNING.balanced;
+}
+
 export function estimateLlamacppRuntimeBytes({
   sizeBytes = 0,
   contextWindow = 0,
@@ -23,12 +73,8 @@ export function estimateLlamacppRuntimeBytes({
 } = {}) {
   const base = Number(sizeBytes || 0);
   const contextBytes = Number(contextWindow || 0) * 163840;
-  const normalizedPreset = normalizeString(preset) || "balanced";
-  const presetPenalty = normalizedPreset === "throughput"
-    ? Math.floor(base * 0.18)
-    : normalizedPreset === "cpu-safe"
-      ? Math.floor(base * 0.04)
-      : Math.floor(base * 0.1);
+  const tuning = resolveCanonicalPreset(preset);
+  const presetPenalty = Math.floor(base * tuning.penaltyRatio);
   return base + contextBytes + presetPenalty;
 }
 
@@ -37,11 +83,14 @@ export function deriveLlamacppLaunchProfile({
   baseModel,
   system
 } = {}) {
-  const requestedPreset = normalizeString(variant?.runtimeProfile?.preset) || "balanced";
+  const requestedPreset = normalizeString(variant?.preset)
+    || normalizeString(variant?.runtimeProfile?.preset)
+    || "balanced";
   const failureCategory = normalizeString(
     variant?.runtimeProfile?.lastFailure?.category || variant?.runtimeStatus?.lastFailure?.category
   );
-  const preset = failureCategory === "metal-oom" ? "cpu-safe" : requestedPreset;
+  const tuning = resolveCanonicalPreset(failureCategory === "metal-oom" ? "cpu-safe" : requestedPreset);
+  const preset = tuning.canonicalPreset;
   const contextWindow = normalizePositiveInteger(variant?.contextWindow, 2048);
   const overrides = isPlainObject(variant?.runtimeProfile?.overrides) ? variant.runtimeProfile.overrides : {};
   const extraArgs = Array.isArray(variant?.runtimeProfile?.extraArgs)
@@ -49,13 +98,13 @@ export function deriveLlamacppLaunchProfile({
     : [];
   const gpuLayers = Number.isFinite(Number(overrides.gpuLayers))
     ? Math.floor(Number(overrides.gpuLayers))
-    : (preset === "cpu-safe" ? 0 : (system?.platform === "darwin" ? 99 : 0));
+    : (system?.platform === "darwin" ? tuning.gpuLayers.darwin : tuning.gpuLayers.other);
   const batchSize = Number.isFinite(Number(overrides.batchSize))
     ? Math.floor(Number(overrides.batchSize))
-    : (preset === "throughput" ? 256 : 64);
+    : tuning.batchSize;
   const ubatchSize = Number.isFinite(Number(overrides.ubatchSize))
     ? Math.floor(Number(overrides.ubatchSize))
-    : (preset === "throughput" ? 128 : 16);
+    : tuning.ubatchSize;
   const estimatedRuntimeBytes = estimateLlamacppRuntimeBytes({
     sizeBytes: baseModel?.metadata?.sizeBytes,
     contextWindow,
@@ -72,7 +121,7 @@ export function deriveLlamacppLaunchProfile({
     "--no-warmup"
   ];
 
-  if (preset === "cpu-safe") args.push("--no-cont-batching");
+  if (tuning.noContBatching) args.push("--no-cont-batching");
   args.push("-ngl", String(gpuLayers), ...extraArgs);
 
   return {
