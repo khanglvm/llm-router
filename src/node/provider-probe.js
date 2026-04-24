@@ -310,6 +310,15 @@ function isTransientModelRuntimeError(result, message) {
   return patterns.some((pattern) => pattern.test(text));
 }
 
+function isOutputLimitReachedMessage(message) {
+  const text = String(message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("max_tokens") &&
+    (text.includes("output limit") || text.includes("token limit") || text.includes("finish"))
+  );
+}
+
 function isRateLimitResult(result, message) {
   const status = Number(result?.status || 0);
   if (status === 429) return true;
@@ -374,6 +383,15 @@ function classifyModelProbeResult(format, result) {
       confirmed: false,
       outcome: "auth-error",
       message: message || "Authentication failed for this format."
+    };
+  }
+
+  if (isOutputLimitReachedMessage(message)) {
+    return {
+      supported: true,
+      confirmed: true,
+      outcome: "output-limit",
+      message: message || "Request reached model but the probe token budget was too small."
     };
   }
 

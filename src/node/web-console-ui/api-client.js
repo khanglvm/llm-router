@@ -220,3 +220,30 @@ export async function scanLocalModelPath(targetPath) {
     body: JSON.stringify({ path: targetPath })
   });
 }
+
+export async function testQuotaProbe(providerId, config) {
+  return fetchJson(`/api/providers/${encodeURIComponent(providerId)}/quota-probe/test`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(config)
+  });
+}
+
+export async function refreshQuotaProbe(providerId) {
+  return fetchJson(`/api/providers/${encodeURIComponent(providerId)}/quota-probe/refresh`, {
+    method: "POST",
+    headers: JSON_HEADERS
+  });
+}
+
+export async function getQuotaProbeSnapshot(providerId) {
+  return fetchJson(`/api/providers/${encodeURIComponent(providerId)}/quota-probe/snapshot`);
+}
+
+export async function saveQuotaProbeConfig(providerId, quotaProbe) {
+  return fetchJson(`/api/providers/${encodeURIComponent(providerId)}/quota-probe/save`, {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ quotaProbe })
+  });
+}

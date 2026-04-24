@@ -1,5 +1,6 @@
 import { evaluateCandidatesRateLimits, consumeCandidateRateLimits } from "./rate-limits.js";
 import { buildCandidateKey, buildRouteKey } from "./state-store.js";
+import { resolveProbeVerdict, applyQuotaProbeGate } from "./quota-probe.js";
 
 const WEIGHT_SCALE = 100;
 const MAX_WEIGHT_SLOTS = 512;
@@ -199,10 +200,16 @@ function isCooldownOnlyEntry(entry) {
   return reasons.length > 0 && reasons.every((reason) => reason === "cooldown");
 }
 
+function isFallbackTierEntry(entry) {
+  return String(entry?.candidate?.routeTier || "").trim() === "fallback";
+}
+
 async function buildCandidateEntries({
   candidates,
   stateStore,
   rateLimitEvaluations,
+  quotaProbeSnapshots,
+  config,
   now
 }) {
   const entries = [];
@@ -216,9 +223,33 @@ async function buildCandidateEntries({
     const rateLimitEvaluation = rateLimitEvaluations?.get(candidateKey) || null;
     const health = resolveHealthState(candidateState, now);
     const blockedByRateLimits = rateLimitEvaluation ? !rateLimitEvaluation.eligible : false;
+
+    // Quota probe gate
+    const providerId = candidate?.providerId;
+    const providerConfig = (config?.providers || []).find((p) => p.id === providerId);
+    const probeConfig = providerConfig?.quotaProbe;
+    const snapshot = quotaProbeSnapshots?.get(providerId) || null;
+    const probeVerdict = resolveProbeVerdict(snapshot, probeConfig, now);
+
+    let finalEligibleByQuota;
+    let quotaSkipReason = null;
+
+    if (probeConfig?.enabled && probeConfig?.enforce === "gate") {
+      const gate = applyQuotaProbeGate({
+        combinator: probeConfig.combinator,
+        probeAvailable: probeVerdict?.available ?? null,
+        rateLimitEligible: !blockedByRateLimits
+      });
+      finalEligibleByQuota = gate.eligible;
+      quotaSkipReason = gate.skipReason;
+    } else {
+      finalEligibleByQuota = !blockedByRateLimits;
+      quotaSkipReason = blockedByRateLimits ? "quota-exhausted" : null;
+    }
+
     const skipReasons = [];
     if (health.blocked) skipReasons.push("cooldown");
-    if (blockedByRateLimits) skipReasons.push("quota-exhausted");
+    if (quotaSkipReason) skipReasons.push(quotaSkipReason);
 
     entries.push({
       candidate,
@@ -230,7 +261,7 @@ async function buildCandidateEntries({
       remainingCapacityRatio: rateLimitEvaluation?.remainingCapacityRatio ?? 1,
       healthFactor: health.healthFactor,
       openUntil: health.openUntil,
-      eligible: !health.blocked && !blockedByRateLimits,
+      eligible: !health.blocked && finalEligibleByQuota,
       skipReasons
     });
   }
@@ -302,6 +333,7 @@ export async function rankRouteCandidates({
   stateStore,
   config,
   rateLimitEvaluations,
+  quotaProbeSnapshots,
   requestContext,
   now = Date.now()
 }) {
@@ -320,6 +352,8 @@ export async function rankRouteCandidates({
     candidates,
     stateStore,
     rateLimitEvaluations: evaluations,
+    quotaProbeSnapshots,
+    config,
     now: currentTime
   });
   const eligibleEntries = entries
@@ -353,10 +387,18 @@ export async function rankRouteCandidates({
   const rankableEntries = fallbackCooldownEntries.length > 0
     ? fallbackCooldownEntries
     : eligibleEntries;
+  const primaryRankableEntries = rankableEntries.filter((entry) => !isFallbackTierEntry(entry));
+  const fallbackRankableEntries = rankableEntries.filter((entry) => isFallbackTierEntry(entry));
+  const activeRankableEntries = primaryRankableEntries.length > 0
+    ? primaryRankableEntries
+    : fallbackRankableEntries;
+  const inactiveRankableEntries = primaryRankableEntries.length > 0
+    ? fallbackRankableEntries
+    : [];
   const contextAwareGroups = shouldApplyContextAwareOrdering(route, estimatedRequiredTokens)
-    ? partitionEligibleEntriesByContextWindow(rankableEntries, estimatedRequiredTokens)
+    ? partitionEligibleEntriesByContextWindow(activeRankableEntries, estimatedRequiredTokens)
     : {
-        prioritizedEntries: rankableEntries,
+        prioritizedEntries: activeRankableEntries,
         deferredEntries: []
       };
   const ranking = rankEligibleEntries(
@@ -368,6 +410,7 @@ export async function rankRouteCandidates({
   const rankedEntries = [
     ...ranking.orderedEligible,
     ...contextAwareGroups.deferredEntries,
+    ...inactiveRankableEntries,
     ...skippedIneligibleEntries
   ];
 

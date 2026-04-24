@@ -17,6 +17,7 @@ import {
   normalizeFactoryDroidReasoningEffort,
   resolveFactoryDroidRouterModelRef
 } from "../shared/coding-tool-bindings.js";
+import { LOCAL_RUNTIME_PROVIDER_TYPE } from "../runtime/local-models.js";
 
 const BACKUP_SUFFIX = ".llm_router_backup";
 const CODEX_PROVIDER_ID = "llm-router";
@@ -972,9 +973,11 @@ export async function patchClaudeCodeEffortLevel({
 const FACTORY_DROID_ROUTER_MARKER = "_llmRouterManaged";
 const FACTORY_DROID_OPENAI_PROVIDER = "openai";
 const FACTORY_DROID_ANTHROPIC_PROVIDER = "anthropic";
+const FACTORY_DROID_GENERIC_CHAT_COMPLETIONS_PROVIDER = "generic-chat-completion-api";
 const FACTORY_DROID_ROUTER_PROVIDERS = Object.freeze([
   FACTORY_DROID_OPENAI_PROVIDER,
-  FACTORY_DROID_ANTHROPIC_PROVIDER
+  FACTORY_DROID_ANTHROPIC_PROVIDER,
+  FACTORY_DROID_GENERIC_CHAT_COMPLETIONS_PROVIDER
 ]);
 
 function dedupeStrings(values = []) {
@@ -1116,6 +1119,17 @@ function resolveFactoryDroidRouteFormat(modelRef, config = {}, seen = new Set())
 }
 
 function resolveFactoryDroidCustomModelProvider(modelRef, config = {}) {
+  const normalizedModelRef = String(modelRef || "").trim();
+  if (normalizedModelRef.includes("/")) {
+    const separatorIndex = normalizedModelRef.indexOf("/");
+    const providerId = normalizedModelRef.slice(0, separatorIndex).trim();
+    const provider = (Array.isArray(config?.providers) ? config.providers : [])
+      .find((entry) => String(entry?.id || "").trim() === providerId);
+    if (String(provider?.type || "").trim().toLowerCase() === LOCAL_RUNTIME_PROVIDER_TYPE) {
+      return FACTORY_DROID_GENERIC_CHAT_COMPLETIONS_PROVIDER;
+    }
+  }
+
   return mapFactoryDroidFormatToProvider(resolveFactoryDroidRouteFormat(modelRef, config))
     || FACTORY_DROID_OPENAI_PROVIDER;
 }

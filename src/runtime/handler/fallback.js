@@ -524,6 +524,13 @@ export async function classifyFailureResult(result, retryPolicy) {
   };
 }
 
+export function shouldEmitCapErrorTrigger(status, probeConfig) {
+  if (!probeConfig?.enabled || !probeConfig?.refreshTriggers?.onUpstreamError) return false;
+  const triggers = probeConfig.refreshTriggers.onUpstreamError;
+  if (Array.isArray(triggers.statusCodes) && triggers.statusCodes.includes(Number(status))) return true;
+  return false;
+}
+
 export function enrichErrorMessage(error, candidate, isFallback) {
   const prefix = `${candidate.providerId}/${candidate.modelId}`;
   if (isFallback) {

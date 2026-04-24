@@ -15,6 +15,7 @@ import {
   materializeLocalVariantProvider,
   normalizeLocalModelsMetadata
 } from "./local-models.js";
+import { normalizeQuotaProbeConfig } from "./quota-probe.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
@@ -1471,6 +1472,8 @@ function normalizeProvider(provider, index = 0) {
     }))
     .filter(Boolean);
 
+  const quotaProbe = normalizeQuotaProbeConfig(provider.quotaProbe);
+
   const auth = normalizeAuthConfig(provider.auth) || null;
   const authByFormat = provider.authByFormat && typeof provider.authByFormat === "object"
     ? Object.fromEntries(
@@ -1500,7 +1503,8 @@ function normalizeProvider(provider, index = 0) {
     models: normalizedModels,
     rateLimits: normalizedRateLimits,
     metadata: normalizeMetadataObject(provider.metadata),
-    lastProbe: provider.lastProbe && typeof provider.lastProbe === "object" ? provider.lastProbe : undefined
+    lastProbe: provider.lastProbe && typeof provider.lastProbe === "object" ? provider.lastProbe : undefined,
+    quotaProbe
   };
   
   // Add subscription-specific fields
@@ -2229,20 +2233,21 @@ export function resolveProviderUrl(provider, targetFormat, requestKind = undefin
   const baseUrl = sanitizeEndpointUrl(provider?.baseUrlByFormat?.[targetFormat] || provider?.baseUrl || "").replace(/\/+$/, "");
   if (!baseUrl) return "";
   const isVersionedApiRoot = /\/v\d+(?:\.\d+)?$/i.test(baseUrl);
+  const hasVersionedApiPath = /\/v\d+[a-z]*(?:\.\d+)?(?:\/|$)/i.test(baseUrl);
 
   if (targetFormat === FORMATS.OPENAI) {
     if (requestKind === "responses") {
       if (baseUrl.endsWith("/responses")) return baseUrl;
-      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/responses`;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot || hasVersionedApiPath) return `${baseUrl}/responses`;
       return `${baseUrl}/v1/responses`;
     }
     if (requestKind === "completions") {
       if (baseUrl.endsWith("/completions")) return baseUrl;
-      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/completions`;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot || hasVersionedApiPath) return `${baseUrl}/completions`;
       return `${baseUrl}/v1/completions`;
     }
     if (baseUrl.endsWith("/chat/completions")) return baseUrl;
-    if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/chat/completions`;
+    if (baseUrl.endsWith("/v1") || isVersionedApiRoot || hasVersionedApiPath) return `${baseUrl}/chat/completions`;
     return `${baseUrl}/v1/chat/completions`;
   }
 

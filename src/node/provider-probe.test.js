@@ -183,6 +183,43 @@ test("probeProviderEndpointMatrix retries 429 responses with wait before succeed
   assert.ok(progress.some((event) => event.phase === "rate-limit-wait" && event.reason === "rate-limit"));
 });
 
+test("probeProviderEndpointMatrix treats output-limit errors as confirmed model support", async (t) => {
+  const endpoint = "https://output-limit.example/v1";
+
+  installFetchMock(t, ({ url, method, body }) => {
+    if (url === `${endpoint}/models` && method === "GET") {
+      return jsonResponse({ object: "list", data: [{ id: "gpt-5.4" }] });
+    }
+    if (url === `${endpoint}/chat/completions` && method === "POST") {
+      if (body?.model === "__llm_router_probe__") {
+        return jsonResponse({ error: { message: "model not found" } }, { status: 400 });
+      }
+      if (body?.model === "gpt-5.4") {
+        return jsonResponse({
+          error: {
+            message: "Could not finish the message because max_tokens or model output limit was reached. Please try again with higher max_tokens."
+          }
+        }, { status: 400 });
+      }
+    }
+    if (url === `${endpoint}/messages` && method === "POST") {
+      return jsonResponse({ message: "not found" }, { status: 404 });
+    }
+    return jsonResponse({ error: { message: `unhandled ${method} ${url}` } }, { status: 500 });
+  });
+
+  const result = await probeProviderEndpointMatrix({
+    endpoints: [endpoint],
+    models: ["gpt-5.4"],
+    apiKey: "sk-test"
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.models, ["gpt-5.4"]);
+  assert.deepEqual(result.modelSupport, { "gpt-5.4": ["openai"] });
+  assert.deepEqual(result.unresolvedModels, []);
+});
+
 test("probeProviderEndpointMatrix reports partial failure when rate-limit retries are exhausted", async (t) => {
   const endpoint = "https://rate-limit-hard.example/v1";
   let modelAttempts = 0;

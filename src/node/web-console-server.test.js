@@ -4975,3 +4975,79 @@ test("POST /api/local-models/runtime/stop stops a running llama.cpp runtime by p
     await fixture.cleanup();
   }
 });
+
+// ── Quota Probe endpoint tests ─────────────────────────────────────
+
+test("GET quota-probe snapshot returns null for unprobed provider", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/demo/quota-probe/snapshot`);
+    const payload = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(payload.snapshot, null);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST quota-probe refresh returns 400 for provider without quotaProbe", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/demo/quota-probe/refresh`, {
+      method: "POST",
+      headers: { "content-type": "application/json" }
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST quota-probe test returns snapshot result for valid config", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/demo/quota-probe/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "http",
+        capKind: "dollars",
+        http: {
+          method: "GET",
+          url: "https://httpbin.org/status/404",
+          headers: [],
+          timeoutMs: 3000,
+          mapping: {}
+        }
+      })
+    });
+    const payload = await res.json();
+    assert.equal(res.status, 200);
+    assert.ok("snapshot" in payload);
+    assert.equal(typeof payload.latencyMs, "number");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST quota-probe test returns 404 for unknown provider", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/nonexistent/quota-probe/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "http", capKind: "dollars", http: { url: "https://example.com" } })
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});

@@ -83,6 +83,7 @@ import {
   downloadManagedHuggingFaceGguf,
   searchHuggingFaceGgufCandidates
 } from "./huggingface-gguf.js";
+import { createQuotaProbeRunner } from "./quota-probe-runner.js";
 import {
   CONFIG_VERSION,
   DEFAULT_MODEL_ALIAS_ID,
@@ -1034,6 +1035,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     watchBinary: routerWatchBinary !== false,
     requireAuth: routerRequireAuth === true
   };
+
+  const quotaProbeRunner = createQuotaProbeRunner({ fetchImpl: globalThis.fetch });
 
   async function readWebSearchState(config = null) {
     if (!config || typeof config !== "object") return null;
@@ -3030,6 +3033,102 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           syncedFrom: synced.syncedFrom,
           syncedTo: synced.syncedTo
         });
+        return;
+      }
+
+      // ── Quota Probe routes ──────────────────────────────────────────
+      const quotaProbeTestMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/test$/);
+      if (method === "POST" && quotaProbeTestMatch) {
+        const providerId = decodeURIComponent(quotaProbeTestMatch[1]);
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const provider = (configState.normalizedConfig?.providers || []).find((entry) => entry.id === providerId);
+        if (!provider) {
+          sendJson(res, 404, { error: "Provider not found." });
+          return;
+        }
+        const shortcodeCtx = {
+          providerApiKey: resolveProviderApiKey(provider, process.env) || "",
+          providerBaseUrl: provider.baseUrl || "",
+          providerId: provider.id
+        };
+        const probeConfig = {
+          ...(provider.quotaProbe || {}),
+          enabled: true,
+          capKind: body.capKind || provider.quotaProbe?.capKind || "dollars",
+          mode: body.mode || provider.quotaProbe?.mode || "http",
+          http: body.http || provider.quotaProbe?.http,
+          custom: body.custom || provider.quotaProbe?.custom
+        };
+        const tempRunner = createQuotaProbeRunner({ fetchImpl: globalThis.fetch });
+        const now = Date.now();
+        const startMs = now;
+        try {
+          const snapshot = await tempRunner.executeProbe({ providerId, probeConfig, shortcodeCtx, env: process.env, now });
+          const latencyMs = Date.now() - startMs;
+          sendJson(res, 200, { snapshot, raw: snapshot.raw, latencyMs, error: snapshot.error });
+        } finally {
+          tempRunner.dispose();
+        }
+        return;
+      }
+
+      const quotaProbeRefreshMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/refresh$/);
+      if (method === "POST" && quotaProbeRefreshMatch) {
+        const providerId = decodeURIComponent(quotaProbeRefreshMatch[1]);
+        const configState = await readConfigState(configPath);
+        const provider = (configState.normalizedConfig?.providers || []).find((entry) => entry.id === providerId);
+        if (!provider) {
+          sendJson(res, 404, { error: "Provider not found." });
+          return;
+        }
+        if (!provider.quotaProbe?.enabled) {
+          sendJson(res, 400, { error: "Quota probe not enabled for this provider." });
+          return;
+        }
+        const shortcodeCtx = {
+          providerApiKey: resolveProviderApiKey(provider, process.env) || "",
+          providerBaseUrl: provider.baseUrl || "",
+          providerId: provider.id
+        };
+        const snapshot = await quotaProbeRunner.enqueueRefresh({
+          providerId,
+          probeConfig: provider.quotaProbe,
+          shortcodeCtx,
+          env: process.env,
+          bypassCircuit: true
+        });
+        sendJson(res, 200, { snapshot });
+        return;
+      }
+
+      const quotaProbeSnapshotMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/snapshot$/);
+      if (method === "GET" && quotaProbeSnapshotMatch) {
+        const providerId = decodeURIComponent(quotaProbeSnapshotMatch[1]);
+        sendJson(res, 200, { snapshot: quotaProbeRunner.getSnapshot(providerId) });
+        return;
+      }
+
+      const quotaProbeSaveMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/save$/);
+      if (method === "POST" && quotaProbeSaveMatch) {
+        const providerId = decodeURIComponent(quotaProbeSaveMatch[1]);
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, { error: `Config parse error: ${configState.parseError}` });
+          return;
+        }
+        const rawConfig = configState.rawConfig || {};
+        const providerList = Array.isArray(rawConfig.providers) ? rawConfig.providers : [];
+        const providerIndex = providerList.findIndex((entry) => entry?.id === providerId);
+        if (providerIndex === -1) {
+          sendJson(res, 404, { error: "Provider not found." });
+          return;
+        }
+        providerList[providerIndex] = { ...providerList[providerIndex], quotaProbe: body.quotaProbe || null };
+        rawConfig.providers = providerList;
+        const { snapshot } = await writeAndBroadcastConfig(rawConfig, { source: "quota-probe-save" });
+        sendJson(res, 200, { ok: true, snapshot });
         return;
       }
 

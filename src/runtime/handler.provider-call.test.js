@@ -206,6 +206,75 @@ test("makeProviderCall applies configured OpenAI responses hosted web search too
   }
 });
 
+test("makeProviderCall downgrades Responses API to chat completions on versioned OpenAI-compatible providers", { concurrency: false }, async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const body = JSON.parse(String(init.body || "{}"));
+    calls.push({
+      url: String(url),
+      body
+    });
+
+    if (String(url).endsWith("/responses")) {
+      return jsonResponse({
+        error: { message: "Not Found" }
+      }, 404);
+    }
+
+    return jsonResponse({
+      id: "chatcmpl_zai",
+      object: "chat.completion",
+      model: body.model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "ok" },
+          finish_reason: "stop"
+        }
+      ],
+      usage: {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2
+      }
+    });
+  };
+
+  try {
+    const result = await makeProviderCall({
+      body: {
+        model: "gpt-5.4",
+        input: "ping"
+      },
+      sourceFormat: FORMATS.OPENAI,
+      stream: false,
+      candidate: buildOpenAICandidate({
+        id: "zai-coding",
+        name: "Z.AI Coding",
+        baseUrl: "https://api.z.ai/api/coding/paas/v4"
+      }),
+      requestKind: "responses",
+      requestHeaders: new Headers(),
+      env: {}
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(calls.map((entry) => entry.url), [
+      "https://api.z.ai/api/coding/paas/v4/responses",
+      "https://api.z.ai/api/coding/paas/v4/chat/completions"
+    ]);
+    assert.equal(calls[1]?.body?.model, "gpt-5.4");
+    assert.equal(calls[1]?.body?.messages?.[0]?.role, "user");
+
+    const payload = await result.response.json();
+    assert.equal(payload.object, "response");
+    assert.equal(payload.output?.[0]?.content?.[0]?.text, "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("makeProviderCall intercepts native Claude web search locally for non-AMP clients", { concurrency: false }, async () => {
   const calls = [];
   const originalFetch = globalThis.fetch;

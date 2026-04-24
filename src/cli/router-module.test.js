@@ -1887,6 +1887,75 @@ test("set-factory-droid-routing injects every router alias into Factory Droid cu
   assert.equal(factoryDroidSettings.missionModelSettings?.validationWorkerModel, customModelIdsByModelRef.get("chat.plan"));
 });
 
+test("set-factory-droid-routing uses generic chat-completion provider for local llama.cpp routes", async (t) => {
+  const configAction = getConfigAction();
+  const configPath = await createTempConfigFile(t, {
+    ...baseConfigFixture(),
+    masterKey: "gw_local_master",
+    metadata: {
+      localModels: {
+        library: {
+          "qwen3-6-35b-a3b-claude-4-6": {
+            id: "qwen3-6-35b-a3b-claude-4-6",
+            source: "llamacpp-attached",
+            displayName: "Qwen3.6-35B-A3B-Claude-4.6",
+            path: "/Users/tester/models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "local-qwen3-6-35b-a3b-claude-4-6-balanced": {
+            key: "local-qwen3-6-35b-a3b-claude-4-6-balanced",
+            baseModelId: "qwen3-6-35b-a3b-claude-4-6",
+            id: "local/qwen3-6-35b-a3b-claude-4-6-balanced",
+            name: "Qwen3.6-35B-A3B-Claude-4.6 Balanced",
+            runtime: "llamacpp",
+            enabled: true,
+            contextWindow: 200000,
+            availability: "available"
+          }
+        },
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/opt/homebrew/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        }
+      }
+    }
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm-router-factory-droid-local-runtime-"));
+  t.after(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+  const factoryDroidSettingsPath = path.join(tempDir, "settings.json");
+
+  const patchResult = await configAction.run(createConfigContext({
+    operation: "set-factory-droid-routing",
+    config: configPath,
+    "factory-droid-settings-file": factoryDroidSettingsPath,
+    "default-model": "local-models/local/qwen3-6-35b-a3b-claude-4-6-balanced"
+  }));
+
+  assert.equal(patchResult.ok, true);
+  const factoryDroidSettings = JSON.parse(await fs.readFile(factoryDroidSettingsPath, "utf8"));
+  const localEntry = factoryDroidSettings.customModels.find(
+    (entry) => entry.model === "local-models/local/qwen3-6-35b-a3b-claude-4-6-balanced"
+  );
+  assert.ok(localEntry, "local llama.cpp route should be present in customModels");
+  assert.equal(localEntry.provider, "generic-chat-completion-api");
+  assert.match(localEntry.baseUrl || "", /\/openai\/v1$/);
+
+  const statusResult = await configAction.run(createConfigContext({
+    operation: "tool-status",
+    config: configPath,
+    "factory-droid-settings-file": factoryDroidSettingsPath
+  }));
+  assert.equal(statusResult.ok, true);
+  assert.match(String(statusResult.data || ""), /Provider\s+\|\s+generic-chat-completion-api/);
+});
+
 test("set-factory-droid-routing accepts stable llm model ids for Factory bindings", async (t) => {
   const configAction = getConfigAction();
   const configPath = await createTempConfigFile(t, {

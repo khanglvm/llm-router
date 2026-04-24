@@ -69,6 +69,27 @@ function openAISuccess(model = "gpt-4o-mini") {
   });
 }
 
+function openAIResponsesSuccess(model = "gpt-4o-mini") {
+  return jsonPayloadResponse({
+    id: "resp_1",
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    model,
+    output: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "ok" }]
+      }
+    ],
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      total_tokens: 2
+    }
+  });
+}
+
 function claudeSuccess(model = "claude-3-5-haiku") {
   return jsonPayloadResponse({
     id: "msg_1",
@@ -82,6 +103,28 @@ function claudeSuccess(model = "claude-3-5-haiku") {
       input_tokens: 1,
       output_tokens: 1
     }
+  });
+}
+
+function makeOpenAIResponsesRequest(model, {
+  stream = false,
+  headers = undefined,
+  bodyOverrides = undefined
+} = {}) {
+  const payload = {
+    model,
+    input: "Hello",
+    stream,
+    ...(bodyOverrides || {})
+  };
+
+  return new Request("http://router.local/openai/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(headers || {})
+    },
+    body: JSON.stringify(payload)
   });
 }
 
@@ -490,6 +533,66 @@ test("alias fallback targets are used when alias primaries fail", { concurrency:
     assert.deepEqual(calls, [
       "gpt-4o-mini",
       "claude-3-5-haiku"
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("auto alias fallback targets are not scheduled before healthy primaries", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "gpt-5.4",
+    modelAliases: {
+      "gpt-5.4": {
+        strategy: "auto",
+        targets: [{ ref: "rc/gpt-5.5", weight: 1 }],
+        fallbackTargets: [{ ref: "zai-coding/glm-5.1", weight: 1 }]
+      }
+    },
+    providers: [
+      {
+        id: "rc",
+        name: "rc",
+        baseUrl: "https://ramclouds.me",
+        format: "openai",
+        models: [{ id: "gpt-5.5" }]
+      },
+      {
+        id: "zai-coding",
+        name: "Z.AI Coding",
+        baseUrl: "https://api.z.ai/api/coding/paas/v4",
+        format: "openai",
+        models: [{ id: "glm-5.1" }]
+      }
+    ]
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (_url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      return openAIResponsesSuccess(payload.model);
+    };
+
+    const first = await fetchHandler(makeOpenAIResponsesRequest("gpt-5.4"), {});
+    const second = await fetchHandler(makeOpenAIResponsesRequest("gpt-5.4"), {});
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.deepEqual(upstreamModels, [
+      "gpt-5.5",
+      "gpt-5.5"
     ]);
   } finally {
     globalThis.fetch = originalFetch;

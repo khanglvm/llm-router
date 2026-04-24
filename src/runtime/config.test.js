@@ -11,6 +11,7 @@ import {
   listConfiguredModels,
   migrateRuntimeConfig,
   normalizeRuntimeConfig,
+  resolveProviderUrl,
   resolveRequestModel,
   resolveRequestedRoute,
   resolveRouteReference,
@@ -76,6 +77,30 @@ test("normalizeRuntimeConfig migrates legacy defaults into the fixed default ali
   assert.deepEqual(Object.keys(roundTrip.modelAliases), [DEFAULT_MODEL_ALIAS_ID]);
   assert.deepEqual(roundTrip.modelAliases[DEFAULT_MODEL_ALIAS_ID].targets.map((target) => target.ref), ["openrouter/gpt-4o-mini"]);
   assert.deepEqual(roundTrip.providers[0].rateLimits, []);
+});
+
+test("resolveProviderUrl appends OpenAI paths directly for versioned provider API roots", () => {
+  const zaiProvider = {
+    baseUrl: "https://api.z.ai/api/coding/paas/v4",
+    format: FORMATS.OPENAI
+  };
+  const geminiOpenAIProvider = {
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    format: FORMATS.OPENAI
+  };
+
+  assert.equal(
+    resolveProviderUrl(zaiProvider, FORMATS.OPENAI, "chat-completions"),
+    "https://api.z.ai/api/coding/paas/v4/chat/completions"
+  );
+  assert.equal(
+    resolveProviderUrl(zaiProvider, FORMATS.OPENAI, "responses"),
+    "https://api.z.ai/api/coding/paas/v4/responses"
+  );
+  assert.equal(
+    resolveProviderUrl(geminiOpenAIProvider, FORMATS.OPENAI, "chat-completions"),
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+  );
 });
 
 test("normalizeRuntimeConfig upgrades explicit v1 to v2 when v2-only fields are present", () => {

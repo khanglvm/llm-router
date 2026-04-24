@@ -30,6 +30,7 @@ import { ChipInput } from "./chip-input.jsx";
 import { appendRateLimitDraftRow, RateLimitBucketsEditor } from "./rate-limit-editor.jsx";
 import { ProviderModelsEditor } from "./provider-models-editor.jsx";
 import { SummaryChipButton } from "./shared.jsx";
+import { QuotaProbeCard } from "./QuotaProbeCard.jsx";
 
 export function ProviderCard({
   provider,
@@ -373,6 +374,7 @@ export function ProviderCard({
           <TabsList className="w-full justify-start">
             <TabsTrigger value="provider">Provider</TabsTrigger>
             <TabsTrigger value="models">Model list</TabsTrigger>
+            <TabsTrigger value="quota-probe">Quota Probe</TabsTrigger>
           </TabsList>
 
           <TabsContent forceMount value="provider" className={cn("space-y-4 pb-4", editTab !== "provider" ? "hidden" : null)}>
@@ -484,6 +486,17 @@ export function ProviderCard({
               testStateByModel={modelSaveState.modelStates}
               savePhase={modelSaveState.phase}
               saveMessage={modelSaveState.message}
+            />
+          </TabsContent>
+
+          <TabsContent value="quota-probe" className="space-y-4 pb-4">
+            <QuotaProbeCard
+              providerId={provider.id}
+              probeConfig={provider.quotaProbe}
+              snapshot={null}
+              onSave={(probeConfig) => {
+                console.log("Save quota probe config:", probeConfig);
+              }}
             />
           </TabsContent>
         </Tabs>
