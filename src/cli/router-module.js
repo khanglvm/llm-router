@@ -66,6 +66,7 @@ import {
   sanitizeConfigForDisplay,
   validateRuntimeConfig
 } from "../runtime/config.js";
+import { normalizeQuotaProbeConfig } from "../runtime/quota-probe.js";
 import {
   CODEX_SUBSCRIPTION_MODELS,
   CLAUDE_CODE_SUBSCRIPTION_MODELS
@@ -8041,6 +8042,234 @@ async function doSetProviderRateLimits(context) {
   };
 }
 
+function parseProbeHeaders(raw) {
+  if (!raw) return undefined;
+  const str = String(raw).trim();
+  if (!str) return undefined;
+  try {
+    const parsed = JSON.parse(str);
+    if (Array.isArray(parsed)) return parsed;
+    if (typeof parsed === "object" && parsed !== null) {
+      return Object.entries(parsed).map(([key, value]) => ({ key, value: String(value) }));
+    }
+  } catch {
+    // not JSON — ignore
+  }
+  return undefined;
+}
+
+function parseProbeMapping(raw) {
+  if (!raw) return undefined;
+  const str = String(raw).trim();
+  if (!str) return undefined;
+  try {
+    return JSON.parse(str);
+  } catch {
+    return undefined;
+  }
+}
+
+function buildMappingFieldEntry(pathStr, coerceAs) {
+  if (!pathStr) return undefined;
+  return { path: String(pathStr).trim(), as: coerceAs || "number" };
+}
+
+export function setProviderQuotaProbeInConfig(config, { providerId, quotaProbe }) {
+  const next = structuredClone(config);
+  const normalizedProviderId = String(providerId || "").trim();
+  if (!normalizedProviderId) {
+    return { config: next, changed: false, reason: "provider-id is required." };
+  }
+  const provider = (next.providers || []).find((item) => item.id === normalizedProviderId);
+  if (!provider) {
+    return { config: next, changed: false, reason: `Provider '${normalizedProviderId}' not found.` };
+  }
+  const previous = provider.quotaProbe || null;
+  provider.quotaProbe = quotaProbe;
+  const validationErrors = findIntroducedConfigValidationErrors(config, next);
+  if (validationErrors.length > 0) {
+    return { config, changed: false, reason: formatConfigValidationError(validationErrors) };
+  }
+  return {
+    config: next,
+    changed: serializeStable(previous) !== serializeStable(provider.quotaProbe),
+    reason: "",
+    providerId: normalizedProviderId,
+    quotaProbe: provider.quotaProbe
+  };
+}
+
+function buildQuotaProbeReport(providerId, probe) {
+  if (!probe) return `Provider '${providerId}': quota probe disabled.`;
+  const lines = [`Provider '${providerId}': quota probe configured.`];
+  lines.push(`  enabled:    ${probe.enabled}`);
+  lines.push(`  mode:       ${probe.mode}`);
+  lines.push(`  capKind:    ${probe.capKind}`);
+  lines.push(`  combinator: ${probe.combinator}`);
+  lines.push(`  enforce:    ${probe.enforce}`);
+  if (probe.safetyMargin) {
+    lines.push(`  margin:     $${probe.safetyMargin.dollars} or ${probe.safetyMargin.percent}%`);
+  }
+  if (probe.mode === "http" && probe.http) {
+    lines.push(`  url:        ${probe.http.method} ${probe.http.url}`);
+    lines.push(`  timeout:    ${probe.http.timeoutMs}ms`);
+    if (probe.http.headers?.length) {
+      lines.push(`  headers:    ${probe.http.headers.map((h) => h.key).join(", ")}`);
+    }
+  }
+  if (probe.mode === "custom" && probe.custom) {
+    lines.push(`  timeout:    ${probe.custom.timeoutMs}ms`);
+    lines.push(`  source:     ${probe.custom.source.length} chars`);
+  }
+  return lines.join("\n");
+}
+
+async function doSetQuotaProbe(context) {
+  const args = context.args || {};
+  const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
+  const config = await readConfigFile(configPath);
+  const providerId = String(readArg(args, ["provider-id", "providerId"], "") || "").trim();
+
+  if (!providerId) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "provider-id is required." };
+  }
+
+  const provider = config.providers.find((item) => item.id === providerId);
+  if (!provider) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: `Provider '${providerId}' not found.` };
+  }
+
+  const disableProbe = toBoolean(readArg(args, ["disable-quota-probe", "disableQuotaProbe"], false), false);
+  if (disableProbe) {
+    const result = setProviderQuotaProbeInConfig(config, { providerId, quotaProbe: null });
+    if (!result.changed && result.reason) {
+      return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: result.reason };
+    }
+    await writeConfigFile(result.config, configPath);
+    return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: `Provider '${providerId}': quota probe disabled.` };
+  }
+
+  const quotaProbeJsonRaw = readArg(args, ["quota-probe-json", "quotaProbeJson"], undefined);
+  let probeConfig;
+
+  if (quotaProbeJsonRaw) {
+    try {
+      probeConfig = JSON.parse(String(quotaProbeJsonRaw));
+    } catch {
+      return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "quota-probe-json must be valid JSON." };
+    }
+    if (typeof probeConfig !== "object" || probeConfig === null) {
+      return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "quota-probe-json must be a JSON object." };
+    }
+    if (!("enabled" in probeConfig)) probeConfig.enabled = true;
+  } else {
+    const existing = provider.quotaProbe || {};
+    const mode = String(readArg(args, ["probe-mode", "probeMode"], existing.mode || "http") || "http").trim();
+    const capKind = String(readArg(args, ["cap-kind", "capKind"], existing.capKind || "") || "").trim();
+    const combinator = String(readArg(args, ["combinator"], existing.combinator || "AND") || "AND").trim().toUpperCase();
+    const enforce = String(readArg(args, ["enforce"], existing.enforce || "gate") || "gate").trim();
+    const marginDollars = toNumber(readArg(args, ["safety-margin-dollars", "safetyMarginDollars"], existing.safetyMargin?.dollars), 0);
+    const marginPercent = toNumber(readArg(args, ["safety-margin-percent", "safetyMarginPercent"], existing.safetyMargin?.percent), 0);
+
+    if (!capKind) {
+      return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "cap-kind is required (dollars | tokens | requests)." };
+    }
+
+    probeConfig = {
+      enabled: true,
+      capKind,
+      combinator,
+      enforce,
+      mode,
+      safetyMargin: { dollars: marginDollars, percent: marginPercent }
+    };
+
+    if (mode === "http") {
+      const existingHttp = existing.http || {};
+      const url = String(readArg(args, ["probe-url", "probeUrl"], existingHttp.url || "") || "").trim();
+      const method = String(readArg(args, ["probe-method", "probeMethod"], existingHttp.method || "GET") || "GET").trim().toUpperCase();
+      const timeoutMs = toNumber(readArg(args, ["probe-timeout", "probeTimeout"], existingHttp.timeoutMs), undefined);
+      const headersRaw = readArg(args, ["probe-headers", "probeHeaders"], undefined);
+      const bodyRaw = readArg(args, ["probe-body", "probeBody"], undefined);
+
+      if (!url) {
+        return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "probe-url is required for HTTP mode." };
+      }
+
+      const headers = parseProbeHeaders(headersRaw) ?? existingHttp.headers ?? [];
+      const body = bodyRaw !== undefined ? String(bodyRaw) : existingHttp.body;
+
+      const mappingJsonRaw = readArg(args, ["probe-mapping", "probeMapping"], undefined);
+      let mapping;
+      if (mappingJsonRaw) {
+        mapping = parseProbeMapping(mappingJsonRaw);
+        if (!mapping) {
+          return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "probe-mapping must be valid JSON." };
+        }
+      } else {
+        const existingMapping = existingHttp.mapping || {};
+        const usedPath = readArg(args, ["probe-mapping-used", "probeMappingUsed"], undefined);
+        const limitPath = readArg(args, ["probe-mapping-limit", "probeMappingLimit"], undefined);
+        const remainingPath = readArg(args, ["probe-mapping-remaining", "probeMappingRemaining"], undefined);
+        const resetAtPath = readArg(args, ["probe-mapping-reset-at", "probeMappingResetAt"], undefined);
+        const isUnlimitedPath = readArg(args, ["probe-mapping-is-unlimited", "probeMappingIsUnlimited"], undefined);
+        mapping = { ...existingMapping };
+        if (usedPath) mapping.used = buildMappingFieldEntry(usedPath, "number");
+        if (limitPath) mapping.limit = buildMappingFieldEntry(limitPath, "number");
+        if (remainingPath) mapping.remaining = buildMappingFieldEntry(remainingPath, "number");
+        if (resetAtPath) mapping.resetAt = buildMappingFieldEntry(resetAtPath, "datetime");
+        if (isUnlimitedPath) mapping.isUnlimited = buildMappingFieldEntry(isUnlimitedPath, "boolean");
+      }
+
+      probeConfig.http = { method, url, headers, timeoutMs, mapping };
+      if (body !== undefined) probeConfig.http.body = body;
+    } else if (mode === "custom") {
+      const existingCustom = existing.custom || {};
+      const source = readArg(args, ["custom-source", "customSource"], existingCustom.source || "");
+      const timeoutMs = toNumber(readArg(args, ["probe-timeout", "probeTimeout"], existingCustom.timeoutMs), undefined);
+      if (!source) {
+        return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "custom-source is required for custom mode." };
+      }
+      probeConfig.custom = { source: String(source), timeoutMs };
+    }
+
+    const refreshOnUiOpen = toBoolean(readArg(args, ["refresh-on-ui-open", "refreshOnUiOpen"], undefined), undefined);
+    const refreshOnResetAt = toBoolean(readArg(args, ["refresh-on-reset-at", "refreshOnResetAt"], undefined), undefined);
+    const refreshOnErrorRaw = readArg(args, ["refresh-on-upstream-error", "refreshOnUpstreamError"], undefined);
+
+    if (refreshOnUiOpen !== undefined || refreshOnResetAt !== undefined || refreshOnErrorRaw !== undefined) {
+      const existingTriggers = existing.refreshTriggers || {};
+      probeConfig.refreshTriggers = {
+        onUiOpen: refreshOnUiOpen !== undefined ? refreshOnUiOpen : !!existingTriggers.onUiOpen,
+        onManual: true,
+        onResetAt: refreshOnResetAt !== undefined ? refreshOnResetAt : !!existingTriggers.onResetAt,
+        onUpstreamError: null
+      };
+      if (refreshOnErrorRaw) {
+        const codes = String(refreshOnErrorRaw).split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
+        if (codes.length > 0) probeConfig.refreshTriggers.onUpstreamError = { statusCodes: codes };
+      } else if (existingTriggers.onUpstreamError) {
+        probeConfig.refreshTriggers.onUpstreamError = existingTriggers.onUpstreamError;
+      }
+    }
+  }
+
+  const normalized = normalizeQuotaProbeConfig(probeConfig);
+  if (!normalized) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: "Invalid quota probe config. Ensure enabled=true and capKind is one of: dollars, tokens, requests." };
+  }
+
+  const result = setProviderQuotaProbeInConfig(config, { providerId, quotaProbe: probeConfig });
+  if (!result.changed && result.reason) {
+    return { ok: false, mode: context.mode, exitCode: EXIT_VALIDATION, errorMessage: result.reason };
+  }
+  if (!result.changed) {
+    return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildQuotaProbeReport(providerId, normalized) + "\n(no changes)" };
+  }
+  await writeConfigFile(result.config, configPath);
+  return { ok: true, mode: context.mode, exitCode: EXIT_SUCCESS, data: buildQuotaProbeReport(providerId, normalized) };
+}
+
 async function doSetMasterKey(context) {
   const args = context.args || {};
   const configPath = readArg(args, ["config", "configPath"], getDefaultConfigPath());
@@ -8554,6 +8783,9 @@ async function runConfigAction(context) {
     case "set-model-fallbacks":
     case "set-model-fallback":
       return doSetModelFallbacks(context);
+    case "set-quota-probe":
+    case "set-provider-quota-probe":
+      return doSetQuotaProbe(context);
     case "set-master-key":
       return doSetMasterKey(context);
     case "set-amp-config":
@@ -10575,7 +10807,7 @@ const routerModule = {
     },
     {
       actionId: "config",
-      description: "Config manager for providers, diagnostics, coding-tool routing, AMP, and startup service.",
+      description: "Config manager for providers, diagnostics, coding-tool routing, AMP, quota probes, and startup service.",
       tui: { steps: ["cli-only"] },
       commandline: {
         requiredArgs: [],
@@ -10610,6 +10842,29 @@ const routerModule = {
           "rate-limits",
           "remove-bucket",
           "replace-rate-limits",
+          "probe-mode",
+          "probe-url",
+          "probe-method",
+          "probe-headers",
+          "probe-body",
+          "probe-timeout",
+          "probe-mapping",
+          "probe-mapping-used",
+          "probe-mapping-limit",
+          "probe-mapping-remaining",
+          "probe-mapping-reset-at",
+          "probe-mapping-is-unlimited",
+          "cap-kind",
+          "combinator",
+          "enforce",
+          "safety-margin-dollars",
+          "safety-margin-percent",
+          "custom-source",
+          "quota-probe-json",
+          "disable-quota-probe",
+          "refresh-on-ui-open",
+          "refresh-on-reset-at",
+          "refresh-on-upstream-error",
           "alias-id",
           "alias",
           "targets",
@@ -10681,7 +10936,7 @@ const routerModule = {
         ]
       },
       help: {
-        summary: `Manage providers, diagnostics, config validation, coding-tool routing, model aliases, rate-limit buckets, AMP proxy settings, master key, and OS startup. \`${CLI_COMMAND} config\` opens the web console by default; use \`--operation\` for direct CLI actions.`,
+        summary: `Manage providers, diagnostics, config validation, coding-tool routing, model aliases, rate-limit buckets, quota probes (external provider budget monitoring), AMP proxy settings, master key, and OS startup. \`${CLI_COMMAND} config\` opens the web console by default; use \`--operation\` for direct CLI actions.`,
         args: [
           { name: "operation", required: false, description: "Config operation (optional; defaults to a config summary when omitted in direct CLI mode).", example: "--operation=upsert-provider" },
           { name: "provider-id", required: false, description: "Provider id (lowercase letters/numbers/dashes).", example: "--provider-id=openrouter-primary" },
@@ -10718,6 +10973,29 @@ const routerModule = {
           { name: "remove-bucket", required: false, description: "Remove bucket by --bucket-id in set-provider-rate-limits.", example: "--remove-bucket=true" },
           { name: "replace-rate-limits", required: false, description: "Replace all provider buckets with provided entries.", example: "--replace-rate-limits=true" },
           { name: "rate-limits", required: false, description: "Rate-limit bucket JSON object/array for bulk update.", example: "--rate-limits='[{\"id\":\"or-month\",\"models\":[\"all\"],\"requests\":20000,\"window\":{\"unit\":\"month\",\"size\":1}}]'" },
+          { name: "probe-mode", required: false, description: "For set-quota-probe: probe execution mode. 'http' sends an HTTP request to a provider quota/usage endpoint and maps the JSON response to a normalized snapshot. 'custom' runs a sandboxed JS function. Default: http.", example: "--probe-mode=http" },
+          { name: "probe-url", required: false, description: "For set-quota-probe (HTTP mode): the full URL of the provider's quota/usage/subscription API endpoint that returns JSON with usage data. Supports {{providerApiKey}}, {{providerBaseUrl}}, {{providerId}}, and {{env.VAR_NAME}} shortcodes for secret interpolation.", example: "--probe-url=https://ramclouds.me/api/subscription/self" },
+          { name: "probe-method", required: false, description: "For set-quota-probe (HTTP mode): HTTP method. Default: GET.", example: "--probe-method=GET" },
+          { name: "probe-headers", required: false, description: "For set-quota-probe (HTTP mode): request headers as a JSON array of {key,value} objects or a JSON object {key:value}. Use {{providerApiKey}} to interpolate the provider's API key, or {{env.VAR_NAME}} to interpolate environment variables for secrets that differ from the provider API key (e.g. a separate system token).", example: "--probe-headers='[{\"key\":\"Authorization\",\"value\":\"Bearer {{env.RC_TOKEN}}\"},{\"key\":\"New-Api-User\",\"value\":\"{{env.RC_USER}}\"}]'" },
+          { name: "probe-body", required: false, description: "For set-quota-probe (HTTP mode, POST only): request body string. Supports the same {{shortcode}} interpolation as probe-headers.", example: "--probe-body='{\"action\":\"get_usage\"}'" },
+          { name: "probe-timeout", required: false, description: "For set-quota-probe: request timeout in milliseconds. HTTP mode default: 5000 (max 15000). Custom mode default: 2000 (max 10000).", example: "--probe-timeout=10000" },
+          { name: "probe-mapping", required: false, description: "For set-quota-probe (HTTP mode): full JSON mapping object that maps provider API response JSON paths to normalized snapshot fields. Each field has {path, as} where 'path' is a dot-path like '$.data.used_quota' and 'as' is the coercion type. Coercion types: 'number' (numeric), 'dollars-from-cents' (divides by 100), 'boolean', 'datetime' (ISO-8601/epoch/duration), 'raw'. Alternative to individual --probe-mapping-* flags.", example: "--probe-mapping='{\"used\":{\"path\":\"$.data.used\",\"as\":\"number\"},\"limit\":{\"path\":\"$.data.limit\",\"as\":\"number\"}}'" },
+          { name: "probe-mapping-used", required: false, description: "For set-quota-probe (HTTP mode): JSON dot-path in the provider API response to the 'used' quota value (how much has been consumed). Coerced as number. At least 2 of {used, limit, remaining} are required; the third is auto-derived.", example: "--probe-mapping-used=$.data.used_quota" },
+          { name: "probe-mapping-limit", required: false, description: "For set-quota-probe (HTTP mode): JSON dot-path to the 'limit' value (total quota cap). Coerced as number.", example: "--probe-mapping-limit=$.data.quota_limit" },
+          { name: "probe-mapping-remaining", required: false, description: "For set-quota-probe (HTTP mode): JSON dot-path to the 'remaining' value (quota left). Coerced as number.", example: "--probe-mapping-remaining=$.data.remaining_quota" },
+          { name: "probe-mapping-reset-at", required: false, description: "For set-quota-probe (HTTP mode): JSON dot-path to the reset timestamp (when quota resets). Coerced as datetime (auto-detects ISO-8601, epoch seconds, epoch milliseconds, or duration strings like '2h' or 'PT30M').", example: "--probe-mapping-reset-at=$.data.reset_at" },
+          { name: "probe-mapping-is-unlimited", required: false, description: "For set-quota-probe (HTTP mode): JSON dot-path to a boolean indicating unlimited quota. When true, the probe always reports 'available' regardless of used/limit values.", example: "--probe-mapping-is-unlimited=$.data.is_unlimited" },
+          { name: "cap-kind", required: false, description: "For set-quota-probe: the unit of the quota cap reported by the provider. Determines how used/limit/remaining values are interpreted. Values: 'dollars' (monetary budget), 'tokens' (token count), 'requests' (request count).", example: "--cap-kind=dollars" },
+          { name: "combinator", required: false, description: "For set-quota-probe: how the quota probe verdict combines with local rate-limit verdict to decide if a provider is eligible. 'AND' = both must pass (default, safest). 'OR' = either can pass (lenient). 'REPLACE' = probe verdict replaces rate-limit entirely.", example: "--combinator=AND" },
+          { name: "enforce", required: false, description: "For set-quota-probe: enforcement mode. 'gate' = blocks routing when quota exhausted (production use). 'observe' = logs verdict but never blocks (dry-run/testing). Default: gate.", example: "--enforce=gate" },
+          { name: "safety-margin-dollars", required: false, description: "For set-quota-probe: dollar-based safety margin. Provider is considered exhausted when remaining ≤ this value. Applied as max(dollars, limit×percent/100). Default: 0.", example: "--safety-margin-dollars=1" },
+          { name: "safety-margin-percent", required: false, description: "For set-quota-probe: percentage-based safety margin. Provider is considered exhausted when remaining ≤ limit×percent/100. Applied as max(dollars, limit×percent/100). Default: 0.", example: "--safety-margin-percent=2" },
+          { name: "custom-source", required: false, description: "For set-quota-probe (custom mode): JavaScript async function source that runs in a sandboxed VM. Receives ctx object with {fetch, providerApiKey, providerBaseUrl, providerId}. Must return {capKind, used, limit} or {capKind, remaining, limit}. No access to process, require, or globalThis.", example: "--custom-source='export default async function(ctx) { const r = await ctx.fetch(\"https://api.example.com/usage\", {headers:{\"Authorization\":\"Bearer \"+ctx.providerApiKey}}); const d = await r.json(); return {capKind:\"dollars\",used:d.used,limit:d.limit}; }'" },
+          { name: "quota-probe-json", required: false, description: "For set-quota-probe: provide the full quotaProbe config as a single JSON object. Overrides all other probe flags. Useful when the config is complex or pre-built. The object is written directly to the provider's quotaProbe field.", example: "--quota-probe-json='{\"enabled\":true,\"capKind\":\"dollars\",\"mode\":\"http\",\"combinator\":\"AND\",\"enforce\":\"gate\",\"http\":{\"method\":\"GET\",\"url\":\"https://example.com/api/usage\",\"headers\":[{\"key\":\"Authorization\",\"value\":\"Bearer {{providerApiKey}}\"}],\"mapping\":{\"used\":{\"path\":\"$.used\",\"as\":\"number\"},\"limit\":{\"path\":\"$.limit\",\"as\":\"number\"}}}}'" },
+          { name: "disable-quota-probe", required: false, description: "For set-quota-probe: set to true to disable and remove the quota probe config from the provider. The provider will no longer be gated by external quota checks.", example: "--disable-quota-probe=true" },
+          { name: "refresh-on-ui-open", required: false, description: "For set-quota-probe: auto-refresh the quota snapshot when the web console UI is opened. Default: false.", example: "--refresh-on-ui-open=true" },
+          { name: "refresh-on-reset-at", required: false, description: "For set-quota-probe: schedule an automatic refresh at the resetAt timestamp returned by the probe. Useful when the provider reports when the quota window rolls over. Default: false.", example: "--refresh-on-reset-at=true" },
+          { name: "refresh-on-upstream-error", required: false, description: "For set-quota-probe: comma-separated HTTP status codes from upstream provider errors that should trigger a quota probe refresh. Common: 429 (rate limited), 402 (payment required).", example: "--refresh-on-upstream-error=429,402" },
           { name: "format", required: false, description: "Manual format if probe is skipped.", example: "--format=openai" },
           { name: "headers", required: false, description: "Custom provider headers as JSON object (default User-Agent applied when omitted).", example: "--headers={\"User-Agent\":\"Mozilla/5.0\"}" },
           { name: "skip-probe", required: false, description: "Skip live endpoint/model probe.", example: "--skip-probe=true" },
@@ -10795,6 +11073,10 @@ const routerModule = {
           `${CLI_COMMAND} config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-id=openrouter-all-month --bucket-models=all --bucket-requests=20000 --bucket-window=month:1`,
           `${CLI_COMMAND} config --operation=set-provider-rate-limits --provider-id=openrouter --bucket-name="6-hours cap" --bucket-models=all --bucket-requests=600 --bucket-window=hour:6`,
           `${CLI_COMMAND} config --operation=migrate-config --target-version=2 --create-backup=true`,
+          `${CLI_COMMAND} config --operation=set-quota-probe --provider-id=ramclouds --cap-kind=dollars --probe-url=https://ramclouds.me/api/subscription/self --probe-headers='[{"key":"Authorization","value":"Bearer {{env.RC_TOKEN}}"},{"key":"New-Api-User","value":"{{env.RC_USER}}"}]' --probe-mapping-used=$.data.used_quota --probe-mapping-limit=$.data.quota_limit --safety-margin-dollars=1 --combinator=AND --enforce=gate`,
+          `${CLI_COMMAND} config --operation=set-quota-probe --provider-id=openrouter --cap-kind=dollars --probe-url=https://openrouter.ai/api/v1/auth/key --probe-headers='{"Authorization":"Bearer {{providerApiKey}}"}' --probe-mapping-used=$.data.usage --probe-mapping-limit=$.data.limit --refresh-on-upstream-error=429,402`,
+          `${CLI_COMMAND} config --operation=set-quota-probe --provider-id=myapi --cap-kind=tokens --probe-url=https://api.example.com/usage --probe-method=GET --probe-headers='{"Authorization":"Bearer {{providerApiKey}}"}' --probe-mapping-remaining=$.remaining --probe-mapping-limit=$.total --enforce=observe`,
+          `${CLI_COMMAND} config --operation=set-quota-probe --provider-id=ramclouds --disable-quota-probe=true`,
           `${CLI_COMMAND} config --operation=set-model-fallbacks --provider-id=openrouter --model=gpt-4o --fallback-models=anthropic/claude-3-7-sonnet,openrouter/gpt-4.1-mini`,
           `${CLI_COMMAND} config --operation=remove-model --provider-id=openrouter --model=gpt-4o`,
           `${CLI_COMMAND} config --operation=set-amp-config --patch-amp-client-config=true --amp-client-settings-scope=workspace --amp-client-url=${LOCAL_ROUTER_ORIGIN}`,

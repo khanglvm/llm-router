@@ -126,6 +126,13 @@ export function claudeToOpenAIRequest(model, body, stream) {
   // Fix missing tool responses
   fixMissingToolResponses(result.messages);
 
+  // Strip trailing empty assistant message (prefill).
+  // Claude Code sends {"role":"assistant","content":[]} to prefill responses, but OpenAI-
+  // compatible providers backed by Claude reject it with "This model does not support
+  // assistant message prefill."  An empty trailing assistant adds no semantic value in
+  // OpenAI format, so we drop it.
+  stripTrailingEmptyAssistant(result.messages);
+
   // Tools
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = body.tools.map(tool => {
@@ -162,6 +169,27 @@ export function claudeToOpenAIRequest(model, body, stream) {
   }
 
   return result;
+}
+
+function isEmptyAssistantContent(content) {
+  if (content === "" || content === null || content === undefined) return true;
+  if (Array.isArray(content)) {
+    return content.length === 0
+      || content.every((part) =>
+        part?.type === "text" && (typeof part.text !== "string" || !part.text.trim()));
+  }
+  if (typeof content === "string") return !content.trim();
+  return false;
+}
+
+function stripTrailingEmptyAssistant(messages) {
+  while (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    if (last.role !== "assistant") break;
+    if (last.tool_calls?.length) break;
+    if (!isEmptyAssistantContent(last.content)) break;
+    messages.pop();
+  }
 }
 
 /**
