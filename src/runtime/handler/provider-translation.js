@@ -3,7 +3,10 @@ import {
   claudeEventToOpenAIChunks,
   initClaudeToOpenAIState
 } from "../../translator/response/claude-to-openai.js";
-import { finalizeOpenAIToClaudeStream } from "../../translator/response/openai-to-claude.js";
+import {
+  finalizeOpenAIToClaudeStream,
+  normalizeOpenAIUsageToClaude
+} from "../../translator/response/openai-to-claude.js";
 import { passthroughResponseWithCors, withCorsHeaders } from "./http.js";
 
 function normalizeOpenAIContent(content) {
@@ -120,10 +123,7 @@ export function convertOpenAINonStreamToClaude(result, fallbackModel = "unknown"
     content,
     stop_reason: convertOpenAIFinishReason(resolveOpenAINonStreamFinishReason(choice)),
     stop_sequence: null,
-    usage: {
-      input_tokens: result?.usage?.prompt_tokens || 0,
-      output_tokens: result?.usage?.completion_tokens || 0
-    }
+    usage: normalizeOpenAIUsageToClaude(result?.usage)
   };
 }
 

@@ -11,6 +11,7 @@ import {
   listConfiguredModels,
   migrateRuntimeConfig,
   normalizeRuntimeConfig,
+  resolveProviderUrl,
   resolveRequestModel,
   resolveRequestedRoute,
   resolveRouteReference,
@@ -76,6 +77,30 @@ test("normalizeRuntimeConfig migrates legacy defaults into the fixed default ali
   assert.deepEqual(Object.keys(roundTrip.modelAliases), [DEFAULT_MODEL_ALIAS_ID]);
   assert.deepEqual(roundTrip.modelAliases[DEFAULT_MODEL_ALIAS_ID].targets.map((target) => target.ref), ["openrouter/gpt-4o-mini"]);
   assert.deepEqual(roundTrip.providers[0].rateLimits, []);
+});
+
+test("resolveProviderUrl appends OpenAI paths directly for versioned provider API roots", () => {
+  const zaiProvider = {
+    baseUrl: "https://api.z.ai/api/coding/paas/v4",
+    format: FORMATS.OPENAI
+  };
+  const geminiOpenAIProvider = {
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    format: FORMATS.OPENAI
+  };
+
+  assert.equal(
+    resolveProviderUrl(zaiProvider, FORMATS.OPENAI, "chat-completions"),
+    "https://api.z.ai/api/coding/paas/v4/chat/completions"
+  );
+  assert.equal(
+    resolveProviderUrl(zaiProvider, FORMATS.OPENAI, "responses"),
+    "https://api.z.ai/api/coding/paas/v4/responses"
+  );
+  assert.equal(
+    resolveProviderUrl(geminiOpenAIProvider, FORMATS.OPENAI, "chat-completions"),
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+  );
 });
 
 test("normalizeRuntimeConfig upgrades explicit v1 to v2 when v2-only fields are present", () => {
@@ -616,6 +641,50 @@ test("resolveRequestModel prefers an explicit smart alias over the fixed default
   assert.equal(defaultResolved.primary.requestModelId, "openrouter/gpt-4o-mini");
 });
 
+test("resolveRequestModel resolves bare model ids containing brackets (e.g. opus[1m])", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    providers: [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+        format: "openai",
+        models: [
+          { id: "opus[1m]" },
+          { id: "sonnet[500k]", aliases: ["sonnet-half"] }
+        ]
+      }
+    ]
+  }));
+
+  const resolved = resolveRequestModel(config, "opus[1m]", FORMATS.OPENAI);
+  assert.equal(resolved.routeType, "bare-model");
+  assert.equal(resolved.resolvedModel, "opus[1m]");
+  assert.equal(resolved.primary.requestModelId, "openrouter/opus[1m]");
+
+  const aliasResolved = resolveRequestModel(config, "sonnet-half", FORMATS.OPENAI);
+  assert.equal(aliasResolved.routeType, "bare-model");
+  assert.equal(aliasResolved.primary.requestModelId, "openrouter/sonnet[500k]");
+});
+
+test("resolveRequestModel resolves alias ids containing brackets (e.g. fast[1m])", () => {
+  const config = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    modelAliases: {
+      "fast[1m]": {
+        strategy: "ordered",
+        targets: [{ ref: "openrouter/gpt-4o-mini" }]
+      }
+    }
+  }));
+
+  const resolved = resolveRequestModel(config, "fast[1m]", FORMATS.OPENAI);
+  assert.equal(resolved.routeType, "alias");
+  assert.equal(resolved.routeRef, "fast[1m]");
+  assert.equal(resolved.primary.requestModelId, "openrouter/gpt-4o-mini");
+});
+
 test("resolveRequestModel uses probed model formats when saved model formats are stale", () => {
   const config = normalizeRuntimeConfig({
     version: CONFIG_VERSION,
@@ -928,6 +997,68 @@ test("normalizeRuntimeConfig preserves hosted GPT web search routes", () => {
     ],
     interceptInternalSearch: false
   });
+});
+
+test("normalizeRuntimeConfig preserves Claude Code web search provider selection", () => {
+  const normalized = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      providers: [
+        {
+          id: "openrouter/gpt-4o-mini",
+          providerId: "openrouter",
+          model: "gpt-4o-mini"
+        },
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "openrouter/gpt-4o-mini"
+    }
+  }));
+
+  assert.deepEqual(normalized.claudeCode, {
+    webSearchProvider: "openrouter/gpt-4o-mini"
+  });
+});
+
+test("validateRuntimeConfig requires Claude Code web search provider selection to reference a configured webSearch provider", () => {
+  const valid = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "brave"
+    }
+  }));
+  assert.deepEqual(validateRuntimeConfig(valid), []);
+
+  const invalid = normalizeRuntimeConfig(createBaseRawConfig({
+    version: CONFIG_VERSION,
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "openrouter/gpt-4o-mini"
+    }
+  }));
+  assert.deepEqual(validateRuntimeConfig(invalid), [
+    "claudeCode.webSearchProvider 'openrouter/gpt-4o-mini' must reference a configured webSearch provider."
+  ]);
 });
 
 test("normalizeRuntimeConfig lets top-level webSearch override legacy amp.webSearch", () => {

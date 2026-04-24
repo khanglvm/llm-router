@@ -6,6 +6,7 @@ import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server
 
 const DEFAULT_INSTANCE_STATE_FILENAME = ".llm-router.runtime.json";
 const MAX_START_OUTPUT_CHARS = 4000;
+export const RUNTIME_STATE_PATH_ENV = "LLM_ROUTER_RUNTIME_STATE_PATH";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,7 +81,9 @@ function runtimeMatchesStartOptions(runtime, {
     && normalized.requireAuth === normalizeBoolean(requireAuth, false);
 }
 
-export function getRuntimeStatePath() {
+export function getRuntimeStatePath({ env = process.env } = {}) {
+  const override = String(env?.[RUNTIME_STATE_PATH_ENV] || "").trim();
+  if (override) return path.resolve(override);
   return path.join(os.homedir(), DEFAULT_INSTANCE_STATE_FILENAME);
 }
 
@@ -236,6 +239,7 @@ export async function waitForRuntimeMatch(options = {}, deps = {}) {
 
 export function spawnStartProcess({
   cliPath,
+  startCommand = "start-runtime",
   configPath,
   host = FIXED_LOCAL_ROUTER_HOST,
   port = FIXED_LOCAL_ROUTER_PORT,
@@ -253,7 +257,7 @@ export function spawnStartProcess({
 
   const args = [
     finalCliPath,
-    "start",
+    String(startCommand || "start-runtime").trim() || "start-runtime",
     `--config=${configPath}`,
     `--host=${host}`,
     `--port=${port}`,
@@ -287,7 +291,10 @@ export async function startDetachedRouterService(options = {}, deps = {}) {
 
   let child;
   try {
-    child = spawnStartProcessFn(options, {
+    child = spawnStartProcessFn({
+      ...options,
+      startCommand: String(options?.startCommand || "start-runtime").trim() || "start-runtime"
+    }, {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
       unref: false,

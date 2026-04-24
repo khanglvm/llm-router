@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-04-23
+
+### Fixed
+- `yarn dev` now force-reclaims stale dev web-console listeners on startup and restarts matching stale dev routers so the next dev session takes over the sandbox cleanly instead of inheriting the old process.
+
+## [2.5.1] - 2026-04-23
+
+### Fixed
+- Relaxed the live Claude Code publish smoke check so short affirmative routed replies such as `OK` or `好的` no longer fail `npm publish` when the end-to-end router path is otherwise healthy.
+
+## [2.5.0] - 2026-04-23
+
+### Added
+- Local Models can now use a native macOS file/folder picker to attach GGUF files in place, scan a selected folder recursively for GGUF artifacts, and browse directly to a local `llama-server` runtime binary.
+
+### Changed
+- Hugging Face GGUF search results for Local Models now rank quantizations more intelligently, show tighter Mac memory-fit guidance, and call out better long-context download choices for 64 GB Macs.
+- `llama.cpp` runtime detection now searches common local source-build locations in addition to `PATH` and Homebrew installs, and server validation now recognizes more `llama-server` help output variants including TurboQuant builds.
+
+### Fixed
+- OpenAI-to-Claude response translation now preserves Anthropic-compatible usage metadata such as `speed`, `service_tier`, cache counters, and tool-usage fields so Claude Code no longer trips over missing `usage.speed` on routed responses.
+
+## [2.4.1] - 2026-04-19
+
+### Fixed
+- The published production web console bundle now rebuilds before packing so Claude Code shows the shared web-search provider selector added in `2.4.0` instead of serving a stale prebuilt client.
+
+## [2.4.0] - 2026-04-18
+
+### Added
+- Claude Code can now store a router-managed `claudeCode.webSearchProvider` selection, with validation plus Web UI controls for choosing either built-in web search providers or hosted search routes.
+- Native Claude web search and page-fetch tool calls can now be intercepted locally for non-AMP clients, so Claude-compatible traffic can use the router-managed shared web search stack instead of falling back to upstream-native tools.
+- `yarn dev` now exposes a one-click "Sync production config" action that clones the current production config into the dedicated dev config while preserving the dev router's local server settings.
+
+### Fixed
+- `yarn dev` now launches the detached router backend with the runtime start path, so the dedicated dev router port is honored instead of conflicting with the fixed production port.
+- Dev-mode router reclaim now leaves startup-managed production instances alone when reclaiming non-fixed dev ports.
+- The dev terminal and web console now clearly mark when you are operating in the isolated development sandbox.
+
+## [2.3.7] - 2026-04-18
+
+### Fixed
+- Local `llr start` now keeps a fixed-port supervisor in front of the router runtime so CLI and tool traffic can survive backend restarts and upgrades without losing the public router endpoint.
+- `llr update` now upgrades the installed package before asking the live backend to reload, keeping the running router online during the install step and draining in-flight requests before the new version takes over.
+- Requests that arrive during a backend restart window are now deferred and automatically retried through the supervisor instead of failing immediately when the backend socket is briefly unavailable.
+
+## [2.3.6] - 2026-04-18
+
+### Fixed
+- Factory Droid routing now injects every managed alias/provider model as its own router-managed `customModels` entry, writes friendly custom model `displayName` labels for the Droid CLI picker, and stores selected defaults as explicit `custom:llm-*` IDs in `model`, `sessionDefaultSettings.model`, `missionOrchestratorModel`, and `missionModelSettings.*` so Droid resolves the router-managed custom provider instead of falling back to native built-in models.
+
+## [2.3.5] - 2026-04-17
+
+### Fixed
+- Added model-aware reasoning/effort conversion so routed requests automatically fall back to the safest supported effort level for the actual backend model, including GPT-5 Codex/OpenAI targets and Claude Opus 4.6 vs 4.7 targets behind the same alias.
+
+## [2.3.4] - 2026-04-17
+
+### Fixed
+- Updated the live provider suite to exercise RamCloud with `minimax-m2.7` only and switched the Claude Code live alias from `normal` to `default`, matching the generated router config so real-provider publish checks pass again.
+
+## [2.3.3] - 2026-04-17
+
+### Fixed
+- Prevented repeated failed OpenAI `/v1/chat/completions` tool-routing attempts for Claude Code requests on dual-format Claude routes by respecting model format preferences and suppressing noisy re-tries after a successful Claude fallback.
+
+## [2.3.2] - 2026-04-17
+
+### Fixed
+- Web UI provider presets now correctly populate the Endpoints field during add-provider setup when the current value is still empty or still on a prior preset default, while preserving any manually entered endpoint or API key values.
+
 ## [2.3.0] - 2026-03-24
 
 ### Added

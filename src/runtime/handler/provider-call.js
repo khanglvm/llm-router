@@ -21,6 +21,7 @@ import {
 import { maybeRewriteAmpClientResponse } from "./amp-response.js";
 import { applyCachingMapping, mergeCachingHeaders } from "./cache-mapping.js";
 import { applyReasoningEffortMapping } from "./reasoning-effort.js";
+import { stripUnsupportedFields } from "./field-filter.js";
 import { resolveUpstreamTimeoutMs } from "./request.js";
 import { parseJsonSafely } from "./utils.js";
 import { buildTimeoutSignal } from "../../shared/timeout-signal.js";
@@ -35,9 +36,137 @@ import {
   rewriteProviderBodyForAmpWebSearch,
   shouldInterceptAmpWebSearch
 } from "./amp-web-search.js";
+import {
+  buildLargeRequestLogEntry,
+  isLargeRequestLoggingEnabled,
+  measureSerializedRequestBytes,
+  resolveLargeRequestLogThresholdBytes
+} from "./large-request-log.js";
+
+const OPENAI_TOOL_ROUTING_SUPPRESSION_TTL_MS = 30 * 60 * 1000;
+const openAIToolRoutingSuppressionUntil = new Map();
 
 function isSubscriptionProvider(provider) {
   return provider?.type === "subscription";
+}
+
+function normalizeFormatList(values) {
+  return [...new Set(
+    (Array.isArray(values) ? values : [values])
+      .map((value) => String(value || "").trim())
+      .filter((value) => value === FORMATS.OPENAI || value === FORMATS.CLAUDE)
+  )];
+}
+
+function resolveCandidateModel(provider, model, modelId) {
+  if (model && typeof model === "object" && !Array.isArray(model)) {
+    return model;
+  }
+  const normalizedModelId = String(modelId || "").trim();
+  if (!normalizedModelId || !Array.isArray(provider?.models)) return null;
+  return provider.models.find((entry) => String(entry?.id || "").trim() === normalizedModelId) || null;
+}
+
+function getProviderModelSupportedFormats(provider, model, modelId) {
+  const resolvedModel = resolveCandidateModel(provider, model, modelId);
+  const configuredFormats = normalizeFormatList(resolvedModel?.formats || resolvedModel?.format);
+  const resolvedModelId = String(resolvedModel?.id || modelId || "").trim();
+  if (!resolvedModelId) return configuredFormats;
+
+  const preferredFormat = provider?.lastProbe?.modelPreferredFormat?.[resolvedModelId];
+  if (preferredFormat === FORMATS.OPENAI || preferredFormat === FORMATS.CLAUDE) {
+    return [preferredFormat];
+  }
+
+  const probedFormats = normalizeFormatList(provider?.lastProbe?.modelSupport?.[resolvedModelId]);
+  return probedFormats.length > 0 ? probedFormats : configuredFormats;
+}
+
+function getProviderModelPreferredFormat(provider, model, modelId) {
+  const resolvedModel = resolveCandidateModel(provider, model, modelId);
+  const resolvedModelId = String(resolvedModel?.id || modelId || "").trim();
+  if (!resolvedModelId) return "";
+  const preferredFormat = String(provider?.lastProbe?.modelPreferredFormat?.[resolvedModelId] || "").trim();
+  return preferredFormat === FORMATS.OPENAI || preferredFormat === FORMATS.CLAUDE
+    ? preferredFormat
+    : "";
+}
+
+function buildOpenAIToolRoutingSuppressionKey(candidate) {
+  const providerId = String(candidate?.providerId || candidate?.provider?.id || "").trim();
+  const modelId = String(candidate?.modelId || candidate?.model?.id || candidate?.backend || "").trim();
+  if (!providerId || !modelId) return "";
+  return `${providerId}/${modelId}`;
+}
+
+function pruneOpenAIToolRoutingSuppressions(now = Date.now()) {
+  for (const [key, expiresAt] of openAIToolRoutingSuppressionUntil.entries()) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+      openAIToolRoutingSuppressionUntil.delete(key);
+    }
+  }
+}
+
+function isOpenAIToolRoutingSuppressed(candidate, now = Date.now()) {
+  const key = buildOpenAIToolRoutingSuppressionKey(candidate);
+  if (!key) return false;
+  pruneOpenAIToolRoutingSuppressions(now);
+  return Number(openAIToolRoutingSuppressionUntil.get(key)) > now;
+}
+
+function suppressOpenAIToolRouting(candidate, now = Date.now()) {
+  const key = buildOpenAIToolRoutingSuppressionKey(candidate);
+  if (!key) return;
+  openAIToolRoutingSuppressionUntil.set(key, now + OPENAI_TOOL_ROUTING_SUPPRESSION_TTL_MS);
+}
+
+export function resetOpenAIToolRoutingLearningState() {
+  openAIToolRoutingSuppressionUntil.clear();
+}
+
+function queueLargeRequestEvent(onLargeRequestLog, payload) {
+  if (typeof onLargeRequestLog !== "function") return;
+  try {
+    const result = onLargeRequestLog(payload);
+    if (result && typeof result.then === "function") {
+      result.catch(() => {});
+    }
+  } catch {
+  }
+}
+
+function maybeQueueLargeRequestLog({
+  env,
+  onLargeRequestLog,
+  providerBody,
+  serializedBody,
+  providerUrl,
+  candidate,
+  sourceFormat,
+  targetFormat,
+  requestKind,
+  clientType,
+  stream,
+  providerType = "http"
+} = {}) {
+  if (!isLargeRequestLoggingEnabled(env) || typeof onLargeRequestLog !== "function") return;
+  const requestBytes = measureSerializedRequestBytes(serializedBody);
+  const thresholdBytes = resolveLargeRequestLogThresholdBytes(env);
+  if (requestBytes < thresholdBytes) return;
+
+  queueLargeRequestEvent(onLargeRequestLog, buildLargeRequestLogEntry({
+    providerBody,
+    requestBytes,
+    thresholdBytes,
+    providerUrl,
+    candidate,
+    sourceFormat,
+    targetFormat,
+    requestKind,
+    clientType,
+    stream,
+    providerType
+  }));
 }
 
 async function toProviderError(response) {
@@ -97,7 +226,8 @@ async function adaptProviderResponse({
   requestKind,
   requestBody,
   clientType,
-  env
+  env,
+  responsesDowngraded
 }) {
   const buildSuccessResponse = async (resultResponse) => ({
     ok: true,
@@ -110,6 +240,30 @@ async function adaptProviderResponse({
       env
     })
   });
+
+  // Responses API was downgraded to Chat Completions for provider compatibility.
+  // Convert response back: Chat Completions → Claude → Responses API.
+  if (responsesDowngraded) {
+    if (stream) {
+      const claudeStream = handleOpenAIStreamToClaude(response);
+      return buildSuccessResponse(handleClaudeStreamToOpenAIResponses(claudeStream, requestBody, fallbackModel));
+    }
+    const raw = await response.text();
+    const parsed = parseJsonSafely(raw);
+    if (!parsed) {
+      return {
+        ok: false,
+        status: 502,
+        retryable: true,
+        response: jsonResponse({
+          type: "error",
+          error: { type: "api_error", message: "Provider returned invalid JSON." }
+        }, 502)
+      };
+    }
+    const claudeMessage = convertOpenAINonStreamToClaude(parsed, fallbackModel);
+    return buildSuccessResponse(jsonResponse(convertClaudeNonStreamToOpenAIResponses(claudeMessage, requestBody, fallbackModel)));
+  }
 
   if (stream) {
     if (!translate) {
@@ -236,6 +390,9 @@ function normalizeProviderRequestKind(targetFormat, requestKind) {
 
 function shouldPreferOpenAIForClaudeToolCalls({
   provider,
+  model,
+  modelId,
+  candidate,
   sourceFormat,
   targetFormat,
   requestKind,
@@ -243,6 +400,11 @@ function shouldPreferOpenAIForClaudeToolCalls({
 } = {}) {
   if (sourceFormat !== FORMATS.CLAUDE || targetFormat !== FORMATS.CLAUDE) return false;
   if (!hasToolDefinitions(body)) return false;
+  if (candidate && isOpenAIToolRoutingSuppressed(candidate)) return false;
+  const preferredFormat = getProviderModelPreferredFormat(provider, model, modelId);
+  if (preferredFormat === FORMATS.CLAUDE) return false;
+  const modelFormats = getProviderModelSupportedFormats(provider, model, modelId);
+  if (modelFormats.length > 0 && !modelFormats.includes(FORMATS.OPENAI)) return false;
   if (!getProviderFormats(provider).includes(FORMATS.OPENAI)) return false;
   return Boolean(resolveProviderUrl(provider, FORMATS.OPENAI, normalizeProviderRequestKind(FORMATS.OPENAI, requestKind)));
 }
@@ -489,14 +651,22 @@ function buildProviderRequestPlan({
   requestKind,
   requestHeaders,
   interceptAmpWebSearch,
-  stream
+  stream,
+  forceResponsesDowngrade = false
 }) {
   const normalizedRequestKind = normalizeProviderRequestKind(targetFormat, requestKind);
   const translate = needsTranslation(sourceFormat, targetFormat);
 
   let providerBody = { ...body };
+  let responsesDowngraded = false;
   if (translate) {
     providerBody = translateRequest(sourceFormat, targetFormat, candidate.backend, body, stream);
+  } else if (forceResponsesDowngrade) {
+    // Provider confirmed to not support Responses API — downgrade to Chat Completions
+    // via double-hop: Responses API → Claude → Chat Completions.
+    const intermediateBody = translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, candidate.backend, body, stream);
+    providerBody = translateRequest(FORMATS.CLAUDE, FORMATS.OPENAI, candidate.backend, intermediateBody, stream);
+    responsesDowngraded = true;
   }
 
   providerBody.model = candidate.backend;
@@ -513,8 +683,18 @@ function buildProviderRequestPlan({
     sourceFormat,
     targetFormat,
     targetModel: candidate.backend,
-    requestHeaders
+    requestHeaders,
+    capabilities: candidate.model?.capabilities
   });
+
+  if (responsesDowngraded) {
+    // Strip Responses-API-only fields that Chat Completions providers reject.
+    delete providerBody.prompt_cache_key;
+    delete providerBody.store;
+    delete providerBody.include;
+    delete providerBody.text;
+    delete providerBody.service_tier;
+  }
 
   const declaredOpenAIHostedWebSearchToolType = getProviderOpenAIHostedWebSearchToolType(candidate.provider, {
     targetFormat,
@@ -532,11 +712,14 @@ function buildProviderRequestPlan({
     providerBody = rewriteProviderBodyForAmpWebSearch(providerBody, targetFormat, requestKind).providerBody;
   }
 
+  providerBody = stripUnsupportedFields(providerBody, candidate.model?.capabilities);
+
   return {
     targetFormat,
-    requestKind: normalizedRequestKind,
+    requestKind: responsesDowngraded ? undefined : normalizedRequestKind,
     translate,
-    providerBody
+    providerBody,
+    responsesDowngraded
   };
 }
 
@@ -552,7 +735,8 @@ export async function makeProviderCall({
   runtimeConfig,
   stateStore,
   ampContext,
-  runtimeFlags
+  runtimeFlags,
+  onLargeRequestLog
 }) {
   const provider = candidate.provider;
   const targetFormat = candidate.targetFormat;
@@ -565,6 +749,9 @@ export async function makeProviderCall({
 
   const preferOpenAIToolRouting = !isSubscriptionProvider(provider) && shouldPreferOpenAIForClaudeToolCalls({
     provider,
+    model: candidate?.model,
+    modelId: candidate?.modelId,
+    candidate,
     sourceFormat,
     targetFormat,
     requestKind,
@@ -576,8 +763,17 @@ export async function makeProviderCall({
     effectiveBody = { ...body, reasoning_effort: ampContext.presets.reasoningEffort };
   }
 
+  // For Responses API requests to OpenAI-format providers, try the native endpoint first.
+  // If the provider doesn't support /v1/responses (returns 404/400), fall back to a
+  // downgraded Chat Completions plan with double-hop translation.
+  const needsResponsesDowngradeFallback = !isSubscriptionProvider(provider)
+    && sourceFormat === FORMATS.OPENAI
+    && targetFormat === FORMATS.OPENAI
+    && requestKind === "responses";
+
   let activePlan;
   let fallbackPlan = null;
+  let responsesDowngradedPlan = null;
   try {
     activePlan = buildProviderRequestPlan({
       body: effectiveBody,
@@ -599,6 +795,19 @@ export async function makeProviderCall({
         requestHeaders,
         interceptAmpWebSearch,
         stream
+      });
+    }
+    if (needsResponsesDowngradeFallback) {
+      responsesDowngradedPlan = buildProviderRequestPlan({
+        body: effectiveBody,
+        sourceFormat,
+        targetFormat,
+        candidate,
+        requestKind,
+        requestHeaders,
+        interceptAmpWebSearch,
+        stream,
+        forceResponsesDowngrade: true
       });
     }
   } catch (error) {
@@ -651,13 +860,33 @@ export async function makeProviderCall({
         prompt_cache_key: activePlan.providerBody.prompt_cache_key || ampContext.threadId
       };
     }
-    const executeSubscriptionRequest = async (requestBody) => makeSubscriptionProviderCall({
-      provider,
-      body: requestBody,
-      // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
-      stream: subscriptionType === "chatgpt-codex" ? true : Boolean(stream),
-      env
-    });
+    const executeSubscriptionRequest = async (requestBody) => {
+      const requestStream = subscriptionType === "chatgpt-codex" ? true : Boolean(stream);
+      const providerUrl = subscriptionType === "chatgpt-codex"
+        ? "https://chatgpt.com/backend-api/codex/responses"
+        : "https://console.anthropic.com/v1/messages?beta=true";
+      maybeQueueLargeRequestLog({
+        env,
+        onLargeRequestLog,
+        providerBody: requestBody,
+        serializedBody: JSON.stringify(requestBody),
+        providerUrl,
+        candidate,
+        sourceFormat,
+        targetFormat: activePlan.targetFormat,
+        requestKind: activePlan.requestKind,
+        clientType,
+        stream: requestStream,
+        providerType: subscriptionType
+      });
+      return makeSubscriptionProviderCall({
+        provider,
+        body: requestBody,
+        // ChatGPT Codex backend expects stream=true; non-stream responses are reconstructed from SSE.
+        stream: requestStream,
+        env
+      });
+    };
     const subscriptionResult = await executeSubscriptionRequest(activePlan.providerBody);
 
     if (!subscriptionResult?.ok) {
@@ -691,6 +920,7 @@ export async function makeProviderCall({
         runtimeConfig,
         env,
         stateStore,
+        originalBody: body,
         executeProviderRequest: async (followUpBody) => {
           const followUpResult = await executeSubscriptionRequest(followUpBody);
           return followUpResult?.response instanceof Response ? followUpResult.response : null;
@@ -854,11 +1084,26 @@ export async function makeProviderCall({
     const timeoutMs = resolveUpstreamTimeoutMs(env);
     const timeoutControl = buildTimeoutSignal(timeoutMs);
     try {
+      const serializedBody = JSON.stringify(plan.providerBody);
       const init = {
         method: "POST",
         headers,
-        body: JSON.stringify(plan.providerBody)
+        body: serializedBody
       };
+      maybeQueueLargeRequestLog({
+        env,
+        onLargeRequestLog,
+        providerBody: plan.providerBody,
+        serializedBody,
+        providerUrl,
+        candidate,
+        sourceFormat,
+        targetFormat: plan.targetFormat,
+        requestKind: plan.requestKind,
+        clientType,
+        stream,
+        providerType: "http"
+      });
       if (timeoutControl.signal) {
         init.signal = timeoutControl.signal;
       }
@@ -908,6 +1153,9 @@ export async function makeProviderCall({
     try {
       const fallbackResponse = await executeHttpProviderRequest(fallbackPlan);
       if (fallbackResponse instanceof Response && fallbackResponse.ok) {
+        if (preferOpenAIToolRouting) {
+          suppressOpenAIToolRouting(candidate);
+        }
         response = fallbackResponse;
         activePlan = fallbackPlan;
       }
@@ -932,6 +1180,19 @@ export async function makeProviderCall({
       ...activePlan,
       providerBody: retriedOpenAIHostedWebSearch.providerBody
     };
+  }
+
+  // Provider doesn't support native /v1/responses — retry with Chat Completions downgrade.
+  if ((!response || !response.ok) && responsesDowngradedPlan) {
+    try {
+      const downgradedResponse = await executeHttpProviderRequest(responsesDowngradedPlan);
+      if (downgradedResponse instanceof Response && downgradedResponse.ok) {
+        response = downgradedResponse;
+        activePlan = responsesDowngradedPlan;
+      }
+    } catch {
+      // Keep the original failure if the downgraded request also fails.
+    }
   }
 
   if (!response.ok) {
@@ -959,6 +1220,7 @@ export async function makeProviderCall({
       runtimeConfig,
       env,
       stateStore,
+      originalBody: body,
       executeProviderRequest: async (followUpBody) => {
         try {
           return await executeHttpProviderRequest({
@@ -983,6 +1245,7 @@ export async function makeProviderCall({
     requestKind: activePlan.requestKind,
     requestBody: body,
     clientType,
-    env
+    env,
+    responsesDowngraded: activePlan.responsesDowngraded
   });
 }

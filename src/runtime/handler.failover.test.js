@@ -69,6 +69,27 @@ function openAISuccess(model = "gpt-4o-mini") {
   });
 }
 
+function openAIResponsesSuccess(model = "gpt-4o-mini") {
+  return jsonPayloadResponse({
+    id: "resp_1",
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    model,
+    output: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "ok" }]
+      }
+    ],
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      total_tokens: 2
+    }
+  });
+}
+
 function claudeSuccess(model = "claude-3-5-haiku") {
   return jsonPayloadResponse({
     id: "msg_1",
@@ -82,6 +103,28 @@ function claudeSuccess(model = "claude-3-5-haiku") {
       input_tokens: 1,
       output_tokens: 1
     }
+  });
+}
+
+function makeOpenAIResponsesRequest(model, {
+  stream = false,
+  headers = undefined,
+  bodyOverrides = undefined
+} = {}) {
+  const payload = {
+    model,
+    input: "Hello",
+    stream,
+    ...(bodyOverrides || {})
+  };
+
+  return new Request("http://router.local/openai/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(headers || {})
+    },
+    body: JSON.stringify(payload)
   });
 }
 
@@ -499,6 +542,66 @@ test("alias fallback targets are used when alias primaries fail", { concurrency:
   }
 });
 
+test("auto alias fallback targets are not scheduled before healthy primaries", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "gpt-5.4",
+    modelAliases: {
+      "gpt-5.4": {
+        strategy: "auto",
+        targets: [{ ref: "rc/gpt-5.5", weight: 1 }],
+        fallbackTargets: [{ ref: "zai-coding/glm-5.1", weight: 1 }]
+      }
+    },
+    providers: [
+      {
+        id: "rc",
+        name: "rc",
+        baseUrl: "https://ramclouds.me",
+        format: "openai",
+        models: [{ id: "gpt-5.5" }]
+      },
+      {
+        id: "zai-coding",
+        name: "Z.AI Coding",
+        baseUrl: "https://api.z.ai/api/coding/paas/v4",
+        format: "openai",
+        models: [{ id: "glm-5.1" }]
+      }
+    ]
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamModels = [];
+  try {
+    globalThis.fetch = async (_url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamModels.push(payload.model);
+      return openAIResponsesSuccess(payload.model);
+    };
+
+    const first = await fetchHandler(makeOpenAIResponsesRequest("gpt-5.4"), {});
+    const second = await fetchHandler(makeOpenAIResponsesRequest("gpt-5.4"), {});
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.deepEqual(upstreamModels, [
+      "gpt-5.5",
+      "gpt-5.5"
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
 test("streaming request through alias route works", { concurrency: false }, async () => {
   const config = buildConfig({
     modelAliases: {
@@ -851,7 +954,7 @@ test("direct claude->openai routing maps Claude Code reasoning headers to target
   }
 });
 
-for (const modelId of ["gpt-5.2-codex", "gpt-5.3-codex"]) {
+for (const modelId of ["gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4"]) {
   test(`direct claude->openai preserves xhigh effort for ${modelId}`, { concurrency: false }, async () => {
     const config = buildConfig({
       modelAliases: {},
@@ -904,6 +1007,166 @@ for (const modelId of ["gpt-5.2-codex", "gpt-5.3-codex"]) {
     }
   });
 }
+
+for (const modelId of ["gpt-5.3-codex", "gpt-5.4"]) {
+  test(`direct claude->openai downgrades max effort to xhigh for ${modelId}`, { concurrency: false }, async () => {
+    const config = buildConfig({
+      modelAliases: {},
+      defaultModel: `openrouter/${modelId}`,
+      providers: [
+        {
+          id: "openrouter",
+          name: "OpenRouter",
+          baseUrl: "https://openrouter.ai/api/v1",
+          format: "openai",
+          models: [{ id: modelId }]
+        }
+      ]
+    });
+    const store = createMemoryStateStore();
+    const fetchHandler = createFetchHandler({
+      getConfig: async () => config,
+      ignoreAuth: true,
+      stateStore: store
+    });
+
+    const originalFetch = globalThis.fetch;
+    const upstreamBodies = [];
+    try {
+      globalThis.fetch = async (url, init) => {
+        const payload = JSON.parse(String(init?.body || "{}"));
+        upstreamBodies.push({
+          url: String(url),
+          payload
+        });
+        return openAISuccess(payload.model);
+      };
+
+      const response = await fetchHandler(makeClaudeRequest(`openrouter/${modelId}`, {
+        headers: {
+          "x-claude-code-thinking-mode": "max"
+        }
+      }), {});
+      assert.equal(response.status, 200);
+      assert.equal(upstreamBodies.length, 1);
+      assert.ok(upstreamBodies[0].url.includes("/chat/completions"));
+      assert.equal(upstreamBodies[0].payload.model, modelId);
+      assert.deepEqual(upstreamBodies[0].payload.reasoning, { effort: "xhigh" });
+      assert.equal(upstreamBodies[0].payload.reasoning_effort, undefined);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (typeof fetchHandler.close === "function") {
+        await fetchHandler.close();
+      }
+    }
+  });
+}
+
+test("direct openai->claude uses adaptive effort api for opus 4.7", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {},
+    defaultModel: "anthropic/claude-opus-4-7",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-opus-4-7" }]
+      }
+    ]
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamBodies = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamBodies.push({
+        url: String(url),
+        payload
+      });
+      return claudeSuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeOpenAIRequest("anthropic/claude-opus-4-7", {
+      bodyOverrides: {
+        reasoning_effort: "xhigh",
+        max_tokens: 4096
+      }
+    }), {});
+    assert.equal(response.status, 200);
+    assert.equal(upstreamBodies.length, 1);
+    assert.ok(upstreamBodies[0].url.includes("/messages"));
+    assert.equal(upstreamBodies[0].payload.model, "claude-opus-4-7");
+    assert.deepEqual(upstreamBodies[0].payload.output_config, { effort: "xhigh" });
+    assert.deepEqual(upstreamBodies[0].payload.thinking, { type: "adaptive" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("direct openai->claude downgrades xhigh effort to high for opus 4.6", { concurrency: false }, async () => {
+  const config = buildConfig({
+    modelAliases: {},
+    defaultModel: "anthropic/claude-opus-4.6",
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [{ id: "claude-opus-4.6" }]
+      }
+    ]
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamBodies = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamBodies.push({
+        url: String(url),
+        payload
+      });
+      return claudeSuccess(payload.model);
+    };
+
+    const response = await fetchHandler(makeOpenAIRequest("anthropic/claude-opus-4.6", {
+      bodyOverrides: {
+        reasoning_effort: "xhigh",
+        max_tokens: 4096
+      }
+    }), {});
+    assert.equal(response.status, 200);
+    assert.equal(upstreamBodies.length, 1);
+    assert.ok(upstreamBodies[0].url.includes("/messages"));
+    assert.equal(upstreamBodies[0].payload.model, "claude-opus-4.6");
+    assert.deepEqual(upstreamBodies[0].payload.output_config, { effort: "high" });
+    assert.deepEqual(upstreamBodies[0].payload.thinking, { type: "adaptive" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
 
 test("alias round-robin remaps effort to each final routed model format", { concurrency: false }, async () => {
   const config = buildConfig({
@@ -965,6 +1228,80 @@ test("alias round-robin remaps effort to each final routed model format", { conc
       type: "enabled",
       budget_tokens: 3072
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (typeof fetchHandler.close === "function") {
+      await fetchHandler.close();
+    }
+  }
+});
+
+test("alias effort mapping uses the final routed model id instead of the alias name", { concurrency: false }, async () => {
+  const config = buildConfig({
+    defaultModel: "opus-4-6",
+    modelAliases: {
+      "opus-4-6": {
+        strategy: "round-robin",
+        targets: [
+          { ref: "anthropic/claude-opus-4-7" },
+          { ref: "anthropic/claude-opus-4.6" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com",
+        format: "claude",
+        models: [
+          { id: "claude-opus-4-7" },
+          { id: "claude-opus-4.6" }
+        ]
+      }
+    ]
+  });
+  const store = createMemoryStateStore();
+  const fetchHandler = createFetchHandler({
+    getConfig: async () => config,
+    ignoreAuth: true,
+    stateStore: store
+  });
+
+  const originalFetch = globalThis.fetch;
+  const upstreamBodies = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      const payload = JSON.parse(String(init?.body || "{}"));
+      upstreamBodies.push({
+        url: String(url),
+        payload
+      });
+      return claudeSuccess(payload.model);
+    };
+
+    const first = await fetchHandler(makeOpenAIRequest("opus-4-6", {
+      bodyOverrides: {
+        reasoning_effort: "xhigh",
+        max_tokens: 4096
+      }
+    }), {});
+    const second = await fetchHandler(makeOpenAIRequest("opus-4-6", {
+      bodyOverrides: {
+        reasoning_effort: "xhigh",
+        max_tokens: 4096
+      }
+    }), {});
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(upstreamBodies.length, 2);
+
+    assert.equal(upstreamBodies[0].payload.model, "claude-opus-4-7");
+    assert.deepEqual(upstreamBodies[0].payload.output_config, { effort: "xhigh" });
+
+    assert.equal(upstreamBodies[1].payload.model, "claude-opus-4.6");
+    assert.deepEqual(upstreamBodies[1].payload.output_config, { effort: "high" });
   } finally {
     globalThis.fetch = originalFetch;
     if (typeof fetchHandler.close === "function") {

@@ -84,6 +84,9 @@ function resolveModelsUrl(baseUrl, format) {
       return clean.replace(/\/chat\/completions$/, "/models");
     }
     if (clean.endsWith("/v1") || isVersionedApiRoot) return `${clean}/models`;
+    // Handle base URLs with a versioned segment followed by a sub-path,
+    // e.g. https://generativelanguage.googleapis.com/v1beta/openai
+    if (/\/v\d+[a-z]*\/(?!chat\b)\w+$/i.test(clean)) return `${clean}/models`;
     return `${clean}/v1/models`;
   }
 
@@ -191,8 +194,12 @@ function extractModelIds(result) {
   const ids = [];
   for (const item of body.data) {
     if (!item || typeof item !== "object") continue;
-    const id = typeof item.id === "string" ? item.id : (typeof item.name === "string" ? item.name : null);
-    if (id) ids.push(id);
+    let id = typeof item.id === "string" ? item.id : (typeof item.name === "string" ? item.name : null);
+    if (id) {
+      // Strip provider-specific prefixes (e.g., Gemini "models/gemini-*")
+      if (id.startsWith("models/")) id = id.slice(7);
+      ids.push(id);
+    }
   }
   return [...new Set(ids)];
 }
@@ -303,6 +310,15 @@ function isTransientModelRuntimeError(result, message) {
   return patterns.some((pattern) => pattern.test(text));
 }
 
+function isOutputLimitReachedMessage(message) {
+  const text = String(message || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("max_tokens") &&
+    (text.includes("output limit") || text.includes("token limit") || text.includes("finish"))
+  );
+}
+
 function isRateLimitResult(result, message) {
   const status = Number(result?.status || 0);
   if (status === 429) return true;
@@ -367,6 +383,15 @@ function classifyModelProbeResult(format, result) {
       confirmed: false,
       outcome: "auth-error",
       message: message || "Authentication failed for this format."
+    };
+  }
+
+  if (isOutputLimitReachedMessage(message)) {
+    return {
+      supported: true,
+      confirmed: true,
+      outcome: "output-limit",
+      message: message || "Request reached model but the probe token budget was too small."
     };
   }
 
@@ -553,12 +578,14 @@ async function probeOpenAI(baseUrl, apiKey, timeoutMs, extraHeaders = {}) {
     }, timeoutMs);
     details.checks.push({ step: "chat", auth: variant.type, status: chatResult.status, error: chatResult.error || null });
 
-    if (looksOpenAI(chatResult)) {
+    const modelsLooksValid = looksOpenAI(modelsResult) && authLooksValid(modelsResult);
+
+    if (looksOpenAI(chatResult) || modelsLooksValid) {
       details.supported = true;
-      if (authLooksValid(chatResult)) {
+      if (looksOpenAI(chatResult) ? authLooksValid(chatResult) : modelsLooksValid) {
         details.working = true;
         details.auth = { type: variant.type === "x-api-key" ? "x-api-key" : "bearer" };
-        if (looksOpenAI(modelsResult) && authLooksValid(modelsResult)) {
+        if (modelsLooksValid) {
           details.models = extractModelIds(modelsResult);
         }
         return details;
@@ -797,6 +824,61 @@ function pickPreferredFormatForModel(modelId, formats, { providerPreferredFormat
   if (providerPreferredFormat && supported.includes(providerPreferredFormat)) return providerPreferredFormat;
   if (supported.includes(FORMATS.OPENAI)) return FORMATS.OPENAI;
   return supported[0];
+}
+
+/**
+ * Probes a list of models against an OpenAI-compatible endpoint to detect
+ * free-tier availability. Returns a map of modelId -> { freeTier, rpm }.
+ * A model is considered not-free-tier if the response contains "limit: 0"
+ * in a free-tier quota metric.
+ */
+export async function probeFreeTierModels(options) {
+  const baseUrl = String(options?.baseUrl || "").trim().replace(/\/+$/, "");
+  const apiKey = String(options?.apiKey || "").trim();
+  const modelIds = (options?.modelIds || []).map((id) => String(id || "").trim()).filter(Boolean);
+  const timeoutMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 6000;
+
+  if (!baseUrl || !apiKey || modelIds.length === 0) return {};
+
+  const chatUrl = `${baseUrl}/chat/completions`;
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`
+  };
+  const result = {};
+
+  for (const modelId of modelIds) {
+    try {
+      const response = await safeFetchJson(chatUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: modelId,
+          messages: [{ role: "user", content: "hi" }],
+          max_tokens: 1,
+          stream: false
+        })
+      }, timeoutMs);
+
+      const text = response.text || "";
+      const isZeroQuota = /limit:\s*0[,\s]/i.test(text) || text.includes('"limit": 0') || text.includes('"limit":0');
+      const isFreeTierQuota = text.includes("free_tier");
+
+      if (isZeroQuota && isFreeTierQuota) {
+        result[modelId] = { freeTier: false };
+      } else if (response.ok || response.status === 400 || response.status === 404) {
+        result[modelId] = { freeTier: true };
+      } else if (response.status === 429 && !isZeroQuota) {
+        result[modelId] = { freeTier: true };
+      } else {
+        result[modelId] = { freeTier: false };
+      }
+    } catch {
+      result[modelId] = { freeTier: null };
+    }
+  }
+
+  return result;
 }
 
 export async function probeProviderEndpointMatrix(options) {

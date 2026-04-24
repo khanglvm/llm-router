@@ -19,7 +19,12 @@ test("web console dev assets build initial JS and CSS before serving", async () 
     const stylesCss = assets.getStylesCss();
 
     assert.equal(assets.isDevMode, true);
-    assert.match(appJs, /createRoot|react-dom|LLM Router Web|Provider models/);
+    assert.match(appJs, /createRoot|react-dom|LLM Router Web|Provider models|Local Models/);
+    assert.match(appJs, /Ollama/);
+    assert.match(appJs, /llama\.cpp/);
+    assert.doesNotMatch(appJs, /Overview/);
+    assert.doesNotMatch(appJs, /Qwen Local/);
+    assert.doesNotMatch(appJs, /qwen-local-q5/);
     assert.doesNotMatch(appJs, /Waiting for dev bundle/);
     assert.match(stylesCss, /tailwindcss|@layer|--color-background/);
     assert.equal(stylesCss.trim().length > 0, true);

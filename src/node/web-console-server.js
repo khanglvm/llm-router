@@ -1,4 +1,5 @@
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
@@ -12,12 +13,11 @@ import {
   areLocalServerSettingsEqual,
   formatStartupDetail,
   formatStartupLabel,
-  getFixedLocalRouterOrigin,
   readLocalServerSettings
 } from "./local-server-settings.js";
 import { appendActivityLogEntry, clearActivityLogFile, createActivityLogEntry, readActivityLogEntries, resolveActivityLogPath } from "./activity-log.js";
 import { listListeningPids, reclaimPort } from "./port-reclaim.js";
-import { probeProvider, probeProviderEndpointMatrix } from "./provider-probe.js";
+import { probeProvider, probeProviderEndpointMatrix, probeFreeTierModels } from "./provider-probe.js";
 import { installStartup, startupStatus, stopStartup, uninstallStartup } from "./startup-manager.js";
 import { WEB_CONSOLE_CSS, renderWebConsoleHtml } from "./web-console-assets.js";
 import {
@@ -49,10 +49,50 @@ import {
 } from "./coding-tool-config.js";
 import { loginSubscription } from "../runtime/subscription-provider.js";
 import {
+  ollamaCheckConnection,
+  ollamaListModels,
+  ollamaListRunning,
+  ollamaShowModel,
+  ollamaLoadModel,
+  ollamaUnloadModel,
+  ollamaPinModel,
+  ollamaSetKeepAlive,
+  ollamaPullModel,
+  ollamaDeleteModel
+} from "./ollama-client.js";
+import { estimateMaxContext, estimateModelVram, formatBytes } from "./ollama-hardware.js";
+import { detectOllamaInstallation, installOllama, startOllamaServer, stopOllamaServer, isOllamaRunning } from "./ollama-install.js";
+import { browseForLocalModelPath, scanLocalModelPath } from "./local-model-browser.js";
+import {
+  detectLlamacppCandidates,
+  startConfiguredLlamacppRuntime,
+  stopManagedLlamacppRuntime,
+  validateLlamacppCommand
+} from "./llamacpp-runtime.js";
+import {
+  getManagedLocalModelsDir,
+  reconcileLocalModelPaths,
+  registerAttachedLlamacppModel,
+  registerManagedLlamacppModel,
+  removeLocalBaseModel,
+  saveLocalModelVariant
+  ,
+  updateLocalBaseModelPath
+} from "./local-models-service.js";
+import {
+  downloadManagedHuggingFaceGguf,
+  searchHuggingFaceGgufCandidates
+} from "./huggingface-gguf.js";
+import { createQuotaProbeRunner } from "./quota-probe-runner.js";
+import {
   CONFIG_VERSION,
   DEFAULT_MODEL_ALIAS_ID,
   DEFAULT_PROVIDER_USER_AGENT,
+  OLLAMA_KEEP_ALIVE_PATTERN,
+  OLLAMA_PROVIDER_TYPE,
   configHasProvider,
+  normalizeClaudeCodeWebSearchProvider,
+  normalizeOllamaConfig,
   normalizeRuntimeConfig,
   resolveProviderApiKey,
   validateRuntimeConfig
@@ -427,8 +467,17 @@ function formatHostForUrl(host, port) {
   return `[${value}]:${port}`;
 }
 
+function buildManagedRouterOrigin(settings = {}) {
+  const port = Number.isInteger(Number(settings?.port)) ? Number(settings.port) : FIXED_LOCAL_ROUTER_PORT;
+  const configuredHost = normalizeRuntimeHost(settings?.host || FIXED_LOCAL_ROUTER_HOST);
+  const host = isWildcardRuntimeHost(configuredHost) || isLoopbackRuntimeHost(configuredHost)
+    ? FIXED_LOCAL_ROUTER_HOST
+    : configuredHost;
+  return `http://${formatHostForUrl(host, port)}`;
+}
+
 function buildAmpClientEndpointUrl(settings = {}) {
-  return getFixedLocalRouterOrigin();
+  return buildManagedRouterOrigin(settings);
 }
 
 function buildCodexCliEndpointUrl(settings = {}) {
@@ -448,7 +497,7 @@ function buildFactoryDroidEndpointUrl(settings = {}) {
 
 function buildRouterEndpoints({ host, port, running }) {
   if (!running) return [];
-  const origin = getFixedLocalRouterOrigin();
+  const origin = buildManagedRouterOrigin({ host, port });
   return [
     { label: "Unified", url: `${origin}/route` },
     { label: "Anthropic", url: `${origin}/anthropic` },
@@ -710,10 +759,11 @@ async function readConfigState(configPath) {
   if (!rawText.trim()) rawText = buildDefaultConfigRawText();
 
   let parseError = "";
+  let rawConfig = null;
   let normalizedConfig = null;
   try {
-    const parsed = rawText.trim() ? JSON.parse(rawText) : {};
-    normalizedConfig = normalizeRuntimeConfig(parsed, { migrateToVersion: CONFIG_VERSION });
+    rawConfig = rawText.trim() ? JSON.parse(rawText) : {};
+    normalizedConfig = normalizeRuntimeConfig(rawConfig, { migrateToVersion: CONFIG_VERSION });
   } catch (error) {
     parseError = error instanceof Error ? error.message : String(error);
   }
@@ -728,6 +778,7 @@ async function readConfigState(configPath) {
 
   return {
     rawText,
+    rawConfig,
     normalizedConfig,
     parseError,
     summary
@@ -786,8 +837,10 @@ function writeJsonLine(res, payload) {
 
 function resolveRouterOptions(current, body) {
   return {
-    host: FIXED_LOCAL_ROUTER_HOST,
-    port: FIXED_LOCAL_ROUTER_PORT,
+    host: normalizeRuntimeHost(body?.host || current?.host || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isInteger(Number(body?.port))
+      ? Number(body.port)
+      : (Number.isInteger(Number(current?.port)) ? Number(current.port) : FIXED_LOCAL_ROUTER_PORT),
     watchConfig: body?.watchConfig === undefined ? current.watchConfig : body.watchConfig === true,
     requireAuth: body?.requireAuth === undefined ? current.requireAuth : body.requireAuth === true,
     watchBinary: body?.watchBinary === undefined ? current.watchBinary : body.watchBinary === true
@@ -796,8 +849,8 @@ function resolveRouterOptions(current, body) {
 
 function getRouterStateSettings(routerState) {
   return {
-    host: FIXED_LOCAL_ROUTER_HOST,
-    port: FIXED_LOCAL_ROUTER_PORT,
+    host: normalizeRuntimeHost(routerState?.host || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isInteger(Number(routerState?.port)) ? Number(routerState.port) : FIXED_LOCAL_ROUTER_PORT,
     watchConfig: routerState?.watchConfig !== false,
     watchBinary: routerState?.watchBinary !== false,
     requireAuth: routerState?.requireAuth === true
@@ -816,11 +869,86 @@ function routeSnapshotDocument(configState) {
   return configState.parseError ? null : (configState.normalizedConfig || buildDefaultConfigObject());
 }
 
+function readConfiguredLlamacppRuntime(config = {}) {
+  const runtime = config?.metadata?.localModels?.runtime?.llamacpp;
+  if (!runtime || typeof runtime !== "object") {
+    return {
+      selectedCommand: "",
+      selectedDirectory: "",
+      manualCommand: "",
+      host: "127.0.0.1",
+      port: 39391,
+      startWithRouter: false,
+      status: ""
+    };
+  }
+
+  const selectedCommand = String(runtime.selectedCommand || runtime.manualCommand || runtime.command || "").trim();
+  return {
+    ...runtime,
+    selectedCommand,
+    selectedDirectory: selectedCommand ? path.dirname(selectedCommand) : "",
+    manualCommand: String(runtime.manualCommand || "").trim(),
+    host: String(runtime.host || "127.0.0.1").trim() || "127.0.0.1",
+    port: Number.isInteger(Number(runtime.port)) ? Number(runtime.port) : 39391,
+    startWithRouter: runtime.startWithRouter === true,
+    status: String(runtime.status || "").trim()
+  };
+}
+
+function buildLlamacppRuntimePayload(runtime = {}, validation = {}, candidates = []) {
+  const selectedCommand = String(runtime.selectedCommand || runtime.manualCommand || runtime.command || "").trim();
+  return {
+    ...runtime,
+    selectedCommand,
+    selectedDirectory: selectedCommand ? path.dirname(selectedCommand) : "",
+    ...(validation && typeof validation === "object" ? validation : {}),
+    candidates
+  };
+}
+
+function updateLlamacppRuntimeConfig(config = {}, runtimePatch = {}) {
+  const nextConfig = JSON.parse(JSON.stringify(config || {}));
+  if (!nextConfig.metadata || typeof nextConfig.metadata !== "object" || Array.isArray(nextConfig.metadata)) {
+    nextConfig.metadata = {};
+  }
+  if (!nextConfig.metadata.localModels || typeof nextConfig.metadata.localModels !== "object" || Array.isArray(nextConfig.metadata.localModels)) {
+    nextConfig.metadata.localModels = {};
+  }
+  if (!nextConfig.metadata.localModels.runtime || typeof nextConfig.metadata.localModels.runtime !== "object" || Array.isArray(nextConfig.metadata.localModels.runtime)) {
+    nextConfig.metadata.localModels.runtime = {};
+  }
+
+  const currentRuntime = readConfiguredLlamacppRuntime(nextConfig);
+  const nextRuntime = {
+    ...currentRuntime,
+    ...runtimePatch
+  };
+  const {
+    selectedDirectory: _selectedDirectory,
+    candidates: _candidates,
+    ...persistedRuntime
+  } = nextRuntime;
+  const selectedCommand = String(nextRuntime.selectedCommand || nextRuntime.manualCommand || nextRuntime.command || "").trim();
+
+  nextConfig.metadata.localModels.runtime.llamacpp = {
+    ...nextConfig.metadata.localModels.runtime.llamacpp,
+    ...persistedRuntime,
+    selectedCommand,
+    manualCommand: selectedCommand,
+    command: selectedCommand,
+    path: selectedCommand,
+    status: String(nextRuntime.status || "").trim()
+  };
+  return nextConfig;
+}
+
 export async function startWebConsoleServer(options = {}, deps = {}) {
   const {
     host = "127.0.0.1",
     port = 8788,
     configPath = getDefaultConfigPath(),
+    productionConfigPath = getDefaultConfigPath(),
     activityLogPath = "",
     routerHost = FIXED_LOCAL_ROUTER_HOST,
     routerPort = FIXED_LOCAL_ROUTER_PORT,
@@ -853,6 +981,40 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     ? deps.waitForRuntimeMatch
     : (startOptions, waitOptions = {}) => waitForRuntimeMatch(startOptions, waitOptions);
   const loginSubscriptionFn = typeof deps.loginSubscription === "function" ? deps.loginSubscription : loginSubscription;
+  const getLocalModelSystemInfoFn = typeof deps.getLocalModelSystemInfo === "function"
+    ? deps.getLocalModelSystemInfo
+    : () => ({
+      platform: process.platform,
+      totalMemoryBytes: os.totalmem(),
+      unifiedMemory: process.platform === "darwin"
+    });
+  const searchHuggingFaceGgufCandidatesFn = typeof deps.searchHuggingFaceGgufCandidates === "function"
+    ? deps.searchHuggingFaceGgufCandidates
+    : searchHuggingFaceGgufCandidates;
+  const downloadManagedHuggingFaceGgufFn = typeof deps.downloadManagedHuggingFaceGguf === "function"
+    ? deps.downloadManagedHuggingFaceGguf
+    : (request, runtimeOptions = {}) => downloadManagedHuggingFaceGguf(request, runtimeOptions);
+  const localModelPathExistsFn = typeof deps.localModelPathExists === "function"
+    ? deps.localModelPathExists
+    : undefined;
+  const browseForLocalModelPathFn = typeof deps.browseForLocalModelPath === "function"
+    ? deps.browseForLocalModelPath
+    : browseForLocalModelPath;
+  const scanLocalModelPathFn = typeof deps.scanLocalModelPath === "function"
+    ? deps.scanLocalModelPath
+    : scanLocalModelPath;
+  const detectLlamacppCandidatesFn = typeof deps.detectLlamacppCandidates === "function"
+    ? deps.detectLlamacppCandidates
+    : detectLlamacppCandidates;
+  const startConfiguredLlamacppRuntimeFn = typeof deps.startConfiguredLlamacppRuntime === "function"
+    ? deps.startConfiguredLlamacppRuntime
+    : (config, callbacks = {}, runtimeDeps = {}) => startConfiguredLlamacppRuntime(config, callbacks, runtimeDeps);
+  const stopManagedLlamacppRuntimeFn = typeof deps.stopManagedLlamacppRuntime === "function"
+    ? deps.stopManagedLlamacppRuntime
+    : (callbacks = {}) => stopManagedLlamacppRuntime(callbacks);
+  const validateLlamacppCommandFn = typeof deps.validateLlamacppCommand === "function"
+    ? deps.validateLlamacppCommand
+    : validateLlamacppCommand;
   const ampClientEnv = deps.ampClientEnv && typeof deps.ampClientEnv === "object" ? deps.ampClientEnv : process.env;
   const ampClientCwd = typeof deps.ampClientCwd === "string" && deps.ampClientCwd.trim() ? deps.ampClientCwd : process.cwd();
   const codexCliEnv = deps.codexCliEnv && typeof deps.codexCliEnv === "object" ? deps.codexCliEnv : process.env;
@@ -862,7 +1024,19 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     ? deps.loadWebConsoleDevAssets
     : loadWebConsoleDevAssets;
   const resolvedRouterCliPath = String(cliPathForRouter || process.env.LLM_ROUTER_CLI_PATH || process.argv[1] || "").trim();
+  const resolvedConfigPath = path.resolve(String(configPath || getDefaultConfigPath()).trim() || getDefaultConfigPath());
+  const resolvedProductionConfigPath = path.resolve(String(productionConfigPath || getDefaultConfigPath()).trim() || getDefaultConfigPath());
   const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
+  const startupControlsEnabled = !devMode;
+  const defaultRouterSettings = {
+    host: normalizeRuntimeHost(routerHost || FIXED_LOCAL_ROUTER_HOST),
+    port: Number.isInteger(Number(routerPort)) ? Number(routerPort) : FIXED_LOCAL_ROUTER_PORT,
+    watchConfig: routerWatchConfig !== false,
+    watchBinary: routerWatchBinary !== false,
+    requireAuth: routerRequireAuth === true
+  };
+
+  const quotaProbeRunner = createQuotaProbeRunner({ fetchImpl: globalThis.fetch });
 
   async function readWebSearchState(config = null) {
     if (!config || typeof config !== "object") return null;
@@ -1154,6 +1328,17 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     return normalizeClaudeBindingsInput(bindings);
   }
 
+  function normalizeFactoryDroidBindingState(bindings = {}) {
+    const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+    return {
+      defaultModel: String(source.defaultModel || "").trim(),
+      missionOrchestratorModel: String(source.missionOrchestratorModel || source.missionModel || "").trim(),
+      missionWorkerModel: String(source.missionWorkerModel || source.missionModel || "").trim(),
+      missionValidatorModel: String(source.missionValidatorModel || source.missionModel || "").trim(),
+      reasoningEffort: normalizeFactoryDroidReasoningEffort(source.reasoningEffort)
+    };
+  }
+
   function areCodexBindingsEqual(left = {}, right = {}) {
     const normalizedLeft = normalizeCodexBindingState(left);
     const normalizedRight = normalizeCodexBindingState(right);
@@ -1171,6 +1356,18 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       && String(left?.defaultHaikuModel || "").trim() === String(right?.defaultHaikuModel || "").trim()
       && String(left?.subagentModel || "").trim() === String(right?.subagentModel || "").trim()
       && normalizeClaudeCodeEffortLevel(left?.thinkingLevel) === normalizeClaudeCodeEffortLevel(right?.thinkingLevel)
+    );
+  }
+
+  function areFactoryDroidBindingsEqual(left = {}, right = {}) {
+    const normalizedLeft = normalizeFactoryDroidBindingState(left);
+    const normalizedRight = normalizeFactoryDroidBindingState(right);
+    return (
+      normalizedLeft.defaultModel === normalizedRight.defaultModel
+      && normalizedLeft.missionOrchestratorModel === normalizedRight.missionOrchestratorModel
+      && normalizedLeft.missionWorkerModel === normalizedRight.missionWorkerModel
+      && normalizedLeft.missionValidatorModel === normalizedRight.missionValidatorModel
+      && normalizedLeft.reasoningEffort === normalizedRight.reasoningEffort
     );
   }
 
@@ -1213,6 +1410,23 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     };
   }
 
+  function reconcileFactoryDroidBindingsForConfig(bindings = {}, previousConfig = {}, nextConfig = {}) {
+    const currentBindings = normalizeFactoryDroidBindingState(bindings);
+    const rewriteContext = buildManagedRouteRewriteContext(previousConfig, nextConfig);
+    const nextDefaultModel = reconcileManagedRouteBinding(currentBindings.defaultModel, rewriteContext)
+      || pickDefaultManagedRoute(nextConfig);
+    return {
+      defaultModel: nextDefaultModel,
+      missionOrchestratorModel: reconcileManagedRouteBinding(currentBindings.missionOrchestratorModel, rewriteContext)
+        || nextDefaultModel,
+      missionWorkerModel: reconcileManagedRouteBinding(currentBindings.missionWorkerModel, rewriteContext)
+        || nextDefaultModel,
+      missionValidatorModel: reconcileManagedRouteBinding(currentBindings.missionValidatorModel, rewriteContext)
+        || nextDefaultModel,
+      reasoningEffort: currentBindings.reasoningEffort
+    };
+  }
+
   async function readCodexCliGlobalRoutingState(settings = {}, config = null) {
     const endpointUrl = buildAmpClientEndpointUrl(settings);
     const apiKey = String(config?.masterKey || "").trim();
@@ -1249,6 +1463,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   async function readClaudeCodeGlobalRoutingState(settings = {}, config = null) {
     const endpointUrl = buildAmpClientEndpointUrl(settings);
     const apiKey = String(config?.masterKey || "").trim();
+    const webSearchProvider = normalizeClaudeCodeWebSearchProvider(config?.claudeCode?.webSearchProvider);
     try {
       const state = await readClaudeCodeRoutingState({
         endpointUrl,
@@ -1257,6 +1472,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       });
       return {
         ...state,
+        webSearchProvider,
         endpointUrl,
         error: ""
       };
@@ -1277,6 +1493,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           subagentModel: "",
           thinkingLevel: ""
         },
+        webSearchProvider,
         endpointUrl,
         error: error instanceof Error ? error.message : String(error)
       };
@@ -1429,7 +1646,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const endpointUrl = buildAmpClientEndpointUrl(settings);
     try {
       const state = await readFactoryDroidRoutingState({
-        endpointUrl
+        endpointUrl,
+        config
       });
       return {
         ...state,
@@ -1445,8 +1663,19 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         backupExists: false,
         routedViaRouter: false,
         configuredBaseUrl: "",
+        configuredProvider: "",
         bindings: {
           defaultModel: "",
+          missionOrchestratorModel: "",
+          missionWorkerModel: "",
+          missionValidatorModel: "",
+          reasoningEffort: ""
+        },
+        bindingIds: {
+          defaultModel: "",
+          missionOrchestratorModel: "",
+          missionWorkerModel: "",
+          missionValidatorModel: "",
           reasoningEffort: ""
         },
         endpointUrl,
@@ -1471,8 +1700,6 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       && (previousEndpointUrl !== nextEndpointUrl || previousMasterKey !== nextMasterKey)
     );
 
-    if (!endpointOrKeyChanged) return false;
-
     const routingState = await readFactoryDroidGlobalRoutingState(previousSettings, previousConfig);
     if (routingState.error) {
       addLog("warn", "Factory Droid route check failed.", routingState.error);
@@ -1481,13 +1708,23 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     if (!routingState.routedViaRouter) return false;
 
     try {
+      const currentBindings = normalizeFactoryDroidBindingState(routingState.bindings);
+      const bindings = reconcileFactoryDroidBindingsForConfig(currentBindings, previousConfig, nextConfig);
+      const bindingsChanged = !areFactoryDroidBindingsEqual(currentBindings, bindings);
+      if (!endpointOrKeyChanged && !bindingsChanged) return false;
+
       await patchFactoryDroidSettingsFile({
         endpointUrl: nextEndpointUrl,
         apiKey: nextMasterKey,
-        bindings: routingState.bindings,
+        bindings,
+        config: nextConfig,
         captureBackup: false
       });
-      addLog("info", "Updated Factory Droid route to match the local router.", buildFactoryDroidEndpointUrl(nextSettings));
+      if (endpointOrKeyChanged) {
+        addLog("info", "Updated Factory Droid route to match the local router.", buildFactoryDroidEndpointUrl(nextSettings));
+      } else {
+        addLog("info", "Updated Factory Droid bindings to match the saved router config.", bindings.defaultModel || "Default");
+      }
       return true;
     } catch (error) {
       addLog("warn", "Factory Droid route update failed.", error instanceof Error ? error.message : String(error));
@@ -1639,11 +1876,11 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   let activityLogEnabled = true;
 
   const routerState = {
-    host: FIXED_LOCAL_ROUTER_HOST,
-    port: FIXED_LOCAL_ROUTER_PORT,
-    watchConfig: routerWatchConfig,
-    watchBinary: routerWatchBinary,
-    requireAuth: routerRequireAuth,
+    host: defaultRouterSettings.host,
+    port: defaultRouterSettings.port,
+    watchConfig: defaultRouterSettings.watchConfig,
+    watchBinary: defaultRouterSettings.watchBinary,
+    requireAuth: defaultRouterSettings.requireAuth,
     lastError: ""
   };
 
@@ -1908,6 +2145,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   }
 
   async function stopUntrackedStartupRuntime({ reason = "Stopped startup-managed LLM Router." } = {}) {
+    if (!startupControlsEnabled) return false;
     const startup = await startupStatusFn().catch(() => null);
     if (!startup?.running) return false;
     await stopStartupFn();
@@ -1917,6 +2155,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
   }
 
   async function startStartupOwnedRouter(settings, { restart = false } = {}) {
+    if (!startupControlsEnabled) {
+      const error = new Error("Startup service controls are disabled in dev mode.");
+      error.statusCode = 409;
+      throw error;
+    }
+
     await clearRuntimeStateFn();
     const detail = await installStartupFn({
       configPath,
@@ -1979,7 +2223,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       };
     }
 
-    const startup = await startupStatusFn().catch(() => null);
+    const startup = startupControlsEnabled ? await startupStatusFn().catch(() => null) : null;
     const activeRuntime = await readManagedRuntime(configLocalServer);
     if (activeRuntime) {
       return {
@@ -1996,7 +2240,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       await stopExternalRuntime(externalRuntime, {
         reason: `Stopped an existing LLM Router instance so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
       });
-    } else {
+    } else if (startupControlsEnabled) {
       await stopUntrackedStartupRuntime({
         reason: `Stopped the startup-managed LLM Router instance so the web console can manage ${configLocalServer.host}:${configLocalServer.port} during ${reason}.`
       });
@@ -2077,17 +2321,34 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     return savedConfig;
   }
 
-  async function writeAndBroadcastConfig(parsed, { source = "" } = {}) {
+  async function writeAndBroadcastConfig(parsed, {
+    source = "",
+    preserveMissingKeys = true,
+    successMessage = ""
+  } = {}) {
     const previousConfigState = await readConfigState(configPath);
     const previousConfig = previousConfigState.normalizedConfig || buildDefaultConfigObject();
     const previousLocalServer = getConfigLocalServer(previousConfigState);
+
+    // Safeguard: preserve existing top-level keys absent from the incoming config.
+    // This prevents partial writes (e.g. from scoped Ollama endpoints) from wiping
+    // unrelated config sections like masterKey, modelAliases, amp, metadata, etc.
+    const previousRaw = previousConfigState.rawConfig;
+    if (preserveMissingKeys && previousRaw && typeof previousRaw === "object" && parsed && typeof parsed === "object") {
+      for (const key of Object.keys(previousRaw)) {
+        if (!(key in parsed)) {
+          parsed[key] = previousRaw[key];
+        }
+      }
+    }
+
     ignoreConfigWatchUntil = Date.now() + 800;
     const savedConfig = await writeConfigFile(parsed, configPath, { migrateToVersion: CONFIG_VERSION });
     resolveActivityLogSnapshot(savedConfig);
     const nextLocalServer = readLocalServerSettings(savedConfig, previousLocalServer);
 
     if (source !== "autosave") {
-      addLog("success", `Config saved to ${path.basename(configPath)}.`);
+      addLog("success", successMessage || `Config saved to ${path.basename(configPath)}.`);
     }
 
     const managedRuntime = await readManagedRuntime(previousLocalServer);
@@ -2152,6 +2413,54 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     };
   }
 
+  async function syncConfigFromProduction() {
+    if (!devMode) {
+      const error = new Error("Production config sync is only available in dev mode.");
+      error.statusCode = 409;
+      throw error;
+    }
+
+    if (resolvedConfigPath === resolvedProductionConfigPath) {
+      const error = new Error("Current config already points to the production config file.");
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const currentConfigState = await readConfigState(configPath);
+    const currentLocalServer = getConfigLocalServer(currentConfigState);
+    const productionConfigState = await readConfigState(resolvedProductionConfigPath);
+
+    if (!productionConfigState.summary?.exists) {
+      const error = new Error(`Production config file was not found at ${resolvedProductionConfigPath}.`);
+      error.statusCode = 404;
+      throw error;
+    }
+
+    if (productionConfigState.parseError) {
+      const error = new Error(`Production config JSON must parse before syncing: ${productionConfigState.parseError}`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const clonedConfig = applyLocalServerSettings(
+      productionConfigState.normalizedConfig || buildDefaultConfigObject(),
+      currentLocalServer
+    );
+
+    const result = await writeAndBroadcastConfig(clonedConfig, {
+      source: "production-sync",
+      preserveMissingKeys: false,
+      successMessage: `Synced ${path.basename(resolvedConfigPath)} from ${path.basename(resolvedProductionConfigPath)}.`
+    });
+
+    return {
+      ...result,
+      message: `Synced dev config from ${resolvedProductionConfigPath}.`,
+      syncedFrom: resolvedProductionConfigPath,
+      syncedTo: resolvedConfigPath
+    };
+  }
+
   let routerRestartPromise = null;
 
   async function restartManagedRouterWithSettings(settings, {
@@ -2178,13 +2487,21 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const configState = await readConfigState(configPath);
     const configLocalServer = getConfigLocalServer(configState);
     const activityLog = resolveActivityLogSnapshot(configState.normalizedConfig);
-    const startup = await startupStatusFn().catch((error) => ({
-      manager: "unknown",
-      serviceId: "llm-router",
-      installed: false,
-      running: false,
-      detail: error instanceof Error ? error.message : String(error)
-    }));
+    const startup = startupControlsEnabled
+      ? await startupStatusFn().catch((error) => ({
+        manager: "unknown",
+        serviceId: "llm-router",
+        installed: false,
+        running: false,
+        detail: error instanceof Error ? error.message : String(error)
+      }))
+      : {
+        manager: "disabled",
+        serviceId: "llm-router",
+        installed: false,
+        running: false,
+        detail: "Startup service controls are disabled in dev mode."
+      };
     const managedRuntime = await readManagedRuntime(configLocalServer);
     const externalRuntime = managedRuntime ? null : await readExternalRuntime(configLocalServer);
     const portProbe = probeRouterPort(configLocalServer);
@@ -2201,8 +2518,20 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
     const claudeCodeGlobal = await readClaudeCodeGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const factoryDroidGlobal = await readFactoryDroidGlobalRoutingState(configLocalServer, configState.normalizedConfig);
     const webSearch = await readWebSearchState(configState.normalizedConfig).catch(() => null);
+    const ollamaConfig = configState.normalizedConfig?.ollama;
+    const ollamaBaseUrl = ollamaConfig?.baseUrl || "http://localhost:11434";
+    const ollamaInstallation = detectOllamaInstallation();
+    const ollamaState = ollamaInstallation.installed
+      ? await ollamaCheckConnection(ollamaBaseUrl).catch(() => ({ ok: false }))
+      : { ok: false };
 
     return {
+      environment: {
+        devMode,
+        configPath: resolvedConfigPath,
+        productionConfigPath: resolvedProductionConfigPath,
+        canSyncProductionConfig: devMode && resolvedConfigPath !== resolvedProductionConfigPath
+      },
       web: {
         host,
         port: actualWebPort,
@@ -2217,9 +2546,12 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       router: routerSnapshot,
       startup: {
         ...startup,
-        label: formatStartupLabel(startup),
-        friendlyDetail: formatStartupDetail(startup),
-        defaults: configLocalServer
+        label: startupControlsEnabled ? formatStartupLabel(startup) : "Startup disabled in dev mode",
+        friendlyDetail: startupControlsEnabled
+          ? formatStartupDetail(startup)
+          : "Development web console will not install, stop, or replace startup-managed routers.",
+        defaults: configLocalServer,
+        available: startupControlsEnabled
       },
       ampClient: {
         global: ampClientGlobal
@@ -2230,6 +2562,14 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         codexCli: codexCliGlobal,
         claudeCode: claudeCodeGlobal,
         factoryDroid: factoryDroidGlobal
+      },
+      ollama: {
+        installed: ollamaInstallation.installed,
+        connected: ollamaState.ok === true,
+        baseUrl: ollamaBaseUrl,
+        enabled: ollamaConfig?.enabled === true,
+        version: ollamaInstallation.version || null,
+        path: ollamaInstallation.path || null
       },
       defaults: {
         providerUserAgent: DEFAULT_PROVIDER_USER_AGENT
@@ -2367,8 +2707,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       nextOptions = persisted.savedSettings;
     }
 
-    const startup = await startupStatusFn().catch(() => null);
-    const preferStartupOwnership = Boolean(startup?.installed);
+    const startup = startupControlsEnabled ? await startupStatusFn().catch(() => null) : null;
+    const preferStartupOwnership = startupControlsEnabled && Boolean(startup?.installed);
     const runningRuntime = await readManagedRuntime(nextOptions);
     const webConsoleConflict = getWebConsoleConflictMessage(nextOptions);
 
@@ -2395,7 +2735,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       await stopExternalRuntime(externalRuntime, {
         reason: "Stopped another LLM Router instance before starting the managed router."
       });
-    } else {
+    } else if (startupControlsEnabled) {
       await stopUntrackedStartupRuntime({
         reason: "Stopped the startup-managed LLM Router instance before starting the managed router."
       });
@@ -2489,6 +2829,8 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
           nextSettings: persistedLocalServer.savedSettings
         });
       }
+      // Non-blocking: preload Ollama models after router start
+      preloadOllamaModels(configState.normalizedConfig).catch(() => {});
       return {
         message: restart ? "Router restarted." : "Router started.",
         snapshot: await buildSnapshot()
@@ -2498,6 +2840,29 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       addLog("error", "Failed to start router.", routerState.lastError);
       await broadcastState().catch(() => {});
       throw error;
+    }
+  }
+
+  async function preloadOllamaModels(config) {
+    const ollamaConfig = config?.ollama;
+    if (!ollamaConfig?.enabled) return;
+    const autoLoadModels = ollamaConfig.autoLoadModels || [];
+    if (!autoLoadModels.length) return;
+    const baseUrl = ollamaConfig.baseUrl || "http://localhost:11434";
+    const connected = await ollamaCheckConnection(baseUrl);
+    if (!connected.ok) {
+      addLog("info", "Ollama not reachable, skipping model preload.");
+      return;
+    }
+    for (const modelId of autoLoadModels) {
+      const keepAlive = ollamaConfig.managedModels?.[modelId]?.keepAlive
+        || ollamaConfig.defaultKeepAlive || "5m";
+      const result = await ollamaLoadModel(baseUrl, modelId, keepAlive).catch(() => ({ ok: false }));
+      if (result.ok) {
+        addLog("info", `Ollama: Preloaded ${modelId} (${Math.round(result.loadDurationMs || 0)}ms).`);
+      } else {
+        addLog("warn", `Ollama: Failed to preload ${modelId}.`);
+      }
     }
   }
 
@@ -2660,6 +3025,113 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      if (method === "POST" && requestUrl.pathname === "/api/config/sync-production") {
+        const synced = await syncConfigFromProduction();
+        sendJson(res, 200, {
+          ...synced.snapshot,
+          message: synced.message,
+          syncedFrom: synced.syncedFrom,
+          syncedTo: synced.syncedTo
+        });
+        return;
+      }
+
+      // ── Quota Probe routes ──────────────────────────────────────────
+      const quotaProbeTestMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/test$/);
+      if (method === "POST" && quotaProbeTestMatch) {
+        const providerId = decodeURIComponent(quotaProbeTestMatch[1]);
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const provider = (configState.normalizedConfig?.providers || []).find((entry) => entry.id === providerId);
+        if (!provider) {
+          sendJson(res, 404, { error: "Provider not found." });
+          return;
+        }
+        const shortcodeCtx = {
+          providerApiKey: resolveProviderApiKey(provider, process.env) || "",
+          providerBaseUrl: provider.baseUrl || "",
+          providerId: provider.id
+        };
+        const probeConfig = {
+          ...(provider.quotaProbe || {}),
+          enabled: true,
+          capKind: body.capKind || provider.quotaProbe?.capKind || "dollars",
+          mode: body.mode || provider.quotaProbe?.mode || "http",
+          http: body.http || provider.quotaProbe?.http,
+          custom: body.custom || provider.quotaProbe?.custom
+        };
+        const tempRunner = createQuotaProbeRunner({ fetchImpl: globalThis.fetch });
+        const now = Date.now();
+        const startMs = now;
+        try {
+          const snapshot = await tempRunner.executeProbe({ providerId, probeConfig, shortcodeCtx, env: process.env, now });
+          const latencyMs = Date.now() - startMs;
+          sendJson(res, 200, { snapshot, raw: snapshot.raw, latencyMs, error: snapshot.error });
+        } finally {
+          tempRunner.dispose();
+        }
+        return;
+      }
+
+      const quotaProbeRefreshMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/refresh$/);
+      if (method === "POST" && quotaProbeRefreshMatch) {
+        const providerId = decodeURIComponent(quotaProbeRefreshMatch[1]);
+        const configState = await readConfigState(configPath);
+        const provider = (configState.normalizedConfig?.providers || []).find((entry) => entry.id === providerId);
+        if (!provider) {
+          sendJson(res, 404, { error: "Provider not found." });
+          return;
+        }
+        if (!provider.quotaProbe?.enabled) {
+          sendJson(res, 400, { error: "Quota probe not enabled for this provider." });
+          return;
+        }
+        const shortcodeCtx = {
+          providerApiKey: resolveProviderApiKey(provider, process.env) || "",
+          providerBaseUrl: provider.baseUrl || "",
+          providerId: provider.id
+        };
+        const snapshot = await quotaProbeRunner.enqueueRefresh({
+          providerId,
+          probeConfig: provider.quotaProbe,
+          shortcodeCtx,
+          env: process.env,
+          bypassCircuit: true
+        });
+        sendJson(res, 200, { snapshot });
+        return;
+      }
+
+      const quotaProbeSnapshotMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/snapshot$/);
+      if (method === "GET" && quotaProbeSnapshotMatch) {
+        const providerId = decodeURIComponent(quotaProbeSnapshotMatch[1]);
+        sendJson(res, 200, { snapshot: quotaProbeRunner.getSnapshot(providerId) });
+        return;
+      }
+
+      const quotaProbeSaveMatch = requestUrl.pathname.match(/^\/api\/providers\/([^/]+)\/quota-probe\/save$/);
+      if (method === "POST" && quotaProbeSaveMatch) {
+        const providerId = decodeURIComponent(quotaProbeSaveMatch[1]);
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, { error: `Config parse error: ${configState.parseError}` });
+          return;
+        }
+        const rawConfig = configState.rawConfig || {};
+        const providerList = Array.isArray(rawConfig.providers) ? rawConfig.providers : [];
+        const providerIndex = providerList.findIndex((entry) => entry?.id === providerId);
+        if (providerIndex === -1) {
+          sendJson(res, 404, { error: "Provider not found." });
+          return;
+        }
+        providerList[providerIndex] = { ...providerList[providerIndex], quotaProbe: body.quotaProbe || null };
+        rawConfig.providers = providerList;
+        const { snapshot } = await writeAndBroadcastConfig(rawConfig, { source: "quota-probe-save" });
+        sendJson(res, 200, { ok: true, snapshot });
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/config/test-provider") {
         const body = await readJsonBody(req);
         const endpoints = Array.isArray(body?.endpoints) ? body.endpoints.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
@@ -2812,6 +3284,31 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      if (method === "POST" && requestUrl.pathname === "/api/config/probe-free-tier-models") {
+        const body = await readJsonBody(req);
+        const baseUrl = String(body?.baseUrl || "").trim();
+        const apiKeyEnv = String(body?.apiKeyEnv || "").trim();
+        const apiKey = String(body?.apiKey || "").trim();
+        const modelIds = Array.isArray(body?.modelIds) ? body.modelIds.map((id) => String(id || "").trim()).filter(Boolean) : [];
+
+        if (!baseUrl || modelIds.length === 0) {
+          sendJson(res, 400, { error: "baseUrl and at least one modelId are required." });
+          return;
+        }
+
+        try {
+          const finalApiKey = await resolveProbeApiKey(apiKeyEnv, apiKey, { context: "probing free-tier models" });
+          addLog("info", "Probing free-tier model availability.", `${modelIds.length} model(s)`);
+          const result = await probeFreeTierModels({ baseUrl, apiKey: finalApiKey, modelIds, timeoutMs: 6000 });
+          const freeCount = Object.values(result).filter((r) => r?.freeTier === true).length;
+          addLog("success", "Free-tier probe finished.", `${freeCount}/${modelIds.length} model(s) on free tier`);
+          sendJson(res, 200, { result });
+        } catch (error) {
+          sendJson(res, error?.statusCode || 500, { error: error instanceof Error ? error.message : String(error) });
+        }
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/config/litellm-context-lookup") {
         const body = await readJsonBody(req);
         const models = Array.isArray(body?.models) ? body.models.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
@@ -2860,6 +3357,451 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         const source = String(body?.source || "").trim();
         const { snapshot } = await writeAndBroadcastConfig(parsed, { source });
         sendJson(res, 200, snapshot);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/attach") {
+        const body = await readJsonBody(req);
+        const id = String(body.id || "").trim();
+        const filePath = String(body.filePath || "").trim();
+        if (!id || !filePath) {
+          sendJson(res, 400, {
+            error: "id and filePath are required."
+          });
+          return;
+        }
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before attaching a local model: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = await registerAttachedLlamacppModel(configState.rawConfig || {}, {
+          id,
+          displayName: String(body.displayName || "").trim(),
+          filePath,
+          metadata: body.metadata || {}
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-attach"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          library: savedConfig?.metadata?.localModels?.library || {}
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/locate") {
+        const body = await readJsonBody(req);
+        const baseModelId = String(body.baseModelId || "").trim();
+        const filePath = String(body.filePath || "").trim();
+        if (!baseModelId || !filePath) {
+          sendJson(res, 400, {
+            error: "baseModelId and filePath are required."
+          });
+          return;
+        }
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before locating a local model: ${configState.parseError}`
+          });
+          return;
+        }
+
+        try {
+          const relocated = await updateLocalBaseModelPath(configState.rawConfig || {}, baseModelId, filePath);
+          const reconciled = await reconcileLocalModelPaths(relocated, {
+            ...(localModelPathExistsFn ? { pathExists: localModelPathExistsFn } : {})
+          });
+          const { savedConfig } = await writeAndBroadcastConfig(reconciled, {
+            source: "local-models-locate"
+          });
+          sendJson(res, 200, {
+            ok: true,
+            library: savedConfig?.metadata?.localModels?.library || {},
+            variants: savedConfig?.metadata?.localModels?.variants || {}
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/remove") {
+        const body = await readJsonBody(req);
+        const baseModelId = String(body.baseModelId || "").trim();
+        if (!baseModelId) {
+          sendJson(res, 400, {
+            error: "baseModelId is required."
+          });
+          return;
+        }
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before removing a local model: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = await removeLocalBaseModel(configState.rawConfig || {}, baseModelId);
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-remove"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          library: savedConfig?.metadata?.localModels?.library || {},
+          variants: savedConfig?.metadata?.localModels?.variants || {}
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/reconcile") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before refreshing local model status: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = await reconcileLocalModelPaths(configState.rawConfig || {}, {
+          ...(localModelPathExistsFn ? { pathExists: localModelPathExistsFn } : {})
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-reconcile"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          library: savedConfig?.metadata?.localModels?.library || {},
+          variants: savedConfig?.metadata?.localModels?.variants || {}
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/discover") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before discovering llama.cpp runtimes: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const configuredRuntime = readConfiguredLlamacppRuntime(configState.rawConfig || {});
+        const candidates = detectLlamacppCandidatesFn();
+        const hydratedCandidates = candidates.map((candidate) => {
+          const validation = validateLlamacppCommandFn(candidate.path);
+          return {
+            ...candidate,
+            directory: path.dirname(candidate.path),
+            ...validation,
+            current: candidate.path === configuredRuntime.selectedCommand
+          };
+        });
+
+        sendJson(res, 200, {
+          runtime: buildLlamacppRuntimePayload(configuredRuntime, {}, hydratedCandidates)
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/select") {
+        const body = await readJsonBody(req);
+        const command = String(body.command || "").trim();
+        if (!command) {
+          sendJson(res, 400, {
+            error: "command is required."
+          });
+          return;
+        }
+
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before selecting a llama.cpp runtime: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const validation = validateLlamacppCommandFn(command);
+        if (!validation?.ok) {
+          sendJson(res, 400, {
+            error: validation?.errorMessage || `Failed validating llama.cpp runtime '${command}'.`,
+            runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(configState.rawConfig || {}), validation)
+          });
+          return;
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          selectedCommand: command,
+          manualCommand: command,
+          status: "stopped"
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-select"
+        });
+        const configuredRuntime = readConfiguredLlamacppRuntime(savedConfig || {});
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(configuredRuntime, {
+            ...validation,
+            status: configuredRuntime.status || "stopped"
+          })
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/settings") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before updating llama.cpp runtime settings: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          ...(body?.startWithRouter !== undefined ? { startWithRouter: body.startWithRouter === true } : {})
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-settings"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}))
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/start") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before starting llama.cpp runtime: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const configuredRuntime = readConfiguredLlamacppRuntime(configState.rawConfig || {});
+        if (!configuredRuntime.selectedCommand) {
+          sendJson(res, 400, {
+            error: "Select a llama.cpp runtime before starting it."
+          });
+          return;
+        }
+
+        const listenerPids = await Promise.resolve(listListeningPidsFn(configuredRuntime.port)).catch(() => []);
+        let validation = validateLlamacppCommandFn(configuredRuntime.selectedCommand);
+        if ((listenerPids || []).length === 0) {
+          const started = await startConfiguredLlamacppRuntimeFn(configState.rawConfig || {}, {
+            line: (message) => addLog("info", message),
+            error: (message) => addLog("warn", message)
+          });
+          if (!started?.ok) {
+            sendJson(res, 502, {
+              error: started?.errorMessage || "Failed to start llama.cpp runtime."
+            });
+            return;
+          }
+          validation = started?.validation || validation;
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          status: "running"
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-start"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
+            ...(validation && typeof validation === "object" ? validation : {}),
+            status: "running"
+          })
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/runtime/stop") {
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before stopping llama.cpp runtime: ${configState.parseError}`
+          });
+          return;
+        }
+
+        const configuredRuntime = readConfiguredLlamacppRuntime(configState.rawConfig || {});
+        await stopManagedLlamacppRuntimeFn({
+          line: (message) => addLog("info", message),
+          error: (message) => addLog("warn", message)
+        });
+        const listenerPids = await Promise.resolve(listListeningPidsFn(configuredRuntime.port)).catch(() => []);
+        for (const pid of listenerPids) {
+          if (!Number.isInteger(Number(pid))) continue;
+          await stopProcessByPidFn(Number(pid)).catch(() => {});
+        }
+
+        const updated = updateLlamacppRuntimeConfig(configState.rawConfig || {}, {
+          status: "stopped"
+        });
+        const { savedConfig } = await writeAndBroadcastConfig(updated, {
+          source: "local-models-runtime-stop"
+        });
+        sendJson(res, 200, {
+          ok: true,
+          runtime: buildLlamacppRuntimePayload(readConfiguredLlamacppRuntime(savedConfig || {}), {
+            status: "stopped"
+          })
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/browse") {
+        const body = await readJsonBody(req);
+        const selection = String(body.selection || "file").trim() || "file";
+        try {
+          const picked = await browseForLocalModelPathFn({ selection });
+          const matches = picked?.canceled || !picked?.path || selection === "runtime"
+            ? []
+            : await scanLocalModelPathFn(picked.path);
+          sendJson(res, 200, {
+            ok: true,
+            selection: picked,
+            matches
+          });
+        } catch (error) {
+          sendJson(res, 500, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/scan-path") {
+        const body = await readJsonBody(req);
+        const targetPath = String(body.path || "").trim();
+        if (!targetPath) {
+          sendJson(res, 400, { error: "path is required." });
+          return;
+        }
+
+        try {
+          const matches = await scanLocalModelPathFn(targetPath);
+          sendJson(res, 200, {
+            ok: true,
+            path: targetPath,
+            matches
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/search-huggingface") {
+        const body = await readJsonBody(req);
+        const results = await searchHuggingFaceGgufCandidatesFn(String(body.query || "").trim(), {
+          limit: body.limit,
+          totalMemoryBytes: os.totalmem(),
+          expectedContextWindow: Number.isInteger(Number(body.expectedContextWindow))
+            ? Number(body.expectedContextWindow)
+            : 200000
+        });
+        sendJson(res, 200, { results });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/download-managed") {
+        const body = await readJsonBody(req);
+        const id = String(body.id || "").trim();
+        const repo = String(body.repo || "").trim();
+        const file = String(body.file || "").trim();
+        if (!id || !repo || !file) {
+          sendJson(res, 400, { error: "id, repo, and file are required." });
+          return;
+        }
+
+        startJsonLineStream(res);
+        writeJsonLine(res, { type: "start", id, repo, file });
+
+        try {
+          const destinationPath = path.join(getManagedLocalModelsDir(), repo, file);
+          const downloaded = await downloadManagedHuggingFaceGgufFn({
+            id,
+            displayName: String(body.displayName || "").trim() || file,
+            repo,
+            file,
+            destinationPath
+          }, {
+            onProgress: (event) => writeJsonLine(res, { type: "progress", event })
+          });
+          const configState = await readConfigState(configPath);
+          const updated = await registerManagedLlamacppModel(configState.rawConfig || {}, {
+            id,
+            displayName: String(body.displayName || "").trim() || file,
+            filePath: downloaded.filePath,
+            repo,
+            file,
+            sizeBytes: downloaded.sizeBytes
+          });
+          const { savedConfig } = await writeAndBroadcastConfig(updated, {
+            source: "local-models-download-managed"
+          });
+          writeJsonLine(res, {
+            type: "result",
+            result: {
+              library: savedConfig?.metadata?.localModels?.library || {}
+            }
+          });
+        } catch (error) {
+          writeJsonLine(res, {
+            type: "error",
+            statusCode: Number(error?.statusCode) || 500,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        } finally {
+          res.end();
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/local-models/variants/save") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        if (configState.parseError) {
+          sendJson(res, 400, {
+            error: `Config JSON must parse before saving a local variant: ${configState.parseError}`
+          });
+          return;
+        }
+
+        try {
+          const updated = await saveLocalModelVariant(configState.rawConfig || {}, body.variant || {}, {
+            system: getLocalModelSystemInfoFn()
+          });
+          const { savedConfig } = await writeAndBroadcastConfig(updated, {
+            source: "local-models-variant-save"
+          });
+          sendJson(res, 200, {
+            ok: true,
+            variants: savedConfig?.metadata?.localModels?.variants || {}
+          });
+        } catch (error) {
+          sendJson(res, 400, {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
         return;
       }
 
@@ -3262,11 +4204,107 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      if (method === "POST" && requestUrl.pathname === "/api/claude-code/search-provider") {
+        const body = await readJsonBody(req);
+        const currentConfigState = await readConfigState(configPath);
+
+        let parsed;
+        try {
+          if (body?.config && typeof body.config === "object" && !Array.isArray(body.config)) {
+            parsed = body.config;
+          } else if (typeof body?.rawText === "string") {
+            const rawText = String(body.rawText || "");
+            parsed = rawText.trim() ? JSON.parse(rawText) : {};
+          } else {
+            parsed = currentConfigState.rawConfig && typeof currentConfigState.rawConfig === "object" && !Array.isArray(currentConfigState.rawConfig)
+              ? { ...currentConfigState.rawConfig }
+              : {};
+          }
+        } catch (error) {
+          sendJson(res, 400, {
+            error: `Config JSON parse failed: ${error instanceof Error ? error.message : String(error)}`
+          });
+          return;
+        }
+
+        const nextConfig = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        const selectedProvider = normalizeClaudeCodeWebSearchProvider(
+          body?.webSearchProvider
+          ?? body?.searchProvider
+          ?? body?.providerId
+        );
+
+        if (selectedProvider) {
+          let normalizedConfig;
+          try {
+            normalizedConfig = normalizeRuntimeConfig(nextConfig, { migrateToVersion: CONFIG_VERSION });
+          } catch (error) {
+            sendJson(res, 400, {
+              error: `Config normalization failed: ${error instanceof Error ? error.message : String(error)}`
+            });
+            return;
+          }
+          const configuredProviders = Array.isArray(normalizedConfig?.webSearch?.providers) ? normalizedConfig.webSearch.providers : [];
+          const selectedExists = configuredProviders.some((provider) => normalizeClaudeCodeWebSearchProvider(provider?.id) === selectedProvider);
+          if (!selectedExists) {
+            sendJson(res, 400, {
+              error: `Claude Code web search provider '${selectedProvider}' must reference a configured webSearch provider.`
+            });
+            return;
+          }
+        }
+
+        if (selectedProvider) {
+          const currentClaudeCode = nextConfig?.claudeCode && typeof nextConfig.claudeCode === "object" && !Array.isArray(nextConfig.claudeCode)
+            ? nextConfig.claudeCode
+            : (nextConfig?.["claude-code"] && typeof nextConfig["claude-code"] === "object" && !Array.isArray(nextConfig["claude-code"])
+              ? nextConfig["claude-code"]
+              : null);
+          const nextClaudeCode = currentClaudeCode
+            ? { ...currentClaudeCode }
+            : {};
+          nextClaudeCode.webSearchProvider = selectedProvider;
+          nextConfig.claudeCode = nextClaudeCode;
+          delete nextConfig["claude-code"];
+        } else {
+          const currentClaudeCode = nextConfig?.claudeCode && typeof nextConfig.claudeCode === "object" && !Array.isArray(nextConfig.claudeCode)
+            ? nextConfig.claudeCode
+            : (nextConfig?.["claude-code"] && typeof nextConfig["claude-code"] === "object" && !Array.isArray(nextConfig["claude-code"])
+              ? nextConfig["claude-code"]
+              : null);
+          if (currentClaudeCode) {
+            const nextClaudeCode = { ...currentClaudeCode };
+            delete nextClaudeCode.webSearchProvider;
+            delete nextClaudeCode["web-search-provider"];
+            delete nextClaudeCode.searchProvider;
+            delete nextClaudeCode["search-provider"];
+            if (Object.keys(nextClaudeCode).length > 0) {
+              nextConfig.claudeCode = nextClaudeCode;
+            } else {
+              nextConfig.claudeCode = {};
+            }
+            delete nextConfig["claude-code"];
+          }
+        }
+
+        const { snapshot } = await writeAndBroadcastConfig(nextConfig, { source: "claude-code-search-provider" });
+        addLog(
+          "success",
+          selectedProvider ? "Claude Code search capability updated." : "Claude Code search capability cleared.",
+          selectedProvider || "Default router search order"
+        );
+        sendJson(res, 200, {
+          ...snapshot,
+          message: selectedProvider ? "Claude Code search capability updated." : "Claude Code search capability cleared."
+        });
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/claude-code/effort-level") {
         const body = await readJsonBody(req);
         const effortLevel = String(body?.effortLevel || body?.thinkingLevel || "").trim();
         if (effortLevel && !normalizeClaudeCodeEffortLevel(effortLevel)) {
-          sendJson(res, 400, { error: `Invalid effort level '${effortLevel}'. Valid values: low, medium, high, max.` });
+          sendJson(res, 400, { error: `Invalid effort level '${effortLevel}'. Valid values: low, medium, high, xhigh, max.` });
           return;
         }
         const result = await patchClaudeCodeEffortLevel({
@@ -3331,12 +4369,16 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
         const bindings = {
           defaultModel: String(body?.bindings?.defaultModel || "").trim(),
+          missionOrchestratorModel: String(body?.bindings?.missionOrchestratorModel || body?.bindings?.missionModel || "").trim(),
+          missionWorkerModel: String(body?.bindings?.missionWorkerModel || body?.bindings?.missionModel || "").trim(),
+          missionValidatorModel: String(body?.bindings?.missionValidatorModel || body?.bindings?.missionModel || "").trim(),
           reasoningEffort: normalizeFactoryDroidReasoningEffort(body?.bindings?.reasoningEffort)
         };
         const patchResult = await patchFactoryDroidSettingsFile({
           endpointUrl,
           apiKey,
           bindings,
+          config: nextConfig,
           captureBackup: true
         });
         addLog("success", "Factory Droid routing enabled.", patchResult.baseUrl);
@@ -3378,12 +4420,16 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
         const bindings = {
           defaultModel: String(body?.bindings?.defaultModel || "").trim(),
+          missionOrchestratorModel: String(body?.bindings?.missionOrchestratorModel || body?.bindings?.missionModel || "").trim(),
+          missionWorkerModel: String(body?.bindings?.missionWorkerModel || body?.bindings?.missionModel || "").trim(),
+          missionValidatorModel: String(body?.bindings?.missionValidatorModel || body?.bindings?.missionModel || "").trim(),
           reasoningEffort: normalizeFactoryDroidReasoningEffort(body?.bindings?.reasoningEffort)
         };
         const patchResult = await patchFactoryDroidSettingsFile({
           endpointUrl,
           apiKey,
           bindings,
+          config: configState.normalizedConfig,
           captureBackup: false
         });
         addLog("success", "Factory Droid model bindings updated.", patchResult.bindings.defaultModel || "Default");
@@ -3569,6 +4615,10 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       }
 
       if (method === "POST" && requestUrl.pathname === "/api/startup/enable") {
+        if (!startupControlsEnabled) {
+          sendJson(res, 409, { error: "Startup service controls are unavailable in dev mode." });
+          return;
+        }
         const body = await readJsonBody(req);
         const configState = await readConfigState(configPath);
         if (configState.parseError) {
@@ -3631,6 +4681,10 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
       }
 
       if (method === "POST" && requestUrl.pathname === "/api/startup/disable") {
+        if (!startupControlsEnabled) {
+          sendJson(res, 409, { error: "Startup service controls are unavailable in dev mode." });
+          return;
+        }
         await readJsonBody(req);
         const statusBefore = await startupStatusFn().catch(() => null);
         if (!statusBefore?.installed) {
@@ -3733,6 +4787,323 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
         return;
       }
 
+      // ── Ollama API routes ──────────────────────────────────────────────
+      function resolveOllamaBaseUrl(bodyBaseUrl, configBaseUrl) {
+        const raw = String(bodyBaseUrl || configBaseUrl || "http://localhost:11434").trim().replace(/\/+$/, "");
+        try { const u = new URL(raw); if (u.protocol !== "http:" && u.protocol !== "https:") return null; if (u.hostname !== "localhost" && u.hostname !== "127.0.0.1" && u.hostname !== "::1" && !u.hostname.endsWith(".local")) return null; return u.origin; } catch { return null; }
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/status") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const installation = detectOllamaInstallation();
+        const connection = installation.installed
+          ? await ollamaCheckConnection(baseUrl)
+          : { ok: false, error: "Ollama not installed" };
+        const running = connection.ok ? await ollamaListRunning(baseUrl) : { ok: false, models: [] };
+        sendJson(res, 200, {
+          installed: installation.installed,
+          version: installation.version,
+          path: installation.path,
+          connected: connection.ok,
+          running: running.models || [],
+          baseUrl
+        });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/models") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const modelsResult = await ollamaListModels(baseUrl);
+        if (!modelsResult.ok) {
+          sendJson(res, 502, { error: modelsResult.error || "Failed to list Ollama models" });
+          return;
+        }
+        const runningResult = await ollamaListRunning(baseUrl);
+        const runningMap = new Map((runningResult.models || []).map((m) => [m.name, m]));
+        const ollamaProvider = (configState.normalizedConfig?.providers || []).find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        const routedModelIds = new Set((ollamaProvider?.models || []).map((m) => m.id));
+        const enriched = modelsResult.models.map((model) => {
+          const running = runningMap.get(model.name);
+          const managed = ollamaConfig.managedModels?.[model.name];
+          const hwEstimate = model.contextLength && model.parameterSize
+            ? estimateModelVram(model.parameterSize, model.quantizationLevel, model.contextLength)
+            : null;
+          return {
+            ...model,
+            loaded: !!running,
+            sizeVram: running?.sizeVram || 0,
+            sizeVramFormatted: running?.sizeVram ? formatBytes(running.sizeVram) : "",
+            expiresAt: running?.expiresAt || "",
+            isPinned: running?.isPinned || managed?.pinned || false,
+            processor: running?.processor || "",
+            keepAlive: managed?.keepAlive || ollamaConfig.defaultKeepAlive || "5m",
+            autoLoad: managed?.autoLoad || false,
+            inRouter: routedModelIds.has(model.name),
+            estimatedVram: hwEstimate ? formatBytes(hwEstimate.totalBytes) : "",
+            estimatedVramBytes: hwEstimate?.totalBytes || 0
+          };
+        });
+        sendJson(res, 200, { models: enriched });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/load") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const keepAlive = body?.keepAlive || ollamaConfig.managedModels?.[model]?.keepAlive || ollamaConfig.defaultKeepAlive || "5m";
+        addLog("info", `Ollama: Loading ${model}…`);
+        const result = await ollamaLoadModel(baseUrl, model, keepAlive);
+        if (result.ok) addLog("success", `Ollama: Loaded ${model} (${Math.round(result.loadDurationMs || 0)}ms).`);
+        else addLog("warn", `Ollama: Failed to load ${model}.`, result.error || "");
+        sendJson(res, result.ok ? 200 : 502, result);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/unload") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        addLog("info", `Ollama: Unloading ${model}…`);
+        const result = await ollamaUnloadModel(baseUrl, model);
+        if (result.ok) addLog("success", `Ollama: Unloaded ${model}.`);
+        sendJson(res, result.ok ? 200 : 502, result);
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/pin") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const pinned = body?.pinned === true;
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const pinResult = pinned
+          ? await ollamaPinModel(baseUrl, model)
+          : await ollamaSetKeepAlive(baseUrl, model, ollamaConfig.managedModels?.[model]?.keepAlive || ollamaConfig.defaultKeepAlive || "5m");
+        if (!pinResult.ok) { sendJson(res, 502, { error: pinResult.error || "Failed to update model pin state" }); return; }
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), pinned };
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-pin" });
+        sendJson(res, 200, { ok: true, pinned });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/keep-alive") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        const keepAlive = String(body?.keepAlive || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        if (!OLLAMA_KEEP_ALIVE_PATTERN.test(keepAlive)) { sendJson(res, 400, { error: "Invalid keep_alive value" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const kaResult = await ollamaSetKeepAlive(baseUrl, model, keepAlive);
+        if (!kaResult.ok) { sendJson(res, 502, { error: kaResult.error || "Failed to update keep-alive" }); return; }
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), keepAlive };
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-keep-alive" });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/sync-router") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = resolveOllamaBaseUrl(body?.baseUrl, ollamaConfig.baseUrl);
+        if (!baseUrl) { sendJson(res, 400, { error: "Invalid Ollama base URL" }); return; }
+        const modelsResult = await ollamaListModels(baseUrl);
+        if (!modelsResult.ok) { sendJson(res, 502, { error: modelsResult.error || "Failed to list Ollama models" }); return; }
+        const modelIds = modelsResult.models.map((m) => m.name);
+        const providers = [...(rawConfig.providers || [])];
+        let ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        const previousModelIds = new Set((ollamaProvider?.models || []).map((m) => typeof m === "string" ? m : m?.id));
+        if (!ollamaProvider) {
+          ollamaProvider = { id: "ollama", name: "Ollama", type: OLLAMA_PROVIDER_TYPE, baseUrl: baseUrl + "/v1", models: [] };
+          providers.push(ollamaProvider);
+        }
+        ollamaProvider.baseUrl = baseUrl + "/v1";
+        ollamaProvider.models = modelIds.map((id) => {
+          const existing = (ollamaProvider.models || []).find((m) => (typeof m === "string" ? m : m?.id) === id);
+          if (existing && typeof existing === "object") return existing;
+          const details = modelsResult.models.find((m) => m.name === id);
+          return { id, contextWindow: details?.contextLength || undefined };
+        });
+        const nextConfig = { ...rawConfig, providers };
+        const { snapshot } = await writeAndBroadcastConfig(nextConfig, { source: "ollama-sync" });
+        const addedCount = modelIds.filter((id) => !previousModelIds.has(id)).length;
+        const removedCount = [...previousModelIds].filter((id) => !modelIds.includes(id)).length;
+        addLog("info", `Ollama: Synced ${modelIds.length} models (${addedCount} added, ${removedCount} removed).`);
+        sendJson(res, 200, { ok: true, modelCount: modelIds.length, addedCount, removedCount });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/add-model") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const ollamaConfig = configState.normalizedConfig?.ollama || {};
+        const baseUrl = (ollamaConfig.baseUrl || "http://localhost:11434").replace(/\/+$/, "");
+        const providers = [...(rawConfig.providers || [])];
+        let ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        if (!ollamaProvider) {
+          ollamaProvider = { id: "ollama", name: "Ollama", type: OLLAMA_PROVIDER_TYPE, baseUrl: baseUrl + "/v1", models: [] };
+          providers.push(ollamaProvider);
+        }
+        const existing = (ollamaProvider.models || []).find((m) => (typeof m === "string" ? m : m?.id) === model);
+        if (existing) { sendJson(res, 200, { ok: true, added: false, reason: "already exists" }); return; }
+        const contextLength = body?.contextLength || undefined;
+        ollamaProvider.models = [...(ollamaProvider.models || []), { id: model, ...(contextLength ? { contextWindow: contextLength } : {}) }];
+        await writeAndBroadcastConfig({ ...rawConfig, providers }, { source: "ollama-add-model" });
+        addLog("info", `Ollama: Added ${model} to router.`);
+        sendJson(res, 200, { ok: true, added: true });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/remove-model") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const providers = [...(rawConfig.providers || [])];
+        const ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        if (!ollamaProvider) { sendJson(res, 200, { ok: true, removed: false }); return; }
+        const before = (ollamaProvider.models || []).length;
+        ollamaProvider.models = (ollamaProvider.models || []).filter((m) => (typeof m === "string" ? m : m?.id) !== model);
+        const removed = ollamaProvider.models.length < before;
+        if (removed) {
+          await writeAndBroadcastConfig({ ...rawConfig, providers }, { source: "ollama-remove-model" });
+          addLog("info", `Ollama: Removed ${model} from router.`);
+        }
+        sendJson(res, 200, { ok: true, removed });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/save-settings") {
+        const body = await readJsonBody(req);
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const nextOllama = { ...(rawConfig.ollama || {}) };
+        if (body?.baseUrl !== undefined) nextOllama.baseUrl = String(body.baseUrl).trim();
+        if (body?.enabled !== undefined) nextOllama.enabled = body.enabled !== false;
+        if (body?.autoConnect !== undefined) nextOllama.autoConnect = body.autoConnect !== false;
+        if (body?.defaultKeepAlive !== undefined && OLLAMA_KEEP_ALIVE_PATTERN.test(String(body.defaultKeepAlive))) {
+          nextOllama.defaultKeepAlive = String(body.defaultKeepAlive);
+        }
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-settings" });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/auto-load") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        const autoLoad = body?.autoLoad === true;
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), autoLoad };
+        const autoLoadModels = Object.entries(nextOllama.managedModels)
+          .filter(([, v]) => v?.autoLoad).map(([k]) => k);
+        nextOllama.autoLoadModels = autoLoadModels;
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama }, { source: "ollama-auto-load" });
+        sendJson(res, 200, { ok: true, autoLoad });
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/install") {
+        const installation = detectOllamaInstallation();
+        if (installation.installed) {
+          sendJson(res, 200, { ok: true, alreadyInstalled: true, version: installation.version });
+          return;
+        }
+        addLog("info", "Ollama: Starting installation…");
+        const result = await installOllama({
+          onProgress: (event) => pushEvent("ollama-install-progress", event)
+        });
+        if (result.ok && !result.alreadyInstalled) {
+          addLog("success", `Ollama: Installed (${result.version || "unknown"}).`);
+          const started = await startOllamaServer();
+          sendJson(res, 200, { ...result, serverStarted: started.ok });
+          broadcastState();
+        } else if (result.ok) {
+          sendJson(res, 200, result);
+        } else {
+          addLog("error", "Ollama: Installation failed.", result.error || "");
+          sendJson(res, 500, result);
+        }
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/start-server") {
+        const result = await startOllamaServer();
+        if (result.ok) addLog("success", "Ollama: Server started.");
+        else addLog("warn", "Ollama: Failed to start server.", result.error || "");
+        sendJson(res, result.ok ? 200 : 502, result);
+        broadcastState();
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/stop-server") {
+        const result = stopOllamaServer();
+        if (result.ok) addLog("info", "Ollama: Server stopped.");
+        sendJson(res, 200, result);
+        broadcastState();
+        return;
+      }
+
+      if (method === "POST" && requestUrl.pathname === "/api/ollama/context-length") {
+        const body = await readJsonBody(req);
+        const model = String(body?.model || "").trim();
+        const contextLength = Number(body?.contextLength);
+        if (!model) { sendJson(res, 400, { error: "model is required" }); return; }
+        if (!Number.isFinite(contextLength) || contextLength <= 0) { sendJson(res, 400, { error: "contextLength must be a positive number" }); return; }
+        const configState = await readConfigState(configPath);
+        const rawConfig = configState.rawConfig || {};
+        const nextOllama = { ...(rawConfig.ollama || {}), managedModels: { ...(rawConfig.ollama?.managedModels || {}) } };
+        nextOllama.managedModels[model] = { ...(nextOllama.managedModels[model] || {}), contextLength: Math.round(contextLength) };
+        // Also update the provider model entry contextWindow
+        const providers = [...(rawConfig.providers || [])];
+        const ollamaProvider = providers.find((p) => p.type === OLLAMA_PROVIDER_TYPE);
+        if (ollamaProvider) {
+          ollamaProvider.models = (ollamaProvider.models || []).map((m) => {
+            const mid = typeof m === "string" ? m : m?.id;
+            if (mid === model) return { ...(typeof m === "object" ? m : { id: m }), contextWindow: Math.round(contextLength) };
+            return m;
+          });
+        }
+        await writeAndBroadcastConfig({ ...rawConfig, ollama: nextOllama, providers }, { source: "ollama-context-length" });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
       if (method === "POST" && requestUrl.pathname === "/api/exit") {
         sendJson(res, 200, { ok: true, message: "Closing web console." });
         setTimeout(() => {
@@ -3764,6 +5135,7 @@ export async function startWebConsoleServer(options = {}, deps = {}) {
 
   addLog("info", `Web console listening on http://${formatHostForUrl(host, actualWebPort)}`);
   if (devMode) addLog("info", "Development mode enabled for web assets.");
+  if (!startupControlsEnabled) addLog("info", "Startup service controls disabled in dev mode.");
   startConfigWatcher();
   startActivityLogWatcher();
 

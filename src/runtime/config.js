@@ -9,6 +9,13 @@ import {
   CLAUDE_CODE_SUBSCRIPTION_MODELS
 } from "./subscription-constants.js";
 import { sanitizeRuntimeMetadata } from "../shared/local-router-defaults.js";
+import {
+  LOCAL_RUNTIME_PROVIDER_TYPE,
+  collectDuplicateLocalVariantModelIds,
+  materializeLocalVariantProvider,
+  normalizeLocalModelsMetadata
+} from "./local-models.js";
+import { normalizeQuotaProbeConfig } from "./quota-probe.js";
 
 export const CONFIG_VERSION = 2;
 export const MIN_SUPPORTED_CONFIG_VERSION = 1;
@@ -37,11 +44,18 @@ const ALLOWED_RATE_LIMIT_WINDOW_UNITS = new Set([
   "week",
   "month"
 ]);
-const ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const ALIAS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:\-\[\]]*$/;
 const SUBSCRIPTION_PROVIDER_TYPES = Object.freeze({
   CHATGPT_CODEX: "chatgpt-codex",
   CLAUDE_CODE: "claude-code"
 });
+export const OLLAMA_PROVIDER_TYPE = "ollama";
+export const OLLAMA_KEEP_ALIVE_PATTERN = /^(-1|0|\d+(s|m|h))$/;
+export const OLLAMA_KEEP_ALIVE_OPTIONS = Object.freeze([
+  "5m", "10m", "30m", "1h", "24h", "-1", "0"
+]);
+const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434";
+const OLLAMA_DEFAULT_KEEP_ALIVE = "5m";
 let runtimeEnvCache = null;
 
 function readNodeRuntimeInfo() {
@@ -552,6 +566,12 @@ function normalizeAmpWebSearchProviderId(value) {
   return AMP_WEB_SEARCH_PROVIDER_IDS.includes(normalized) ? normalized : "";
 }
 
+export function normalizeClaudeCodeWebSearchProvider(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  return normalizeAmpWebSearchProviderId(normalized) || normalized;
+}
+
 function normalizeAmpWebSearchStrategy(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return "ordered";
@@ -741,6 +761,32 @@ function normalizeAmpWebSearchConfig(rawWebSearch) {
       false
     )
   };
+}
+
+function normalizeClaudeCodeConfig(rawClaudeCode) {
+  if (!rawClaudeCode || typeof rawClaudeCode !== "object" || Array.isArray(rawClaudeCode)) {
+    return undefined;
+  }
+
+  const source = rawClaudeCode;
+  const hasWebSearchProvider = hasOwn(source, "webSearchProvider")
+    || hasOwn(source, "web-search-provider")
+    || hasOwn(source, "searchProvider")
+    || hasOwn(source, "search-provider");
+  const webSearchProvider = normalizeClaudeCodeWebSearchProvider(
+    source.webSearchProvider
+    ?? source["web-search-provider"]
+    ?? source.searchProvider
+    ?? source["search-provider"]
+  );
+
+  if (!hasWebSearchProvider) {
+    return undefined;
+  }
+
+  return webSearchProvider
+    ? { webSearchProvider }
+    : {};
 }
 
 function supportsOpenAIHostedWebSearchRoute(provider, model) {
@@ -1208,6 +1254,26 @@ function normalizeAuthConfig(rawAuth) {
   };
 }
 
+// Keep in sync with CAPABILITY_DEFINITIONS in src/node/web-console-ui/capability-utils.js
+const MODEL_CAPABILITY_KEYS = [
+  "supportsReasoning", "supportsThinking", "supportsResponseFormat",
+  "supportsLogprobs", "supportsServiceTier", "supportsPrediction",
+  "supportsStreamOptions"
+];
+
+function normalizeModelCapabilities(raw) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const result = {};
+  let hasAny = false;
+  for (const key of MODEL_CAPABILITY_KEYS) {
+    if (typeof raw[key] === "boolean") {
+      result[key] = raw[key];
+      hasAny = true;
+    }
+  }
+  return hasAny ? result : undefined;
+}
+
 function normalizeModelEntry(model) {
   if (typeof model === "string") {
     return { id: model };
@@ -1222,6 +1288,7 @@ function normalizeModelEntry(model) {
     model["silent-fallbacks"] ??
     model.fallbacks;
   const fallbackModels = dedupeStrings(toArray(rawFallbacks));
+  const capabilities = normalizeModelCapabilities(model.capabilities);
   return {
     id,
     aliases: dedupeStrings(model.aliases || model.alias || []),
@@ -1232,7 +1299,8 @@ function normalizeModelEntry(model) {
     contextWindow: Number.isFinite(model.contextWindow) ? Number(model.contextWindow) : undefined,
     cost: model.cost,
     metadata: model.metadata && typeof model.metadata === "object" ? model.metadata : undefined,
-    ...(rawFallbacks !== undefined ? { fallbackModels } : {})
+    ...(rawFallbacks !== undefined ? { fallbackModels } : {}),
+    ...(capabilities ? { capabilities } : {})
   };
 }
 
@@ -1295,6 +1363,47 @@ function normalizeBaseUrlByFormat(value) {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function normalizeOllamaManagedModel(entry) {
+  if (!entry || typeof entry !== "object") return { keepAlive: OLLAMA_DEFAULT_KEEP_ALIVE, pinned: false, autoLoad: false };
+  const keepAlive = typeof entry.keepAlive === "string" && OLLAMA_KEEP_ALIVE_PATTERN.test(entry.keepAlive)
+    ? entry.keepAlive : OLLAMA_DEFAULT_KEEP_ALIVE;
+  const contextLength = Number.isFinite(entry.contextLength) && entry.contextLength > 0
+    ? Math.round(entry.contextLength) : undefined;
+  return {
+    keepAlive,
+    contextLength,
+    pinned: entry.pinned === true,
+    autoLoad: entry.autoLoad === true
+  };
+}
+
+export function normalizeOllamaConfig(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { enabled: false, baseUrl: OLLAMA_DEFAULT_BASE_URL, autoConnect: true, defaultKeepAlive: OLLAMA_DEFAULT_KEEP_ALIVE, managedModels: {}, autoLoadModels: [] };
+  }
+  const baseUrl = sanitizeEndpointUrl(raw.baseUrl || raw["base-url"] || OLLAMA_DEFAULT_BASE_URL)
+    || OLLAMA_DEFAULT_BASE_URL;
+  const defaultKeepAlive = typeof raw.defaultKeepAlive === "string" && OLLAMA_KEEP_ALIVE_PATTERN.test(raw.defaultKeepAlive)
+    ? raw.defaultKeepAlive : OLLAMA_DEFAULT_KEEP_ALIVE;
+  const managedModels = {};
+  if (raw.managedModels && typeof raw.managedModels === "object" && !Array.isArray(raw.managedModels)) {
+    for (const [modelId, entry] of Object.entries(raw.managedModels)) {
+      if (typeof modelId === "string" && modelId.trim()) {
+        managedModels[modelId.trim()] = normalizeOllamaManagedModel(entry);
+      }
+    }
+  }
+  const autoLoadModels = dedupeStrings(toArray(raw.autoLoadModels || raw["auto-load-models"]));
+  return {
+    enabled: raw.enabled !== false,
+    baseUrl,
+    autoConnect: raw.autoConnect !== false,
+    defaultKeepAlive,
+    managedModels,
+    autoLoadModels
+  };
+}
+
 function normalizeProvider(provider, index = 0) {
   if (!provider || typeof provider !== "object") return null;
 
@@ -1302,7 +1411,8 @@ function normalizeProvider(provider, index = 0) {
   const id = slugifyId(provider.id || provider.name || `provider-${index + 1}`);
   const providerType = provider.type || null;
   const isSubscription = providerType === "subscription";
-  
+  const isOllama = providerType === OLLAMA_PROVIDER_TYPE;
+
   // Subscription-specific fields
   const subscriptionType = isSubscription ? (provider.subscriptionType || provider.subscription_type || null) : null;
   const subscriptionProfile = isSubscription ? (provider.subscriptionProfile || provider.subscription_profile || id) : null;
@@ -1316,9 +1426,11 @@ function normalizeProvider(provider, index = 0) {
   );
   
   // Subscription providers have a fixed endpoint, so baseUrl is optional
-  const explicitBaseUrl = !isSubscription 
-    ? sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "")
-    : sanitizeEndpointUrl(provider.baseUrl || provider["base-url"] || provider.endpoint || "");
+  // Ollama defaults to localhost:11434/v1 for OpenAI compat
+  const ollamaDefaultUrl = OLLAMA_DEFAULT_BASE_URL + "/v1";
+  const explicitBaseUrl = sanitizeEndpointUrl(
+    provider.baseUrl || provider["base-url"] || provider.endpoint || (isOllama ? ollamaDefaultUrl : "")
+  );
     
   const rawFormat = provider.format || provider.responseFormat || provider["response-format"];
   const preferredFormat = [FORMATS.OPENAI, FORMATS.CLAUDE].includes(rawFormat) ? rawFormat : undefined;
@@ -1336,7 +1448,9 @@ function normalizeProvider(provider, index = 0) {
   const defaultSubscriptionFormat = subscriptionType === SUBSCRIPTION_PROVIDER_TYPES.CLAUDE_CODE
     ? FORMATS.CLAUDE
     : FORMATS.OPENAI;
-  const defaultFormat = isSubscription ? defaultSubscriptionFormat : (orderedFormats[0] || FORMATS.OPENAI);
+  const defaultFormat = isSubscription ? defaultSubscriptionFormat
+    : isOllama ? FORMATS.OPENAI
+    : (orderedFormats[0] || FORMATS.OPENAI);
   
   const baseUrl = explicitBaseUrl
     || (preferredFormat && baseUrlByFormat?.[preferredFormat])
@@ -1358,6 +1472,8 @@ function normalizeProvider(provider, index = 0) {
     }))
     .filter(Boolean);
 
+  const quotaProbe = normalizeQuotaProbeConfig(provider.quotaProbe);
+
   const auth = normalizeAuthConfig(provider.auth) || null;
   const authByFormat = provider.authByFormat && typeof provider.authByFormat === "object"
     ? Object.fromEntries(
@@ -1374,7 +1490,8 @@ function normalizeProvider(provider, index = 0) {
     enabled: provider.enabled !== false,
     baseUrl,
     baseUrlByFormat,
-    apiKey: typeof provider.apiKey === "string" ? provider.apiKey : (typeof provider.credential === "string" ? provider.credential : undefined),
+    apiKey: isOllama ? (typeof provider.apiKey === "string" ? provider.apiKey : "ollama")
+      : (typeof provider.apiKey === "string" ? provider.apiKey : (typeof provider.credential === "string" ? provider.credential : undefined)),
     apiKeyEnv: typeof provider.apiKeyEnv === "string" ? provider.apiKeyEnv : undefined,
     format: preferredFormat || defaultFormat,
     formats: orderedFormats.length > 0 ? orderedFormats : [defaultFormat],
@@ -1386,7 +1503,8 @@ function normalizeProvider(provider, index = 0) {
     models: normalizedModels,
     rateLimits: normalizedRateLimits,
     metadata: normalizeMetadataObject(provider.metadata),
-    lastProbe: provider.lastProbe && typeof provider.lastProbe === "object" ? provider.lastProbe : undefined
+    lastProbe: provider.lastProbe && typeof provider.lastProbe === "object" ? provider.lastProbe : undefined,
+    quotaProbe
   };
   
   // Add subscription-specific fields
@@ -1661,12 +1779,15 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
   const raw = shouldMigrate
     ? migrateRuntimeConfig(rawInput, { targetVersion })
     : rawInput;
-  const providers = sanitizeModelFallbackReferences(
-    toArray(raw.providers)
-    .map(normalizeProvider)
-    .filter(Boolean)
-    .filter((provider) => provider.enabled !== false)
-  );
+  const localModels = normalizeLocalModelsMetadata(raw.metadata?.localModels);
+  const providers = sanitizeModelFallbackReferences([
+    ...toArray(raw.providers)
+      .map(normalizeProvider)
+      .filter(Boolean)
+      .filter((provider) => provider.enabled !== false)
+      .filter((provider) => provider.type !== LOCAL_RUNTIME_PROVIDER_TYPE),
+    ...materializeLocalVariantProvider({ metadata: { localModels } })
+  ]);
   const modelAliasResult = normalizeModelAliases(raw.modelAliases || raw["model-aliases"]);
   const rawDefaultModel = typeof raw.defaultModel === "string"
     ? raw.defaultModel
@@ -1683,16 +1804,20 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     ? rawAmp
     : {};
   const rawWebSearch = raw.webSearch ?? raw["web-search"];
+  const rawClaudeCode = raw.claudeCode ?? raw["claude-code"];
   const amp = normalizeAmpConfig(rawAmp);
   const webSearch = normalizeAmpWebSearchConfig(rawWebSearch)
     ?? (amp?.webSearch && typeof amp.webSearch === "object" && !Array.isArray(amp.webSearch)
       ? amp.webSearch
       : undefined);
+  const claudeCode = normalizeClaudeCodeConfig(rawClaudeCode);
   const normalizedAmp = webSearch && amp?.webSearch && typeof amp.webSearch === "object" && !Array.isArray(amp.webSearch)
     ? Object.fromEntries(
         Object.entries(amp).filter(([key]) => key !== "webSearch")
       )
     : amp;
+
+  const ollama = normalizeOllamaConfig(raw.ollama);
 
   const normalized = {
     version: inferNormalizedConfigVersion(raw, providers, modelAliases),
@@ -1702,7 +1827,12 @@ export function normalizeRuntimeConfig(rawConfig, options = {}) {
     modelAliases,
     amp: normalizedAmp,
     ...(webSearch ? { webSearch } : {}),
-    metadata: sanitizeRuntimeMetadata(raw.metadata)
+    ...(claudeCode && Object.keys(claudeCode).length > 0 ? { claudeCode } : {}),
+    ollama,
+    metadata: sanitizeRuntimeMetadata({
+      ...(normalizeMetadataObject(raw.metadata) || {}),
+      localModels
+    })
   };
   Object.defineProperty(normalized, NORMALIZATION_ISSUES_SYMBOL, {
     value: {
@@ -2006,6 +2136,21 @@ function validateAmpConfig(config, routingIndex, errors) {
       }
     }
   }
+
+  const claudeCode = config?.claudeCode;
+  if (claudeCode && typeof claudeCode === "object" && !Array.isArray(claudeCode)) {
+    const selectedWebSearchProvider = normalizeClaudeCodeWebSearchProvider(claudeCode.webSearchProvider);
+    if (selectedWebSearchProvider) {
+      const configuredProviders = Array.isArray(webSearch?.providers) ? webSearch.providers : [];
+      const selectedExists = configuredProviders.some((provider) => {
+        const providerId = normalizeClaudeCodeWebSearchProvider(provider?.id);
+        return providerId && providerId === selectedWebSearchProvider;
+      });
+      if (!selectedExists) {
+        errors.push(`claudeCode.webSearchProvider '${selectedWebSearchProvider}' must reference a configured webSearch provider.`);
+      }
+    }
+  }
 }
 
 export function validateRuntimeConfig(config, { requireMasterKey = false, requireProvider = false } = {}) {
@@ -2056,6 +2201,9 @@ export function validateRuntimeConfig(config, { requireMasterKey = false, requir
   validateProviderRateLimits(config, routingIndex, errors);
   validateModelAliases(config, routingIndex, errors);
   validateAmpConfig(config, routingIndex, errors);
+  for (const duplicateModelId of collectDuplicateLocalVariantModelIds(config.metadata?.localModels)) {
+    errors.push(`Duplicate local variant model id '${duplicateModelId}'.`);
+  }
 
   if (requireMasterKey && !config.masterKey) {
     errors.push("masterKey is required for worker deployment/export.");
@@ -2085,20 +2233,21 @@ export function resolveProviderUrl(provider, targetFormat, requestKind = undefin
   const baseUrl = sanitizeEndpointUrl(provider?.baseUrlByFormat?.[targetFormat] || provider?.baseUrl || "").replace(/\/+$/, "");
   if (!baseUrl) return "";
   const isVersionedApiRoot = /\/v\d+(?:\.\d+)?$/i.test(baseUrl);
+  const hasVersionedApiPath = /\/v\d+[a-z]*(?:\.\d+)?(?:\/|$)/i.test(baseUrl);
 
   if (targetFormat === FORMATS.OPENAI) {
     if (requestKind === "responses") {
       if (baseUrl.endsWith("/responses")) return baseUrl;
-      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/responses`;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot || hasVersionedApiPath) return `${baseUrl}/responses`;
       return `${baseUrl}/v1/responses`;
     }
     if (requestKind === "completions") {
       if (baseUrl.endsWith("/completions")) return baseUrl;
-      if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/completions`;
+      if (baseUrl.endsWith("/v1") || isVersionedApiRoot || hasVersionedApiPath) return `${baseUrl}/completions`;
       return `${baseUrl}/v1/completions`;
     }
     if (baseUrl.endsWith("/chat/completions")) return baseUrl;
-    if (baseUrl.endsWith("/v1") || isVersionedApiRoot) return `${baseUrl}/chat/completions`;
+    if (baseUrl.endsWith("/v1") || isVersionedApiRoot || hasVersionedApiPath) return `${baseUrl}/chat/completions`;
     return `${baseUrl}/v1/chat/completions`;
   }
 
@@ -2246,6 +2395,9 @@ export function sanitizeConfigForDisplay(config) {
     ...config,
     masterKey: config.masterKey ? maskSecret(config.masterKey) : undefined,
     ...(sanitizedWebSearch ? { webSearch: sanitizedWebSearch } : {}),
+    ...(config.claudeCode && typeof config.claudeCode === "object" && !Array.isArray(config.claudeCode)
+      ? { claudeCode: { ...config.claudeCode } }
+      : {}),
     amp: sanitizedAmp,
     providers: (config.providers || []).map((provider) => ({
       ...provider,
@@ -3274,7 +3426,15 @@ export function resolveRequestedRoute(config, requestedModel, sourceFormat = FOR
     return resolvedAmpRoute;
   }
 
-  const resolvedRoute = resolveRequestedRouteCore(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex);
+  let resolvedRoute = resolveRequestedRouteCore(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex);
+
+  if (!resolvedRoute?.primary && !String(effectiveRequested || "").includes("/")) {
+    const bareRoute = resolveBareModelRoutePlan(config, effectiveRequested, normalizedRequested, sourceFormat, routingIndex, {});
+    if (bareRoute?.primary) {
+      resolvedRoute = bareRoute;
+    }
+  }
+
   if (!resolvedRoute?.primary && effectiveRequested === DEFAULT_MODEL_ALIAS_ID) {
     return {
       ...resolvedRoute,

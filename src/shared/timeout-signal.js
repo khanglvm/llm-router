@@ -3,14 +3,13 @@ export function buildTimeoutSignal(timeoutMs) {
     return { signal: undefined, cleanup: () => {} };
   }
 
-  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-    return {
-      signal: AbortSignal.timeout(timeoutMs),
-      cleanup: () => {}
-    };
-  }
-
   if (typeof AbortController === "undefined") {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return {
+        signal: AbortSignal.timeout(timeoutMs),
+        cleanup: () => {}
+      };
+    }
     return { signal: undefined, cleanup: () => {} };
   }
 

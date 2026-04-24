@@ -11,6 +11,8 @@ import { readConfigFile, getDefaultConfigPath } from "./config-store.js";
 import { FIXED_LOCAL_ROUTER_HOST, FIXED_LOCAL_ROUTER_PORT } from "./local-server-settings.js";
 import { readActivityLogSettings } from "../shared/local-router-defaults.js";
 import { appendActivityLogEntry, resolveActivityLogPath } from "./activity-log.js";
+import { appendLargeRequestLogEntry, resolveLargeRequestLogPath } from "./large-request-log.js";
+import { isLargeRequestLoggingEnabled } from "../runtime/handler/large-request-log.js";
 
 const DEFAULT_CONFIG_RELOAD_DEBOUNCE_MS = 300;
 const MAX_CONFIG_RELOAD_DEBOUNCE_MS = 5000;
@@ -240,6 +242,7 @@ export async function startLocalRouteServer({
   host = FIXED_LOCAL_ROUTER_HOST,
   configPath = getDefaultConfigPath(),
   activityLogPath = "",
+  largeRequestLogPath = "",
   watchConfig = true,
   configReloadDebounceMs = process.env.LLM_ROUTER_CONFIG_RELOAD_DEBOUNCE_MS,
   validateConfig,
@@ -249,6 +252,7 @@ export async function startLocalRouteServer({
 } = {}) {
   const reloadDebounceMs = resolveReloadDebounceMs(configReloadDebounceMs);
   const resolvedActivityLogPath = resolveActivityLogPath(configPath, activityLogPath);
+  const resolvedLargeRequestLogPath = resolveLargeRequestLogPath(configPath, largeRequestLogPath, process.env);
   let activityLogEnabled = true;
   const configStore = createLiveConfigStore({
     configPath,
@@ -278,12 +282,46 @@ export async function startLocalRouteServer({
       }).catch((error) => {
         console.warn(`[llm-router] Failed writing activity log: ${formatError(error)}`);
       });
+    },
+    onLargeRequestLog: (entry) => {
+      if (!isLargeRequestLoggingEnabled(process.env)) return;
+      void appendLargeRequestLogEntry(resolvedLargeRequestLogPath, entry).catch((error) => {
+        console.warn(`[llm-router] Failed writing large request log: ${formatError(error)}`);
+      });
     }
   });
 
   const fallbackHost = formatHostForUrl(host, port);
+  let shuttingDown = false;
+  const socketRequestCounts = new Map();
+
+  function closeSocketIfIdle(socket) {
+    if (!socket || socket.destroyed) return;
+    if (Number(socketRequestCounts.get(socket) || 0) > 0) return;
+    socket.end();
+  }
 
   const server = http.createServer(async (req, res) => {
+    const socket = req.socket;
+    socketRequestCounts.set(socket, Number(socketRequestCounts.get(socket) || 0) + 1);
+    let finalized = false;
+    const finalizeRequest = () => {
+      if (finalized) return;
+      finalized = true;
+      const remaining = Math.max(0, Number(socketRequestCounts.get(socket) || 0) - 1);
+      if (remaining > 0) {
+        socketRequestCounts.set(socket, remaining);
+        return;
+      }
+      socketRequestCounts.set(socket, 0);
+      if (shuttingDown) {
+        closeSocketIfIdle(socket);
+      }
+    };
+
+    res.once("finish", finalizeRequest);
+    res.once("close", finalizeRequest);
+
     try {
       const request = nodeRequestToFetchRequest(req, fallbackHost);
       const response = await fetchHandler(request, {}, undefined);
@@ -298,6 +336,13 @@ export async function startLocalRouteServer({
     }
   });
 
+  server.on("connection", (socket) => {
+    socketRequestCounts.set(socket, Number(socketRequestCounts.get(socket) || 0));
+    socket.on("close", () => {
+      socketRequestCounts.delete(socket);
+    });
+  });
+
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => {
@@ -308,10 +353,15 @@ export async function startLocalRouteServer({
 
   const originalClose = server.close.bind(server);
   server.close = (callback) => {
+    shuttingDown = true;
     Promise.resolve()
       .then(() => configStore.close())
       .then(() => (typeof fetchHandler.close === "function" ? fetchHandler.close() : undefined))
       .finally(() => {
+        server.closeIdleConnections?.();
+        for (const socket of socketRequestCounts.keys()) {
+          closeSocketIfIdle(socket);
+        }
         originalClose(callback);
       });
     return server;

@@ -4,15 +4,20 @@ import { promises as fs } from "node:fs";
 import {
   CODEX_CLI_INHERIT_MODEL_VALUE,
   CLAUDE_CODE_EFFORT_LEVEL_SETTINGS_JSON_VALUE,
+  buildFactoryDroidRouterDisplayName,
+  buildFactoryDroidRouterModelId,
   isCodexCliInheritModelBinding,
+  isFactoryDroidRouterModelId,
   mapClaudeCodeThinkingLevelToTokens,
   mapClaudeCodeThinkingTokensToLevel,
   normalizeClaudeCodeThinkingLevel,
   normalizeClaudeCodeEffortLevel,
   migrateLegacyThinkingTokensToEffortLevel,
   normalizeCodexCliReasoningEffort,
-  normalizeFactoryDroidReasoningEffort
+  normalizeFactoryDroidReasoningEffort,
+  resolveFactoryDroidRouterModelRef
 } from "../shared/coding-tool-bindings.js";
+import { LOCAL_RUNTIME_PROVIDER_TYPE } from "../runtime/local-models.js";
 
 const BACKUP_SUFFIX = ".llm_router_backup";
 const CODEX_PROVIDER_ID = "llm-router";
@@ -966,36 +971,446 @@ export async function patchClaudeCodeEffortLevel({
 }
 
 const FACTORY_DROID_ROUTER_MARKER = "_llmRouterManaged";
+const FACTORY_DROID_OPENAI_PROVIDER = "openai";
+const FACTORY_DROID_ANTHROPIC_PROVIDER = "anthropic";
+const FACTORY_DROID_GENERIC_CHAT_COMPLETIONS_PROVIDER = "generic-chat-completion-api";
+const FACTORY_DROID_ROUTER_PROVIDERS = Object.freeze([
+  FACTORY_DROID_OPENAI_PROVIDER,
+  FACTORY_DROID_ANTHROPIC_PROVIDER,
+  FACTORY_DROID_GENERIC_CHAT_COMPLETIONS_PROVIDER
+]);
+
+function dedupeStrings(values = []) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function normalizeFactoryDroidFormat(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "openai") return "openai";
+  if (normalized === "claude" || normalized === "anthropic") return "claude";
+  return "";
+}
+
+function mapFactoryDroidFormatToProvider(format) {
+  const normalized = normalizeFactoryDroidFormat(format);
+  if (normalized === "claude") return FACTORY_DROID_ANTHROPIC_PROVIDER;
+  if (normalized === "openai") return FACTORY_DROID_OPENAI_PROVIDER;
+  return "";
+}
 
 function normalizeFactoryDroidBindings(bindings = {}) {
   const source = bindings && typeof bindings === "object" && !Array.isArray(bindings) ? bindings : {};
+  const legacyMissionModel = normalizeModelBinding(source.missionModel);
   return {
     defaultModel: normalizeModelBinding(source.defaultModel),
+    missionOrchestratorModel: normalizeModelBinding(source.missionOrchestratorModel) || legacyMissionModel,
+    missionWorkerModel: normalizeModelBinding(source.missionWorkerModel) || legacyMissionModel,
+    missionValidatorModel: normalizeModelBinding(source.missionValidatorModel) || legacyMissionModel,
     reasoningEffort: normalizeFactoryDroidReasoningEffort(source.reasoningEffort)
   };
 }
 
-function buildFactoryDroidBaseUrl(endpointUrl) {
+function buildFactoryDroidBaseUrl(endpointUrl, provider = FACTORY_DROID_OPENAI_PROVIDER) {
   const normalized = normalizeHttpUrl(endpointUrl);
-  return normalized ? `${normalized}/openai/v1` : "";
+  const resolvedProvider = String(provider || "").trim().toLowerCase() || FACTORY_DROID_OPENAI_PROVIDER;
+  if (!normalized) return "";
+  return resolvedProvider === FACTORY_DROID_ANTHROPIC_PROVIDER
+    ? `${normalized}/anthropic`
+    : `${normalized}/openai/v1`;
+}
+
+function inferFactoryDroidFormatFromModelId(modelId) {
+  const normalized = String(modelId || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (/^(?:claude|opus|sonnet|haiku)(?=[-./\s]|$)/i.test(normalized)) return "claude";
+  if (/^gpt(?=[-./\s]|$)/i.test(normalized)) return "openai";
+  return "";
+}
+
+function inferFactoryDroidFormatFromProviderId(providerId) {
+  const normalized = String(providerId || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "anthropic") return "claude";
+  if (normalized === "openai") return "openai";
+  return "";
+}
+
+function getFactoryDroidProviderModelFormats(provider, model, modelId = "") {
+  const resolvedModelId = String(modelId || model?.id || "").trim();
+  const preferredFormat = normalizeFactoryDroidFormat(provider?.lastProbe?.modelPreferredFormat?.[resolvedModelId]);
+  if (preferredFormat) return [preferredFormat];
+
+  return dedupeStrings([
+    ...(provider?.lastProbe?.modelSupport?.[resolvedModelId] || []),
+    ...(model?.formats || []),
+    model?.format
+  ])
+    .map(normalizeFactoryDroidFormat)
+    .filter(Boolean);
+}
+
+function getFactoryDroidProviderFormats(provider) {
+  return dedupeStrings([
+    ...(provider?.formats || []),
+    provider?.format
+  ])
+    .map(normalizeFactoryDroidFormat)
+    .filter(Boolean);
+}
+
+function getFactoryDroidAliasTargetRefs(alias) {
+  const refs = [];
+  const push = (entry) => {
+    const ref = String(
+      typeof entry === "string"
+        ? entry
+        : (entry?.ref || entry?.sourceRef || "")
+    ).trim();
+    if (ref) refs.push(ref);
+  };
+
+  for (const entry of Array.isArray(alias?.targets) ? alias.targets : []) push(entry);
+  for (const entry of Array.isArray(alias?.fallbackTargets) ? alias.fallbackTargets : []) push(entry);
+
+  return refs;
+}
+
+function resolveFactoryDroidRouteFormat(modelRef, config = {}, seen = new Set()) {
+  const normalizedModelRef = String(modelRef || "").trim();
+  if (!normalizedModelRef || seen.has(normalizedModelRef)) return "";
+
+  if (normalizedModelRef.includes("/")) {
+    const separatorIndex = normalizedModelRef.indexOf("/");
+    const providerId = normalizedModelRef.slice(0, separatorIndex).trim();
+    const modelId = normalizedModelRef.slice(separatorIndex + 1).trim();
+    const provider = (Array.isArray(config?.providers) ? config.providers : [])
+      .find((entry) => String(entry?.id || "").trim() === providerId);
+    const model = Array.isArray(provider?.models)
+      ? provider.models.find((entry) => String(entry?.id || "").trim() === modelId)
+      : null;
+    return getFactoryDroidProviderModelFormats(provider, model, modelId)[0]
+      || inferFactoryDroidFormatFromModelId(modelId)
+      || getFactoryDroidProviderFormats(provider)[0]
+      || inferFactoryDroidFormatFromProviderId(providerId)
+      || "";
+  }
+
+  seen.add(normalizedModelRef);
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+  const alias = aliases[normalizedModelRef];
+  if (!alias || typeof alias !== "object" || Array.isArray(alias)) return "";
+
+  for (const targetRef of getFactoryDroidAliasTargetRefs(alias)) {
+    const resolved = resolveFactoryDroidRouteFormat(targetRef, config, new Set(seen));
+    if (resolved) return resolved;
+  }
+
+  return "";
+}
+
+function resolveFactoryDroidCustomModelProvider(modelRef, config = {}) {
+  const normalizedModelRef = String(modelRef || "").trim();
+  if (normalizedModelRef.includes("/")) {
+    const separatorIndex = normalizedModelRef.indexOf("/");
+    const providerId = normalizedModelRef.slice(0, separatorIndex).trim();
+    const provider = (Array.isArray(config?.providers) ? config.providers : [])
+      .find((entry) => String(entry?.id || "").trim() === providerId);
+    if (String(provider?.type || "").trim().toLowerCase() === LOCAL_RUNTIME_PROVIDER_TYPE) {
+      return FACTORY_DROID_GENERIC_CHAT_COMPLETIONS_PROVIDER;
+    }
+  }
+
+  return mapFactoryDroidFormatToProvider(resolveFactoryDroidRouteFormat(modelRef, config))
+    || FACTORY_DROID_OPENAI_PROVIDER;
+}
+
+function resolveFactoryDroidProviderDisplayName(modelRef, config = {}) {
+  const normalizedModelRef = String(modelRef || "").trim();
+  if (!normalizedModelRef.includes("/")) return "";
+  const separatorIndex = normalizedModelRef.indexOf("/");
+  const providerId = normalizedModelRef.slice(0, separatorIndex).trim();
+  const provider = (Array.isArray(config?.providers) ? config.providers : [])
+    .find((entry) => String(entry?.id || "").trim() === providerId);
+  return String(provider?.name || providerId || "").trim();
+}
+
+function collectFactoryDroidAvailableModels(config = {}, bindings = {}) {
+  const refs = [];
+  const seen = new Set();
+  const push = (value) => {
+    const normalized = String(value || "").trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    refs.push(normalized);
+  };
+
+  const aliases = config?.modelAliases && typeof config.modelAliases === "object" && !Array.isArray(config.modelAliases)
+    ? config.modelAliases
+    : {};
+  for (const aliasId of Object.keys(aliases)) {
+    push(aliasId);
+  }
+
+  push(bindings?.defaultModel);
+  push(bindings?.missionOrchestratorModel);
+  push(bindings?.missionWorkerModel);
+  push(bindings?.missionValidatorModel);
+
+  for (const provider of Array.isArray(config?.providers) ? config.providers : []) {
+    if (provider?.enabled === false) continue;
+    const providerId = String(provider?.id || "").trim();
+    if (!providerId) continue;
+    for (const model of Array.isArray(provider?.models) ? provider.models : []) {
+      if (model?.enabled === false) continue;
+      const modelId = String(model?.id || "").trim();
+      if (!modelId) continue;
+      push(`${providerId}/${modelId}`);
+    }
+  }
+
+  return refs;
+}
+
+function buildFactoryDroidAvailableModelDescriptors(config = {}, bindings = {}) {
+  return collectFactoryDroidAvailableModels(config, bindings)
+    .map((modelRef) => {
+      const kind = modelRef.includes("/") ? "model" : "alias";
+      return {
+        modelRef,
+        kind,
+        id: buildFactoryDroidRouterModelId(modelRef, { kind }),
+        displayName: buildFactoryDroidRouterDisplayName(modelRef, {
+          kind,
+          providerName: kind === "model" ? resolveFactoryDroidProviderDisplayName(modelRef, config) : ""
+        })
+      };
+    })
+    .filter((entry) => String(entry.id || "").trim() && String(entry.modelRef || "").trim());
+}
+
+function buildFactoryDroidRouteLookup(config = {}, bindings = {}) {
+  const descriptors = buildFactoryDroidAvailableModelDescriptors(config, bindings);
+  const byId = new Map();
+  const byDisplayName = new Map();
+
+  for (const descriptor of descriptors) {
+    if (descriptor.id) byId.set(descriptor.id, descriptor.modelRef);
+    if (descriptor.displayName) byDisplayName.set(descriptor.displayName, descriptor.modelRef);
+  }
+
+  return {
+    descriptors,
+    byId,
+    byDisplayName
+  };
+}
+
+function resolveFactoryDroidRouteRefFromLookup(value, routeLookup) {
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedValue || !routeLookup || typeof routeLookup !== "object") return "";
+  if (routeLookup.byId instanceof Map && routeLookup.byId.has(normalizedValue)) {
+    return String(routeLookup.byId.get(normalizedValue) || "").trim();
+  }
+  if (routeLookup.byDisplayName instanceof Map && routeLookup.byDisplayName.has(normalizedValue)) {
+    return String(routeLookup.byDisplayName.get(normalizedValue) || "").trim();
+  }
+  return "";
+}
+
+function getFactoryDroidCustomModelEntryByValue(customModels, value, { preferRouterManaged = false } = {}) {
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedValue || !Array.isArray(customModels)) return null;
+
+  const entries = preferRouterManaged
+    ? [
+      ...customModels.filter((entry) => isFactoryDroidRouterManagedEntry(entry)),
+      ...customModels.filter((entry) => !isFactoryDroidRouterManagedEntry(entry))
+    ]
+    : customModels;
+
+  return entries.find((entry) => entry && typeof entry === "object" && (
+    String(entry.id || "").trim() === normalizedValue
+    || String(entry.model || "").trim() === normalizedValue
+    || String(entry.displayName || "").trim() === normalizedValue
+  )) || null;
+}
+
+function resolveFactoryDroidBindingModelRef(value, customModels, routeLookup = null) {
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedValue) return "";
+  const matchedEntry = getFactoryDroidCustomModelEntryByValue(customModels, normalizedValue, { preferRouterManaged: true });
+  if (!matchedEntry) {
+    return resolveFactoryDroidRouteRefFromLookup(normalizedValue, routeLookup)
+      || resolveFactoryDroidRouterModelRef(normalizedValue);
+  }
+  return resolveFactoryDroidRouterModelRef(
+    String(matchedEntry.model || matchedEntry.displayName || matchedEntry.id || normalizedValue).trim()
+  );
+}
+
+function getNextFactoryDroidCustomModelIndex(customModels) {
+  if (!Array.isArray(customModels) || customModels.length === 0) return 0;
+  let maxIndex = -1;
+  for (const entry of customModels) {
+    const parsed = Number(entry?.index);
+    if (Number.isFinite(parsed)) maxIndex = Math.max(maxIndex, parsed);
+  }
+  return maxIndex >= 0 ? (maxIndex + 1) : customModels.length;
+}
+
+function buildFactoryDroidCustomModelId(modelRef, index) {
+  return buildFactoryDroidRouterModelId(modelRef) || `custom:llm-alias-llm-router-${Number(index)}`;
+}
+
+function resolveFactoryDroidBindingSelectionValue(value, customModels, routeLookup = null) {
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedValue) return "";
+  const matchedEntry = getFactoryDroidCustomModelEntryByValue(customModels, normalizedValue, { preferRouterManaged: true });
+  if (matchedEntry) {
+    const matchedId = String(matchedEntry.id || "").trim();
+    const preferredId = buildFactoryDroidCustomModelId(
+      resolveFactoryDroidBindingModelRef(normalizedValue, customModels, routeLookup),
+      Number(matchedEntry.index) || 0
+    );
+    if (matchedEntry[FACTORY_DROID_ROUTER_MARKER] === true || isFactoryDroidRouterModelId(matchedId)) {
+      return preferredId || matchedId || normalizedValue;
+    }
+    return matchedId || preferredId || normalizedValue;
+  }
+  const resolvedRouteRef = resolveFactoryDroidRouteRefFromLookup(normalizedValue, routeLookup);
+  if (resolvedRouteRef) return buildFactoryDroidCustomModelId(resolvedRouteRef, 0) || normalizedValue;
+  return buildFactoryDroidCustomModelId(
+    resolveFactoryDroidBindingModelRef(normalizedValue, customModels, routeLookup),
+    0
+  ) || normalizedValue;
 }
 
 function findRouterManagedCustomModelIndex(customModels) {
   if (!Array.isArray(customModels)) return -1;
   return customModels.findIndex(
-    (entry) => entry && typeof entry === "object" && entry[FACTORY_DROID_ROUTER_MARKER] === true
+    (entry) => isFactoryDroidRouterManagedEntry(entry)
   );
+}
+
+function getRouterManagedCustomModel(customModels) {
+  const routerIndex = findRouterManagedCustomModelIndex(customModels);
+  return routerIndex >= 0 ? customModels[routerIndex] : null;
+}
+
+function isFactoryDroidRouterManagedEntry(entry, { baseUrl = "" } = {}) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  if (entry[FACTORY_DROID_ROUTER_MARKER] === true) return true;
+
+  const entryId = String(entry.id || "").trim();
+  if (isFactoryDroidRouterModelId(entryId)) return true;
+
+  const provider = String(entry.provider || "").trim().toLowerCase();
+  if (!FACTORY_DROID_ROUTER_PROVIDERS.includes(provider)) return false;
+
+  const entryBaseUrl = String(entry.baseUrl || "").trim();
+  if (baseUrl && entryBaseUrl === String(baseUrl || "").trim()) return true;
+
+  const apiKey = String(entry.apiKey || "").trim();
+  return apiKey.startsWith("gw_") && (
+    entryBaseUrl.includes("/openai/v1")
+    || entryBaseUrl.includes("/anthropic")
+  );
+}
+
+function stripRouterManagedCustomModels(customModels, { baseUrl = "" } = {}) {
+  if (!Array.isArray(customModels)) return [];
+  return customModels.filter(
+    (entry) => !isFactoryDroidRouterManagedEntry(entry, { baseUrl })
+  );
+}
+
+function getNestedObjectValue(source, keys = []) {
+  let current = source;
+  for (const key of keys) {
+    if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) {
+      return undefined;
+    }
+    current = current[key];
+  }
+  return current;
+}
+
+function setNestedObjectValue(target, keys = [], value) {
+  if (!target || typeof target !== "object" || Array.isArray(target) || !Array.isArray(keys) || keys.length === 0) {
+    return;
+  }
+
+  let current = target;
+  for (let index = 0; index < keys.length - 1; index += 1) {
+    const key = keys[index];
+    const nextValue = current[key];
+    if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
+      current[key] = {};
+    }
+    current = current[key];
+  }
+
+  current[keys[keys.length - 1]] = value;
+}
+
+function deleteNestedObjectValue(target, keys = []) {
+  if (!target || typeof target !== "object" || Array.isArray(target) || !Array.isArray(keys) || keys.length === 0) {
+    return;
+  }
+
+  const parents = [];
+  let current = target;
+  for (let index = 0; index < keys.length - 1; index += 1) {
+    const key = keys[index];
+    if (!current[key] || typeof current[key] !== "object" || Array.isArray(current[key])) {
+      return;
+    }
+    parents.push([current, key]);
+    current = current[key];
+  }
+
+  delete current[keys[keys.length - 1]];
+
+  for (let index = parents.length - 1; index >= 0; index -= 1) {
+    const [parent, key] = parents[index];
+    const value = parent[key];
+    if (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0) {
+      delete parent[key];
+      continue;
+    }
+    break;
+  }
+}
+
+function applyNestedBackupValue(target, keys = [], snapshot) {
+  if (snapshot?.exists) {
+    setNestedObjectValue(target, keys, String(snapshot.value || ""));
+    return;
+  }
+  deleteNestedObjectValue(target, keys);
 }
 
 function captureFactoryDroidBackup(config) {
   const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
-  const model = String(config?.model || "").trim();
-  const reasoningEffort = String(config?.reasoningEffort || "").trim();
   return {
     tool: "factory-droid",
-    version: 1,
-    model: { exists: Boolean(model), value: model },
-    reasoningEffort: { exists: Boolean(reasoningEffort), value: reasoningEffort },
+    version: 2,
+    model: getBackupValue(config?.model),
+    sessionDefaultModel: getBackupValue(getNestedObjectValue(config, ["sessionDefaultSettings", "model"])),
+    missionOrchestratorModel: getBackupValue(config?.missionOrchestratorModel),
+    missionWorkerModel: getBackupValue(getNestedObjectValue(config, ["missionModelSettings", "workerModel"])),
+    missionValidationWorkerModel: getBackupValue(getNestedObjectValue(config, ["missionModelSettings", "validationWorkerModel"])),
+    reasoningEffort: getBackupValue(config?.reasoningEffort),
     hadCustomModels: customModels.length > 0
   };
 }
@@ -1005,17 +1420,16 @@ function applyFactoryDroidBackup(config, backup = {}) {
     ? structuredClone(config)
     : {};
 
-  const customModels = Array.isArray(next.customModels) ? [...next.customModels] : [];
-  const routerIndex = findRouterManagedCustomModelIndex(customModels);
-  if (routerIndex >= 0) customModels.splice(routerIndex, 1);
+  const customModels = stripRouterManagedCustomModels(next.customModels);
   if (customModels.length > 0) next.customModels = customModels;
   else delete next.customModels;
 
-  if (backup?.model?.exists) next.model = backup.model.value;
-  else delete next.model;
-
-  if (backup?.reasoningEffort?.exists) next.reasoningEffort = backup.reasoningEffort.value;
-  else delete next.reasoningEffort;
+  applyBackupValue(next, "model", backup?.model);
+  applyNestedBackupValue(next, ["sessionDefaultSettings", "model"], backup?.sessionDefaultModel);
+  applyBackupValue(next, "missionOrchestratorModel", backup?.missionOrchestratorModel);
+  applyNestedBackupValue(next, ["missionModelSettings", "workerModel"], backup?.missionWorkerModel);
+  applyNestedBackupValue(next, ["missionModelSettings", "validationWorkerModel"], backup?.missionValidationWorkerModel);
+  applyBackupValue(next, "reasoningEffort", backup?.reasoningEffort);
 
   return next;
 }
@@ -1052,21 +1466,34 @@ export async function readFactoryDroidRoutingState({
   settingsFilePath = "",
   backupFilePath = "",
   endpointUrl = "",
+  config = {},
   homeDir = os.homedir()
 } = {}) {
   const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveFactoryDroidSettingsFilePath({ homeDir })).trim());
   const resolvedBackupPath = path.resolve(String(backupFilePath || resolveCodingToolBackupFilePath(resolvedSettingsPath)).trim());
-  const expectedBaseUrl = buildFactoryDroidBaseUrl(endpointUrl);
+  const routeLookup = buildFactoryDroidRouteLookup(config);
   const settingsState = await readJsonObjectFile(resolvedSettingsPath, `Factory Droid settings file '${resolvedSettingsPath}'`);
   const backupState = await readJsonObjectFile(resolvedBackupPath, `Backup file '${resolvedBackupPath}'`);
   const customModels = Array.isArray(settingsState.data?.customModels) ? settingsState.data.customModels : [];
-  const routerIndex = findRouterManagedCustomModelIndex(customModels);
-  const routerEntry = routerIndex >= 0 ? customModels[routerIndex] : null;
+  const resolvedDefaultModelValue = getNestedObjectValue(settingsState.data, ["sessionDefaultSettings", "model"])
+    || settingsState.data?.model
+    || "";
+  const resolvedMissionOrchestratorValue = settingsState.data?.missionOrchestratorModel || "";
+  const resolvedMissionWorkerValue = getNestedObjectValue(settingsState.data, ["missionModelSettings", "workerModel"]) || "";
+  const resolvedMissionValidatorValue = getNestedObjectValue(settingsState.data, ["missionModelSettings", "validationWorkerModel"]) || "";
+  const routerEntry = getFactoryDroidCustomModelEntryByValue(customModels, resolvedDefaultModelValue, { preferRouterManaged: true })
+    || getRouterManagedCustomModel(customModels);
   const configuredBaseUrl = routerEntry ? String(routerEntry.baseUrl || "").trim() : "";
+  const configuredProvider = routerEntry ? String(routerEntry.provider || "").trim() : "";
+  const expectedBaseUrls = new Set(
+    FACTORY_DROID_ROUTER_PROVIDERS
+      .map((provider) => buildFactoryDroidBaseUrl(endpointUrl, provider))
+      .filter(Boolean)
+  );
   const routedViaRouter = Boolean(
-    expectedBaseUrl
+    configuredBaseUrl
       && routerEntry
-      && configuredBaseUrl === expectedBaseUrl
+      && expectedBaseUrls.has(configuredBaseUrl)
   );
 
   return {
@@ -1077,8 +1504,19 @@ export async function readFactoryDroidRoutingState({
     backupExists: backupState.existed,
     routedViaRouter,
     configuredBaseUrl,
+    configuredProvider,
     bindings: normalizeFactoryDroidBindings({
-      defaultModel: routerEntry?.model || settingsState.data?.model || "",
+      defaultModel: resolveFactoryDroidBindingModelRef(resolvedDefaultModelValue, customModels, routeLookup),
+      missionOrchestratorModel: resolveFactoryDroidBindingModelRef(resolvedMissionOrchestratorValue, customModels, routeLookup),
+      missionWorkerModel: resolveFactoryDroidBindingModelRef(resolvedMissionWorkerValue, customModels, routeLookup),
+      missionValidatorModel: resolveFactoryDroidBindingModelRef(resolvedMissionValidatorValue, customModels, routeLookup),
+      reasoningEffort: normalizeFactoryDroidReasoningEffort(settingsState.data?.reasoningEffort)
+    }),
+    bindingIds: normalizeFactoryDroidBindings({
+      defaultModel: resolveFactoryDroidBindingSelectionValue(resolvedDefaultModelValue, customModels, routeLookup),
+      missionOrchestratorModel: resolveFactoryDroidBindingSelectionValue(resolvedMissionOrchestratorValue, customModels, routeLookup),
+      missionWorkerModel: resolveFactoryDroidBindingSelectionValue(resolvedMissionWorkerValue, customModels, routeLookup),
+      missionValidatorModel: resolveFactoryDroidBindingSelectionValue(resolvedMissionValidatorValue, customModels, routeLookup),
       reasoningEffort: normalizeFactoryDroidReasoningEffort(settingsState.data?.reasoningEffort)
     })
   };
@@ -1090,14 +1528,16 @@ export async function patchFactoryDroidSettingsFile({
   endpointUrl = "",
   apiKey = "",
   bindings = {},
+  config = {},
   captureBackup = true,
   homeDir = os.homedir()
 } = {}) {
   const resolvedSettingsPath = path.resolve(String(settingsFilePath || resolveFactoryDroidSettingsFilePath({ homeDir })).trim());
   const resolvedBackupPath = path.resolve(String(backupFilePath || resolveCodingToolBackupFilePath(resolvedSettingsPath)).trim());
-  const baseUrl = buildFactoryDroidBaseUrl(endpointUrl);
+  const baseUrl = buildFactoryDroidBaseUrl(endpointUrl, FACTORY_DROID_OPENAI_PROVIDER);
   const normalizedApiKey = String(apiKey || "").trim();
   const normalizedBindings = normalizeFactoryDroidBindings(bindings);
+  const routeLookup = buildFactoryDroidRouteLookup(config);
 
   if (!baseUrl) {
     throw new Error("Factory Droid endpoint URL must be a valid http:// or https:// URL.");
@@ -1112,32 +1552,92 @@ export async function patchFactoryDroidSettingsFile({
   const nextSettings = settingsState.data && typeof settingsState.data === "object" && !Array.isArray(settingsState.data)
     ? structuredClone(settingsState.data)
     : {};
+  const existingCustomModels = Array.isArray(nextSettings.customModels) ? nextSettings.customModels : [];
 
   if (captureBackup && !backupHasData(existingBackup)) {
     const backup = settingsState.existed ? captureFactoryDroidBackup(nextSettings) : {};
     await writeJsonObjectFile(resolvedBackupPath, backup);
   }
 
-  const customModels = Array.isArray(nextSettings.customModels) ? [...nextSettings.customModels] : [];
-  const routerIndex = findRouterManagedCustomModelIndex(customModels);
-  const routerEntry = {
-    [FACTORY_DROID_ROUTER_MARKER]: true,
-    model: normalizedBindings.defaultModel || "llm-router",
-    displayName: "LLM Router",
-    baseUrl,
-    apiKey: normalizedApiKey,
-    provider: "openai"
-  };
+  const resolvedBindings = normalizeFactoryDroidBindings({
+    defaultModel: resolveFactoryDroidBindingModelRef(normalizedBindings.defaultModel, existingCustomModels, routeLookup),
+    missionOrchestratorModel: resolveFactoryDroidBindingModelRef(normalizedBindings.missionOrchestratorModel, existingCustomModels, routeLookup),
+    missionWorkerModel: resolveFactoryDroidBindingModelRef(normalizedBindings.missionWorkerModel, existingCustomModels, routeLookup),
+    missionValidatorModel: resolveFactoryDroidBindingModelRef(normalizedBindings.missionValidatorModel, existingCustomModels, routeLookup),
+    reasoningEffort: normalizedBindings.reasoningEffort
+  });
 
-  if (routerIndex >= 0) {
-    customModels[routerIndex] = routerEntry;
-  } else {
-    customModels.push(routerEntry);
-  }
+  const customModels = stripRouterManagedCustomModels(existingCustomModels, { baseUrl });
+  const availableModels = buildFactoryDroidAvailableModelDescriptors(config, resolvedBindings);
+  const routerEntryStartIndex = getNextFactoryDroidCustomModelIndex(customModels);
+  const routerEntries = availableModels.length > 0
+    ? availableModels.map((descriptor, index) => {
+      const entryIndex = routerEntryStartIndex + index;
+      const modelId = buildFactoryDroidCustomModelId(descriptor.modelRef, entryIndex);
+      const provider = resolveFactoryDroidCustomModelProvider(descriptor.modelRef, config);
+      return {
+        [FACTORY_DROID_ROUTER_MARKER]: true,
+        model: descriptor.modelRef,
+        id: modelId,
+        index: entryIndex,
+        displayName: descriptor.displayName,
+        baseUrl: buildFactoryDroidBaseUrl(endpointUrl, provider),
+        apiKey: normalizedApiKey,
+        provider
+      };
+    })
+    : [{
+      [FACTORY_DROID_ROUTER_MARKER]: true,
+      model: "llm-router",
+      id: buildFactoryDroidCustomModelId("llm-router", routerEntryStartIndex),
+      index: routerEntryStartIndex,
+      displayName: buildFactoryDroidRouterDisplayName("llm-router", { kind: "alias" }),
+      baseUrl,
+      apiKey: normalizedApiKey,
+      provider: FACTORY_DROID_OPENAI_PROVIDER
+    }];
+
+  customModels.push(...routerEntries);
   nextSettings.customModels = customModels;
+  const allCustomModels = nextSettings.customModels;
 
   if (normalizedBindings.defaultModel) {
-    nextSettings.model = normalizedBindings.defaultModel;
+    const selectedModel = resolveFactoryDroidBindingSelectionValue(normalizedBindings.defaultModel, allCustomModels, routeLookup);
+    nextSettings.model = selectedModel;
+    setNestedObjectValue(nextSettings, ["sessionDefaultSettings", "model"], selectedModel);
+  } else {
+    delete nextSettings.model;
+    deleteNestedObjectValue(nextSettings, ["sessionDefaultSettings", "model"]);
+  }
+
+  if (normalizedBindings.missionOrchestratorModel) {
+    nextSettings.missionOrchestratorModel = resolveFactoryDroidBindingSelectionValue(
+      normalizedBindings.missionOrchestratorModel,
+      allCustomModels,
+      routeLookup
+    );
+  } else {
+    delete nextSettings.missionOrchestratorModel;
+  }
+
+  if (normalizedBindings.missionWorkerModel) {
+    setNestedObjectValue(
+      nextSettings,
+      ["missionModelSettings", "workerModel"],
+      resolveFactoryDroidBindingSelectionValue(normalizedBindings.missionWorkerModel, allCustomModels, routeLookup)
+    );
+  } else {
+    deleteNestedObjectValue(nextSettings, ["missionModelSettings", "workerModel"]);
+  }
+
+  if (normalizedBindings.missionValidatorModel) {
+    setNestedObjectValue(
+      nextSettings,
+      ["missionModelSettings", "validationWorkerModel"],
+      resolveFactoryDroidBindingSelectionValue(normalizedBindings.missionValidatorModel, allCustomModels, routeLookup)
+    );
+  } else {
+    deleteNestedObjectValue(nextSettings, ["missionModelSettings", "validationWorkerModel"]);
   }
 
   if (normalizedBindings.reasoningEffort) {
@@ -1147,12 +1647,32 @@ export async function patchFactoryDroidSettingsFile({
   }
 
   await writeJsonObjectFile(resolvedSettingsPath, nextSettings);
+  const primaryEntry = resolvedBindings.defaultModel
+    ? getFactoryDroidCustomModelEntryByValue(allCustomModels, resolvedBindings.defaultModel, { preferRouterManaged: true })
+    : null;
+  const configuredEntry = primaryEntry || getRouterManagedCustomModel(allCustomModels);
   return {
     settingsFilePath: resolvedSettingsPath,
     backupFilePath: resolvedBackupPath,
     settingsCreated: !settingsState.existed,
-    baseUrl,
-    bindings: normalizedBindings
+    baseUrl: String(configuredEntry?.baseUrl || baseUrl).trim(),
+    configuredProvider: String(configuredEntry?.provider || FACTORY_DROID_OPENAI_PROVIDER).trim(),
+    bindings: resolvedBindings,
+    bindingIds: normalizeFactoryDroidBindings({
+      defaultModel: normalizedBindings.defaultModel
+        ? resolveFactoryDroidBindingSelectionValue(normalizedBindings.defaultModel, allCustomModels, routeLookup)
+        : "",
+      missionOrchestratorModel: normalizedBindings.missionOrchestratorModel
+        ? resolveFactoryDroidBindingSelectionValue(normalizedBindings.missionOrchestratorModel, allCustomModels, routeLookup)
+        : "",
+      missionWorkerModel: normalizedBindings.missionWorkerModel
+        ? resolveFactoryDroidBindingSelectionValue(normalizedBindings.missionWorkerModel, allCustomModels, routeLookup)
+        : "",
+      missionValidatorModel: normalizedBindings.missionValidatorModel
+        ? resolveFactoryDroidBindingSelectionValue(normalizedBindings.missionValidatorModel, allCustomModels, routeLookup)
+        : "",
+      reasoningEffort: normalizedBindings.reasoningEffort
+    })
   };
 }
 

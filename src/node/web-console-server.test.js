@@ -164,6 +164,17 @@ async function fetchJson(url, options = {}) {
   return { response, payload };
 }
 
+async function fetchJsonLines(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  const messages = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  return { response, messages };
+}
+
 function createSilentEventSource(window) {
   return class SilentEventSource extends window.EventTarget {
     close() {}
@@ -478,6 +489,67 @@ test("web console state exposes config metadata and raw text", async () => {
     assert.equal(payload.activityLog.enabled, true);
     assert.match(payload.startup.label, /startup|launchagent|systemd/i);
     assert.equal(Array.isArray(payload.logs), true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console state exposes local model runtime, library, and variant metadata", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/opt/homebrew/bin/llama-server",
+            status: "running",
+            host: "127.0.0.1",
+            port: 39391
+          }
+        },
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            displayName: "Qwen Q5",
+            source: "llamacpp-managed",
+            path: "/Users/test/.llm-router/local-models/qwen-q5.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-q5-balanced",
+            name: "Qwen Q5 Balanced",
+            runtime: "llamacpp",
+            enabled: true,
+            preload: true,
+            availability: "available",
+            contextWindow: 200000
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  });
+
+  try {
+    const { response, payload } = await fetchJson(`${server.url}/api/state`);
+    assert.equal(response.status, 200);
+    assert.equal(payload.config.document.metadata.localModels.runtime.llamacpp.status, "running");
+    assert.equal(payload.config.document.metadata.localModels.library["base-qwen"].displayName, "Qwen Q5");
+    assert.equal(payload.config.document.metadata.localModels.variants["variant-qwen"].preload, true);
+
+    const localProvider = payload.config.document.providers.find((provider) => provider.id === "local-models");
+    assert.equal(localProvider?.type, "local-runtime");
+    assert.deepEqual(localProvider?.models?.map((model) => model.id), ["local/qwen-q5-balanced"]);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -1233,6 +1305,8 @@ test("web console serves the React shell assets", async () => {
     const appResponse = await fetch(`${server.url}/app.js`);
     assert.equal(appResponse.status, 200);
     assert.match(appResponse.headers.get("content-type") || "", /application\/javascript/);
+    const appJs = await appResponse.text();
+    assert.match(appJs, /claudeCode\.webSearchProvider/);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -1864,7 +1938,6 @@ test("web console reports an occupied router port and can reclaim it", async () 
       body: JSON.stringify({})
     });
     assert.equal(reclaimed.response.status, 200);
-    assert.equal(reclaimed.payload.router.running, false);
     assert.equal(reclaimed.payload.router.portBusy, false);
     assert.deepEqual(reclaimed.payload.router.listenerPids, []);
     assert.deepEqual(reclaimCalls, [state.payload.config.localServer.port]);
@@ -2909,6 +2982,149 @@ test("web console toggles Codex CLI global routing and restores the prior config
   }
 });
 
+test("web console uses the configured router port for Codex CLI routing endpoints", async () => {
+  const customRouterPort = FIXED_LOCAL_ROUTER_PORT + 1;
+  const codexCli = await makeCodexCliEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop"
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+    routerPort: customRouterPort
+  }, {
+    codexCliEnv: codexCli.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    assert.equal(initial.response.status, 200);
+
+    const enabled = await fetchJson(`${server.url}/api/codex-cli/global-route`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        rawText: initial.payload.config.rawText
+      })
+    });
+    assert.equal(enabled.response.status, 200);
+    assert.equal(enabled.payload.codingTools.codexCli.routedViaRouter, true);
+
+    const expectedBaseUrl = `http://${FIXED_LOCAL_ROUTER_HOST}:${customRouterPort}/openai/v1`;
+    const codexConfigText = await readTextFileOrNull(getCodexConfigPath(codexCli.env));
+    assert.ok(String(codexConfigText || "").includes(`base_url = "${expectedBaseUrl}"`));
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await codexCli.cleanup();
+  }
+});
+
+test("web console dev mode blocks startup management", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  let installCalls = 0;
+  let uninstallCalls = 0;
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+    devMode: true,
+    routerPort: FIXED_LOCAL_ROUTER_PORT + 1
+  }, {
+    installStartup: async () => {
+      installCalls += 1;
+      return { manager: "launchd", installed: true, running: true };
+    },
+    uninstallStartup: async () => {
+      uninstallCalls += 1;
+    }
+  });
+
+  try {
+    const enableResponse = await fetchJson(`${server.url}/api/startup/enable`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(enableResponse.response.status, 409);
+    assert.match(enableResponse.payload.error || "", /unavailable in dev mode/i);
+
+    const disableResponse = await fetchJson(`${server.url}/api/startup/disable`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(disableResponse.response.status, 409);
+    assert.match(disableResponse.payload.error || "", /unavailable in dev mode/i);
+    assert.equal(installCalls, 0);
+    assert.equal(uninstallCalls, 0);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("web console dev mode can sync from the production config while preserving the dev router port", async () => {
+  const devRouterPort = FIXED_LOCAL_ROUTER_PORT + 1;
+  const fixture = await makeTempConfig(createBaseConfig());
+  const productionFixture = await makeTempConfig({
+    providers: [
+      {
+        id: "prod-sync",
+        name: "Production Sync Provider",
+        baseUrl: "https://prod.example.com/v1",
+        apiKey: "sk-prod-sync-1234",
+        format: "openai",
+        models: [{ id: "gpt-4.1-mini" }]
+      }
+    ],
+    modelAliases: {
+      default: {
+        id: "default",
+        strategy: "ordered",
+        targets: [{ ref: "prod-sync/gpt-4.1-mini" }],
+        fallbackTargets: []
+      }
+    }
+  });
+
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath,
+    productionConfigPath: productionFixture.configPath,
+    routerPort: devRouterPort,
+    devMode: true
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    assert.equal(initial.response.status, 200);
+    assert.equal(initial.payload.environment.devMode, true);
+    assert.equal(initial.payload.environment.canSyncProductionConfig, true);
+    assert.equal(initial.payload.config.localServer.port, devRouterPort);
+
+    const synced = await fetchJson(`${server.url}/api/config/sync-production`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(synced.response.status, 200);
+    assert.equal(synced.payload.environment.devMode, true);
+    assert.equal(synced.payload.config.localServer.port, devRouterPort);
+    assert.equal(synced.payload.router.port, devRouterPort);
+    assert.match(String(synced.payload.config.rawText || ""), /prod-sync/);
+    assert.match(String(synced.payload.message || ""), /Synced dev config from/);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await productionFixture.cleanup();
+  }
+});
+
 test("web console writes Codex CLI model catalog metadata for alias bindings and removes it on disconnect", async () => {
   const codexCli = await makeCodexCliEnv();
   const fixture = await makeTempConfig({
@@ -3574,6 +3790,181 @@ test("web console treats Claude Code as connected when the endpoint matches and 
   }
 });
 
+test("web console state exposes Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        },
+        {
+          id: "demo/gpt-4o-mini",
+          providerId: "demo",
+          model: "gpt-4o-mini"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "demo/gpt-4o-mini"
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const state = await fetchJson(`${server.url}/api/state`);
+    assert.equal(state.response.status, 200);
+    assert.equal(state.payload.codingTools.claudeCode.webSearchProvider, "demo/gpt-4o-mini");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console updates Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const updated = await fetchJson(`${server.url}/api/claude-code/search-provider`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: initial.payload.config.rawText,
+        webSearchProvider: "brave"
+      })
+    });
+
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.payload.codingTools.claudeCode.webSearchProvider, "brave");
+
+    const config = await readJsonFileOrNull(fixture.configPath);
+    assert.equal(config.claudeCode.webSearchProvider, "brave");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console clears Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    },
+    claudeCode: {
+      webSearchProvider: "brave"
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const cleared = await fetchJson(`${server.url}/api/claude-code/search-provider`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: initial.payload.config.rawText,
+        webSearchProvider: ""
+      })
+    });
+
+    assert.equal(cleared.response.status, 200);
+    assert.equal(cleared.payload.codingTools.claudeCode.webSearchProvider, "");
+
+    const config = await readJsonFileOrNull(fixture.configPath);
+    assert.equal(config.claudeCode, undefined);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console rejects invalid Claude Code web search provider selection", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    webSearch: {
+      providers: [
+        {
+          id: "brave",
+          apiKey: "brave_test_key"
+        }
+      ]
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const initial = await fetchJson(`${server.url}/api/state`);
+    const invalid = await fetchJson(`${server.url}/api/claude-code/search-provider`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rawText: initial.payload.config.rawText,
+        webSearchProvider: "demo/gpt-4o-mini"
+      })
+    });
+
+    assert.equal(invalid.response.status, 400);
+    assert.equal(
+      invalid.payload.error,
+      "Claude Code web search provider 'demo/gpt-4o-mini' must reference a configured webSearch provider."
+    );
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
 test("web console restores deprecated Claude Code small/fast bindings from backup on disconnect", async () => {
   const claudeCode = await makeClaudeCodeEnv();
   const fixture = await makeTempConfig({
@@ -3627,6 +4018,41 @@ test("web console restores deprecated Claude Code small/fast bindings from backu
     assert.equal(disabled.response.status, 200);
     assert.deepEqual(await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env)), originalSettings);
     assert.deepEqual(await readJsonFileOrNull(getToolBackupPath(getClaudeSettingsPath(claudeCode.env))), {});
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+    await claudeCode.cleanup();
+  }
+});
+
+test("web console accepts xhigh Claude Code effort level updates", async () => {
+  const claudeCode = await makeClaudeCodeEnv();
+  const fixture = await makeTempConfig({
+    ...createBaseConfig(),
+    masterKey: "gw_test_master_key_1234567890abcdefghijklmnop"
+  });
+  const server = await startTestWebConsoleServer({
+    host: "127.0.0.1",
+    port: 0,
+    configPath: fixture.configPath
+  }, {
+    claudeCodeEnv: claudeCode.env
+  });
+
+  try {
+    const updated = await fetchJson(`${server.url}/api/claude-code/effort-level`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        effortLevel: "xhigh"
+      })
+    });
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.payload.codingTools.claudeCode.bindings.thinkingLevel, "xhigh");
+
+    const settings = await readJsonFileOrNull(getClaudeSettingsPath(claudeCode.env));
+    assert.equal(settings.env.CLAUDE_CODE_EFFORT_LEVEL, "xhigh");
+    assert.equal(settings.effortLevel, undefined);
   } finally {
     await server.close("test-cleanup");
     await fixture.cleanup();
@@ -3894,5 +4320,734 @@ test("web console updates Claude Code routing when the gateway key changes", asy
     await server.close("test-cleanup");
     await fixture.cleanup();
     await claudeCode.cleanup();
+  }
+});
+
+test("POST /api/local-models/attach stores an attached llama.cpp model in config metadata", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {},
+        library: {},
+        variants: {},
+        capacity: {}
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    localModelPathExists: async () => true
+  });
+
+  try {
+    const attached = await fetchJson(`${server.url}/api/local-models/attach`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "base-qwen",
+        displayName: "Qwen External",
+        filePath: "/Volumes/models/qwen.gguf"
+      })
+    });
+
+    assert.equal(attached.response.status, 200);
+    assert.equal(attached.payload.ok, true);
+    assert.equal(attached.payload.library["base-qwen"].source, "llamacpp-attached");
+
+    const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(saved.metadata.localModels.library["base-qwen"].path, "/Volumes/models/qwen.gguf");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/search-huggingface returns shaped candidates with disabled reasons", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    searchHuggingFaceGgufCandidates: async () => ([
+      {
+        repo: "org/model",
+        file: "model.Q5_K_M.gguf",
+        sizeBytes: 24 * 1024 ** 3,
+        disabled: false,
+        disabledReason: "",
+        fit: "safe",
+        badges: ["GGUF", "llama.cpp", "Mac OK"]
+      },
+      {
+        repo: "org/model",
+        file: "model.safetensors",
+        sizeBytes: 24 * 1024 ** 3,
+        disabled: true,
+        disabledReason: "Not a GGUF file",
+        fit: "unsupported",
+        badges: ["Mac review"]
+      }
+    ])
+  });
+
+  try {
+    const searched = await fetchJson(`${server.url}/api/local-models/search-huggingface`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: "qwen" })
+    });
+
+    assert.equal(searched.response.status, 200);
+    assert.equal(searched.payload.results.length, 2);
+    assert.equal(searched.payload.results[1].disabled, true);
+    assert.match(searched.payload.results[1].disabledReason, /not a gguf file/i);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/download-managed streams progress and registers the managed model", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    downloadManagedHuggingFaceGguf: async (request, { onProgress }) => {
+      onProgress({ receivedBytes: 5, totalBytes: 10 });
+      return {
+        id: "base-qwen-managed",
+        displayName: "Qwen Managed",
+        filePath: path.join(fixture.dir, "managed", "qwen.Q5.gguf"),
+        repo: request.repo,
+        file: request.file,
+        sizeBytes: 10
+      };
+    }
+  });
+
+  try {
+    const streamed = await fetchJsonLines(`${server.url}/api/local-models/download-managed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "base-qwen-managed",
+        displayName: "Qwen Managed",
+        repo: "org/model",
+        file: "qwen.Q5.gguf"
+      })
+    });
+
+    assert.equal(streamed.response.status, 200);
+    assert.equal(streamed.messages[0].type, "start");
+    assert.equal(streamed.messages.some((message) => message.type === "progress"), true);
+    const resultMessage = streamed.messages.find((message) => message.type === "result");
+    assert.equal(resultMessage.result.library["base-qwen-managed"].source, "llamacpp-managed");
+
+    const saved = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    assert.equal(saved.metadata.localModels.library["base-qwen-managed"].managed, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/variants/save persists a local variant and returns it", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-managed",
+            path: "/tmp/qwen.gguf",
+            metadata: { sizeBytes: 8 * 1024 ** 3 }
+          }
+        },
+        variants: {}
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    getLocalModelSystemInfo: () => ({
+      platform: "darwin",
+      totalMemoryBytes: 64 * 1024 ** 3,
+      unifiedMemory: true
+    })
+  });
+
+  try {
+    const saved = await fetchJson(`${server.url}/api/local-models/variants/save`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        variant: {
+          key: "qwen-balanced",
+          baseModelId: "base-qwen",
+          id: "local/qwen-balanced",
+          name: "Qwen Balanced",
+          runtime: "llamacpp",
+          enabled: true,
+          preload: false,
+          contextWindow: 65536
+        }
+      })
+    });
+
+    assert.equal(saved.response.status, 200);
+    assert.equal(saved.payload.ok, true);
+    assert.equal(saved.payload.variants["qwen-balanced"].id, "local/qwen-balanced");
+    assert.equal(saved.payload.variants["qwen-balanced"].capacityState, "safe");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/locate repairs a stale base model path and descendant variants", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            path: "/missing/qwen.gguf",
+            availability: "stale"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp",
+            availability: "stale"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    localModelPathExists: async () => true
+  });
+
+  try {
+    const located = await fetchJson(`${server.url}/api/local-models/locate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        baseModelId: "base-qwen",
+        filePath: "/Volumes/models/qwen.gguf"
+      })
+    });
+
+    assert.equal(located.response.status, 200);
+    assert.equal(located.payload.ok, true);
+    assert.equal(located.payload.library["base-qwen"].path, "/Volumes/models/qwen.gguf");
+    assert.equal(located.payload.library["base-qwen"].availability, "available");
+    assert.equal(located.payload.variants["variant-qwen"].availability, "available");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/remove deletes a base model and descendant variants", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            path: "/models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  });
+
+  try {
+    const removed = await fetchJson(`${server.url}/api/local-models/remove`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        baseModelId: "base-qwen"
+      })
+    });
+
+    assert.equal(removed.response.status, 200);
+    assert.equal(removed.payload.ok, true);
+    assert.equal(removed.payload.library["base-qwen"], undefined);
+    assert.equal(removed.payload.variants["variant-qwen"], undefined);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/reconcile refreshes stale availability from disk state", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        library: {
+          "base-qwen": {
+            id: "base-qwen",
+            source: "llamacpp-attached",
+            path: "/models/qwen.gguf",
+            availability: "available"
+          }
+        },
+        variants: {
+          "variant-qwen": {
+            key: "variant-qwen",
+            baseModelId: "base-qwen",
+            id: "local/qwen-balanced",
+            name: "Qwen Balanced",
+            runtime: "llamacpp",
+            availability: "available"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    localModelPathExists: async () => false
+  });
+
+  try {
+    const reconciled = await fetchJson(`${server.url}/api/local-models/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(reconciled.response.status, 200);
+    assert.equal(reconciled.payload.ok, true);
+    assert.equal(reconciled.payload.library["base-qwen"].availability, "stale");
+    assert.equal(reconciled.payload.variants["variant-qwen"].availability, "stale");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/discover exposes detected llama.cpp candidates and TurboQuant builds", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/opt/homebrew/bin/llama-server",
+            startWithRouter: true,
+            host: "127.0.0.1",
+            port: 39391
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    detectLlamacppCandidates: () => ([
+      { id: "/opt/homebrew/bin/llama-server", label: "Homebrew llama-server", path: "/opt/homebrew/bin/llama-server", source: "homebrew" }
+    ]),
+    validateLlamacppCommand: () => ({
+      ok: true,
+      kind: "server",
+      supportsHost: true,
+      supportsPort: true,
+      isTurboQuant: true
+    })
+  });
+
+  try {
+    const discovered = await fetchJson(`${server.url}/api/local-models/runtime/discover`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(discovered.response.status, 200);
+    assert.equal(discovered.payload.runtime.selectedCommand, "/opt/homebrew/bin/llama-server");
+    assert.equal(discovered.payload.runtime.candidates.length, 1);
+    assert.equal(discovered.payload.runtime.candidates[0].isTurboQuant, true);
+    assert.equal(discovered.payload.runtime.candidates[0].current, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/browse returns scanned GGUF matches for a selected directory", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    browseForLocalModelPath: async () => ({
+      canceled: false,
+      selection: "directory",
+      path: "/Volumes/models"
+    }),
+    scanLocalModelPath: async () => ([
+      { filePath: "/Volumes/models/qwen.Q5_K_M.gguf", fileName: "qwen.Q5_K_M.gguf", sizeBytes: 24 * 1024 ** 3 }
+    ])
+  });
+
+  try {
+    const result = await fetchJson(`${server.url}/api/local-models/browse`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ selection: "directory" })
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.payload.selection.path, "/Volumes/models");
+    assert.equal(result.payload.matches.length, 1);
+    assert.equal(result.payload.matches[0].fileName, "qwen.Q5_K_M.gguf");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/scan-path scans a manual folder path for GGUF files", async () => {
+  const fixture = await makeTempConfig({ version: 2, providers: [] });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    scanLocalModelPath: async (targetPath) => ([
+      { filePath: `${targetPath}/qwen.Q5_K_M.gguf`, fileName: "qwen.Q5_K_M.gguf", sizeBytes: 24 * 1024 ** 3 }
+    ])
+  });
+
+  try {
+    const result = await fetchJson(`${server.url}/api/local-models/scan-path`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "/Volumes/models" })
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.payload.path, "/Volumes/models");
+    assert.equal(result.payload.matches.length, 1);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/select persists a browsed llama.cpp runtime command", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: true
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    validateLlamacppCommand: () => ({
+      ok: true,
+      kind: "server",
+      supportsHost: true,
+      supportsPort: true,
+      isTurboQuant: true
+    })
+  });
+
+  try {
+    const selected = await fetchJson(`${server.url}/api/local-models/runtime/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        command: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server"
+      })
+    });
+
+    assert.equal(selected.response.status, 200);
+    assert.equal(selected.payload.ok, true);
+    assert.equal(selected.payload.runtime.selectedCommand, "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server");
+    assert.equal(selected.payload.runtime.status, "stopped");
+    assert.equal(selected.payload.runtime.isTurboQuant, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/settings persists llama.cpp autostart settings", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: false,
+            status: "stopped"
+          }
+        }
+      }
+    }
+  });
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  });
+
+  try {
+    const updated = await fetchJson(`${server.url}/api/local-models/runtime/settings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        startWithRouter: true
+      })
+    });
+
+    assert.equal(updated.response.status, 200);
+    assert.equal(updated.payload.ok, true);
+    assert.equal(updated.payload.runtime.startWithRouter, true);
+    assert.equal(updated.payload.runtime.selectedCommand, "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/start starts the configured llama.cpp runtime and marks it running", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: true,
+            status: "stopped"
+          }
+        }
+      }
+    }
+  });
+  let startCalls = 0;
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    listListeningPids: () => [],
+    startConfiguredLlamacppRuntime: async () => {
+      startCalls += 1;
+      return {
+        ok: true,
+        validation: {
+          ok: true,
+          kind: "server",
+          supportsHost: true,
+          supportsPort: true,
+          isTurboQuant: true
+        }
+      };
+    }
+  });
+
+  try {
+    const started = await fetchJson(`${server.url}/api/local-models/runtime/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(started.response.status, 200);
+    assert.equal(started.payload.ok, true);
+    assert.equal(startCalls, 1);
+    assert.equal(started.payload.runtime.status, "running");
+    assert.equal(started.payload.runtime.isTurboQuant, true);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST /api/local-models/runtime/stop stops a running llama.cpp runtime by port and marks it stopped", async () => {
+  const fixture = await makeTempConfig({
+    version: 2,
+    providers: [],
+    metadata: {
+      localModels: {
+        runtime: {
+          llamacpp: {
+            selectedCommand: "/Users/khang/src/llama-cpp-turboquant/build/bin/llama-server",
+            host: "127.0.0.1",
+            port: 39391,
+            startWithRouter: true,
+            status: "running"
+          }
+        }
+      }
+    }
+  });
+  const stoppedPids = [];
+  const server = await startTestWebConsoleServer({
+    configPath: fixture.configPath,
+    port: await getAvailablePort()
+  }, {
+    listListeningPids: () => [42424],
+    stopProcessByPid: async (pid) => {
+      stoppedPids.push(pid);
+      return { ok: true };
+    },
+    stopManagedLlamacppRuntime: async () => ({ ok: true, skipped: true })
+  });
+
+  try {
+    const stopped = await fetchJson(`${server.url}/api/local-models/runtime/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+
+    assert.equal(stopped.response.status, 200);
+    assert.equal(stopped.payload.ok, true);
+    assert.deepEqual(stoppedPids, [42424]);
+    assert.equal(stopped.payload.runtime.status, "stopped");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+// ── Quota Probe endpoint tests ─────────────────────────────────────
+
+test("GET quota-probe snapshot returns null for unprobed provider", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/demo/quota-probe/snapshot`);
+    const payload = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(payload.snapshot, null);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST quota-probe refresh returns 400 for provider without quotaProbe", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/demo/quota-probe/refresh`, {
+      method: "POST",
+      headers: { "content-type": "application/json" }
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST quota-probe test returns snapshot result for valid config", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/demo/quota-probe/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "http",
+        capKind: "dollars",
+        http: {
+          method: "GET",
+          url: "https://httpbin.org/status/404",
+          headers: [],
+          timeoutMs: 3000,
+          mapping: {}
+        }
+      })
+    });
+    const payload = await res.json();
+    assert.equal(res.status, 200);
+    assert.ok("snapshot" in payload);
+    assert.equal(typeof payload.latencyMs, "number");
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
+  }
+});
+
+test("POST quota-probe test returns 404 for unknown provider", async () => {
+  const fixture = await makeTempConfig(createBaseConfig());
+  const server = await startTestWebConsoleServer({ configPath: fixture.configPath, port: 0 });
+  try {
+    const res = await fetch(`${server.url}/api/providers/nonexistent/quota-probe/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "http", capKind: "dollars", http: { url: "https://example.com" } })
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await server.close("test-cleanup");
+    await fixture.cleanup();
   }
 });

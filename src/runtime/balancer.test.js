@@ -472,3 +472,119 @@ test("quota-exhausted routes still return no selected candidate", async () => {
   assert.equal(ranked.skippedEntries.length, 2);
   assert.ok(ranked.skippedEntries.every((entry) => entry.skipReasons.includes("quota-exhausted")));
 });
+
+test("rankRouteCandidates skips candidate when probe snapshot shows exhausted + AND combinator", async () => {
+  const store = createMemoryStateStore();
+  const config = normalizeRuntimeConfig({
+    version: 2,
+    defaultModel: "chat.default",
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [
+          { ref: "probed-provider/model-a" },
+          { ref: "fallback-provider/model-b" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "probed-provider",
+        name: "Probed",
+        baseUrl: "https://api.probed.example.com",
+        format: "openai",
+        models: [{ id: "model-a" }],
+        quotaProbe: {
+          enabled: true,
+          enforce: "gate",
+          combinator: "AND",
+          capKind: "dollars",
+          safetyMargin: { dollars: 1, percent: 0 }
+        }
+      },
+      {
+        id: "fallback-provider",
+        name: "Fallback",
+        baseUrl: "https://api.fallback.example.com",
+        format: "openai",
+        models: [{ id: "model-b" }]
+      }
+    ]
+  });
+
+  const route = resolveRequestedRoute(config, "chat.default", "openai");
+  const candidates = [route.primary, ...route.fallbacks];
+
+  const quotaProbeSnapshots = new Map();
+  quotaProbeSnapshots.set("probed-provider", {
+    remaining: 0.5,
+    limit: 100,
+    used: 99.5,
+    state: "fresh",
+    capKind: "dollars"
+  });
+
+  const ranked = await rankRouteCandidates({
+    route,
+    strategy: route.routeStrategy,
+    candidates,
+    stateStore: store,
+    config,
+    quotaProbeSnapshots
+  });
+
+  assert.equal(ranked.selectedEntry?.candidate.requestModelId, "fallback-provider/model-b");
+  assert.ok(
+    ranked.skippedEntries.some((entry) =>
+      entry.candidate.requestModelId === "probed-provider/model-a" &&
+      entry.skipReasons.some((r) => r.includes("probe"))
+    )
+  );
+});
+
+test("rankRouteCandidates allows candidate when no quotaProbeSnapshots (backward compat)", async () => {
+  const store = createMemoryStateStore();
+  const config = normalizeRuntimeConfig({
+    version: 2,
+    defaultModel: "chat.default",
+    modelAliases: {
+      "chat.default": {
+        strategy: "ordered",
+        targets: [
+          { ref: "probed-provider/model-a" }
+        ]
+      }
+    },
+    providers: [
+      {
+        id: "probed-provider",
+        name: "Probed",
+        baseUrl: "https://api.probed.example.com",
+        format: "openai",
+        models: [{ id: "model-a" }],
+        quotaProbe: {
+          enabled: true,
+          enforce: "gate",
+          combinator: "AND",
+          capKind: "dollars",
+          safetyMargin: { dollars: 1, percent: 0 }
+        }
+      }
+    ]
+  });
+
+  const route = resolveRequestedRoute(config, "chat.default", "openai");
+  const candidates = [route.primary, ...route.fallbacks];
+
+  const ranked = await rankRouteCandidates({
+    route,
+    strategy: route.routeStrategy,
+    candidates,
+    stateStore: store,
+    config,
+    quotaProbeSnapshots: null
+  });
+
+  assert.equal(ranked.selectedEntry?.candidate.requestModelId, "probed-provider/model-a");
+  assert.equal(ranked.skippedEntries.length, 0);
+});

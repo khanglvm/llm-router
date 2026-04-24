@@ -73,12 +73,24 @@ function extractLiteLlmContextWindow(entry) {
   return null;
 }
 
+function extractLiteLlmCapabilities(entry = {}) {
+  const capabilities = {};
+  let hasAny = false;
+  if (typeof entry.supports_response_schema === "boolean") {
+    capabilities.supportsResponseFormat = entry.supports_response_schema;
+    hasAny = true;
+  }
+  return hasAny ? capabilities : undefined;
+}
+
 function createLiteLlmLookupResult(modelName, entry = {}) {
+  const capabilities = extractLiteLlmCapabilities(entry);
   return {
     model: String(modelName || "").trim(),
     contextWindow: extractLiteLlmContextWindow(entry),
     provider: String(entry?.litellm_provider || "").trim(),
-    mode: String(entry?.mode || "").trim()
+    mode: String(entry?.mode || "").trim(),
+    ...(capabilities ? { capabilities } : {})
   };
 }
 

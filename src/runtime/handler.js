@@ -20,6 +20,11 @@ import {
   buildFailureResponse,
   makeProviderCall
 } from "./handler/provider-call.js";
+import {
+  buildToolNameMap,
+  sanitizeBodyToolNames,
+  reverseToolNamesInResponse
+} from "./handler/tool-name-sanitizer.js";
 import { corsResponse, jsonResponse } from "./handler/http.js";
 import {
   detectUserRequestFormat,
@@ -637,6 +642,10 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     }, 503), routeDebug);
   }
 
+  // Sanitize tool names that upstream providers would reject (e.g. dots in MCP names).
+  const toolNameMap = buildToolNameMap(body);
+  const sanitizedBody = toolNameMap ? sanitizeBodyToolNames(body, toolNameMap) : body;
+
   let lastErrorResult = null;
   let lastErrorMessage = "Unknown error";
   let routeSelectionCommitted = false;
@@ -666,7 +675,7 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
     while (attempt < maxAttempts) {
       attempt += 1;
       result = await makeProviderCall({
-        body,
+        body: sanitizedBody,
         sourceFormat,
         stream,
         requestKind: options.requestKind,
@@ -677,7 +686,8 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
         runtimeConfig: config,
         stateStore,
         ampContext,
-        runtimeFlags
+        runtimeFlags,
+        onLargeRequestLog: options.onLargeRequestLog
       });
 
       if (!quotaConsumed && shouldConsumeQuotaFromResult(result)) {
@@ -722,7 +732,10 @@ async function handleRouteRequest(request, env, getConfig, sourceFormatHint, opt
         if (ampContext?.threadId && options.threadAffinityStore) {
           options.threadAffinityStore.setAffinity(ampContext.threadId, entry.candidateKey);
         }
-        return withRouteDebugHeaders(result.response, routeDebug);
+        const finalResponse = toolNameMap
+          ? reverseToolNamesInResponse(result.response, toolNameMap, stream)
+          : result.response;
+        return withRouteDebugHeaders(finalResponse, routeDebug);
       }
 
       classification = await classifyFailureResult(result, retryPolicy);
