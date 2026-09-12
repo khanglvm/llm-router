@@ -65,5 +65,9 @@
     "SECURITY.md",
     "CHANGELOG.md",
     "wrangler.toml"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/khanglvm/llm-router.git"
+  }
 }
